@@ -1,0 +1,361 @@
+<mxfile host="Electron" modified="2024-06-13T16:06:00.186Z" agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) draw.io/24.2.5 Chrome/120.0.6099.109 Electron/28.1.0 Safari/537.36" etag="RazcFsY7srvsdsCawQPq" version="24.2.5" type="device">
+  <diagram name="Page-1" id="ZjDDQJJPFg0Ox1GyfzFk">
+    <mxGraphModel dx="5005" dy="4992" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="0" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="4000" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="5_DyJyI8M9IPfwXmiHKh-10" value="" style="shape=ext;double=1;rounded=0;whiteSpace=wrap;html=1;fillColor=none;" parent="1" vertex="1">
+          <mxGeometry x="-2462" y="20" width="1702" height="1130" as="geometry" />
+        </mxCell>
+        <mxCell id="op9TbKIEDOTLHS-nMI7d-17" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0;exitY=0;exitDx=170;exitDy=66;exitPerimeter=0;entryX=0.18;entryY=0;entryDx=0;entryDy=0;entryPerimeter=0;strokeWidth=6;" parent="1" source="KJcT8KKadc8VXpA1oSE8-1" target="5_DyJyI8M9IPfwXmiHKh-10" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="-2412" y="90" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="KJcT8KKadc8VXpA1oSE8-1" value="Drug_Screening_Platform" style="shape=folder;fontStyle=1;spacingTop=10;tabWidth=40;tabHeight=14;tabPosition=left;html=1;whiteSpace=wrap;" parent="1" vertex="1">
+          <mxGeometry x="-2900" y="-480" width="170" height="118" as="geometry" />
+        </mxCell>
+        <mxCell id="S1ebgUeqdzHGPqSR9HJT-7" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" parent="1" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="230" y="235" as="sourcePoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="S1ebgUeqdzHGPqSR9HJT-41" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0;exitY=1;exitDx=0;exitDy=0;entryX=0.75;entryY=1;entryDx=0;entryDy=0;" parent="1" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="177.5" y="260" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="rPnB2i1iDil81EqJOdZv-5" value="" style="rounded=0;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+          <mxGeometry x="-2050" y="40" width="370" height="370" as="geometry" />
+        </mxCell>
+        <mxCell id="rPnB2i1iDil81EqJOdZv-6" value="drug_screening_package&amp;nbsp;" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontStyle=1" parent="1" vertex="1">
+          <mxGeometry x="-1987.5" y="38" width="195" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="rPnB2i1iDil81EqJOdZv-12" value="actions_level_0.py" style="swimlane;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+          <mxGeometry x="-2040" y="68" width="350" height="162" as="geometry">
+            <mxRectangle x="190" y="190" width="140" height="30" as="alternateBounds" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="rPnB2i1iDil81EqJOdZv-13" value="- process_emolecules_raw_file() - &lt;font color=&quot;#ff0000&quot;&gt;obsolete&lt;/font&gt;&lt;div&gt;- process_emolecules_raw_file_tqdm()&lt;/div&gt;&lt;div&gt;- process_emolecules_raw_file_pandarallel() - &lt;font color=&quot;#009900&quot;&gt;&lt;b&gt;recommended&lt;/b&gt;&lt;/font&gt;&lt;/div&gt;&lt;div&gt;- process_raw_csv_file_pandarallel() -&amp;nbsp;&lt;font color=&quot;#009900&quot;&gt;&lt;b&gt;recommended&lt;/b&gt;&lt;/font&gt;&lt;font color=&quot;#009900&quot;&gt;&lt;b&gt;&lt;br&gt;&lt;/b&gt;&lt;/font&gt;&lt;div&gt;- add_reactant_filter_to_db()&lt;/div&gt;&lt;div&gt;- add_reaction_smarts_to_db()&lt;/div&gt;&lt;/div&gt;" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;" parent="rPnB2i1iDil81EqJOdZv-12" vertex="1">
+          <mxGeometry x="3" y="31" width="337" height="119" as="geometry" />
+        </mxCell>
+        <mxCell id="rPnB2i1iDil81EqJOdZv-15" value="actions_level_1.py" style="swimlane;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+          <mxGeometry x="-2040" y="280" width="350" height="120" as="geometry">
+            <mxRectangle x="190" y="190" width="140" height="30" as="alternateBounds" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="rPnB2i1iDil81EqJOdZv-16" value="- create_level_1_project()" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;" parent="rPnB2i1iDil81EqJOdZv-15" vertex="1">
+          <mxGeometry x="3" y="25" width="190" height="64" as="geometry" />
+        </mxCell>
+        <mxCell id="op9TbKIEDOTLHS-nMI7d-1" value="" style="rounded=0;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+          <mxGeometry x="-1670" y="38" width="420" height="1102" as="geometry" />
+        </mxCell>
+        <mxCell id="op9TbKIEDOTLHS-nMI7d-2" value="general_procedures" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontStyle=1" parent="1" vertex="1">
+          <mxGeometry x="-1596.25" y="38" width="195" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="op9TbKIEDOTLHS-nMI7d-3" value="operations_on_sql_database.py" style="swimlane;whiteSpace=wrap;html=1;startSize=23;" parent="1" vertex="1">
+          <mxGeometry x="-1654.5" y="66" width="394.5" height="350" as="geometry">
+            <mxRectangle x="190" y="190" width="140" height="30" as="alternateBounds" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="op9TbKIEDOTLHS-nMI7d-4" value="- store_df_to_sql()&lt;div&gt;- delete_record()&lt;/div&gt;&lt;div&gt;- select_reactants_based_on_smarts() - &lt;font color=&quot;#ff0000&quot;&gt;obsolete&lt;/font&gt;&lt;/div&gt;&lt;div&gt;- select_reactants_based_on_smarts_tqdm()&lt;br&gt;&lt;/div&gt;&lt;div&gt;- select_reactants_based_on_smarts_pandarallel() - &lt;font color=&quot;#009900&quot;&gt;&lt;b&gt;recommended&lt;/b&gt;&lt;/font&gt;&lt;br&gt;&lt;/div&gt;&lt;div&gt;- exclude_reactants_based_on_smarts_pandarallel()&amp;nbsp;&lt;font color=&quot;#009900&quot;&gt;&lt;b&gt;&lt;br&gt;&lt;/b&gt;&lt;/font&gt;&lt;/div&gt;&lt;div&gt;- exclude_reactants_based_on_number_of_functional_groups()&lt;/div&gt;&lt;div&gt;- check_smiles_vs_smarts()&lt;/div&gt;&lt;div&gt;- get_number_of_matches()&lt;/div&gt;&lt;div&gt;- read_database_record()&lt;/div&gt;&lt;div&gt;- read_database_field()&lt;/div&gt;&lt;div&gt;- read_database_table()&lt;/div&gt;&lt;div&gt;&lt;b&gt;- insert_smiles_in_table_from_file()&lt;/b&gt;&lt;/div&gt;&lt;div&gt;&lt;b&gt;-&amp;nbsp;&lt;/b&gt;&lt;b style=&quot;background-color: initial;&quot;&gt;add_smiles_in_table_from_file()&lt;/b&gt;&lt;/div&gt;&lt;div&gt;- subset_molecules_based_on_index()&lt;/div&gt;&lt;div&gt;- subset_available_molecules()&lt;/div&gt;&lt;div&gt;- subset_molecules_by_property_range()&lt;/div&gt;&lt;div&gt;- subset_molecules_by_column_value()&lt;/div&gt;&lt;div&gt;&lt;div&gt;- purge_duplicates_in_table()&lt;/div&gt;&lt;div&gt;&lt;font color=&quot;#ff3333&quot;&gt;- inform_duplicates_in_table()&lt;/font&gt;&lt;/div&gt;&lt;div&gt;- mark_molecule_as_available()&lt;/div&gt;&lt;/div&gt;" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;" parent="op9TbKIEDOTLHS-nMI7d-3" vertex="1">
+          <mxGeometry x="3" y="13" width="377" height="337" as="geometry" />
+        </mxCell>
+        <mxCell id="op9TbKIEDOTLHS-nMI7d-5" value="smiles_processing.py" style="swimlane;whiteSpace=wrap;html=1;startSize=23;" parent="1" vertex="1">
+          <mxGeometry x="-1654.5" y="425" width="394.5" height="425" as="geometry">
+            <mxRectangle x="190" y="190" width="140" height="30" as="alternateBounds" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="op9TbKIEDOTLHS-nMI7d-6" value="- generate_clean_smiles()&lt;div&gt;- generate_clean_smiles_2()&lt;/div&gt;&lt;div&gt;- generate_clean_smiles_2_retain_stereo()&lt;br&gt;&lt;div&gt;- remove_smiles_stereo()&lt;/div&gt;&lt;div&gt;- get_largest_fragment()&lt;/div&gt;&lt;div&gt;- compute_inchi_key()&lt;/div&gt;&lt;div&gt;- depict_smiles()&lt;/div&gt;&lt;div&gt;- sanitize_smiles_errors()&lt;/div&gt;&lt;div&gt;- mol_from_smiles()&lt;/div&gt;&lt;div&gt;- smiles_from_mol()&lt;/div&gt;&lt;div&gt;- reaction_from_smarts()&lt;/div&gt;&lt;div&gt;- react_1_component()&amp;nbsp;&lt;span style=&quot;background-color: initial;&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span style=&quot;background-color: initial;&quot;&gt;&amp;nbsp;&lt;/span&gt;&lt;font style=&quot;background-color: initial;&quot; color=&quot;#ff00ff&quot;&gt;accesory function&lt;/font&gt;&lt;/div&gt;&lt;div&gt;- react_2_components()&amp;nbsp;&lt;span style=&quot;background-color: initial;&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span style=&quot;background-color: initial;&quot;&gt;&amp;nbsp;&lt;/span&gt;&lt;font style=&quot;background-color: initial;&quot; color=&quot;#ff00ff&quot;&gt;accesory function&lt;/font&gt;&lt;br&gt;&lt;/div&gt;&lt;div&gt;&lt;b&gt;- apply_reaction_1_component() - &lt;font color=&quot;#cc0000&quot;&gt;obsolete&lt;/font&gt;&lt;/b&gt;&lt;/div&gt;&lt;div&gt;&lt;b&gt;- apply_reaction_1_component_tqdm()&lt;/b&gt;&lt;b&gt;&lt;font color=&quot;#cc0000&quot;&gt;&lt;br&gt;&lt;/font&gt;&lt;/b&gt;&lt;/div&gt;&lt;div&gt;&lt;b&gt;- apply_reaction_1_component_pandarallel() - &lt;font color=&quot;#009900&quot;&gt;recommended&lt;/font&gt;&lt;/b&gt;&lt;b&gt;&lt;br&gt;&lt;/b&gt;&lt;/div&gt;&lt;div&gt;&lt;div&gt;&lt;b&gt;- apply_reaction_2_components()&lt;/b&gt;&lt;/div&gt;&lt;div&gt;&lt;b&gt;- apply_reaction_2_components()_pandarallel - &lt;font color=&quot;#009900&quot;&gt;recommended&lt;/font&gt;&lt;/b&gt;&lt;b&gt;&lt;br&gt;&lt;/b&gt;&lt;/div&gt;&lt;div&gt;&lt;b&gt;- compute_chemspace_coord()&lt;/b&gt;&lt;/div&gt;&lt;div&gt;&lt;b&gt;- &lt;/b&gt;compute_molecule_properties&lt;b&gt;()&lt;/b&gt;&lt;/div&gt;&lt;div&gt;- compute_&lt;span style=&quot;background-color: initial;&quot;&gt;molecule_properties_on_table()&lt;/span&gt;&lt;/div&gt;&lt;div&gt;&lt;span style=&quot;background-color: initial;&quot;&gt;- return_enumerated_stereoisomers()&amp;nbsp;&lt;/span&gt;&lt;span style=&quot;background-color: initial;&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span style=&quot;background-color: initial;&quot;&gt;&amp;nbsp;&lt;/span&gt;&lt;font style=&quot;background-color: initial;&quot; color=&quot;#ff00ff&quot;&gt;accesory function&lt;/font&gt;&lt;/div&gt;&lt;div&gt;- enumerate_stereoisomers()&lt;span style=&quot;background-color: initial;&quot;&gt;&lt;br&gt;&lt;/span&gt;&lt;/div&gt;&lt;div&gt;- count_chiral_centers()&lt;/div&gt;&lt;div&gt;- enumerate_stereoisomers_selected_molecule()&lt;/div&gt;&lt;div&gt;&lt;br&gt;&lt;/div&gt;&lt;/div&gt;&lt;div&gt;&lt;br&gt;&lt;/div&gt;&lt;/div&gt;" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;" parent="op9TbKIEDOTLHS-nMI7d-5" vertex="1">
+          <mxGeometry x="3" y="61" width="367" height="321" as="geometry" />
+        </mxCell>
+        <mxCell id="op9TbKIEDOTLHS-nMI7d-7" value="" style="rounded=0;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+          <mxGeometry x="-1220" y="38" width="380" height="702" as="geometry" />
+        </mxCell>
+        <mxCell id="op9TbKIEDOTLHS-nMI7d-8" value="input_output_operations" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontStyle=1" parent="1" vertex="1">
+          <mxGeometry x="-1142.5" y="38" width="195" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="op9TbKIEDOTLHS-nMI7d-9" value="actions_on_dbs.py" style="swimlane;whiteSpace=wrap;html=1;startSize=23;" parent="1" vertex="1">
+          <mxGeometry x="-1210" y="63" width="360" height="290" as="geometry">
+            <mxRectangle x="190" y="190" width="140" height="30" as="alternateBounds" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="op9TbKIEDOTLHS-nMI7d-10" value="- drop_table_from_db()&lt;div&gt;-&amp;nbsp;&lt;span style=&quot;background-color: initial;&quot;&gt;drop_record_from_db()&lt;/span&gt;&lt;/div&gt;&lt;div&gt;- modify_cell_in_db()&lt;/div&gt;&lt;div&gt;- rename_table_in_db()&lt;/div&gt;&lt;div&gt;- rename_colname_in_db()&lt;/div&gt;&lt;div&gt;- extract_joined_data_by_key()&lt;/div&gt;&lt;div&gt;- extract_row_by_value()&lt;/div&gt;&lt;div&gt;- extract_row_by_index()&lt;/div&gt;&lt;div&gt;- check_reactants_presence()&lt;/div&gt;&lt;div&gt;- create_2_fields_table()&lt;/div&gt;&lt;div&gt;- copy_table_between_dbs()&lt;/div&gt;&lt;div&gt;- merge_two_tables()&lt;/div&gt;&lt;div&gt;- extract_table_as_csv()&lt;/div&gt;&lt;div&gt;- create_table_from_csv()&lt;/div&gt;&lt;div&gt;- replicate_table_empty_state()&amp;nbsp;&amp;nbsp;&lt;span style=&quot;background-color: initial;&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span style=&quot;background-color: initial;&quot;&gt;&amp;nbsp;&lt;/span&gt;&lt;font style=&quot;background-color: initial;&quot; color=&quot;#ff00ff&quot;&gt;accesory function&lt;/font&gt;&lt;/div&gt;&lt;div&gt;&lt;font style=&quot;background-color: initial;&quot;&gt;- establish_row_factory_connection()&amp;nbsp;&amp;nbsp;&lt;/font&gt;&lt;span style=&quot;background-color: initial;&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span style=&quot;background-color: initial;&quot;&gt;&amp;nbsp;&lt;/span&gt;&lt;font style=&quot;background-color: initial;&quot; color=&quot;#ff00ff&quot;&gt;accesory function&lt;/font&gt;&lt;/div&gt;&lt;div&gt;&lt;font style=&quot;background-color: initial;&quot;&gt;&lt;b&gt;- copy_table_between_dbs()&lt;/b&gt;&lt;/font&gt;&lt;/div&gt;" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;" parent="op9TbKIEDOTLHS-nMI7d-9" vertex="1">
+          <mxGeometry x="9.25" y="27" width="340.75" height="263" as="geometry" />
+        </mxCell>
+        <mxCell id="op9TbKIEDOTLHS-nMI7d-11" value="i_o_checkings.py" style="swimlane;whiteSpace=wrap;html=1;startSize=23;" parent="1" vertex="1">
+          <mxGeometry x="-1210" y="360" width="360" height="140" as="geometry">
+            <mxRectangle x="190" y="190" width="140" height="30" as="alternateBounds" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="op9TbKIEDOTLHS-nMI7d-12" value="- check_lists_size()&lt;div&gt;- check_1_list_size()&lt;/div&gt;&lt;div&gt;- merge_2_lists_into_df()&lt;/div&gt;&lt;div&gt;- merge_3_lists_into_df()&lt;/div&gt;&lt;div&gt;- merge_4_lists_into_df()&lt;br&gt;&lt;/div&gt;&lt;div&gt;- convert_1_list_into_df()&lt;/div&gt;" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;" parent="op9TbKIEDOTLHS-nMI7d-11" vertex="1">
+          <mxGeometry x="7" y="21" width="227" height="103" as="geometry" />
+        </mxCell>
+        <mxCell id="op9TbKIEDOTLHS-nMI7d-14" value="read_data_from_db.py" style="swimlane;whiteSpace=wrap;html=1;startSize=23;" parent="1" vertex="1">
+          <mxGeometry x="-1210" y="514" width="360" height="100" as="geometry">
+            <mxRectangle x="190" y="190" width="140" height="30" as="alternateBounds" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="op9TbKIEDOTLHS-nMI7d-15" value="- read_reactants()&lt;div&gt;&lt;br&gt;&lt;/div&gt;" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;" parent="op9TbKIEDOTLHS-nMI7d-14" vertex="1">
+          <mxGeometry y="29" width="227" height="61" as="geometry" />
+        </mxCell>
+        <mxCell id="op9TbKIEDOTLHS-nMI7d-18" value="depiction_procedures.py" style="swimlane;whiteSpace=wrap;html=1;startSize=23;" parent="1" vertex="1">
+          <mxGeometry x="-1654.5" y="857" width="394.5" height="87" as="geometry">
+            <mxRectangle x="190" y="190" width="140" height="30" as="alternateBounds" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="op9TbKIEDOTLHS-nMI7d-20" value="- generate_depiction_grid()&lt;div&gt;-&amp;nbsp;&lt;span style=&quot;background-color: initial;&quot;&gt;generate_depiction_grid_mol_id()&lt;/span&gt;&lt;/div&gt;&lt;div&gt;- plot_table_chemspace()&lt;br&gt;&lt;div&gt;&lt;br&gt;&lt;/div&gt;&lt;/div&gt;&lt;div&gt;&lt;br&gt;&lt;/div&gt;" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;" parent="op9TbKIEDOTLHS-nMI7d-18" vertex="1">
+          <mxGeometry x="2" y="31" width="227" height="64" as="geometry" />
+        </mxCell>
+        <mxCell id="lbyZ6owVBrFahI_U88o8-2" value="objects_processing.py" style="swimlane;whiteSpace=wrap;html=1;startSize=23;" parent="1" vertex="1">
+          <mxGeometry x="-1654.5" y="951" width="394.5" height="59" as="geometry">
+            <mxRectangle x="190" y="190" width="140" height="30" as="alternateBounds" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="lbyZ6owVBrFahI_U88o8-3" value="- split_list_in_chunks()&lt;div&gt;&lt;div&gt;&lt;br&gt;&lt;/div&gt;&lt;/div&gt;" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;" parent="lbyZ6owVBrFahI_U88o8-2" vertex="1">
+          <mxGeometry x="3" y="38" width="227" height="25" as="geometry" />
+        </mxCell>
+        <mxCell id="6K7ebZLv46I86Yor-Uzl-1" value="blob_operations.py" style="swimlane;whiteSpace=wrap;html=1;startSize=23;" parent="1" vertex="1">
+          <mxGeometry x="-1654.5" y="1016" width="394.5" height="120" as="geometry">
+            <mxRectangle x="190" y="190" width="140" height="30" as="alternateBounds" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="6K7ebZLv46I86Yor-Uzl-2" value="- &lt;b&gt;create_blob_objects_table&lt;/b&gt;()&lt;div&gt;&lt;div&gt;- read_blob_object() -&amp;gt; &lt;font color=&quot;#ff00ff&quot;&gt;accesory function&lt;/font&gt;&lt;/div&gt;&lt;div&gt;- write_blob_object()&amp;nbsp;&lt;span style=&quot;background-color: initial;&quot;&gt;-&amp;gt; &lt;font color=&quot;#ff00ff&quot;&gt;accesory function&lt;/font&gt;&lt;/span&gt;&lt;/div&gt;&lt;div&gt;- check_id_in_table() -&amp;gt; &lt;font color=&quot;#ff00ff&quot;&gt;accesory function&lt;/font&gt;&lt;br&gt;&lt;div&gt;&lt;b&gt;- append_blob_object_to_table()&lt;/b&gt;&lt;/div&gt;&lt;div&gt;&lt;b&gt;- retrieve_blob_objects()&lt;br&gt;&lt;/b&gt;&lt;div&gt;&lt;div&gt;&lt;br&gt;&lt;/div&gt;&lt;/div&gt;&lt;/div&gt;&lt;/div&gt;&lt;/div&gt;" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;" parent="6K7ebZLv46I86Yor-Uzl-1" vertex="1">
+          <mxGeometry x="3" y="34" width="267" height="86" as="geometry" />
+        </mxCell>
+        <mxCell id="qKzU55aZ_MgjHmYQfqIT-2" value="" style="rounded=0;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+          <mxGeometry x="-2640" y="-400" width="370" height="180" as="geometry" />
+        </mxCell>
+        <mxCell id="qKzU55aZ_MgjHmYQfqIT-3" value="functions_execution_layer" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontStyle=1" parent="1" vertex="1">
+          <mxGeometry x="-2552.5" y="-392" width="195" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="5_DyJyI8M9IPfwXmiHKh-1" value="generate_project_template.py" style="swimlane;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+          <mxGeometry x="-2610" y="-365" width="310" height="65" as="geometry">
+            <mxRectangle x="190" y="190" width="140" height="30" as="alternateBounds" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="5_DyJyI8M9IPfwXmiHKh-4" value="" style="shape=image;html=1;verticalLabelPosition=bottom;verticalAlign=top;imageAspect=1;aspect=fixed;image=img/clipart/Gear_128x128.png" parent="5_DyJyI8M9IPfwXmiHKh-1" vertex="1">
+          <mxGeometry x="130.16" y="25" width="29.84" height="35" as="geometry" />
+        </mxCell>
+        <mxCell id="5_DyJyI8M9IPfwXmiHKh-11" value="Chemical Space: generation, analysis and management" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=29;fontColor=#0000FF;fontStyle=1" parent="1" vertex="1">
+          <mxGeometry x="-1972" y="-20" width="800" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="5_DyJyI8M9IPfwXmiHKh-12" value="" style="shape=ext;double=1;rounded=0;whiteSpace=wrap;html=1;fillColor=none;" parent="1" vertex="1">
+          <mxGeometry x="-2470" y="1210" width="1710" height="660" as="geometry" />
+        </mxCell>
+        <mxCell id="5_DyJyI8M9IPfwXmiHKh-13" value="Molecular Docking: execution, processing and management" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=29;fontColor=#0000FF;fontStyle=1" parent="1" vertex="1">
+          <mxGeometry x="-2125" y="1170" width="880" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="5_DyJyI8M9IPfwXmiHKh-14" value="" style="shape=ext;double=1;rounded=0;whiteSpace=wrap;html=1;fillColor=none;" parent="1" vertex="1">
+          <mxGeometry x="-2480" y="1970" width="1640" height="820" as="geometry" />
+        </mxCell>
+        <mxCell id="5_DyJyI8M9IPfwXmiHKh-15" value="Machine Learning: molecular docking results analyses" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=29;fontColor=#0000FF;fontStyle=1" parent="1" vertex="1">
+          <mxGeometry x="-2125" y="1910" width="880" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="aTlMjv3ezEQamQvf1I-T-4" value="" style="rounded=0;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+          <mxGeometry x="-2060" y="1230" width="380" height="300" as="geometry" />
+        </mxCell>
+        <mxCell id="aTlMjv3ezEQamQvf1I-T-5" value="receptor_management" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontStyle=1" parent="1" vertex="1">
+          <mxGeometry x="-1972.5" y="1233" width="195" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="aTlMjv3ezEQamQvf1I-T-8" value="receptor_management.py" style="swimlane;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+          <mxGeometry x="-2050" y="1259" width="360" height="120" as="geometry">
+            <mxRectangle x="190" y="190" width="140" height="30" as="alternateBounds" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="aTlMjv3ezEQamQvf1I-T-9" value="- create_receptors_table() -&amp;gt; &lt;font color=&quot;#ff00ff&quot;&gt;accesory_function&lt;/font&gt;&lt;div&gt;- store_receptor()&amp;nbsp;&lt;span style=&quot;background-color: initial;&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span style=&quot;background-color: initial;&quot;&gt;&amp;nbsp;&lt;/span&gt;&lt;font style=&quot;background-color: initial;&quot; color=&quot;#ff00ff&quot;&gt;accesory_function&lt;/font&gt;&lt;/div&gt;&lt;div&gt;- restore_receptor_manual()&amp;nbsp;&amp;nbsp;&lt;span style=&quot;background-color: initial;&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span style=&quot;background-color: initial;&quot;&gt;&amp;nbsp;&lt;/span&gt;&lt;b style=&quot;background-color: initial;&quot;&gt;&lt;font color=&quot;#0000ff&quot;&gt;main_function&lt;/font&gt;&lt;/b&gt;&lt;/div&gt;&lt;div&gt;- restore_receptor_acc()&amp;nbsp;&lt;span style=&quot;background-color: initial;&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span style=&quot;background-color: initial;&quot;&gt;&amp;nbsp;&lt;/span&gt;&lt;font style=&quot;background-color: initial;&quot; color=&quot;#ff00ff&quot;&gt;accesory_function&lt;/font&gt;&lt;br&gt;&lt;/div&gt;" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;" parent="aTlMjv3ezEQamQvf1I-T-8" vertex="1">
+          <mxGeometry x="3" y="23" width="337" height="89" as="geometry" />
+        </mxCell>
+        <mxCell id="CnKzWvlWqhQ8PirCTRX0-1" value="blob_operations.py" style="swimlane;whiteSpace=wrap;html=1;startSize=23;" parent="1" vertex="1">
+          <mxGeometry x="-2050" y="1385" width="360" height="120" as="geometry">
+            <mxRectangle x="190" y="190" width="140" height="30" as="alternateBounds" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="CnKzWvlWqhQ8PirCTRX0-2" value="&lt;div&gt;&lt;div&gt;- create_blob_objects_table()&amp;nbsp;&lt;/div&gt;&lt;div&gt;- append_receptor_blob_object_to_table()&amp;nbsp;&lt;span style=&quot;background-color: initial;&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span style=&quot;background-color: initial;&quot;&gt;&amp;nbsp;&lt;/span&gt;&lt;font style=&quot;background-color: initial;&quot; color=&quot;#ff00ff&quot;&gt;accesory_function&lt;/font&gt;&lt;/div&gt;&lt;div&gt;- append_ligand_blob_object_to_table()&lt;/div&gt;&lt;div&gt;- write_blob_object()&lt;/div&gt;&lt;div&gt;&lt;div&gt;- retrieve_blob_object()&lt;/div&gt;&lt;/div&gt;&lt;/div&gt;&lt;div&gt;&lt;br&gt;&lt;/div&gt;" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;" parent="CnKzWvlWqhQ8PirCTRX0-1" vertex="1">
+          <mxGeometry x="3" y="34" width="357" height="86" as="geometry" />
+        </mxCell>
+        <mxCell id="BOrHv1OWvrkvpR48PMWf-4" value="" style="rounded=0;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+          <mxGeometry x="-1220" y="1233" width="350" height="147" as="geometry" />
+        </mxCell>
+        <mxCell id="BOrHv1OWvrkvpR48PMWf-8" value="input_output_operations" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontStyle=1" parent="1" vertex="1">
+          <mxGeometry x="-1142.5" y="1231" width="195" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="7TFo4y6W_42p0ru7j4Ib-7" value="" style="rounded=0;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+          <mxGeometry x="-2059.5" y="1536" width="369.5" height="300" as="geometry" />
+        </mxCell>
+        <mxCell id="7TFo4y6W_42p0ru7j4Ib-8" value="ligands_management" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontStyle=1" parent="1" vertex="1">
+          <mxGeometry x="-1972" y="1543" width="195" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="7TFo4y6W_42p0ru7j4Ib-9" value="process_ligands_table.py" style="swimlane;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+          <mxGeometry x="-2049.5" y="1580" width="349.5" height="150" as="geometry">
+            <mxRectangle x="190" y="190" width="140" height="30" as="alternateBounds" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="7TFo4y6W_42p0ru7j4Ib-10" value="&lt;div&gt;- create_ligands_blob_table()&amp;nbsp;&lt;span style=&quot;color: rgb(255, 0, 255); background-color: initial;&quot;&gt;-&amp;gt; accessory_function&lt;/span&gt;&lt;/div&gt;- create_blob_object()&amp;nbsp;&lt;span style=&quot;color: rgb(255, 0, 255);&quot;&gt;-&amp;gt; accessory_function&lt;/span&gt;&lt;div&gt;- compute_inchi_key&amp;nbsp;&lt;span style=&quot;color: rgb(255, 0, 255); background-color: initial;&quot;&gt;-&amp;gt; accessory_function&lt;/span&gt;&lt;/div&gt;&lt;div&gt;- compute_pdbqt_file()&amp;nbsp;&lt;span style=&quot;color: rgb(255, 0, 255);&quot;&gt;-&amp;gt; accessory_function&lt;/span&gt;&lt;br&gt;&lt;div&gt;- append_ligand_blob_object_to_table()&amp;nbsp;&lt;span style=&quot;color: rgb(255, 0, 255); background-color: initial;&quot;&gt;-&amp;gt; accessory_function&lt;/span&gt;&lt;/div&gt;&lt;div&gt;- process_ligands_table()&amp;nbsp;&lt;span style=&quot;background-color: initial;&quot;&gt;&lt;b style=&quot;&quot;&gt;&lt;font color=&quot;#0000ff&quot;&gt;-&amp;gt; main_function&lt;/font&gt;&lt;/b&gt;&lt;/span&gt;&lt;/div&gt;&lt;div&gt;- write_blob_object() &lt;font color=&quot;#ff00ff&quot;&gt;-&amp;gt; accessory_function&lt;/font&gt;&lt;/div&gt;&lt;div&gt;- restore_ligands_from_table()&amp;nbsp;&lt;b style=&quot;background-color: initial;&quot;&gt;&lt;font color=&quot;#0000ff&quot;&gt;-&amp;gt; main_function&lt;/font&gt;&lt;/b&gt;&lt;/div&gt;&lt;div&gt;&lt;br&gt;&lt;/div&gt;&lt;div&gt;&lt;br&gt;&lt;/div&gt;&lt;/div&gt;&lt;div&gt;&lt;br&gt;&lt;/div&gt;" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;" parent="7TFo4y6W_42p0ru7j4Ib-9" vertex="1">
+          <mxGeometry x="3" y="29" width="337" height="149" as="geometry" />
+        </mxCell>
+        <mxCell id="EQOfs4SET3LyxnaPZ16r-1" value="" style="rounded=0;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+          <mxGeometry x="-1660" y="1230" width="369.5" height="610" as="geometry" />
+        </mxCell>
+        <mxCell id="EQOfs4SET3LyxnaPZ16r-2" value="perform_docking" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontStyle=1" parent="1" vertex="1">
+          <mxGeometry x="-1572.75" y="1230" width="195" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="EQOfs4SET3LyxnaPZ16r-3" value="docking_configuration.py" style="swimlane;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+          <mxGeometry x="-1640.5" y="1270" width="350" height="120" as="geometry">
+            <mxRectangle x="190" y="190" width="140" height="30" as="alternateBounds" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="EQOfs4SET3LyxnaPZ16r-4" value="&lt;div&gt;&lt;br&gt;&lt;/div&gt;&lt;div&gt;- create_docking_assay_folder() -&amp;gt; &lt;font color=&quot;#ff00ff&quot;&gt;accesory_function&lt;/font&gt;&lt;/div&gt;&lt;div&gt;&lt;br&gt;&lt;/div&gt;" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;" parent="EQOfs4SET3LyxnaPZ16r-3" vertex="1">
+          <mxGeometry x="3" y="23" width="337" height="89" as="geometry" />
+        </mxCell>
+        <mxCell id="ADFE6VU8ZeG-jz34yDhz-1" value="" style="rounded=0;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+          <mxGeometry x="-2450" y="1230" width="370" height="610" as="geometry" />
+        </mxCell>
+        <mxCell id="ADFE6VU8ZeG-jz34yDhz-2" value="registers_management" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontStyle=1" parent="1" vertex="1">
+          <mxGeometry x="-2370" y="1233" width="195" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="ADFE6VU8ZeG-jz34yDhz-3" value="docking_params_registers.py" style="swimlane;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+          <mxGeometry x="-2440" y="1399" width="350" height="241" as="geometry">
+            <mxRectangle x="190" y="190" width="140" height="30" as="alternateBounds" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="ADFE6VU8ZeG-jz34yDhz-4" value="- create_params_registry_table()&amp;nbsp; -&amp;gt;&amp;nbsp;&lt;b&gt;&lt;font color=&quot;#0000ff&quot;&gt;main_function&lt;/font&gt;&lt;/b&gt;&lt;div&gt;- drop_params_registry_table()&amp;nbsp;&lt;div&gt;&lt;div&gt;- clear_&lt;span style=&quot;background-color: initial;&quot;&gt;params_registry_table()&lt;/span&gt;&lt;/div&gt;&lt;div&gt;- create_default_dict()&lt;/div&gt;&lt;div&gt;- check_param_exists()&amp;nbsp;&amp;nbsp;&lt;span style=&quot;background-color: initial;&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span style=&quot;background-color: initial;&quot;&gt;&amp;nbsp;&lt;/span&gt;&lt;font style=&quot;background-color: initial;&quot; color=&quot;#ff00ff&quot;&gt;accesory_function&lt;/font&gt;&lt;/div&gt;&lt;div&gt;- create_custom_params_dict()&amp;nbsp;&lt;span style=&quot;background-color: initial;&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span style=&quot;background-color: initial;&quot;&gt;&amp;nbsp;&lt;/span&gt;&lt;font style=&quot;background-color: initial;&quot; color=&quot;#ff00ff&quot;&gt;accesory_function&lt;/font&gt;&lt;/div&gt;&lt;div&gt;&lt;font style=&quot;background-color: initial;&quot;&gt;- get_last_param_record_id() -&amp;gt;&lt;/font&gt;&lt;font style=&quot;background-color: initial;&quot; color=&quot;#ff00ff&quot;&gt; accesory_function&lt;/font&gt;&lt;/div&gt;&lt;div&gt;&lt;font style=&quot;background-color: initial;&quot;&gt;- check_params_dict_existence() -&amp;gt;&lt;/font&gt;&lt;font style=&quot;background-color: initial;&quot; color=&quot;#ff00ff&quot;&gt; accesory_function&lt;/font&gt;&lt;/div&gt;&lt;div&gt;&lt;font style=&quot;background-color: initial;&quot;&gt;- store_custom_param_dict() -&amp;gt; &lt;b&gt;&lt;font color=&quot;#0000ff&quot;&gt;main_function&lt;/font&gt;&lt;/b&gt;&lt;/font&gt;&lt;/div&gt;&lt;div&gt;&lt;font style=&quot;background-color: initial;&quot;&gt;- retrieve_docking_conditions_set() - &amp;gt;&amp;nbsp;&lt;font color=&quot;#ff00ff&quot;&gt;accesory_function&lt;/font&gt;&lt;b&gt;&lt;font color=&quot;#0000ff&quot;&gt;&lt;br&gt;&lt;/font&gt;&lt;/b&gt;&lt;/font&gt;&lt;/div&gt;&lt;div&gt;- compare_params_dicts()&amp;nbsp;&lt;span style=&quot;background-color: initial;&quot;&gt;- &amp;gt;&amp;nbsp;&lt;/span&gt;&lt;font style=&quot;background-color: initial;&quot; color=&quot;#ff00ff&quot;&gt;accesory_function&lt;/font&gt;&lt;/div&gt;&lt;/div&gt;&lt;/div&gt;" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;" parent="ADFE6VU8ZeG-jz34yDhz-3" vertex="1">
+          <mxGeometry x="3" y="23" width="337" height="207" as="geometry" />
+        </mxCell>
+        <mxCell id="eR63OcBkwr-KhbFWogTF-1" value="receptor_models_registers.py" style="swimlane;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+          <mxGeometry x="-2440" y="1659" width="350" height="170" as="geometry">
+            <mxRectangle x="190" y="190" width="140" height="30" as="alternateBounds" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="eR63OcBkwr-KhbFWogTF-2" value="- create_receptor_registry_table() -&amp;gt; &lt;b&gt;&lt;font color=&quot;#0000ff&quot;&gt;main_function&amp;nbsp;&lt;/font&gt;&lt;/b&gt;&lt;div&gt;- drop_receptor_registry_table()&lt;/div&gt;&lt;div&gt;- clear_&lt;span style=&quot;background-color: initial;&quot;&gt;receptor_registry_table()&lt;/span&gt;&lt;/div&gt;&lt;div&gt;- clear_&lt;span style=&quot;background-color: initial;&quot;&gt;receptor_registry_table()&lt;/span&gt;&lt;/div&gt;&lt;div&gt;- get_last_receptor_id() -&amp;gt; &lt;font color=&quot;#ff00ff&quot;&gt;accesory_function&lt;/font&gt;&lt;/div&gt;&lt;div&gt;- append_receptor_registry()&amp;nbsp;&lt;span style=&quot;background-color: initial;&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span style=&quot;background-color: initial;&quot;&gt;&amp;nbsp;&lt;/span&gt;&lt;b style=&quot;background-color: initial;&quot;&gt;&lt;font color=&quot;#0000ff&quot;&gt;main_function&amp;nbsp;&lt;/font&gt;&lt;/b&gt;&lt;br&gt;&lt;/div&gt;&lt;div&gt;&lt;br&gt;&lt;/div&gt;" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;" parent="eR63OcBkwr-KhbFWogTF-1" vertex="1">
+          <mxGeometry x="3" y="27" width="337" height="143" as="geometry" />
+        </mxCell>
+        <mxCell id="OJveNlAJFDGngDRPULqP-1" value="docking_assay.py" style="swimlane;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+          <mxGeometry x="-1640.5" y="1410" width="350" height="120" as="geometry">
+            <mxRectangle x="190" y="190" width="140" height="30" as="alternateBounds" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="OJveNlAJFDGngDRPULqP-2" value="&lt;div&gt;- prepare_docking_exec_script()&lt;/div&gt;&lt;div&gt;- create_docking_assay()&amp;nbsp;&lt;span style=&quot;background-color: initial;&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;b style=&quot;background-color: initial;&quot;&gt;&amp;nbsp;&lt;font color=&quot;#0000ff&quot;&gt;main_function&lt;/font&gt;&lt;/b&gt;&lt;/div&gt;&lt;div&gt;&lt;br&gt;&lt;/div&gt;" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;" parent="OJveNlAJFDGngDRPULqP-1" vertex="1">
+          <mxGeometry x="3" y="23" width="337" height="89" as="geometry" />
+        </mxCell>
+        <mxCell id="Pbow1lUQlRlXHXGFYeLb-1" value="Project_structure" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=29;fontColor=#0000FF;fontStyle=1" parent="1" vertex="1">
+          <mxGeometry x="-2132.5" y="-410" width="340" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="Pbow1lUQlRlXHXGFYeLb-2" value="" style="rounded=0;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+          <mxGeometry x="-2132.5" y="-370" width="392.5" height="170" as="geometry" />
+        </mxCell>
+        <mxCell id="Pbow1lUQlRlXHXGFYeLb-3" value="project_structure_generation" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontStyle=1" parent="1" vertex="1">
+          <mxGeometry x="-2050" y="-370" width="195" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="Pbow1lUQlRlXHXGFYeLb-4" value="generate_project_structure.py" style="swimlane;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+          <mxGeometry x="-2111.25" y="-340" width="350" height="120" as="geometry">
+            <mxRectangle x="190" y="190" width="140" height="30" as="alternateBounds" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="Pbow1lUQlRlXHXGFYeLb-5" value="- configure_project_structure()" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;" parent="Pbow1lUQlRlXHXGFYeLb-4" vertex="1">
+          <mxGeometry x="3" y="31" width="337" height="89" as="geometry" />
+        </mxCell>
+        <mxCell id="Pf9SrlKcHNW4N-9utT2A-1" value="" style="rounded=0;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+          <mxGeometry x="-1250" y="1399" width="470" height="461" as="geometry" />
+        </mxCell>
+        <mxCell id="Pf9SrlKcHNW4N-9utT2A-2" value="docking_results_processing" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontStyle=1" parent="1" vertex="1">
+          <mxGeometry x="-1142.5" y="1400" width="195" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="Pf9SrlKcHNW4N-9utT2A-3" value="actions_on_dbs.py" style="swimlane;whiteSpace=wrap;html=1;startSize=23;" parent="1" vertex="1">
+          <mxGeometry x="-1200" y="1271" width="330" height="99" as="geometry">
+            <mxRectangle x="190" y="190" width="140" height="30" as="alternateBounds" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="Pf9SrlKcHNW4N-9utT2A-4" value="- check_receptor_blob_item_index_ presence()&lt;div&gt;- uncompress_receptor_files()&lt;/div&gt;" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;" parent="Pf9SrlKcHNW4N-9utT2A-3" vertex="1">
+          <mxGeometry x="7" y="29.5" width="290.75" height="50.5" as="geometry" />
+        </mxCell>
+        <mxCell id="Pf9SrlKcHNW4N-9utT2A-5" value="process_docking_assay.py" style="swimlane;whiteSpace=wrap;html=1;startSize=23;" parent="1" vertex="1">
+          <mxGeometry x="-1240" y="1428" width="450" height="322" as="geometry">
+            <mxRectangle x="190" y="190" width="140" height="30" as="alternateBounds" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="Pf9SrlKcHNW4N-9utT2A-6" value="- create_db_from_dlg() -&amp;gt; &lt;font color=&quot;#ff00ff&quot;&gt;accesory_function&lt;/font&gt;&lt;div&gt;- print_ringtail_default_ops()&lt;/div&gt;&lt;div&gt;- split_sdf_file()&amp;nbsp;&amp;nbsp;&lt;span style=&quot;background-color: initial;&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span style=&quot;background-color: initial;&quot;&gt;&amp;nbsp;&lt;/span&gt;&lt;font style=&quot;background-color: initial;&quot; color=&quot;#ff00ff&quot;&gt;accesory_function&lt;/font&gt;&lt;/div&gt;&lt;div&gt;- extract_single_sdf_molecule()&amp;nbsp;&lt;span style=&quot;background-color: initial;&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span style=&quot;background-color: initial;&quot;&gt;&amp;nbsp;&lt;/span&gt;&lt;font style=&quot;background-color: initial;&quot; color=&quot;#ff00ff&quot;&gt;accesory_function&lt;/font&gt;&lt;/div&gt;&lt;div&gt;- extract_all_sdf_molecules()&amp;nbsp;&lt;span style=&quot;background-color: initial;&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span style=&quot;background-color: initial;&quot;&gt;&amp;nbsp;&lt;/span&gt;&lt;font style=&quot;background-color: initial;&quot; color=&quot;#ff00ff&quot;&gt;accesory_function&lt;/font&gt;&lt;br&gt;&lt;/div&gt;&lt;div&gt;- generate_pdb_from_sdf()&amp;nbsp;&lt;span style=&quot;background-color: initial;&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span style=&quot;background-color: initial;&quot;&gt;&amp;nbsp;&lt;/span&gt;&lt;font style=&quot;background-color: initial;&quot; color=&quot;#ff00ff&quot;&gt;accesory_function&lt;/font&gt;&lt;font style=&quot;background-color: initial;&quot; color=&quot;#ff00ff&quot;&gt;&lt;br&gt;&lt;/font&gt;&lt;/div&gt;&lt;div&gt;- generate_pdb_from_sdf_single_file()&amp;nbsp;&lt;span style=&quot;background-color: initial;&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span style=&quot;background-color: initial;&quot;&gt;&amp;nbsp;&lt;/span&gt;&lt;font style=&quot;background-color: initial;&quot; color=&quot;#ff00ff&quot;&gt;accesory_function&lt;/font&gt;&lt;font style=&quot;background-color: initial;&quot; color=&quot;#ff00ff&quot;&gt;&lt;br&gt;&lt;/font&gt;&lt;/div&gt;&lt;div&gt;- extract_lowest_energy_cluster_pdb()&amp;nbsp;&lt;span style=&quot;background-color: initial;&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span style=&quot;background-color: initial;&quot;&gt;&amp;nbsp;&lt;/span&gt;&lt;font style=&quot;background-color: initial;&quot; color=&quot;#ff00ff&quot;&gt;accesory_function&lt;/font&gt;&lt;font style=&quot;background-color: initial;&quot; color=&quot;#ff00ff&quot;&gt;&lt;br&gt;&lt;/font&gt;&lt;/div&gt;&lt;div&gt;- extract_most_populated_cluster_pdb()&amp;nbsp;&lt;span style=&quot;background-color: initial;&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span style=&quot;background-color: initial;&quot;&gt;&amp;nbsp;&lt;/span&gt;&lt;font style=&quot;background-color: initial;&quot; color=&quot;#ff00ff&quot;&gt;accesory_function&lt;/font&gt;&lt;font style=&quot;background-color: initial;&quot; color=&quot;#ff00ff&quot;&gt;&lt;br&gt;&lt;/font&gt;&lt;/div&gt;&lt;div&gt;&lt;font style=&quot;background-color: initial;&quot;&gt;- create_receptor_mda_object()&amp;nbsp;&lt;/font&gt;&lt;span style=&quot;background-color: initial;&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span style=&quot;background-color: initial;&quot;&gt;&amp;nbsp;&lt;/span&gt;&lt;font style=&quot;background-color: initial;&quot; color=&quot;#ff00ff&quot;&gt;accesory_function&lt;/font&gt;&lt;/div&gt;&lt;div&gt;&lt;font style=&quot;background-color: initial;&quot;&gt;- create_empty_receptor_df_columns()&lt;/font&gt;&lt;/div&gt;&lt;div&gt;&lt;font style=&quot;background-color: initial;&quot;&gt;- compute_single_prolif_interaction_pattern()&amp;nbsp;&lt;/font&gt;&lt;span style=&quot;background-color: initial;&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span style=&quot;background-color: initial;&quot;&gt;&amp;nbsp;&lt;/span&gt;&lt;font style=&quot;background-color: initial;&quot; color=&quot;#ff00ff&quot;&gt;accesory_function&lt;/font&gt;&lt;font style=&quot;background-color: initial;&quot; color=&quot;#ff00ff&quot;&gt;&lt;br&gt;&lt;/font&gt;&lt;/div&gt;&lt;div&gt;&lt;font style=&quot;background-color: initial;&quot;&gt;- compute_all_prolif_interactions_patterns()&amp;nbsp;&lt;/font&gt;&lt;span style=&quot;background-color: initial;&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span style=&quot;background-color: initial;&quot;&gt;&amp;nbsp;&lt;/span&gt;&lt;font style=&quot;background-color: initial;&quot; color=&quot;#ff00ff&quot;&gt;accesory_function&lt;/font&gt;&lt;font style=&quot;background-color: initial;&quot; color=&quot;#ff00ff&quot;&gt;&lt;br&gt;&lt;/font&gt;&lt;/div&gt;&lt;div&gt;&lt;font style=&quot;background-color: initial;&quot;&gt;- compute_selected_prolif_interactions_patterns()&amp;nbsp;&lt;/font&gt;&lt;span style=&quot;background-color: initial;&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span style=&quot;background-color: initial;&quot;&gt;&amp;nbsp;&lt;/span&gt;&lt;font style=&quot;background-color: initial;&quot; color=&quot;#ff00ff&quot;&gt;accesory_function&lt;/font&gt;&lt;font style=&quot;background-color: initial;&quot; color=&quot;#ff00ff&quot;&gt;&lt;br&gt;&lt;/font&gt;&lt;/div&gt;&lt;div&gt;&lt;font style=&quot;background-color: initial;&quot;&gt;- process_prolif_raw_dataframe()&amp;nbsp;&lt;/font&gt;&lt;span style=&quot;background-color: initial;&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span style=&quot;background-color: initial;&quot;&gt;&amp;nbsp;&lt;/span&gt;&lt;font style=&quot;background-color: initial;&quot; color=&quot;#ff00ff&quot;&gt;accesory_function&lt;/font&gt;&lt;font style=&quot;background-color: initial;&quot; color=&quot;#ff00ff&quot;&gt;&lt;br&gt;&lt;/font&gt;&lt;/div&gt;&lt;div&gt;&lt;font style=&quot;background-color: initial;&quot;&gt;- perform_docking_assayt_analysis()&amp;nbsp;&lt;/font&gt;&lt;span style=&quot;background-color: initial;&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span style=&quot;background-color: initial;&quot;&gt;&amp;nbsp;&lt;/span&gt;&lt;font color=&quot;#0000ff&quot; style=&quot;background-color: initial;&quot;&gt;&lt;b&gt;main_function&lt;/b&gt;&lt;/font&gt;&lt;font style=&quot;background-color: initial;&quot; color=&quot;#ff00ff&quot;&gt;&lt;br&gt;&lt;/font&gt;&lt;/div&gt;&lt;div&gt;&lt;font style=&quot;background-color: initial;&quot;&gt;- plot_grid_favored_binders()&amp;nbsp;&lt;/font&gt;&lt;span style=&quot;background-color: initial;&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span style=&quot;background-color: initial;&quot;&gt;&amp;nbsp;&lt;/span&gt;&lt;font style=&quot;background-color: initial;&quot; color=&quot;#0000ff&quot;&gt;&lt;b&gt;main_function&lt;/b&gt;&lt;/font&gt;&lt;br&gt;&lt;/div&gt;&lt;div&gt;&lt;font style=&quot;background-color: initial;&quot;&gt;- create_pdb_from_df()&amp;nbsp;&lt;/font&gt;&lt;/div&gt;&lt;div&gt;&lt;font style=&quot;background-color: initial;&quot;&gt;&lt;font color=&quot;#ff0000&quot;&gt;- predict_binder_class()&amp;nbsp;&lt;/font&gt;&lt;br&gt;&lt;/font&gt;&lt;/div&gt;" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;" parent="Pf9SrlKcHNW4N-9utT2A-5" vertex="1">
+          <mxGeometry x="6" y="29.5" width="434" height="290.5" as="geometry" />
+        </mxCell>
+        <mxCell id="968z07vUoYRDuk8--jja-1" value="" style="rounded=0;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+          <mxGeometry x="-2450" y="1990" width="370" height="610" as="geometry" />
+        </mxCell>
+        <mxCell id="968z07vUoYRDuk8--jja-2" value="fingerprints_colection" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontStyle=1" parent="1" vertex="1">
+          <mxGeometry x="-2357.5" y="2000" width="195" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="968z07vUoYRDuk8--jja-3" value="construct_fingerprints_database.py" style="swimlane;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+          <mxGeometry x="-2443.5" y="2040" width="350" height="260" as="geometry">
+            <mxRectangle x="190" y="190" width="140" height="30" as="alternateBounds" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="968z07vUoYRDuk8--jja-4" value="&lt;div&gt;- create_fingerprints_table()&lt;br&gt;&lt;/div&gt;&lt;div&gt;- create_dummy_fingerprint_record()&lt;br&gt;&lt;/div&gt;- store_positive_fingerprint()&lt;div&gt;&lt;div&gt;&lt;div&gt;- store_negative_fingerprint()&lt;/div&gt;&lt;div&gt;- compute_and_store_selected_fingerprint()&lt;br&gt;&lt;div&gt;- get_last_fp_number()&lt;/div&gt;&lt;div&gt;- store_fingerprint_ligand_pdb_file()&lt;/div&gt;&lt;div&gt;- store_fingerprint_receptor_pdb_file()&lt;br&gt;&lt;/div&gt;&lt;div&gt;- check_fp_existence()&lt;/div&gt;&lt;div&gt;- construct_overall_fingerprints_file()&lt;/div&gt;&lt;/div&gt;&lt;/div&gt;&lt;/div&gt;" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;" parent="968z07vUoYRDuk8--jja-3" vertex="1">
+          <mxGeometry x="3" y="27" width="337" height="163" as="geometry" />
+        </mxCell>
+        <mxCell id="G3TMKoj88cVbfoWxMca9-1" value="results_ depiction_procedures.py" style="swimlane;whiteSpace=wrap;html=1;startSize=23;" parent="1" vertex="1">
+          <mxGeometry x="-1230" y="1760" width="380" height="95" as="geometry">
+            <mxRectangle x="190" y="190" width="140" height="30" as="alternateBounds" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="G3TMKoj88cVbfoWxMca9-2" value="- generate_depiction_grid_with_results_labels()&lt;div&gt;&lt;br&gt;&lt;/div&gt;&lt;div&gt;&lt;br&gt;&lt;/div&gt;" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;" parent="G3TMKoj88cVbfoWxMca9-1" vertex="1">
+          <mxGeometry x="2" y="31" width="368" height="64" as="geometry" />
+        </mxCell>
+        <mxCell id="nZ29s7PdqyWc_FCmheY2-1" value="" style="shape=ext;double=1;rounded=0;whiteSpace=wrap;html=1;fillColor=none;" parent="1" vertex="1">
+          <mxGeometry x="-720" y="1210" width="1710" height="660" as="geometry" />
+        </mxCell>
+        <mxCell id="nZ29s7PdqyWc_FCmheY2-2" value="Molecular Dynamics: execution, processing and management" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=29;fontColor=#0000FF;fontStyle=1" parent="1" vertex="1">
+          <mxGeometry x="-210" y="1170" width="880" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="nZ29s7PdqyWc_FCmheY2-3" value="" style="shape=ext;double=1;rounded=0;whiteSpace=wrap;html=1;fillColor=none;" parent="1" vertex="1">
+          <mxGeometry x="-720" y="1970" width="1710" height="660" as="geometry" />
+        </mxCell>
+        <mxCell id="nZ29s7PdqyWc_FCmheY2-4" value="QM/MM-Mds: execution, processing and management" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=29;fontColor=#0000FF;fontStyle=1" parent="1" vertex="1">
+          <mxGeometry x="-210" y="1920" width="880" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="T3aqxv6ggl5nKynL88Fx-3" value="" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+          <mxGeometry y="1233" width="369.5" height="610" as="geometry" />
+        </mxCell>
+        <mxCell id="T3aqxv6ggl5nKynL88Fx-5" value="" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+          <mxGeometry x="-680" y="1235" width="370" height="610" as="geometry" />
+        </mxCell>
+        <mxCell id="T3aqxv6ggl5nKynL88Fx-1" value="md_assay.py" style="swimlane;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+          <mxGeometry x="5.75" y="1405" width="359.75" height="90" as="geometry">
+            <mxRectangle x="190" y="190" width="140" height="30" as="alternateBounds" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="T3aqxv6ggl5nKynL88Fx-2" value="&lt;div&gt;&lt;span style=&quot;background-color: initial;&quot;&gt;- create_md_assay()&amp;nbsp;&lt;/span&gt;&lt;span style=&quot;background-color: initial;&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;b style=&quot;background-color: initial;&quot;&gt;&amp;nbsp;&lt;font color=&quot;#0000ff&quot;&gt;main_function&lt;/font&gt;&lt;/b&gt;&lt;br&gt;&lt;/div&gt;&lt;div&gt;&lt;br&gt;&lt;/div&gt;" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;" vertex="1" parent="T3aqxv6ggl5nKynL88Fx-1">
+          <mxGeometry x="3" y="23" width="337" height="89" as="geometry" />
+        </mxCell>
+        <mxCell id="T3aqxv6ggl5nKynL88Fx-4" value="perform_md" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="100" y="1231" width="195" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="T3aqxv6ggl5nKynL88Fx-6" value="md_registers_management" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="-592.5" y="1240" width="195" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="T3aqxv6ggl5nKynL88Fx-7" value="md_configuration.py" style="swimlane;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+          <mxGeometry x="9.75" y="1271" width="350" height="120" as="geometry">
+            <mxRectangle x="190" y="190" width="140" height="30" as="alternateBounds" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="T3aqxv6ggl5nKynL88Fx-8" value="&lt;div&gt;&lt;br&gt;&lt;/div&gt;&lt;div&gt;- create_md_assay_folder() -&amp;gt; &lt;font color=&quot;#ff00ff&quot;&gt;accesory_function&lt;/font&gt;&lt;/div&gt;&lt;div&gt;&lt;br&gt;&lt;/div&gt;" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;" vertex="1" parent="T3aqxv6ggl5nKynL88Fx-7">
+          <mxGeometry x="3" y="23" width="337" height="89" as="geometry" />
+        </mxCell>
+        <mxCell id="T3aqxv6ggl5nKynL88Fx-9" value="docking_assays_registers.py" style="swimlane;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+          <mxGeometry x="-2430" y="1275.5" width="350" height="120" as="geometry">
+            <mxRectangle x="190" y="190" width="140" height="30" as="alternateBounds" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="T3aqxv6ggl5nKynL88Fx-10" value="- create_docking_registry_table()&amp;nbsp;&lt;div&gt;- erase_docking_assays_registry_table()&lt;/div&gt;&lt;div&gt;- clear&lt;span style=&quot;background-color: initial;&quot;&gt;_docking_assays_registry_table()&lt;/span&gt;&lt;/div&gt;&lt;div&gt;- get_last_docking_assay_id() -&amp;gt; &lt;font color=&quot;#ff00ff&quot;&gt;accesory_function&lt;/font&gt;&lt;/div&gt;&lt;div&gt;- append_docking_registry()&amp;nbsp;&lt;span style=&quot;background-color: initial;&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span style=&quot;background-color: initial;&quot;&gt;&amp;nbsp;&lt;/span&gt;&lt;font color=&quot;#0000ff&quot; style=&quot;background-color: initial;&quot;&gt;&lt;b&gt;main_function&lt;/b&gt;&lt;/font&gt;&lt;br&gt;&lt;/div&gt;" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;" vertex="1" parent="T3aqxv6ggl5nKynL88Fx-9">
+          <mxGeometry x="3" y="27" width="337" height="93" as="geometry" />
+        </mxCell>
+        <mxCell id="8mmla9rb65wIQOKI0KTY-1" value="md_assays_registers.py" style="swimlane;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+          <mxGeometry x="-670" y="1280" width="350" height="120" as="geometry">
+            <mxRectangle x="190" y="190" width="140" height="30" as="alternateBounds" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="8mmla9rb65wIQOKI0KTY-2" value="- create_md_registry_table()&amp;nbsp;&lt;div&gt;- erase_md_assays_registry_table()&lt;/div&gt;&lt;div&gt;- clear&lt;span style=&quot;background-color: initial;&quot;&gt;_md_assays_registry_table()&lt;/span&gt;&lt;/div&gt;&lt;div&gt;- get_last_md_assay_id() -&amp;gt; &lt;font color=&quot;#ff00ff&quot;&gt;accesory_function&lt;/font&gt;&lt;/div&gt;&lt;div&gt;- append_md_registry()&amp;nbsp;&lt;span style=&quot;background-color: initial;&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span style=&quot;background-color: initial;&quot;&gt;&amp;nbsp;&lt;/span&gt;&lt;font color=&quot;#0000ff&quot; style=&quot;background-color: initial;&quot;&gt;&lt;b&gt;main_function&lt;/b&gt;&lt;/font&gt;&lt;br&gt;&lt;/div&gt;" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;" parent="8mmla9rb65wIQOKI0KTY-1" vertex="1">
+          <mxGeometry x="3" y="27" width="337" height="93" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
