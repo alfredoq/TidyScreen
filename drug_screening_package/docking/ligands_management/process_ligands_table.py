@@ -165,17 +165,15 @@ def compute_pdqbt_file(smiles,conformer_rank,write_conformers):
 
         conformers_energies_dict_sorted=sorted(conformers_energies_dict.items(), key=lambda x: x[1])
         
-        # The following will create a folder containing all conformers
-        try:
-            conf_output_path = f'/tmp/confs/{inchi_key}_confs'
-            os.mkdir(conf_output_path)
-        except Exception as error:
-            print(error)
-            exit()
-
-        
         if write_conformers == 1:
-            #os.mkdir(conf_output_path)
+            # The following will create a folder containing all conformers
+            try:
+                conf_output_path = f'/tmp/confs/{inchi_key}_confs'
+                os.mkdir(conf_output_path)
+            except Exception as error:
+                print(error)
+                exit()    
+
             ## Write the sorted dictionary to the path
             with open(f'{conf_output_path}/{inchi_key}-confs_rank.txt', 'w') as f:
                 print(conformers_energies_dict_sorted, file=f)

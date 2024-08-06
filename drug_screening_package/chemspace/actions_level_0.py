@@ -186,7 +186,6 @@ def process_raw_csv_file_pandarallel(file,db_name,table_name,retain_stereo):
         print(colored(f"Storing molecules to database {db_name}.","green"))
         sql_ops.store_df_to_sql(db_name,clean_df,table_name,"append")
         print(colored(f"Removing duplicated molecules in {db_name}.","green"))
-        print("LLEGO")
         sql_ops.purge_duplicates_in_table(db_name,table_name,"inchi_key")
         
         print(colored(f"SUCCESSFULLY FINISHED PROCESING THE FILE {file}.","green"))
