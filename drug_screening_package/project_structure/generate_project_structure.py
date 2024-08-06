@@ -110,15 +110,20 @@ def set_modules_path(path):
 
         else: 
 
-            # This will find the status of the line to replace using as marker 'MODULE_PATH = ' to point to the variable assignment
-            with open(file,'r') as file_to_check:
-                for line in file_to_check:
-                    if 'MODULE_PATH = ' in line:
-                        line_to_replace = line.rstrip()
+            try: 
             
-            # Now execute the replacement of the corresponding line
-            file = Path(rf"{file}")
-            data = file.read_text()
-            data = data.replace(line_to_replace,f"MODULE_PATH = '{path}'")
-            file.write_text(data)
+                # This will find the status of the line to replace using as marker 'MODULE_PATH = ' to point to the variable assignment
+                with open(file,'r') as file_to_check:
+                    for line in file_to_check:
+                        if 'MODULE_PATH = ' in line:
+                            line_to_replace = line.rstrip()
+            
+                # Now execute the replacement of the corresponding line
+                file = Path(rf"{file}")
+                data = file.read_text()
+                data = data.replace(line_to_replace,f"MODULE_PATH = '{path}'")
+                file.write_text(data)
+
+            except:
+                continue
 
