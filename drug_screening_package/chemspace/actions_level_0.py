@@ -157,16 +157,22 @@ def process_raw_csv_file_pandarallel(file,db_name,table_name,retain_stereo):
         pandarallel.initialize(progress_bar=True) 
         print(colored("Parsing SMILES string.","green"))
         if retain_stereo == 0: # Flag to delete existing stereochemistry
+            print("COMIENZO")
             raw_df["SMILES"] = raw_df["SMILES"].parallel_apply(lambda x: general_proc.generate_clean_smiles_2(x))
             print(colored(" Deleting existing stereochemistry. Computing inchi_key values.","green"))
         if retain_stereo == 1: # Flag to retain existing stereochemistry
             raw_df["SMILES"] = raw_df["SMILES"].parallel_apply(lambda x: general_proc.generate_clean_smiles_2_retain_stereo(x))
             print(colored(" Mantaining existing stereochemistry. Computing inchi_key values.","green"))
-        else:
+        elif retain_stereo != 0 and retain_stereo != 1:
+            print(retain_stereo)
             print(colored("The flag to manage existing stereochistetry is incorrect. EXITING","red"))
             exit()
+        
         raw_df["inchi_key"] = raw_df["SMILES"].parallel_apply(lambda x: general_proc.compute_inchi_key(x))
+        
         print(colored("Droping duplicated molecules.","green"))
+        
+        
         raw_df.drop_duplicates('inchi_key',keep='last')
         
         clean_df = raw_df[["SMILES","inchi_key"]]

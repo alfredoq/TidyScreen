@@ -178,7 +178,6 @@ def retrieve_blob_object(db_name,table_name,obj_id,dest_dir):
     
     for row in query_output:
         data = row[1]
-        #print(data)
         file_full_path = f'{dest_dir}/{row[2]}'
 
     write_blob_object(data,file_full_path)

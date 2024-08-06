@@ -17,6 +17,7 @@ sys.path.append(MODULE_PATH)
 
 import chemspace.general_procedures.smiles_processing as smi_proc
 import docking.receptor_management.blob_operations as blob_ops
+import md.md_preparation_actions.ligand_preparation as md_lig_prep 
 
 def create_ligands_blob_table(db_name,table_name):
     """
@@ -50,7 +51,9 @@ def create_ligands_blob_table(db_name,table_name):
                   (SMILES TEXT NOT NULL, 
                    inchi_key TEXT NOT NULL, 
                    stored_file TEXT NOT NULL, 
-                   blob_item BLOB NOT NULL);"""      
+                   blob_item BLOB NOT NULL,
+                   stored_pdb_file TEXT,
+                   pdb_blob_item BLOB);"""      
         
         conn.execute(sql)
         print(colored("SUCCESFULLY created ligands BLOB objects table","green"))
@@ -99,7 +102,7 @@ def compute_inchi_key(smiles):
     except:
         pass
 
-def compute_pdqbt_file(smiles):
+def compute_pdqbt_file(smiles,conformer_rank,write_conformers):
     dictio = {
     "ATOM_PARAMS": {
     "defaults+4H_triazole": [
@@ -132,12 +135,16 @@ def compute_pdqbt_file(smiles):
     }
 
     try: 
+        # Compute the corresponding inchi_key for compound unique identification
+        inchi_key = compute_inchi_key(smiles)
+        # Process the molecule itself
         mol = Chem.MolFromSmiles(smiles)
         mol_hs = Chem.AddHs(mol)
         props = AllChem.ETKDG()
         props.pruneRmsThresh = 0.25
         props.useRandomCoords = True
         props.numThreads = 1
+        
         # Create the object containing the conformers
         confs = AllChem.EmbedMultipleConfs(mol_hs,50,props)
         ps = AllChem.MMFFGetMoleculeProperties(mol_hs)
@@ -148,7 +155,6 @@ def compute_pdqbt_file(smiles):
 
         for conf in confs:
             try:
-                filename='conformer-' + str(conf + 1) + '.pdb'
                 ff = AllChem.MMFFGetMoleculeForceField(mol_hs,ps,confId=conf)
                 ff.Minimize()
                 energy_value = ff.CalcEnergy()
@@ -158,64 +164,115 @@ def compute_pdqbt_file(smiles):
                 continue
 
         conformers_energies_dict_sorted=sorted(conformers_energies_dict.items(), key=lambda x: x[1])
-        lowest_energy_conformer_nbr = conformers_energies_dict_sorted[0][0]
-        selected_conformer = Chem.MolToMolBlock(mol_hs,confId=lowest_energy_conformer_nbr)
-        selected_mol = Chem.MolFromMolBlock(selected_conformer, removeHs=False)
         
+        # The following will create a folder containing all conformers
+        try:
+            conf_output_path = f'/tmp/confs/{inchi_key}_confs'
+            os.mkdir(conf_output_path)
+        except Exception as error:
+            print(error)
+            exit()
+
+        
+        if write_conformers == 1:
+            #os.mkdir(conf_output_path)
+            ## Write the sorted dictionary to the path
+            with open(f'{conf_output_path}/{inchi_key}-confs_rank.txt', 'w') as f:
+                print(conformers_energies_dict_sorted, file=f)
+            
+            for conf2 in conformers_energies_dict_sorted:
+                selected_conformer = Chem.MolToMolBlock(mol_hs,confId=conf2[0])
+                selected_mol = Chem.MolFromMolBlock(selected_conformer, removeHs=False)
+                pdb_filename = f'{conf_output_path}/{inchi_key}_conf_{conf2[0]}.pdb'
+                Chem.MolToPDBFile(selected_mol,pdb_filename)
+                
+        # The following will store de selected conformer as .pdbqt
+        #lowest_energy_conformer_nbr = conformers_energies_dict_sorted[0][0]
+        #selected_conformer = Chem.MolToMolBlock(mol_hs,confId=lowest_energy_conformer_nbr)
+        selected_conformer = Chem.MolToMolBlock(mol_hs,confId=conformers_energies_dict_sorted[conformer_rank][0])
+        selected_mol = Chem.MolFromMolBlock(selected_conformer, removeHs=False)
+                
+
+        # This will save the .pdb file containing the numbered atoms
+        pdb_file = f'/tmp/{inchi_key}.pdb'
+        print(pdb_file)
+        Chem.MolToPDBFile(selected_mol,pdb_file)
+
+        ## This will prepare a blob object of the pdb file in for storage within the database
+        # This will reload the numbered .pdb file in prior the generating the .pdbqt file containing numbered atoms.
+        mol2 = Chem.MolFromPDBFile(f'/tmp/{inchi_key}.pdb',removeHs=False)
+
         preparator = MoleculePreparation(atom_type_smarts=dictio,merge_these_atom_types=['H'])
-        mol_setups = preparator.prepare(selected_mol)
-    
+        #mol_setups = preparator.prepare(selected_mol)
+        mol_setups = preparator.prepare(mol2)
+        
         for setup in mol_setups:
             pdbqt_string, is_ok, error_msg = PDBQTWriterLegacy.write_string(setup)
    
-        pdbqt_string_ready = pdbqt_string.replace('UNL','MOL')
-
-        inchi_key = compute_inchi_key(smiles)
+        #pdbqt_string_ready = pdbqt_string.replace('UNL','MOL')
 
         with open(f'/tmp/{inchi_key}.pdbqt','w') as pdbqt_file:
-            pdbqt_file.write(pdbqt_string_ready)
+            #pdbqt_file.write(pdbqt_string_ready)
+            pdbqt_file.write(pdbqt_string)
 
         destination_dir = '/tmp'
+        # This will output the .pdbqt file 
         pdbqt_file = f'{destination_dir}/{inchi_key}.pdbqt'
         blob_pdbqt_file = f'{pdbqt_file}.tar.gz'
-    
         tar = tarfile.open(blob_pdbqt_file, "w:gz")
-        tar.add(pdbqt_file,arcname=f"{inchi_key}")
+        tar.add(pdbqt_file,arcname=f"{inchi_key}.pdbqt")
         tar.close()
-    
-        return blob_pdbqt_file
+        
+        # This will output the .pdb file 
+        pdb_file = f'{destination_dir}/{inchi_key}.pdb'
+        #blob_pdb_file = f'{pdb_file}.tar.gz'
+        blob_pdb_file = f'{inchi_key}.tar.gz'
+        tar = tarfile.open(blob_pdb_file, "w:gz")
+        tar.add(pdb_file,arcname=f"{inchi_key}.pdb")
+        tar.close()
+        
+        return blob_pdbqt_file, blob_pdb_file
 
-    except:
+    except Exception as error:
+        print(error)
         return "ERROR_COMPUTING_PDBQT"
         pass
 
-def append_ligand_blob_object_to_table(db_name,table_name,smiles):
+def append_ligand_blob_object_to_table(db_name,table_name,smiles,conformer_rank,write_conformers):
     
     inchi_key = compute_inchi_key(smiles)
-    blob_pdbqt_file = compute_pdqbt_file(smiles).split('/')[-1]
+    blob_pdbqt_file, pdb_file = compute_pdqbt_file(smiles,conformer_rank,write_conformers)
+
+    blob_pdbqt_filename = blob_pdbqt_file.split('/')[-1]
+    
+    pdb_filename = pdb_file.split('/')[-1].replace('.pdb','')
 
     if blob_pdbqt_file == "ERROR_COMPUTING_PDBQT":
         file_blob_object = "ERROR"
     else:
-        file_blob_object = create_blob_object('/tmp/'+blob_pdbqt_file)
+        file_blob_object = create_blob_object('/tmp/'+blob_pdbqt_filename)
+        pdb_file_blob_object = create_blob_object(pdb_filename)
 
     conn = sqlite3.connect(db_name)
     cursor = conn.cursor()
     
-    sql = f"""INSERT INTO '{table_name}' (SMILES, inchi_key, stored_file, blob_item)
-              VALUES (?,?,?,?);"""             
+    sql = f"""INSERT INTO '{table_name}' (SMILES, inchi_key, stored_file, blob_item, stored_pdb_file,pdb_blob_item)
+              VALUES (?,?,?,?,?,?);"""             
     
-    data_tuple = (smiles,inchi_key,blob_pdbqt_file,file_blob_object)
+    data_tuple = (smiles,inchi_key,blob_pdbqt_filename,file_blob_object,pdb_filename,pdb_file_blob_object)
     
     try: 
         cursor.execute(sql,data_tuple)
         conn.commit()
         cursor.close()
-        #print(colored("BLOB data added successfully","green"))
     except sqlite3.Error as error:
         print(error)
         print("Failed to insert blob data into sqlite table", colored(f"{error}","red"))
         cursor.close()
+
+    # This will delete the temporary files after storage within the database
+    os.remove(pdb_file)
+    os.remove('/tmp/'+blob_pdbqt_filename)
 
 def process_ligands_table_single_proc(origin_db,table_name,dest_database):
     conn = sqlite3.connect(origin_db)
@@ -241,7 +298,7 @@ def process_ligands_table_single_proc(origin_db,table_name,dest_database):
         print(error)
         print(colored("Error","red"))
 
-def process_ligands_table(origin_db,table_name,dest_database):
+def process_ligands_table(origin_db,table_name,dest_database,conformer_rank,write_conformers):
     
     conn = sqlite3.connect(origin_db)
     sql = f"""SELECT SMILES, inchi_key
@@ -258,7 +315,8 @@ def process_ligands_table(origin_db,table_name,dest_database):
         #tqdm.pandas() # initialize tqdm for pandas
         pandarallel.initialize(progress_bar=True)
         try: 
-            df['SMILES'].parallel_apply(lambda smiles: append_ligand_blob_object_to_table(dest_database,dest_table_name,smiles))
+            df['SMILES'].parallel_apply(lambda smiles: append_ligand_blob_object_to_table(dest_database,dest_table_name,smiles,conformer_rank,write_conformers))
+
         except Exception as error:
             print(error)
             pass
@@ -296,8 +354,6 @@ def restore_ligands_from_table(db_name,table_name,dest_dir):
         file = tarfile.open(dest_file)
         file.extractall(dest_dir)
         file.close()
-        # This will rename the stored file to .pdbqt
-        os.rename(f'{dest_dir}/{inchi_key}',f'{dest_dir}/{inchi_key}.pdbqt')
         # This will delete de stored compress version of the file
         os.remove(dest_file)
 

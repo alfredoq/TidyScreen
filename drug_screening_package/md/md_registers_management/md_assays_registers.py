@@ -122,7 +122,6 @@ def append_md_registry(general_registries_folder,db_name, table_name, ligand_sub
             raise # This will manually raise an exception to continue
     except:
         sql = f"""INSERT INTO md_registries (assay_id,db_name,lig_table_name,lig_subpose_name,rec_model_id,md_params_id,stored_results,assay_folder,assay_description) VALUES({assay_id},"{db_name}","{table_name}","{ligand_subpose_name}",{rec_model},{md_params_id},{stored_results},"{assay_folder}","{description}");"""
-        print(sql)
         conn.execute(sql)
         conn.commit()
         print(colored(f"MD assay_id {assay_id} is NEW, stored the registry","green"))

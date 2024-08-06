@@ -36,14 +36,21 @@ def generate_clean_smiles(smiles):
         pass
 
 def generate_clean_smiles_2(smiles):
-    sanitized_smiles = sanitize_smiles_errors(smiles)
-    smiles_free_stereo = remove_smiles_stereo(sanitized_smiles)
-    largest_mol_smiles = get_largest_fragment(smiles_free_stereo)
-    # Add here potential processing steps for cleaning/sanitizing the SMILES notation 
-    #####
-    #
-    clean_smiles = largest_mol_smiles # The last cleaning step should be assigned to 'clean_smiles'
-    return clean_smiles
+    try: 
+        sanitized_smiles = sanitize_smiles_errors(smiles)
+        print(sanitized_smiles)
+        smiles_free_stereo = remove_smiles_stereo(sanitized_smiles)
+        print(smiles_free_stereo)
+        largest_mol_smiles = get_largest_fragment(smiles_free_stereo)
+        print(largest_mol_smiles)
+        # Add here potential processing steps for cleaning/sanitizing the SMILES notation 
+        #####
+        #
+        clean_smiles = largest_mol_smiles # The last cleaning step should be assigned to 'clean_smiles'
+        return clean_smiles
+    
+    except Exception as error:
+        print(error)
 
 def generate_clean_smiles_2_retain_stereo(smiles):
     sanitized_smiles = sanitize_smiles_errors(smiles)

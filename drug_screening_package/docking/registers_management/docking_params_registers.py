@@ -341,7 +341,8 @@ def store_custom_param_dict(docking_params_registry_path):
         # Check if the 'custom_dict' is already stored within the database
         check_params_dict_existence(custom_dict,conn)
         description = input(colored("Enter a brief description of the conditions set: ","magenta"))
-        print(description)
+        
+        # Store the corresponding registry to the database
         sql = f"""INSERT INTO docking_params(condition_id,condition_dict,condition_description) 
                   VALUES({last_value+1},"{custom_dict}","{description}");"""
         conn.execute(sql)
