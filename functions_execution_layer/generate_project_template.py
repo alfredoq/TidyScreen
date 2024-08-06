@@ -70,6 +70,6 @@ with open(f"{project_full_path}/functions_execution_layer/{project_name}.py","w"
     project_template.write('##\n')
     project_template.write('### Step 0: Give the working project a name, create subfolder AND/OR export environment variables. Always leave this function activated since the global variables are exported by this function\n')
     project_template.write(f'project_base_dir = "{project_full_path}"\n')
-    project_template.write(f'project_name = "{project_name}"\n')
+    project_template.write(f'project_name = "{project_name}_project_results"\n')
     project_template.write('raw_data_path, main_db_output_path, miscellaneous_files, receptor_models_registry_path,docking_assays_registry_path, docking_params_registry_path, docking_assays_storing_path, docking_raw_data_path,docking_misc_data_path,ml_models_path,mds_path,qm_mm_mds_path = gen_proj.configure_project_structure(project_base_dir,project_name)\n')
     
