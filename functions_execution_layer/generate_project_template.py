@@ -2,14 +2,19 @@ import os
 from termcolor import colored
 
 current_dir = os.getcwd()
+
 # Check if the execution has been done within the 'functions_execution_layer' folder:
 if 'functions_execution_layer' in current_dir: # This will match if this script is executed within the folder
     previous_dir_list = current_dir.split('/')[:-1]
+    package_name = previous_dir_list[-1]
     previous_dir = '/'.join(previous_dir_list)
     current_dir = previous_dir
+
 import sys
+
 sys.path.append(f'{current_dir}/drug_screening_package')
 from project_structure import generate_project_structure as gen_struct
+
 
 # This will rename all the system path of the modules
 gen_struct.set_modules_path(f'{current_dir}/drug_screening_package')
@@ -60,7 +65,7 @@ with open(f"{project_full_path}/functions_execution_layer/{project_name}.py","w"
     project_template.write('## Imports related to the machine learnign processing\n')
     project_template.write('from ml.fingerprints_colection import construct_fingerprints_database as cons_fps\n')
     project_template.write('## Imports related to the molecular dynamics simulations\n')
-    project_template.write('from from md.perform_md import md_assay as md_assay\n')
+    project_template.write('from md.perform_md import md_assay as md_assay\n')
     project_template.write('##\n')
     project_template.write('##\n')
     project_template.write('### Step 0: Give the working project a name, create subfolder AND/OR export environment variables. Always leave this function activated since the global variables are exported by this function\n')
