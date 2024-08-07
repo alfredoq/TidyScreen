@@ -147,7 +147,7 @@ def prepare_docking_exec_script_mendieta(docking_assay_folder,custom_string,mend
 
         print(colored("SUCESSFULLY written the docking execution script Mendieta","green"))
 
-def prepare_docking_exec_script_mendieta2(docking_assay_folder,custom_string,mendieta_assay_path,n_chunk):
+def prepare_docking_exec_script_hpc(docking_assay_folder,custom_string,hpc_assay_path,n_chunk):
     """
     This script will prepare the execution script to be run on bash for a whole docking assay for execution in Mendieta cluster.
     """
@@ -188,7 +188,7 @@ def prepare_docking_exec_script_mendieta2(docking_assay_folder,custom_string,men
             mendieta_exec_file.write("### Environment modules\n")
             mendieta_exec_file.write("module load gcc/11.2.0\n")
             mendieta_exec_file.write("module load cuda/11.6.2\n")
-            mendieta_exec_file.write(f"export DOCK_RUN_PATH='{mendieta_assay_path}/{assay_folder}'\n")
+            mendieta_exec_file.write(f"export DOCK_RUN_PATH='{hpc_assay_path}/{assay_folder}'\n")
             mendieta_exec_file.write("### Ejecutar la tarea\n")
             mendieta_exec_file.write("### NOTA: srun configura MVAPICH2 y MPICH con lo puesto arriba,\n")
             mendieta_exec_file.write("### no hay que llamar a mpirun.\n")
@@ -196,7 +196,7 @@ def prepare_docking_exec_script_mendieta2(docking_assay_folder,custom_string,men
 
     chunk = 1
     for list_of_ligands in divided_list:
-        with open(f'{docking_assay_folder}/docking_execution_mendieta_{chunk}.sh','a') as exec_file:
+        with open(f'{docking_assay_folder}/docking_execution_hpc_{chunk}.sh','a') as exec_file:
             counter = 1
             for ligand in list_of_ligands:
                 if counter == 1:
@@ -212,16 +212,16 @@ def prepare_docking_exec_script_mendieta2(docking_assay_folder,custom_string,men
         
             # Append the final timings instruction
             exec_file.write("end=$(date +%s)\n")
-            exec_file.write(f"date >> timing_mendieta_{chunk}.txt\n")
-            exec_file.write('echo "It took $(($end - $start)) seconds to finish." >> timing_mendieta.txt\n')
-            subprocess.call(['chmod','777',f'{docking_assay_folder}/docking_execution_mendieta_{chunk}.sh'])
+            exec_file.write(f"date >> timing_hpc_{chunk}.txt\n")
+            exec_file.write('echo "It took $(($end - $start)) seconds to finish." >> timing_hpc.txt\n')
+            subprocess.call(['chmod','777',f'{docking_assay_folder}/docking_execution_hpc_{chunk}.sh'])
 
         # Update the chunk number for the next operation
         chunk+=1
 
-    print(colored("SUCESSFULLY written the docking execution script Mendieta","green"))
+    print(colored("SUCESSFULLY written the docking execution script in HPC","green"))
 
-def create_docking_assay(receptor_models_registry_path,docking_assays_registry_path,docking_params_registry_path,docking_assays_storing_path,ligands_db,ligands_table_name,rec_model_id,docking_params_id,mendieta_assay_path,n_chunk):
+def create_docking_assay(receptor_models_registry_path,docking_assays_registry_path,docking_params_registry_path,docking_assays_storing_path,ligands_db,ligands_table_name,rec_model_id,docking_params_id,hpc_assay_path,n_chunk):
     """
     This function will create a tar.gz file containing all the information (ligands, receptor, parameters, execution script) required to perform a docking assay.
 
@@ -257,7 +257,7 @@ def create_docking_assay(receptor_models_registry_path,docking_assays_registry_p
     ## Prepare the execution script to run the whole docking assay
     prepare_docking_exec_script(docking_assay_folder,custom_params_string,n_chunk)
     ## Prepare the execution script to run the whole docking assay in MENDIETA
-    prepare_docking_exec_script_mendieta2(docking_assay_folder,custom_params_string,mendieta_assay_path,n_chunk)
+    prepare_docking_exec_script_hpc(docking_assay_folder,custom_params_string,hpc_assay_path,n_chunk)
 
 #################
 
