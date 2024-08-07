@@ -158,7 +158,11 @@ Once molecules are stored within a table, the preparation for molecular docking 
 
 TidyScreen has been prepared to work in conjunction with [AutoDock-GPU](https://github.com/ccsb-scripps/AutoDock-GPU), which has been developed by the [ForliLab](https://forlilab.org/) at Scripps Research. We acknowledge Stefano Forli, Diogo Santos-Martins and Andreas Tillack for the kind feedback during TidyScreen development.
 
-The first step to perform a docking assay with AutoDock-GPU is to prepare the corresponding _.pdbqt_ files for the ligands. This can be accomplised on the whole table using the corresponding function:
+The first step to perform a docking assay with AutoDock-GPU is to prepare the corresponding _.pdbqt_ files for the ligands. 
+
+In order to prepare .pdbqt ligands, TidyScreen uses [Meeko](https://github.com/forlilab/Meeko) a package developed at [ForliLab](https://forlilab.org/) and which has many customizing options that are very useful in diverse screening scenarios. We again acknowledge [Diogo Santos-Martins](https://forlilab.org/members/) for the support during this implementation process.
+
+Preparation of the ligands .pdbqt files can be accomplised on the whole table using the corresponding function:
 
 ```
 # STEP 5: Generate the .pdqbt files for docking purposes.
