@@ -267,6 +267,11 @@ def apply_reaction_1_component_pandarallel(origin_db_name,reaction_name,reactant
     chemicals_df.rename(columns={'product_smiles':"SMILES"},inplace=True)
     chemicals_df = chemicals_df[['SMILES','inchi_key']] # Reorder the dataframe columns
     
+    # Create a mol_id index and make it the first column
+    chemicals_df["mol_id"] = chemicals_df.index
+    first_column = chemicals_df.pop('mol_id')
+    chemicals_df.insert(0, 'mol_id', first_column)
+    
     # Store products to the database
     db_ops.store_df_to_sql(destination_db_name,chemicals_df,product_table_name,sql_action)
 
