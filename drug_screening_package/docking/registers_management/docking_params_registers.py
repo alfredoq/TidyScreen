@@ -121,7 +121,7 @@ def create_default_dict():
                         }
    
     output_ops_dict = {'--resname':'ligand basename',
-                       '--contact_analysis':0,
+                       '--contact_analysis':1,
                        '--xmloutput':1,
                        '--dlgoutput':1,
                        '--dlg2stdout':0,
