@@ -481,7 +481,8 @@ def parse_dlg_file_by_cluster(docking_assays_registry_path,assay_id,receptor_mod
         
                 if trigger == 1 and new_line[1] == 'ATOM': # This extract the lines constituting the .pdb file
                     # This will output the .pdb file with the corresponding format
-                    pdb_output.write(f"{new_line[1]}{new_line[2]:>7}{'':<2}{new_line[3]:<4}{new_line[4]:<8}{new_line[5]:<7}{new_line[6]:<8}{new_line[7]:<8}{new_line[8]:<8}\n")
+                    ## pdb_output.write(f"{new_line[1]}{new_line[2]:>7}{'':<2}{new_line[3]:<4}{new_line[4]:<8}{new_line[5]:<7}{new_line[6]:<8}{new_line[7]:<8}{new_line[8]:<8}\n") ## Deprecated due to parsing error
+                    pdb_output.write(f"{new_line[1]}{new_line[2]:>7}{'':<2}{new_line[3]:<4}{new_line[4]:<8}{new_line[5]:>1} {new_line[6]:>11}{new_line[7]:>8}{new_line[8]:>8}\n")
 
         pdb_output.close()
         
