@@ -14,6 +14,8 @@ import numpy as np
 import pickle
 from sklearn.ensemble import RandomForestClassifier
 import xtarfile as tarfile
+from pathlib import Path
+import matplotlib.pyplot as plt 
 
 import sys
 MODULE_PATH = '/home/fredy/MisDocumentos/Diseno-de-Scripts/CADD_platform/drug_screening_package'
@@ -951,6 +953,70 @@ def process_prolif_raw_dataframe(df):
     
     return df_final_grouped
 
+def perform_ligands_histograms_analysis(docking_assays_storing_path, assay_nbr):
+    """
+    This function will save an histogram of the docked_score vs. cluster_size for each ligand processed in a database
+    """
+    
+    database_file = f'{docking_assays_storing_path}/docking_assay_{assay_nbr}/docking_assay_{assay_nbr}.db'
+    output_dir = f'{docking_assays_storing_path}/docking_assay_{assay_nbr}/ligs_histograms'
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    conn = sqlite3.connect(database_file)
+
+    sql_inst = "SELECT LigName, docking_score, cluster_size FROM Results;"
+    df = pd.read_sql(sql_inst,conn)
+
+    unique_name_list = []
+    dock_score_list = []
+    clust_size_list = []
+    
+    number_of_rows = df.shape[0] 
+    counter = 1
+    
+    print(number_of_rows)
+    
+    for index, row in df.iterrows():
+        lig_name = row['LigName']
+        if lig_name not in unique_name_list: 
+            # This part of the code will append the values for the first iteration in the first ligand
+            if len(dock_score_list) == 0:
+                dock_score_list.append(row['docking_score'])
+                clust_size_list.append(row['cluster_size'])        
+                unique_name_list.append(lig_name)
+            
+            # Once a new ligand in found, save the plot and reset the lists
+            else:
+                # This will save the corresponding plot prior to delete del lists
+                plt.bar(dock_score_list, clust_size_list, color ='blue', width = 0.1)
+                plt.xlabel("docking score")
+                plt.ylabel("cluster_size")
+                plt.title(f"Clustering analysis for {lig_name}")
+                plt.savefig(f"/{output_dir}/{lig_name}.png")
+                # Append the new ligand name
+                unique_name_list.append(lig_name)
+                # Reset the lists
+                dock_score_list = []
+                clust_size_list = []
+
+        # This part of the code will continue to append the values for the same ligand
+        dock_score_list.append(row['docking_score'])
+        clust_size_list.append(row['cluster_size'])        
+    
+        # This will save the plot for the last ligand
+        print(counter)
+        if counter == number_of_rows:
+            print("Grabo grafico")
+            # This will save the corresponding plot prior to delete del lists
+            plt.bar(dock_score_list, clust_size_list, color ='blue', width = 0.1)
+            plt.xlabel("docking score")
+            plt.ylabel("cluster_size")
+            plt.title(f"Clustering analysis for {lig_name}")
+            plt.savefig(f"/{output_dir}/{lig_name}.png")
+    
+        # Update the counter 
+        counter+=1
+
 def perform_docking_assay_analysis(receptor_models_registry_path,docking_assays_registry_path,docking_assays_storing_path,docking_raw_data_path,assay_nbr,max_poses,database_construction_flag,delete_dlgs_flag,extract_all_sdf_flag,extract_lowest_energy_flag,extract_lowest_energy_pdb_flag,extract_lowest_pdb_range,start,stop,extract_most_pop_flag,extract_most_pop_pdb_flag,compute_all_prolif_flag,extract_pdb_poses):
     """
     This function will perform the whole set of analysis for molecular docking assay.
@@ -988,6 +1054,9 @@ def perform_docking_assay_analysis(receptor_models_registry_path,docking_assays_
         if database_construction_flag == 1:
             create_db_from_dlgs(docking_assays_storing_path, assay_nbr, max_poses)
             print(colored("Finished creating database from .dlg files","green"))
+            
+            # Perform the ploting and storing of the corresponding histograms
+            perform_ligands_histograms_analysis(docking_assays_storing_path, assay_nbr)
             
         if delete_dlgs_flag == 1:
                 shutil.rmtree(f'{docking_assays_storing_path}/docking_assay_{assay_nbr}/dlgs')
