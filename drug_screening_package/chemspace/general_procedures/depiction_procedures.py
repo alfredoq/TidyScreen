@@ -120,18 +120,29 @@ def generate_depiction_grid_mol_id(db_name, table_name, output_path, max_mols_pp
             df_query = pd.read_sql_query(sql,conn)
             smiles_list = df_query["SMILES"].to_list()
             labels_list = df_query["mol_id"].to_list()
+            inchi_labels_list = df_query["inchi_key"].to_list()
+            # This will generate a list of labels only with mol_id to be depicted
             labels_list_str = [f'mol_id: {x}' for x in (labels_list)]
+            # This will generate a list of labels combining mol_id and the corresponding inchi_key to be depicted
+            inchi_labels_list_str= [f'mol_id: {x} - inchi_key: {y}' for x,y in zip(labels_list,inchi_labels_list)]
+            
             indexes_list = [f'cpd_row_id: {x+1}' for x in range(len(smiles_list))]
         
             smiles_list_chunks = obj_proc.split_list_in_chunks(smiles_list, max_mols_ppage)
+            # Return chunks of labels containing only the mol_id
             labels_list_chunks = obj_proc.split_list_in_chunks(labels_list_str, max_mols_ppage)
+            # Return chunks of labels containing both the mol_id and inchi_key value
+            inchi_labels_list_chunks = obj_proc.split_list_in_chunks(inchi_labels_list_str, max_mols_ppage)
                
             counter = 0 # used to number figures with chunks
             for index, list_item in enumerate(smiles_list_chunks):
                 df_chunk  = pd.DataFrame({'SMILES':list_item})
                 df_chunk.to_csv(f"{output_path}/{table_name}_{counter}.csv",index=None,header=None)
                 mols_item = [Chem.MolFromSmiles(smile) for smile in list_item]
-                img = MolsToGridImage(mols=mols_item, legends=labels_list_chunks[index], molsPerRow=5,subImgSize=(400,250))
+                ## This will output the plot containing molecules only with mol_id label 
+                #img = MolsToGridImage(mols=mols_item, legends=labels_list_chunks[index], molsPerRow=5,subImgSize=(400,250))
+                ## This will output the plot containing molecules both with mol_id and inchi_key labels
+                img = MolsToGridImage(mols=mols_item, legends=inchi_labels_list_chunks[index], molsPerRow=5,subImgSize=(400,250))
                 img.save(f"{output_path}/{table_name}_{counter}.png")
                 counter+=1
     

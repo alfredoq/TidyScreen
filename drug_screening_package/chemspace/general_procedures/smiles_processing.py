@@ -10,7 +10,8 @@ from rdkit.Chem import Draw
 from rdkit.Chem import Descriptors
 from rdkit import RDLogger
 from rdkit.Chem.EnumerateStereoisomers import EnumerateStereoisomers, StereoEnumerationOptions
-
+import matplotlib.pyplot as plt
+from pathlib import Path
 RDLogger.DisableLog('rdApp.*')
 import sys
 import pandas as pd
@@ -38,11 +39,8 @@ def generate_clean_smiles(smiles):
 def generate_clean_smiles_2(smiles):
     try: 
         sanitized_smiles = sanitize_smiles_errors(smiles)
-        print(sanitized_smiles)
         smiles_free_stereo = remove_smiles_stereo(sanitized_smiles)
-        print(smiles_free_stereo)
         largest_mol_smiles = get_largest_fragment(smiles_free_stereo)
-        print(largest_mol_smiles)
         # Add here potential processing steps for cleaning/sanitizing the SMILES notation 
         #####
         #
@@ -151,8 +149,6 @@ def react_2_components(reaction_mol,smiles_1,smiles_2):
         mol_2 = mol_from_smiles(smiles_2)
         product_mol = reaction_mol.RunReactants((mol_1,mol_2))[0][0]
         product_smiles = smiles_from_mol(product_mol)
-        #print("estoy")
-        #print(product_smiles)
         return product_smiles
     
     except:
@@ -411,6 +407,11 @@ def apply_reaction_2_components_pandarallel(origin_db_name,reaction_name,reactan
                 print(f"Iteration {counter}")
                 counter+=1
 
+            # Create a mol_id index and make it the first column
+            df_products["mol_id"] = df_products.index
+            first_column = df_products.pop('mol_id')
+            df_products.insert(0, 'mol_id', first_column)
+
             # Store the final dataframe to the corresponding database
             db_ops.store_df_to_sql(destination_db_name,df_products,product_table_name,"replace")
             print("Reaction finished SUCCESSFULLY")
@@ -440,6 +441,11 @@ def apply_reaction_2_components_pandarallel(origin_db_name,reaction_name,reactan
                 df_products = pd.concat([df_products,df_products_iteration],axis=0)
                 print(f"Iteration {counter}")
                 counter+=1
+
+            # Create a mol_id index and make it the first column
+            df_products["mol_id"] = df_products.index
+            first_column = df_products.pop('mol_id')
+            df_products.insert(0, 'mol_id', first_column)
 
             # Store the final dataframe to the corresponding database
             db_ops.store_df_to_sql(destination_db_name,df_products,product_table_name,"replace")
@@ -567,6 +573,49 @@ def compute_molecule_properties_on_table(db_name,table_name):
     except Exception as error:
         print(error)
         print(f"Error retrieving the table {table_name}. Check for errors.")
+
+def plot_histograms_of_properties(db_name,table_name,n_bins,miscellaneous_files):
+    """
+    Given a table in which molecular properties have been computed for the stored molecules, this function will plot a serie of histograms corresponding to each property present in the table.
+    
+    ------
+    Parameters:
+    ------
+    - db_name: the full path to the database in which the table containing the properties is stored.
+    - table_name: the name of the table containing the computed properties
+    - n_bins: the number of bins included in the histograms
+    - miscellaneous_files: the full path to the folder in which the Chemspace miscellaneous files are stored.
+    
+    ------
+    Returns
+    ------
+    A serie of histograms stored in de /misc/{table_name} folder
+    """
+
+    conn = sqlite3.connect(db_name)
+    sql = f"SELECT * FROM {table_name}"
+    df = pd.read_sql_query(sql,conn)
+    
+    number_of_cpds = df.shape[0]
+    
+    exclude_columns_list = ["Pose_ID","mol_id","SMILES","inchi_key","available","LigName","sub_pose","receptor"]
+
+    hist_output_dir = f'{miscellaneous_files}/{table_name}_props_hist'
+    Path(hist_output_dir).mkdir(parents=True, exist_ok=True)
+
+    for column in df.columns:
+        #print(column)
+        if column not in exclude_columns_list:
+            try:
+                counts, edges, bars = plt.hist(df[column],bins=n_bins,edgecolor='k')
+                plt.bar_label(bars, rotation=90)
+                plt.xlabel(column)
+                plt.ylabel("Cpds number")
+                plt.title(f"Number of cpds: {number_of_cpds}")
+                plt.savefig(f"{hist_output_dir}/hist_{column}.png")
+                plt.clf()
+            except:
+                continue
 
 def return_enumerated_stereoisomers(smiles):
     """

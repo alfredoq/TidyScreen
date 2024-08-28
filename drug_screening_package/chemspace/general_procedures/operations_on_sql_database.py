@@ -570,6 +570,47 @@ def subset_molecules_by_property_range(db_name,table_origin,table_dest,parameter
         print(error)
         print("Problem subseting the provided table")
 
+def subset_molecules_by_set_of_properties_range(db_name,table_origin,table_dest,values_list):
+    """
+    This function will filter a table containing molecules with calculated properties, using multiple conditions as indicated in a properties list of lists. An example dictionary is:
+
+        values_list = [["A",[">",30]],
+               ["A",["<",50]],
+               ["B",["<",20]],
+               ["C",[">",70]],
+              ]
+ 
+    In order to efficiently define the values_list it is advisable to be assisted by the histograms plotted for every property
+
+    ------
+    Parameters
+    ------
+    db_name: the full path to the database containing the folder to be filtered.
+    table_origin: the name of the table to be filtered.
+    table_dest: tne name of the table in which the filtered compounds are to be stored.
+    values_list: the values_list containing the multiple filtering criteria. Pay special attention to the sample dictionary format.
+
+    ------
+    Returns
+    ------
+    table_dest is written to the same database. If exists, it will be replaced by the new sunseting.
+    """
+
+    conn = sqlite3.connect(db_name)
+    sql = f"SELECT * FROM {table_origin}"
+
+    try:
+        df = pd.read_sql_query(sql,conn)
+        #query = ' and '.join([f'({k} {v[0]} {v[1]})' for k, v in values_dict.items()])
+        query = ' and '.join([f'{v[0]} {v[1][0]} {v[1][1]}' for v in values_list])
+        subset_df = df.query(query)
+        store_df_to_sql(db_name,subset_df,table_dest,"replace")
+        print(f"Table {table_origin} SUCCESFULLY subseted to {table_dest}")
+
+    except Exception as error:
+        print(error)
+        print("Problem subseting the provided table")
+
 def subset_molecules_by_column_value(db_name,table_origin,table_dest,column_name,value,action):
     """
     Given a table in which molecular properties are present for the corresponding molecules, this function will subset molecules based on a given column and provided value.

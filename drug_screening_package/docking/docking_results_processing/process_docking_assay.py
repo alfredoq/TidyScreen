@@ -974,8 +974,6 @@ def perform_ligands_histograms_analysis(docking_assays_storing_path, assay_nbr):
     number_of_rows = df.shape[0] 
     counter = 1
     
-    print(number_of_rows)
-    
     for index, row in df.iterrows():
         lig_name = row['LigName']
         if lig_name not in unique_name_list: 
@@ -1004,9 +1002,7 @@ def perform_ligands_histograms_analysis(docking_assays_storing_path, assay_nbr):
         clust_size_list.append(row['cluster_size'])        
     
         # This will save the plot for the last ligand
-        print(counter)
         if counter == number_of_rows:
-            print("Grabo grafico")
             # This will save the corresponding plot prior to delete del lists
             plt.bar(dock_score_list, clust_size_list, color ='blue', width = 0.1)
             plt.xlabel("docking score")
