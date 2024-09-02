@@ -289,6 +289,74 @@ def exclude_reactants_based_on_number_of_functional_groups(db_name,table_to_filt
     if write_excluded == 1:
         store_df_to_sql(db_name,df_excluded,output_table_name+'_excluded',"replace")
 
+
+def exclude_reactants_based_on_number_of_functional_groups_dict(db_name,table_to_filter,filter_dict,output_table_name,write_excluded):
+    """
+    This function will exclude molecules from a table based on the number of times a functional group indicated by the provided 'filter_name' is present in the molecule. In this case, a serie of filters are provided as a dictionary
+
+    The number of functional group ocurrences can be explicitly indicated.
+
+    The compounds passing the filter will be written to 'output_table_name', while if the options to store the excluded compounds (e.g. for inspection purposes) is selected, a table '{output_table_name_excluded}' will be created.
+
+    The output table will contain a column named '{filter_name}_count' indicating the number of matching occurrences.
+
+    ------
+    Parameters:
+    ------
+    - db_name: the full path to the database containing the source table containing the SMILES notation which is to be filtered based on a SMARTS pattern.
+    - table_to_filter: the name of the table containing all the SMILES notation of the molecules to be compared with the SMARTS
+    - filter_dict: A dictionary containing a key value pair corresponding to the 'filter_name:max_count' values
+    - output_table_name: the name of the table to which the compounds matching the limit of functional groups will be written.
+    - write_excluded: indicate (1:yes, 0:no) if a table named '{output_table_name_excluded}' is to be created to store excluded molecules.
+    
+    ------
+    Returns:
+    ------
+    A table containing the molecules containing a number of functional groups below the number indicated.
+
+    """
+    
+    counter = 1
+    
+    for item in filter_dict.items():
+    
+        # Extract the parameters from the dictionary
+        filter_name = item[0]
+        max_count = item[1]
+
+        # Extract the SMARTS for the corresponding filter name
+        conn =  sqlite3.connect(f'{db_name}')
+        sql_search_op = f'SELECT SMARTS FROM reactants_types WHERE Reactant == "{filter_name}";'
+        query_result = conn.execute(sql_search_op)
+        target_smarts = query_result.fetchone()[0]
+
+        # This will search the cpds in the first iteration
+        if counter == 1:
+            sql_search_op = f'SELECT * FROM {table_to_filter};'
+            df_to_filter = pd.read_sql_query(sql_search_op,conn)
+
+        else:
+            df_to_filter = df_clean    
+
+        pandarallel.initialize(progress_bar=True) # Instatiate the pandarallel package for posterior running.
+        df_to_filter[filter_name+'_count'] = df_to_filter['SMILES'].parallel_apply(lambda x: get_number_of_matches(x,target_smarts))
+
+        df_clean = df_to_filter[df_to_filter[filter_name+'_count'] <= max_count]
+        
+        df_excluded = df_to_filter[df_to_filter[filter_name+'_count'] > max_count]
+
+        # Add the counter after the first iteration
+        counter+=1
+
+    
+    # After finishing the last iteration output the final df to a table
+    store_df_to_sql(db_name,df_clean,output_table_name,"replace")
+
+    if write_excluded == 1:
+        store_df_to_sql(db_name,df_excluded,output_table_name+'_excluded',"replace")
+
+        
+
 def check_smiles_vs_smarts(smiles, target_smarts):
     """
     This function will compare a SMILES input with a given SMARTS pattern, and will return a 0/1 tag in case the match is FALSE/TRUE.

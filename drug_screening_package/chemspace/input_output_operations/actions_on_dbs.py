@@ -20,9 +20,9 @@ def drop_table_from_db(db_name,table_name):
         cursor.execute(f'DROP TABLE {table_name};')
         conn.commit
         cursor.close()
-        print("Drop of the column was successful")
+        print(f"The table {table_name} was dropped succesfully")
     except Exception as error:
-        print(colored("Drop of the column failed","red"))
+        print(colored(f"Drop of the table {table_name} failed","red"))
         print(error)
         exit()
     

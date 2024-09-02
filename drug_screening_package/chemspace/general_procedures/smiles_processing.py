@@ -565,8 +565,6 @@ def compute_molecule_properties_on_table(db_name,table_name):
         for header in integer_values:
             df_props = df_props.astype({header:int})    
     
-        print(df_props.head())
-
         db_ops.store_df_to_sql(db_name,df_props,table_name,"replace")
         print(" Succesfully computed and stored de molecular properties info.")
 
