@@ -513,17 +513,22 @@ def compute_molecule_properties(smiles):
     
     properties_dict = {}
     
-    mol = Chem.MolFromSmiles(smiles)
+    try:
 
-    for nm,fn in Descriptors._descList:
-        if nm in molecular_properties_to_compute:
-            value = fn(mol)
-            properties_dict[nm] = round(value,2)
+        mol = Chem.MolFromSmiles(smiles)
 
-    chiral_ctrs_nbr = count_chiral_centers(smiles)
-    properties_dict["chiral_ctrs_nbr"] = int(chiral_ctrs_nbr)
+        for nm,fn in Descriptors._descList:
+            if nm in molecular_properties_to_compute:
+                value = fn(mol)
+                properties_dict[nm] = round(value,2)
 
-    return properties_dict
+        chiral_ctrs_nbr = count_chiral_centers(smiles)
+        properties_dict["chiral_ctrs_nbr"] = int(chiral_ctrs_nbr)
+
+        return properties_dict
+    
+    except:
+        pass
 
 def compute_molecule_properties_on_table(db_name,table_name):
     """

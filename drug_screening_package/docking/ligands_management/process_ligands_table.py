@@ -193,7 +193,7 @@ def compute_pdqbt_file(smiles,conformer_rank,write_conformers):
 
         # This will save the .pdb file containing the numbered atoms
         pdb_file = f'/tmp/{inchi_key}.pdb'
-        print(pdb_file)
+        #print(pdb_file)
         Chem.MolToPDBFile(selected_mol,pdb_file)
 
         ## This will prepare a blob object of the pdb file in for storage within the database
