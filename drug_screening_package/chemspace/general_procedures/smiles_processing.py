@@ -492,7 +492,7 @@ def compute_chemspace_coord(db_name,table_name,calc_type):
     db_ops.store_df_to_sql(db_name,df_with_chem_space,table_name,"replace")
     print("Succesfully computed and stored de chemical space info.")
 
-def compute_molecule_properties(smiles):
+def compute_molecule_properties(smiles,molecular_properties_to_compute):
     """
     This function will receive a SMILES string and will compute a set of hardcoded molecular properties.
 
@@ -508,7 +508,7 @@ def compute_molecule_properties(smiles):
     ------
     A dictionary containing the key:value pairs for the corresponding computed properties
     """
-    molecular_properties_to_compute = ['MolWt', 'MolLogP', 'NumHAcceptors', 'NumHDonors', 'NumRotatableBonds']
+    #molecular_properties_to_compute = ['MolWt', 'MolLogP', 'NumHAcceptors', 'NumHDonors', 'NumRotatableBonds']
     integer_values = ['NumHAcceptors', 'NumHDonors', 'NumRotatableBonds']
     
     properties_dict = {}
@@ -530,7 +530,7 @@ def compute_molecule_properties(smiles):
     except:
         pass
 
-def compute_molecule_properties_on_table(db_name,table_name):
+def compute_molecule_properties_on_table(db_name,table_name,molecular_properties_to_compute,integer_values):
     """
     This function will receive a table, and compute the molecular properties for each SMILES included in it.
 
@@ -539,6 +539,8 @@ def compute_molecule_properties_on_table(db_name,table_name):
     ------
     - db_name: the full path to the database in which the table to be processed exists.
     - table_name: the name of the table to be processed.
+    - molecular_properties_to_compute: the list of molecular properties to compute.
+    - integer_values: the propoerties that are going to be converted into integer values.
 
     ------
     Returns
@@ -546,7 +548,7 @@ def compute_molecule_properties_on_table(db_name,table_name):
     Columns containing the calculated molecular descriptors are added to the original table.
     """
     
-    integer_values = ['NumHAcceptors', 'NumHDonors', 'NumRotatableBonds','chiral_ctrs_nbr']
+    #integer_values = ['NumHAcceptors', 'NumHDonors', 'NumRotatableBonds','chiral_ctrs_nbr']
 
     conn = sqlite3.connect(db_name)
     sql = f"""SELECT * 
@@ -563,7 +565,7 @@ def compute_molecule_properties_on_table(db_name,table_name):
 
         # Initialize the pandarallel library for pandas
         pandarallel.initialize(progress_bar=True)
-        df['properties_dict'] = df['SMILES'].parallel_apply(lambda x: compute_molecule_properties(x))
+        df['properties_dict'] = df['SMILES'].parallel_apply(lambda x: compute_molecule_properties(x,molecular_properties_to_compute))
         df_props = pd.concat([df.drop(['properties_dict'],axis=1),df['properties_dict'].apply(pd.Series)],axis=1)
 
         # This will process the integer values columns
