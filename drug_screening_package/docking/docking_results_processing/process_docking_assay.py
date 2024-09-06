@@ -991,8 +991,15 @@ def perform_ligands_histograms_analysis(docking_assays_storing_path, assay_nbr):
                 plt.ylabel("cluster_size")
                 plt.title(f"Clustering analysis for {lig_name}")
                 plt.savefig(f"/{output_dir}/{lig_name}.png")
+                # Clear the plot for the next iteration
+                plt.clf()
                 # Append the new ligand name
                 unique_name_list.append(lig_name)
+                ## Save a csv with the plotted values
+                #df = pd.DataFrame({'docking_score':dock_score_list,
+                #                   'cluster_size':clust_size_list})
+                #df.to_csv(f"/{output_dir}/{lig_name}.csv",index=False,header=False)
+                
                 # Reset the lists
                 dock_score_list = []
                 clust_size_list = []
@@ -1009,6 +1016,7 @@ def perform_ligands_histograms_analysis(docking_assays_storing_path, assay_nbr):
             plt.ylabel("cluster_size")
             plt.title(f"Clustering analysis for {lig_name}")
             plt.savefig(f"/{output_dir}/{lig_name}.png")
+            plt.clf() # Clear the last plot
     
         # Update the counter 
         counter+=1
