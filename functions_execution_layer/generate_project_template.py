@@ -66,6 +66,11 @@ with open(f"{project_full_path}/functions_execution_layer/{project_name}.py","w"
     project_template.write('from ml.fingerprints_colection import construct_fingerprints_database as cons_fps\n')
     project_template.write('## Imports related to the molecular dynamics simulations\n')
     project_template.write('from md.perform_md import md_assay as md_assay\n')
+    project_template.write('from md.md_registers_management import md_assays_registers as md_assay_reg\n')
+    project_template.write('from md.md_registers_management import md_conditions_registers as md_cond_reg\n')
+    project_template.write('from md.md_analysis import md_analyses as md_analyses\n')
+    project_template.write('from md.md_preparation_actions import ligand_preparation as lig_prep\n')
+    
     project_template.write('##\n')
     project_template.write('##\n')
     project_template.write('### Step 0: Give the working project a name, create subfolder AND/OR export environment variables. Always leave this function activated since the global variables are exported by this function\n')
