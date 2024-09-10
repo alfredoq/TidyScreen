@@ -953,7 +953,7 @@ def process_prolif_raw_dataframe(df):
     
     return df_final_grouped
 
-def perform_ligands_histograms_analysis(docking_assays_storing_path, assay_nbr):
+def perform_ligands_histograms_analysis(docking_assays_storing_path, assay_nbr,cluster_number_threshold):
     """
     This function will save an histogram of the docked_score vs. cluster_size for each ligand processed in a database
     """
@@ -976,37 +976,46 @@ def perform_ligands_histograms_analysis(docking_assays_storing_path, assay_nbr):
     
     for index, row in df.iterrows():
         lig_name = row['LigName']
+        
         if lig_name not in unique_name_list: 
             # This part of the code will append the values for the first iteration in the first ligand
             if len(dock_score_list) == 0:
                 dock_score_list.append(row['docking_score'])
                 clust_size_list.append(row['cluster_size'])        
                 unique_name_list.append(lig_name)
+                #continue
             
             # Once a new ligand in found, save the plot and reset the lists
+            
             else:
+                # This will create the prvious ligname variable to store the corresponding data
+                previous_lig_name = unique_name_list[-1]
                 # This will save the corresponding plot prior to delete del lists
                 plt.bar(dock_score_list, clust_size_list, color ='blue', width = 0.1)
                 plt.xlabel("docking score")
                 plt.ylabel("cluster_size")
-                plt.title(f"Clustering analysis for {lig_name}")
-                plt.savefig(f"/{output_dir}/{lig_name}.png")
+                plt.title(f"Clustering analysis for {previous_lig_name}")
+                plt.savefig(f"/{output_dir}/{previous_lig_name}.png")
                 # Clear the plot for the next iteration
                 plt.clf()
-                # Append the new ligand name
-                unique_name_list.append(lig_name)
                 ## Save a csv with the plotted values
-                #df = pd.DataFrame({'docking_score':dock_score_list,
-                #                   'cluster_size':clust_size_list})
-                #df.to_csv(f"/{output_dir}/{lig_name}.csv",index=False,header=False)
+                df = pd.DataFrame({'docking_score':dock_score_list,
+                                   'cluster_size':clust_size_list})
+                df.to_csv(f"/{output_dir}/{previous_lig_name}.csv",index=False,header=False)
                 
                 # Reset the lists
                 dock_score_list = []
                 clust_size_list = []
+                
+                # Store the values and append the LigName
+                dock_score_list.append(row['docking_score'])
+                clust_size_list.append(row['cluster_size'])        
+                unique_name_list.append(lig_name)
 
-        # This part of the code will continue to append the values for the same ligand
-        dock_score_list.append(row['docking_score'])
-        clust_size_list.append(row['cluster_size'])        
+        else: 
+            # This part of the code will continue to append the values for the same ligand
+            dock_score_list.append(row['docking_score'])
+            clust_size_list.append(row['cluster_size'])        
     
         # This will save the plot for the last ligand
         if counter == number_of_rows:
@@ -1017,11 +1026,59 @@ def perform_ligands_histograms_analysis(docking_assays_storing_path, assay_nbr):
             plt.title(f"Clustering analysis for {lig_name}")
             plt.savefig(f"/{output_dir}/{lig_name}.png")
             plt.clf() # Clear the last plot
-    
+            previous_lig_name = unique_name_list[-1]
+            
+            #Save a csv with the plotted values
+            df = pd.DataFrame({'docking_score':dock_score_list,
+                               'cluster_size':clust_size_list})
+            df.to_csv(f"{output_dir}/{previous_lig_name}.csv",index=False,header=False)
+        
         # Update the counter 
         counter+=1
 
-def perform_docking_assay_analysis(receptor_models_registry_path,docking_assays_registry_path,docking_assays_storing_path,docking_raw_data_path,assay_nbr,max_poses,database_construction_flag,delete_dlgs_flag,extract_all_sdf_flag,extract_lowest_energy_flag,extract_lowest_energy_pdb_flag,extract_lowest_pdb_range,start,stop,extract_most_pop_flag,extract_most_pop_pdb_flag,compute_all_prolif_flag,extract_pdb_poses):
+    ## Extract the preferred binder from the whole analysis
+    extract_preferred_binders(conn,cluster_number_threshold,output_dir)
+
+def extract_preferred_binders(connection,cluster_number_threshold,output_path):
+    """
+    This function will create a .csv file containing the SMILES and inchi_key of the compounds resulting from a docking campaign in which the number of conformations in the lowest energy cluster is above a certain threshold limit.
+
+    ------
+    Parameters
+    ------
+    - connection: a connection already established to a database corresponding to a docking result processing.
+    - cluster_number_threshold: the threshold corresponding to the minumum number of cluster conformatios to be detected in the lowest energy cluster.
+    - output_path: The full path were the output .csv file is to be written.
+
+    ------
+    Returns
+    ------
+    A .csv file
+    """
+
+    sql = "SELECT * FROM Results WHERE pose_rank = 1"
+    df = pd.read_sql(sql,connection)
+    df_preferred_binders = df[df["cluster_size"] > cluster_number_threshold]    
+    preferred_binders_ligname_list = df_preferred_binders["LigName"].to_list()
+
+    sql_ligands = "SELECT * FROM Ligands"
+    df_ligands = pd.read_sql(sql_ligands,connection)
+
+    selected_smiles_list = []
+    selected_ligname_list = []
+    for index, row in df_ligands.iterrows():
+        ligname = row["LigName"]
+        if ligname in preferred_binders_ligname_list:
+            smiles = str(row["ligand_smile"]).strip()
+            selected_ligname = str(row["LigName"]).strip()
+            selected_smiles_list.append(smiles)
+            selected_ligname_list.append(selected_ligname)
+
+    df_preferred_binders_smiles = pd.DataFrame({"SMILES":selected_smiles_list,
+                                                "name":selected_ligname_list})
+    df_preferred_binders_smiles.to_csv(f"{output_path}/selected_binders.csv",header=True,index=False)
+
+def perform_docking_assay_analysis(receptor_models_registry_path,docking_assays_registry_path,docking_assays_storing_path,docking_raw_data_path,assay_nbr,max_poses,database_construction_flag,delete_dlgs_flag,extract_all_sdf_flag,extract_lowest_energy_flag,extract_lowest_energy_pdb_flag,extract_lowest_pdb_range,start,stop,extract_most_pop_flag,extract_most_pop_pdb_flag,compute_all_prolif_flag,extract_pdb_poses,cluster_number_threshold):
     """
     This function will perform the whole set of analysis for molecular docking assay.
     ------
@@ -1060,7 +1117,7 @@ def perform_docking_assay_analysis(receptor_models_registry_path,docking_assays_
             print(colored("Finished creating database from .dlg files","green"))
             
             # Perform the ploting and storing of the corresponding histograms
-            perform_ligands_histograms_analysis(docking_assays_storing_path, assay_nbr)
+            perform_ligands_histograms_analysis(docking_assays_storing_path, assay_nbr, cluster_number_threshold)
             
         if delete_dlgs_flag == 1:
                 shutil.rmtree(f'{docking_assays_storing_path}/docking_assay_{assay_nbr}/dlgs')
