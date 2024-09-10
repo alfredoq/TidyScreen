@@ -78,7 +78,7 @@ def generate_depiction_grid(db_name, table_name, output_path, max_mols_ppage):
         print(error)
         print(colored(f"ERROR depicting molecules in table: '{table_name}'.","red"))
 
-def generate_depiction_grid_mol_id(db_name, table_name, output_path, max_mols_ppage):
+def generate_depiction_grid_mol_id(db_name, table_name, miscellaneous_files, max_mols_ppage):
     """
     This function will create one/multiple .png documents depicting grids of molecules corresponding to the table and column of SMILES read as input. The label of the compound will be assigned from the 'mol_id' column.
 
@@ -100,7 +100,8 @@ def generate_depiction_grid_mol_id(db_name, table_name, output_path, max_mols_pp
     ------
     A serie of .png files that are stored in the 'output_path'
     """
-    
+    output_path = f'{miscellaneous_files}/{table_name}'
+
     try: 
 
         # First check if the destination directory alredy exists. If True, exit informing.
@@ -108,7 +109,6 @@ def generate_depiction_grid_mol_id(db_name, table_name, output_path, max_mols_pp
             print(colored(f"The destination folder '{output_path}' already exists. EXITING","red"))
             exit()
         else:
-
             # Create the destination directory
             os.makedirs(output_path)            
             print(colored(f"SUCESSFULLY created the output folder: {output_path}","green"))
