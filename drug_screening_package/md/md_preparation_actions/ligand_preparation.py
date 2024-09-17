@@ -54,6 +54,7 @@ def retrieve_docked_subpose_pdb_file(ligand_table_name,ligand_db,ligand_subpose_
     return f'{output_folder}/{ligand_subpose_name}.pdb'
 
 def retrieve_reference_pdb_file(md_assay_folder,source_ligands_db,source_ligands_pdbqt_table,ligand_inchi_key):
+    
     # This will retrieve the corresponding database containing ligands
     conn = sqlite3.connect(source_ligands_db)
     
@@ -84,6 +85,41 @@ def retrieve_reference_pdb_file(md_assay_folder,source_ligands_db,source_ligands
     os.remove(f'{md_assay_folder}/{stored_pdb_filename}')
 
     return f'{md_assay_folder}/{reference_pdb_file}'
+
+def restore_all_reference_pdb_files_to_path(source_db,ligands_pdbqt_table,output_path):
+    """
+    This function will retrieve all the .pdb files containing all Hs atoms and correctly numbered by RDKit as stored in a {source_ligands_pdbqt_table} table, and will output the .pdb files the {output_path}. These .pdb files are consistant with the .pdb poses extracted by the docking analysis tools, and can be further used to prepare MD parameters files.
+    
+    """
+
+    # This will retrieve the corresponding database containing ligands
+    conn = sqlite3.connect(source_db)
+    
+    cursor = conn.cursor()
+    
+    sql = f"SELECT * FROM {ligands_pdbqt_table}"
+    
+    cursor.execute(sql)
+    query_output = cursor.fetchall()
+    
+    
+    for row in query_output:
+        stored_pdb_filename = row[4]
+        print(stored_pdb_filename)
+        stored_pdb_blob = row[5]
+    
+        dest_file = f'{output_path}/{stored_pdb_filename}'
+        with open(dest_file, 'wb') as file:
+            file.write(stored_pdb_blob)
+        file.close()
+        print(f"File {dest_file} stored SUCCESSFULLY")
+    
+        # This will extract the retrieved tar.gz file and delete it afterwards
+        reference_pdb_file = stored_pdb_filename.replace('.tar.gz','.pdb')
+        file = tarfile.open(f'{output_path}/{stored_pdb_filename}')
+        file.extract(f'{reference_pdb_file}',f'{output_path}')
+        file.close()
+        os.remove(f'{output_path}/{stored_pdb_filename}')
 
 def process_pdb_with_antechamber(file,output_path,md_cond_dict):
     """

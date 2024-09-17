@@ -311,11 +311,8 @@ def extract_all_sdf_molecules(docking_assays_storing_path,assay_nbr):
     
     # Configure the output path to store corresponding .sdf files    
     output_path = f'{docking_assays_storing_path}/docking_assay_{assay_nbr}/docked_ligands'
-    if not os.path.exists(output_path):
-        os.makedirs(output_path)
-    else: 
-        print(colored("The directory containing the docked ligand files already exists. Stoping execution","red"))
-        exit()
+
+    Path(output_path).mkdir(parents=True, exist_ok=True)
 
     conn = sqlite3.connect(database)
 
@@ -349,11 +346,7 @@ def extract_all_pdb_poses(docking_assays_storing_path,assay_nbr,max_poses):
     
     # Configure the output path to store corresponding .sdf files    
     output_path = f'{docking_assays_storing_path}/docking_assay_{assay_nbr}/docked_ligands'
-    if not os.path.exists(output_path):
-        os.makedirs(output_path)
-    else: 
-        print(colored("The directory containing the docked ligand files already exists. Stoping execution","red"))
-        exit()
+    Path(output_path).mkdir(parents=True, exist_ok=True)
     
     # Retrieve the names of ligand in order to get the .dlg to process and that contains the ligands
     sql = f"""SELECT LigName
@@ -367,8 +360,9 @@ def extract_all_pdb_poses(docking_assays_storing_path,assay_nbr,max_poses):
         parse_dlg_file(database,dlg_file_to_parse,max_poses)
 
 def parse_dlg_file(database,dlg_file,max_poses):
+    
     """"
-    This function will parse a .dlg file in order to generate the one .pdb file for each detected cluster
+    This function will parse a .dlg file in order to generate one .pdb file for each detected cluster
     
     ------
     Parameters:
@@ -419,7 +413,10 @@ def parse_dlg_file(database,dlg_file,max_poses):
         
                 if trigger == 1 and new_line[1] == 'ATOM': # This extract the lines constituting the .pdb file
                     # This will output the .pdb file with the corresponding format
-                    pdb_output.write(f"{new_line[1]}{new_line[2]:>7}{'':<2}{new_line[3]:<4}{new_line[4]:<8}{new_line[5]:<7}{new_line[6]:<8}{new_line[7]:<8}{new_line[8]:<8}\n")
+                    #pdb_output.write(f"{new_line[1]}{new_line[2]:>7}{'':<2}{new_line[3]:<4}{new_line[4]:<8}{new_line[5]:<7}{new_line[6]:<8}{new_line[7]:<8}{new_line[8]:<8}\n")
+                    atom_field = "HETATM"
+                    pdb_output.write(f"{atom_field:<6}{new_line[2]:>5}{'':<1}{new_line[3]:>4}{'':<1}{new_line[4]:>3}{'':<2}{new_line[5]:>4}{'':<4}{new_line[6]:>8}{new_line[7]:>8}{new_line[8]:>8}\n")
+        
         pdb_output.close()
         
         # Compress the .pdb file
@@ -430,7 +427,6 @@ def parse_dlg_file(database,dlg_file,max_poses):
         tar.close()
         
         pdb_blob_obj = lig_proc.create_blob_object(f"/tmp/{model_name}.tar.gz")
-        
         store_pdb_file_in_database(database,output_file,pdb_blob_obj)
         
         # Clean the generated files in the /tmp dir
@@ -439,7 +435,7 @@ def parse_dlg_file(database,dlg_file,max_poses):
 
 def parse_dlg_file_by_cluster(docking_assays_registry_path,assay_id,receptor_models_registry_path,ligand_main_name,cluster_number):
     """
-    This function will parse a .dlg file and extract all the poses in the given cluter in order to generate one .pdb file for each run
+    This function will parse a .dlg file and extract all the poses in the given cluster in order to generate one .pdb file for each run.
         
     """
     ligand_db,source_ligands_db,source_ligands_pdbqt_table, rec_model_id, receptor_pdb_file = md_conf.retrieve_assay_relevant_variables(docking_assays_registry_path,assay_id,receptor_models_registry_path)
@@ -484,7 +480,9 @@ def parse_dlg_file_by_cluster(docking_assays_registry_path,assay_id,receptor_mod
                 if trigger == 1 and new_line[1] == 'ATOM': # This extract the lines constituting the .pdb file
                     # This will output the .pdb file with the corresponding format
                     ## pdb_output.write(f"{new_line[1]}{new_line[2]:>7}{'':<2}{new_line[3]:<4}{new_line[4]:<8}{new_line[5]:<7}{new_line[6]:<8}{new_line[7]:<8}{new_line[8]:<8}\n") ## Deprecated due to parsing error
-                    pdb_output.write(f"{new_line[1]}{new_line[2]:>7}{'':<2}{new_line[3]:<4}{new_line[4]:<8}{new_line[5]:>1} {new_line[6]:>11}{new_line[7]:>8}{new_line[8]:>8}\n")
+                    #pdb_output.write(f"{new_line[1]}{new_line[2]:>7}{'':<2}{new_line[3]:<4}{new_line[4]:<8}{new_line[5]:>1} {new_line[6]:>11}{new_line[7]:>8}{new_line[8]:>8}\n")
+                    atom_field = "HETATM"
+                    pdb_output.write(f"{atom_field:<6}{new_line[2]:>5}{'':<1}{new_line[3]:>4}{'':<1}{new_line[4]:>3}{'':<2}{new_line[5]:>4}{'':<4}{new_line[6]:>8}{new_line[7]:>8}{new_line[8]:>8}\n")
 
         pdb_output.close()
         
@@ -500,7 +498,221 @@ def parse_dlg_file_by_cluster(docking_assays_registry_path,assay_id,receptor_mod
         store_pdb_file_in_database_by_cluster(ligand_db,file_name,pdb_blob_obj,ligand_main_name,cluster_number,counter)
         
         counter+=1
+
+def extract_1_per_cluster_from_dlg(docking_assays_storing_path,assay_nbr):
+    """
+    This function will parse a .dlg file and will extract 1 .pdb per identified cluster into a folder named 'cluster_pdb_files' located within the docking assay folder
+    
+    """
+    # Create a connection to the already created database
+    database = f'{docking_assays_storing_path}/docking_assay_{assay_nbr}/docking_assay_{assay_nbr}.db'
+    conn = sqlite3.connect(database)
+
+    # Configure the output path to store corresponding .sdf files    
+    output_path = f'{docking_assays_storing_path}/docking_assay_{assay_nbr}/docked_ligands_from_dlg_1_per_cluster'
+    Path(output_path).mkdir(parents=True, exist_ok=True)
+
+    # Retrieve the names of ligand in order to get the .dlg to process and that contains the ligands
+    sql = f"""SELECT LigName
+              FROM Ligands;"""
+
+    ligands_name_df = pd.read_sql_query(sql,conn)
+
+    activation_keywords =  ['CLUSTERING', 'HISTOGRAM'] # This is the opening line of the Clustering Histogram
+    shutdown_keywords = ['RMSD', 'TABLE']
+    number_of_poses_to_extract = 999
+
+    for index, row in ligands_name_df.iterrows():
+        ligname = row['LigName']
+        dlg_file_to_parse = f'{docking_assays_storing_path}/docking_assay_{assay_nbr}/dlgs/{ligname}.dlg'
         
+        trigger = 0 
+        
+        # This loop will construct the list of docked poses to store based on the clustering histogram
+        counter = 1
+        pose_rank_list = []
+        pose_id_list = []
+
+        for line in open(dlg_file_to_parse):
+            new_line = line.rsplit()
+            if new_line == activation_keywords:
+                trigger = 1
+            elif new_line == shutdown_keywords:
+                trigger = 0
+    
+            if trigger == 1 and len(new_line) == 10 and counter <= number_of_poses_to_extract and "#" in new_line[-1]:
+                pose_rank_list.append(int(new_line[0]))
+                pose_id_list.append(new_line[4])
+                counter+=1        
+
+        # This will extract all the pre-identified pdb files and store them into the indicated folder
+        for pose_rank in pose_rank_list:
+            output_file = f'{output_path}/{ligname}_{pose_rank}.pdb'
+            pose_id = pose_id_list[pose_rank-1]
+            trigger_2 = 0
+            activation_keywords_2 =  ['DOCKED:', 'USER', 'Run', '=', pose_id] # This is the opening line of the .pdbqt run to extract
+            shutdown_keywords_2 = ['DOCKED:', 'ENDMDL']
+            with open(output_file,'w') as pdb_output:
+                for line in open(dlg_file_to_parse):
+                    new_line = line.rsplit()
+                    if new_line == activation_keywords_2:
+                        trigger_2 = 1
+                    elif new_line == shutdown_keywords_2:
+                        trigger_2 = 0
+        
+                    if trigger_2 == 1 and new_line[1] == 'ATOM': # This extract the lines constituting the .pdb file
+                        # This will output the .pdb file with the corresponding format
+                        #pdb_output.write(f"{new_line[1]}{new_line[2]:>7}{'':<2}{new_line[3]:<4}{new_line[4]:<8}{new_line[5]:<7}{new_line[6]:<8}{new_line[7]:<8}{new_line[8]:<8}\n")
+                        atom_field = "HETATM"
+                        pdb_output.write(f"{atom_field:<6}{new_line[2]:>5}{'':<1}{new_line[3]:>4}{'':<1}{new_line[4]:>3}{'':<2}{new_line[5]:>4}{'':<4}{new_line[6]:>8}{new_line[7]:>8}{new_line[8]:>8}\n")
+        
+            pdb_output.close()
+            
+def extract_lowest_energy_conformation_from_dlg(docking_assays_storing_path,assay_nbr):
+    """
+    This function will parse all .dlg files in a docking experiment and will extract the lowest energy conformation as a .pdb file for each .dlg file.
+    
+    """
+    # Create a connection to the already created database
+    database = f'{docking_assays_storing_path}/docking_assay_{assay_nbr}/docking_assay_{assay_nbr}.db'
+    conn = sqlite3.connect(database)
+
+    # Configure the output path to store corresponding .sdf files    
+    output_path = f'{docking_assays_storing_path}/docking_assay_{assay_nbr}/docked_ligands_from_dlg_lowest_energy'
+    Path(output_path).mkdir(parents=True, exist_ok=True)
+
+    # Retrieve the names of ligand in order to get the .dlg to process and that contains the ligands
+    sql = f"""SELECT LigName
+              FROM Ligands;"""
+
+    ligands_name_df = pd.read_sql_query(sql,conn)
+
+    activation_keywords =  ['CLUSTERING', 'HISTOGRAM'] # This is the opening line of the Clustering Histogram
+    shutdown_keywords = ['RMSD', 'TABLE']
+    number_of_poses_to_extract = 1
+
+    for index, row in ligands_name_df.iterrows():
+        ligname = row['LigName']
+        dlg_file_to_parse = f'{docking_assays_storing_path}/docking_assay_{assay_nbr}/dlgs/{ligname}.dlg'
+        
+        trigger = 0 
+        
+        # This loop will construct the list of docked poses to store based on the clustering histogram
+        counter = 1
+        pose_rank_list = []
+        pose_id_list = []
+
+        for line in open(dlg_file_to_parse):
+            new_line = line.rsplit()
+            if new_line == activation_keywords:
+                trigger = 1
+            elif new_line == shutdown_keywords:
+                trigger = 0
+    
+            if trigger == 1 and len(new_line) == 10 and counter <= number_of_poses_to_extract and "#" in new_line[-1]:
+                pose_rank_list.append(int(new_line[0]))
+                pose_id_list.append(new_line[4])
+                counter+=1        
+
+        # This will extract all the pre-identified pdb files and store them into the indicated folder
+        for pose_rank in pose_rank_list:
+            output_file = f'{output_path}/{ligname}_{pose_rank}.pdb'
+            pose_id = pose_id_list[pose_rank-1]
+            trigger_2 = 0
+            activation_keywords_2 =  ['DOCKED:', 'USER', 'Run', '=', pose_id] # This is the opening line of the .pdbqt run to extract
+            shutdown_keywords_2 = ['DOCKED:', 'ENDMDL']
+            with open(output_file,'w') as pdb_output:
+                for line in open(dlg_file_to_parse):
+                    new_line = line.rsplit()
+                    if new_line == activation_keywords_2:
+                        trigger_2 = 1
+                    elif new_line == shutdown_keywords_2:
+                        trigger_2 = 0
+        
+                    if trigger_2 == 1 and new_line[1] == 'ATOM': # This extract the lines constituting the .pdb file
+                        # This will output the .pdb file with the corresponding format
+                        #pdb_output.write(f"{new_line[1]}{new_line[2]:>7}{'':<2}{new_line[3]:<4}{new_line[4]:<8}{new_line[5]:<7}{new_line[6]:<8}{new_line[7]:<8}{new_line[8]:<8}\n")
+                        atom_field = "HETATM"
+                        pdb_output.write(f"{atom_field:<6}{new_line[2]:>5}{'':<1}{new_line[3]:>4}{'':<1}{new_line[4]:>3}{'':<2}{new_line[5]:>4}{'':<4}{new_line[6]:>8}{new_line[7]:>8}{new_line[8]:>8}\n")
+        
+            pdb_output.close()            
+
+def extract_most_populated_cluster_conformation_from_dlg(docking_assays_storing_path,assay_nbr):
+    """
+    This function will process a docking assay and will return the most populated cluster of conformations by the parsing the .dlg files stored in the assay.
+    
+    """
+
+    # Create a connection to the already created database
+    database = f'{docking_assays_storing_path}/docking_assay_{assay_nbr}/docking_assay_{assay_nbr}.db'
+    conn = sqlite3.connect(database)
+
+    # Configure the output path to store corresponding .sdf files    
+    output_path = f'{docking_assays_storing_path}/docking_assay_{assay_nbr}/docked_ligands_from_dlg_most_populated_clusters'
+    Path(output_path).mkdir(parents=True, exist_ok=True)
+
+    # Retrieve the names of ligand in order to get the .dlg to process and that contains the ligands
+    sql = f"""SELECT LigName
+              FROM Ligands;"""
+
+    ligands_name_df = pd.read_sql_query(sql,conn)
+
+    activation_keywords =  ['CLUSTERING', 'HISTOGRAM'] # This is the opening line of the Clustering Histogram
+    shutdown_keywords = ['RMSD', 'TABLE']
+    
+    for index, row in ligands_name_df.iterrows():
+        ligname = row['LigName']
+        dlg_file_to_parse = f'{docking_assays_storing_path}/docking_assay_{assay_nbr}/dlgs/{ligname}.dlg'
+        
+        trigger = 0 
+        
+        # This loop will construct the list of docked poses to store based on the clustering histogram
+        pose_rank_list = []
+        pose_id_list = []
+        cluster_size_list = []
+        
+        for line in open(dlg_file_to_parse):
+            new_line = line.rsplit()
+    
+            if new_line == activation_keywords:
+                trigger = 1
+            elif new_line == shutdown_keywords:
+                trigger = 0
+    
+            if trigger == 1 and len(new_line) == 10:
+                cluster_size_list.append(len(new_line[9]))
+                pose_rank_list.append(int(new_line[0]))
+                pose_id_list.append(new_line[4])
+
+
+        df = pd.DataFrame({"Rank":pose_rank_list,
+                           "Pose_ID":pose_id_list,
+                           "Cluster_size":cluster_size_list})
+
+        sorted_df = df.sort_values("Cluster_size",ascending=False)
+
+        most_populated_pose_id = sorted_df["Pose_ID"].iloc[0]
+    
+        output_file = f'/{output_path}/{ligname}_pose_{most_populated_pose_id}.pdb'
+        trigger = 0
+        activation_keywords_2 =  ['DOCKED:', 'USER', 'Run', '=', most_populated_pose_id] # This is the opening line of the .pdbqt run to extract
+        shutdown_keywords_2 = ['DOCKED:', 'ENDMDL']
+        
+        with open(output_file,'w') as pdb_output:
+            for line in open(dlg_file_to_parse):
+                new_line = line.rsplit()
+                if new_line == activation_keywords_2:
+                    trigger = 1
+                elif new_line == shutdown_keywords_2:
+                    trigger = 0
+        
+                if trigger == 1 and new_line[1] == 'ATOM': # This extract the lines constituting the .pdb file
+                    # This will output the .pdb file with the corresponding format
+                    #pdb_output.write(f"{new_line[1]}{new_line[2]:>7}{'':<2}{new_line[3]:<4}{new_line[4]:<8}{new_line[5]:<7}{new_line[6]:<8}{new_line[7]:<8}{new_line[8]:<8}\n")
+                    atom_field = "HETATM"
+                    pdb_output.write(f"{atom_field:<6}{new_line[2]:>5}{'':<1}{new_line[3]:>4}{'':<1}{new_line[4]:>3}{'':<2}{new_line[5]:>4}{'':<4}{new_line[6]:>8}{new_line[7]:>8}{new_line[8]:>8}\n")
+        pdb_output.close()
+
 def store_pdb_file_in_database(database,pdb_file,pdb_blob_obj):
     """
     This function will store a pdb_file as a blob object within a database and under the table Results_pdb_files
@@ -657,11 +869,7 @@ def extract_lowest_energy_cluster_pdb(docking_assays_storing_path,assay_nbr,extr
 
     if extract_pdb_flag == 1:
 
-        if not os.path.exists(output_path):
-            os.makedirs(output_path)
-        else: 
-            print(colored("The directory containing the lowest energy docked ligand files already exists. Stoping execution","red"))
-            exit()
+        Path(output_path).mkdir(parents=True, exist_ok=True)
 
         for index, row in lowest_energy_ligands_df.iterrows():
             ligname = row['LigName']
@@ -703,11 +911,8 @@ def extract_most_populated_cluster_pdb(docking_assays_storing_path,assay_nbr,ext
     sql_ops.store_df_to_sql(f'{database}',sorted_df_unique_final,"Results_most_populated","replace")
 
     if extract_most_pop_pdb_flag == 1:
-        if not os.path.exists(output_path):
-            os.makedirs(output_path)
-        else: 
-            print(colored("The directory containing the most populated pose already exists. Stoping execution","red"))
-            exit()
+        
+        Path(output_path).mkdir(parents=True, exist_ok=True)
         
         rank = 1
         for index, row in sorted_df_unique.iterrows():
@@ -1078,7 +1283,7 @@ def extract_preferred_binders(connection,cluster_number_threshold,output_path):
                                                 "name":selected_ligname_list})
     df_preferred_binders_smiles.to_csv(f"{output_path}/selected_binders.csv",header=True,index=False)
 
-def perform_docking_assay_analysis(receptor_models_registry_path,docking_assays_registry_path,docking_assays_storing_path,docking_raw_data_path,assay_nbr,max_poses,database_construction_flag,delete_dlgs_flag,extract_all_sdf_flag,extract_lowest_energy_flag,extract_lowest_energy_pdb_flag,extract_lowest_pdb_range,start,stop,extract_most_pop_flag,extract_most_pop_pdb_flag,compute_all_prolif_flag,extract_pdb_poses,cluster_number_threshold):
+def perform_docking_assay_analysis(receptor_models_registry_path,docking_assays_registry_path,docking_assays_storing_path,docking_raw_data_path,assay_nbr,max_poses,compute_all_prolif_flag,cluster_number_threshold):
     """
     This function will perform the whole set of analysis for molecular docking assay.
     ------
@@ -1090,15 +1295,7 @@ def perform_docking_assay_analysis(receptor_models_registry_path,docking_assays_
     - docking_raw_data_path: the full path to the folder in which the project raw data intended for docking is stored.
     - assay_nbr: the number of the docking assay as stored in the corresponding registries that is to be analyzed.
     - max_poses : the maximum number of poses clusters to retain from the docking file.
-    - database_construction_flag: Flag (0/1) to construct the database from .dlgs .
-    - delete_dlgs_flag: Flag (0/1) to delete the origin .dlgs file after constructing the database.
-    - extract_all_sdf_flag: Flag (0/1) to extract all sdf and pdb files to a sulfoder 'docked_ligands'. Warning: SPACE and TIME.
-    - extract_lowest_energy_flag: Flag (0/1) to extract all sdf and pdb files to a sulfoder 'docked_ligands_lowest_energy'.
-    - extract_lowest_energy_pdb_flag: activate wether the extraction of the pdb files should be written to 'docked_ligands_lowest_energy' (0/1).
-    - extract_most_pop_flag: Flag (0/1) to extract all sdf and pdb files to a sulfoder 'docked_ligands_most_populated'.
     - compute_all_prolif_flag: Flag (0/1) to compute the prolif interactions on all the database ligands poses. Warning: SPACE and TIME.
-    - extract_most_pop_pdb_flag: activate wether the extraction of the pdb files should be written to 'docked_ligands_most_populated' (0/1).
-    - extract_pdb_poses: activating this flag will parse the .dlg files, extract and store the .pdb files corresponding to the docked poses.
     - extract_pdb_poses_from_cluster: this flag controls if a certain cluster number needs to be processed and store all the .pdb file included in it as a separate .pdb files in a table named: 'Results_pdb_files_cluster_#'
     
     ------
@@ -1112,40 +1309,40 @@ def perform_docking_assay_analysis(receptor_models_registry_path,docking_assays_
     
     try: 
         # Step_1: Create the corresponding ringtail database:
-        if database_construction_flag == 1:
-            create_db_from_dlgs(docking_assays_storing_path, assay_nbr, max_poses)
-            print(colored("Finished creating database from .dlg files","green"))
+        create_db_from_dlgs(docking_assays_storing_path, assay_nbr, max_poses)
+        print(colored("Finished creating database from .dlg files","green"))
             
-            # Perform the ploting and storing of the corresponding histograms
-            perform_ligands_histograms_analysis(docking_assays_storing_path, assay_nbr, cluster_number_threshold)
+        # Perform the ploting and storing of the corresponding histograms
+        perform_ligands_histograms_analysis(docking_assays_storing_path, assay_nbr, cluster_number_threshold)
             
-        if delete_dlgs_flag == 1:
-                shutil.rmtree(f'{docking_assays_storing_path}/docking_assay_{assay_nbr}/dlgs')
-    
-        if extract_all_sdf_flag == 1:
+        # Extract one .pdb file for each cluster
+        extract_1_per_cluster_from_dlg(docking_assays_storing_path,assay_nbr)
+        
+        # Extract the lowest energy conformation for each ligand
+        extract_lowest_energy_conformation_from_dlg(docking_assays_storing_path,assay_nbr)
+        
+        # Extract the most populated cluster of conformations
+        extract_most_populated_cluster_conformation_from_dlg(docking_assays_storing_path,assay_nbr)
+        
+        """ if extract_all_sdf_flag == 1:
             # Step_2: Extract all the .sdf and .pdb molecules:
-            extract_all_sdf_molecules(docking_assays_storing_path,assay_nbr)
-    
-        if extract_pdb_poses == 1:
+            extract_all_sdf_molecules(docking_assays_storing_path,assay_nbr) """
+            
+        """ if extract_pdb_poses == 1:
             # This will parse the .dlg files to extract the .pdb docked poses
-            extract_all_pdb_poses(docking_assays_storing_path,assay_nbr,max_poses)
+            extract_all_pdb_poses(docking_assays_storing_path,assay_nbr,max_poses) """
 
-        if extract_lowest_energy_flag == 1:
+        """ if extract_lowest_energy_flag == 1:
             # Step_3: Extract all the low energy .pdb molecules:
-            extract_lowest_energy_cluster_pdb(docking_assays_storing_path,assay_nbr,extract_lowest_energy_pdb_flag)
+            extract_lowest_energy_cluster_pdb(docking_assays_storing_path,assay_nbr,1) """
 
-        if extract_lowest_pdb_range == 1:
-            extract_lowest_energy_pdb_file_range(docking_assays_storing_path,assay_nbr,start,stop)
-
-        if extract_most_pop_flag == 1:
+        """ if extract_most_pop_flag == 1:
             # Step_4: Extract the most populated cluster .pdb file for each ligand:
-            extract_most_populated_cluster_pdb(docking_assays_storing_path,assay_nbr,extract_most_pop_pdb_flag)
+            extract_most_populated_cluster_pdb(docking_assays_storing_path,assay_nbr,1) """
 
         if compute_all_prolif_flag == 1:
             # Step_5: Compute and store the corresponding ProLIF interactions for the whole assay:
             compute_all_prolif_interaction_patterns(receptor_models_registry_path,docking_assays_registry_path,docking_raw_data_path,assay_nbr)
-    
-        
     
     
         print(colored(f"Docking analysis of assay: {assay_nbr} finished SUCCESFULLY.","green"))
@@ -1164,6 +1361,8 @@ def extract_lowest_energy_pdb_file_range(docking_assays_storing_path,assay_nbr,s
     
     # Configure the output path to store corresponding .sdf files    
     output_path = f'{docking_assays_storing_path}/docking_assay_{assay_nbr}/results_lowest_energy_{start}_{stop}'
+    
+    
     if not os.path.exists(output_path):
         os.makedirs(output_path)
     else: 

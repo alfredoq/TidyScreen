@@ -92,7 +92,7 @@ def generate_depiction_grid_mol_id(db_name, table_name, miscellaneous_files, max
     ------
     - db_name: the full path of the database cotaining the SMILES to be depicted in the grid.
     - table_name: the table included in the 'db-name' that contains the SMILES strings to depict.
-    - output_path: the full path were the generated .png files of the depicted images will be saved.    
+    - miscellaneous_files: the full path to the misc files (provided by the general script)
     - max_mols_ppage: the maximum number of molecules that will be depipected per page.
 
     ------

@@ -190,7 +190,6 @@ def compute_pdqbt_file(smiles,conformer_rank,write_conformers):
         selected_conformer = Chem.MolToMolBlock(mol_hs,confId=conformers_energies_dict_sorted[conformer_rank][0])
         selected_mol = Chem.MolFromMolBlock(selected_conformer, removeHs=False)
                 
-
         # This will save the .pdb file containing the numbered atoms
         pdb_file = f'/tmp/{inchi_key}.pdb'
         #print(pdb_file)
@@ -333,6 +332,23 @@ def write_blob_object(data,dest_file):
         print(f"Problem storing {dest_file}. Check for errors.")
 
 def restore_ligands_from_table(db_name,table_name,dest_dir):
+    """
+    This function will retrieve the whole set of .pdbqt files stored in a table ending with the '_pdbqt_ligand' sufix, and will store it into a defined destination directory.
+    
+    ------
+    Parameters
+    ------
+    - db_name: the full path to the database containing the table in which the .pdbqt files are stored in a table.
+    - table_name: the name of the table containing the BLOB object in which the .pdbqt file is stored. The suffix '_pdbqt_ligands' should be associated to this table.
+    - dest_dir: the full path in which the corresponding .pdbqt file is to be restored.
+    
+    ------
+    Returns
+    ------
+    A set of .pdqbt files stored in the indicated folder.
+    
+    """
+    
     conn = sqlite3.connect(db_name)
     cursor = conn.cursor()
 
@@ -345,15 +361,58 @@ def restore_ligands_from_table(db_name,table_name,dest_dir):
     for row in query_output:
         smiles = row[0]
         inchi_key = row[1]
-        data = row[3]
+        data = row[3] # The data corresponding to the .pdqbt file
         dest_file = dest_dir+'/'+inchi_key+'.pdbqt.tar.gz'
         write_blob_object(data,dest_file)
+        
         ## This will extract the file in the specified folder
         file = tarfile.open(dest_file)
         file.extractall(dest_dir)
         file.close()
         # This will delete de stored compress version of the file
         os.remove(dest_file)
+        
+def restore_pdb_ligands_from_table(db_name,table_name,dest_dir):
+    """
+    This function will retrieve the whole set of .pdb files stored in a table ending with the '_pdbqt_ligand' sufix, and will store it into a defined destination directory.
+    
+    ------
+    Parameters
+    ------
+    - db_name: the full path to the database containing the table in which the .pdbqt files are stored in a table.
+    - table_name: the name of the table containing the BLOB object in which the .pdb file is stored. The suffix '_pdbqt_ligands' should be associated to this table.
+    - dest_dir: the full path in which the corresponding .pdb file is to be restored.
+    
+    ------
+    Returns
+    ------
+    A set of .pdb files stored in the indicated folder.
+    
+    """
+    
+    conn = sqlite3.connect(db_name)
+    cursor = conn.cursor()
+
+    sql = f"""SELECT * 
+             FROM '{table_name}';"""
+
+    cursor.execute(sql)
+    query_output = cursor.fetchall()
+
+    for row in query_output:
+        smiles = row[0]
+        inchi_key = row[1]
+        data = row[5] # The data corresponding to the .pdq file
+        dest_file = dest_dir+'/'+inchi_key+'.pdb.tar.gz'
+        write_blob_object(data,dest_file)
+        
+        ## This will extract the file in the specified folder
+        file = tarfile.open(dest_file)
+        file.extractall(dest_dir)
+        file.close()
+        # This will delete de stored compress version of the file
+        os.remove(dest_file)
+
 
 
 #################
