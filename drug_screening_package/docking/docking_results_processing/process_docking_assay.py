@@ -71,6 +71,36 @@ def create_db_from_dlgs(docking_assays_storing_path, assay_nbr, max_poses):
         print(error)
         print(colored("Problem renaming the docking subposes in database: docking_assay_{assay_nbr}.db","red"))
 
+def create_db_from_dlgs_custom_path(dest_folder):
+    """
+    This function will create an sql database from a folder containing all the docking .dlg files in a provided path
+
+    """
+
+    try:
+        opts = RingtailCore.get_defaults()
+        #Modify the corresponding values as needed
+        opts['rman_opts']['values']['file_sources']['file_path']['path'] = [[f'{dest_folder}']]
+        opts['rman_opts']['values']['file_sources']['file_path']['recursive'] = True
+        opts['rman_opts']['values']['max_poses'] = 10
+        opts['storage_opts']['values']['db_file'] = f'{dest_folder}/results.db'
+        opts['storage_opts']['values']['output_all_poses'] = True
+        with RingtailCore(opts_dict=opts) as rt_core:
+            rt_core.add_results()
+
+    except Exception as error:
+        print(error)
+        print(colored("Error creating docking results database","red"))
+
+    # Rename the corresponding docking subposes
+    try:
+        print(colored("Naming indidual subposes within table","green"))
+        add_docking_subposes_nbr_custom_path(dest_folder)
+        print(colored(f"\n SUCCESFULLY created database: results.db","green"))
+    except Exception as error:
+        print(error)
+        print(colored("Problem renaming the docking subposes in database: docking_assay_{assay_nbr}.db","red"))
+
 def add_docking_subposes_nbr(docking_assays_storing_path, assay_nbr):
     """
     This function will process an already prepared database containing docking results and that was processed using ringtail.
@@ -97,6 +127,49 @@ def add_docking_subposes_nbr(docking_assays_storing_path, assay_nbr):
     except Exception as error:
         print(error)
         print(colored(f"Error conecting to database: docking_assay{assay_nbr}.db","red"))
+
+    # Retrieve the 'Results' table as a dataframe for internal processing
+        
+    try:
+        sql = """SELECT *
+               FROM Results;"""
+        
+        df = pd.read_sql(sql,conn)
+
+        # Add the '_#' value to the corresponding name
+
+        unique_names_list = []
+        for index, row in df.iterrows():
+            ligname = row['LigName']
+            if ligname not in unique_names_list:
+                counter=1
+                df.at[index,'sub_pose'] =  ligname+'_'+str(counter)
+                unique_names_list.append(ligname)
+            else:
+                counter+=1 
+                df.at[index,'sub_pose'] =  ligname+'_'+str(counter)
+
+        # Reorder df columns and store to the database replacing the original one
+        df = df[['Pose_ID', 'LigName', 'sub_pose','receptor', 'pose_rank', 'run_number','docking_score', 'leff', 'deltas', 'cluster_rmsd', 'cluster_size','reference_rmsd', 'energies_inter', 'energies_vdw', 'energies_electro','energies_flexLig', 'energies_flexLR', 'energies_intra','energies_torsional', 'unbound_energy', 'nr_interactions', 'num_hb','about_x', 'about_y', 'about_z', 'trans_x', 'trans_y', 'trans_z',
+        'axisangle_x', 'axisangle_y', 'axisangle_z', 'axisangle_w', 'dihedrals','ligand_coordinates', 'flexible_res_coordinates']]
+        
+        sql_ops.store_df_to_sql(database_file,df,"Results","replace")
+
+    except Exception as error:
+        print(error)
+
+def add_docking_subposes_nbr_custom_path(dest_folder):
+    """
+    This function will process an already prepared database containing docking results and that was processed using ringtail.
+
+    """    
+    # Connect to the target database
+    try:
+        database_file = f'{dest_folder}/results.db'
+        conn = sqlite3.connect(database_file)
+    except Exception as error:
+        print(error)
+        print(colored(f"Error conecting to database: results.db in {dest_folder}","red"))
 
     # Retrieve the 'Results' table as a dataframe for internal processing
         
@@ -565,6 +638,76 @@ def extract_1_per_cluster_from_dlg(docking_assays_storing_path,assay_nbr):
                         #pdb_output.write(f"{new_line[1]}{new_line[2]:>7}{'':<2}{new_line[3]:<4}{new_line[4]:<8}{new_line[5]:<7}{new_line[6]:<8}{new_line[7]:<8}{new_line[8]:<8}\n")
                         atom_field = "HETATM"
                         pdb_output.write(f"{atom_field:<6}{new_line[2]:>5}{'':<1}{new_line[3]:>4}{'':<1}{new_line[4]:>3}{'':<2}{new_line[5]:>4}{'':<4}{new_line[6]:>8}{new_line[7]:>8}{new_line[8]:>8}\n")
+        
+            pdb_output.close()
+
+def extract_1_per_cluster_from_dlg_custom_path(dest_folder):
+    """
+    This function will parse a .dlg file and will extract 1 .pdb per identified cluster into a folder named 'cluster_pdb_files' located within the docking assay folder
+    
+    """
+    # Create a connection to the already created database
+    database = f'{dest_folder}/results.db'
+    conn = sqlite3.connect(database)
+
+    # Configure the output path to store corresponding .sdf files    
+    output_path = f'{dest_folder}/docked_ligands_from_dlg_1_per_cluster'
+    Path(output_path).mkdir(parents=True, exist_ok=True)
+
+    # Retrieve the names of ligand in order to get the .dlg to process and that contains the ligands
+    sql = f"""SELECT LigName
+              FROM Ligands;"""
+
+    ligands_name_df = pd.read_sql_query(sql,conn)
+
+    activation_keywords =  ['CLUSTERING', 'HISTOGRAM'] # This is the opening line of the Clustering Histogram
+    shutdown_keywords = ['RMSD', 'TABLE']
+    number_of_poses_to_extract = 999
+
+    for index, row in ligands_name_df.iterrows():
+        ligname = row['LigName']
+        dlg_file_to_parse = f'{dest_folder}/dlgs/{ligname}.dlg'
+        
+        trigger = 0 
+        
+        # This loop will construct the list of docked poses to store based on the clustering histogram
+        counter = 1
+        pose_rank_list = []
+        pose_id_list = []
+
+        for line in open(dlg_file_to_parse):
+            new_line = line.rsplit()
+            if new_line == activation_keywords:
+                trigger = 1
+            elif new_line == shutdown_keywords:
+                trigger = 0
+    
+            if trigger == 1 and len(new_line) == 10 and counter <= number_of_poses_to_extract and "#" in new_line[-1]:
+                pose_rank_list.append(int(new_line[0]))
+                pose_id_list.append(new_line[4])
+                counter+=1        
+                
+        # This will extract all the pre-identified pdb files and store them into the indicated folder
+        for pose_rank in pose_rank_list:
+            output_file = f'{output_path}/{ligname}_{pose_rank}.pdb'
+            pose_id = pose_id_list[pose_rank-1]
+            trigger_2 = 0
+            activation_keywords_2 =  ['DOCKED:', 'USER', 'Run', '=', pose_id] # This is the opening line of the .pdbqt run to extract
+            shutdown_keywords_2 = ['DOCKED:', 'ENDMDL']
+            with open(output_file,'w') as pdb_output:
+                for line in open(dlg_file_to_parse):
+                    new_line = line.rsplit()
+                    if new_line == activation_keywords_2:
+                        trigger_2 = 1
+                    elif new_line == shutdown_keywords_2:
+                        trigger_2 = 0
+        
+                    if trigger_2 == 1:
+                        if new_line[1] == 'ATOM' or new_line[1] == 'HETATM': # This extract the lines constituting the .pdb file
+                            # This will output the .pdb file with the corresponding format
+                            #pdb_output.write(f"{new_line[1]}{new_line[2]:>7}{'':<2}{new_line[3]:<4}{new_line[4]:<8}{new_line[5]:<7}{new_line[6]:<8}{new_line[7]:<8}{new_line[8]:<8}\n")
+                            atom_field = "HETATM"
+                            pdb_output.write(f"{atom_field:<6}{new_line[2]:>5}{'':<1}{new_line[3]:>4}{'':<1}{new_line[4]:>3}{'':<2}{new_line[5]:>4}{'':<4}{new_line[6]:>8}{new_line[7]:>8}{new_line[8]:>8}\n")
         
             pdb_output.close()
             
@@ -1179,21 +1322,25 @@ def perform_ligands_histograms_analysis(docking_assays_storing_path, assay_nbr,c
     number_of_rows = df.shape[0] 
     counter = 1
     
+    df.to_csv("/home/fredy/Desktop/ver.csv",index=False)
+
     for index, row in df.iterrows():
         lig_name = row['LigName']
         
         if lig_name not in unique_name_list: 
             # This part of the code will append the values for the first iteration in the first ligand
             if len(dock_score_list) == 0:
-                dock_score_list.append(row['docking_score'])
-                clust_size_list.append(row['cluster_size'])        
-                unique_name_list.append(lig_name)
-                #continue
+                try:
+                    dock_score_list.append(row['docking_score'])
+                    clust_size_list.append(row['cluster_size'])        
+                    unique_name_list.append(lig_name)
+                    #continue
+                except Exception as error:
+                    print("ERROR")
             
             # Once a new ligand in found, save the plot and reset the lists
-            
             else:
-                # This will create the prvious ligname variable to store the corresponding data
+                # This will create the previous ligname variable to store the corresponding data
                 previous_lig_name = unique_name_list[-1]
                 # This will save the corresponding plot prior to delete del lists
                 plt.bar(dock_score_list, clust_size_list, color ='blue', width = 0.1)
@@ -1219,8 +1366,12 @@ def perform_ligands_histograms_analysis(docking_assays_storing_path, assay_nbr,c
 
         else: 
             # This part of the code will continue to append the values for the same ligand
-            dock_score_list.append(row['docking_score'])
-            clust_size_list.append(row['cluster_size'])        
+            try:
+                dock_score_list.append(row['docking_score'])
+                clust_size_list.append(row['cluster_size'])        
+            except Exception as error:
+                print(error)
+
     
         # This will save the plot for the last ligand
         if counter == number_of_rows:
@@ -1308,38 +1459,22 @@ def perform_docking_assay_analysis(receptor_models_registry_path,docking_assays_
     """
     
     try: 
-        # Step_1: Create the corresponding ringtail database:
+        ## Step_1: Create the corresponding ringtail database:
         create_db_from_dlgs(docking_assays_storing_path, assay_nbr, max_poses)
         print(colored("Finished creating database from .dlg files","green"))
             
-        # Perform the ploting and storing of the corresponding histograms
+        ## Perform the ploting and storing of the corresponding histograms
         perform_ligands_histograms_analysis(docking_assays_storing_path, assay_nbr, cluster_number_threshold)
             
-        # Extract one .pdb file for each cluster
+        ## Extract one .pdb file for each cluster
         extract_1_per_cluster_from_dlg(docking_assays_storing_path,assay_nbr)
         
-        # Extract the lowest energy conformation for each ligand
+        ## Extract the lowest energy conformation for each ligand
         extract_lowest_energy_conformation_from_dlg(docking_assays_storing_path,assay_nbr)
         
-        # Extract the most populated cluster of conformations
+        ## Extract the most populated cluster of conformations
         extract_most_populated_cluster_conformation_from_dlg(docking_assays_storing_path,assay_nbr)
         
-        """ if extract_all_sdf_flag == 1:
-            # Step_2: Extract all the .sdf and .pdb molecules:
-            extract_all_sdf_molecules(docking_assays_storing_path,assay_nbr) """
-            
-        """ if extract_pdb_poses == 1:
-            # This will parse the .dlg files to extract the .pdb docked poses
-            extract_all_pdb_poses(docking_assays_storing_path,assay_nbr,max_poses) """
-
-        """ if extract_lowest_energy_flag == 1:
-            # Step_3: Extract all the low energy .pdb molecules:
-            extract_lowest_energy_cluster_pdb(docking_assays_storing_path,assay_nbr,1) """
-
-        """ if extract_most_pop_flag == 1:
-            # Step_4: Extract the most populated cluster .pdb file for each ligand:
-            extract_most_populated_cluster_pdb(docking_assays_storing_path,assay_nbr,1) """
-
         if compute_all_prolif_flag == 1:
             # Step_5: Compute and store the corresponding ProLIF interactions for the whole assay:
             compute_all_prolif_interaction_patterns(receptor_models_registry_path,docking_assays_registry_path,docking_raw_data_path,assay_nbr)
@@ -1350,6 +1485,19 @@ def perform_docking_assay_analysis(receptor_models_registry_path,docking_assays_
     except Exception as error:
         print(error)
         print(colored(f"ERROR in docking analysis of assay: {assay_nbr}.","red"))
+
+def process_docking_isolated_folder(dest_folder):
+    """
+    This function will apply all the docking processes to a custom folder in which the docking results are stored in the directories:
+
+        $PATH/dlgs
+        $PATH/pdbqt_files
+        $PATH/receptor
+
+    """
+
+    create_db_from_dlgs_custom_path(dest_folder)
+    extract_1_per_cluster_from_dlg_custom_path(dest_folder)
 
 def extract_lowest_energy_pdb_file_range(docking_assays_storing_path,assay_nbr,start,stop):
     """

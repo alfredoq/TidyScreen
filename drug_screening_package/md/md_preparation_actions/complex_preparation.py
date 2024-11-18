@@ -25,10 +25,11 @@ def prepare_complex(md_assay_folder,receptor_file,ligand_file):
         complex_file.write("TER \n")
         
         # append ligand lines to the complex file
+        
         for line in open(ligand_file):
             new_line = line.rstrip().split()
             
-            if new_line[0] == 'ATOM':
+            if new_line[0] == 'ATOM' or new_line[0] == 'HETATM':
                 complex_file.write(line)
         
         # append a TER and END card to the complex file
