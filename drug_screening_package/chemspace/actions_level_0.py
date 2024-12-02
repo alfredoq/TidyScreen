@@ -149,7 +149,6 @@ def process_raw_csv_file_pandarallel(file,db_name,table_name,retain_stereo):
     A database containing the corresponding information.
     """
     # Read the raw datafile into a dataframe
-    print(file)
     
     try: 
         raw_df = pd.read_csv(file)
@@ -183,6 +182,7 @@ def process_raw_csv_file_pandarallel(file,db_name,table_name,retain_stereo):
         clean_df.insert(0, 'mol_id', first_column)
 
         # Store the final info to the corresponding database
+        table_name = table_name.replace('-','_') # This will make sure that the table name does not hace hyphens in order to avoid later problems with sqlite3 selection commands.
         print(colored(f"Storing molecules to database {db_name}.","green"))
         sql_ops.store_df_to_sql(db_name,clean_df,table_name,"append")
         print(colored(f"Removing duplicated molecules in {db_name}.","green"))
