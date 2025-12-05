@@ -9,7 +9,7 @@ setup(name='tidyscreen',
       url='https://github.com/alfredoq/TidyScreen',
       license='GPLv3',
       python_requires='>=3.10',
-      package_data = {'tidyscreen': ['src'],'tidyscreen': ['docs']},
+      package_dir={'tidyscreen': 'src'},
       include_package_data=True,
       install_requires=[
         'pandas==2.2.1',
@@ -35,7 +35,7 @@ setup(name='tidyscreen',
         'py3Dmol',
 	'sqlite_web'
       ],
-      packages=find_packages(),
+      packages=['tidyscreen', 'tidyscreen.chemspace', 'tidyscreen.config', 'tidyscreen.databases', 'tidyscreen.projects'],
       keywords='drug-discovery',
       classifiers=[
           "Programming Language :: Python :: 3.10",
