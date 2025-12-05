@@ -1,0 +1,34 @@
+{
+  "project_structure": {
+    "folders": [
+      "chemspace",
+      "docking",
+      "dynamics",
+      "ml"
+    ],
+    "subfolders": {
+      "chemspace": [
+        "misc",
+        "processed_data",
+        "raw_data"
+      ],
+      "docking": [
+        "docking_assays",
+        "docking_registers",
+        "params",
+        "raw_data",
+        "receptors"
+      ],
+      "dynamics": [
+        "md_assays",
+        "md_params",
+        "md_registers"
+      ],
+      "ml": [
+        "models",
+        "test_sets",
+        "training_sets"
+      ]
+    }
+  }
+}
