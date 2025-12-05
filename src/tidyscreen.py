@@ -1,8 +1,8 @@
 import sys
 import os
 import json
-from databases.DatabaseManager import DatabaseManager
-from projects.projects_management import ProjectsManagement
+from tidyscreen.databases.DatabaseManager import DatabaseManager
+from tidyscreen.projects.projects_management import ProjectsManagement
 import site 
 
 def projects():
