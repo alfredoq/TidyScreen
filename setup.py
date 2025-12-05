@@ -11,6 +11,9 @@ setup(name='tidyscreen',
       python_requires='>=3.10',
       package_dir={'tidyscreen': 'src'},
       include_package_data=True,
+      package_data={
+          'tidyscreen.config': ['*.json'],
+      },
       install_requires=[
         'pandas==2.2.1',
         'rdkit==2023.9.5',
