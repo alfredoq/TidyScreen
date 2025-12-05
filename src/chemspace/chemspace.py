@@ -9,6 +9,15 @@ import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import cpu_count
 import numpy as np
+import time
+
+# Try to import tqdm for progress bars, fallback to simple progress if not available
+try:
+    from tqdm import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
+    print("📋 Note: Install 'tqdm' for enhanced progress bars: pip install tqdm")
 
 # Add the parent directory to path to import our local tidyscreen module
 parent_dir = os.path.dirname(os.path.dirname(__file__))
@@ -1653,7 +1662,7 @@ class ChemSpace:
                              name_available: bool, flag_available: bool, skip_duplicates: bool,
                              max_workers: int, chunk_size: int) -> Dict[str, Any]:
         """
-        Process CSV data using parallel processing with chunks.
+        Process CSV data using parallel processing with chunks and comprehensive progress tracking.
         
         Args:
             df (pd.DataFrame): DataFrame containing the CSV data
@@ -1671,49 +1680,147 @@ class ChemSpace:
             dict: Results containing counts and status
         """
         try:
-            # Split DataFrame into chunks
-            chunks = self._split_dataframe_into_chunks(df, chunk_size)
-            print(f"   📦 Split into {len(chunks)} chunks")
+            # Record start time for performance tracking
+            start_time = time.time()
             
-            # Process chunks in parallel
+            # Split DataFrame into chunks
+            print(f"   📦 Splitting {len(df)} rows into chunks...")
+            chunks = self._split_dataframe_into_chunks(df, chunk_size)
+            num_chunks = len(chunks)
+            
+            print(f"   📊 Parallel Processing Setup:")
+            print(f"      📦 Total chunks: {num_chunks}")
+            print(f"      📏 Chunk size: {chunk_size}")
+            print(f"      👥 Workers: {max_workers}")
+            
+            # Initialize progress tracking
             total_compounds_added = 0
             total_duplicates_skipped = 0
             total_errors = 0
+            processed_rows = 0
+            
+            # Initialize progress bar if tqdm is available
+            if TQDM_AVAILABLE:
+                progress_bar = tqdm(
+                    total=len(df),
+                    desc="Processing compounds",
+                    unit="compounds",
+                    bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
+                )
+            else:
+                progress_bar = None
+                print(f"   🚀 Starting parallel processing of {num_chunks} chunks...")
             
             with ProcessPoolExecutor(max_workers=max_workers) as executor:
-                # Submit all chunk processing jobs
+                # Submit all chunk processing jobs with timing
                 future_to_chunk = {}
+                chunk_submission_start = time.time()
+                
                 for i, chunk in enumerate(chunks):
                     future = executor.submit(
                         _process_chunk_worker,
                         chunk, smiles_column, name_column, flag_column,
                         name_available, flag_available, i * chunk_size
                     )
-                    future_to_chunk[future] = i
+                    future_to_chunk[future] = {
+                        'index': i,
+                        'size': len(chunk),
+                        'submitted_at': time.time()
+                    }
                 
-                # Collect results and insert into database
+                chunk_submission_time = time.time() - chunk_submission_start
+                print(f"   ⏱️  All {num_chunks} chunks submitted in {chunk_submission_time:.2f}s")
+                
+                # Collect results and insert into database with detailed progress
                 processed_chunks = 0
+                failed_chunks = 0
+                
                 for future in as_completed(future_to_chunk):
-                    chunk_idx = future_to_chunk[future]
+                    chunk_info = future_to_chunk[future]
+                    chunk_idx = chunk_info['index']
+                    chunk_size_actual = chunk_info['size']
+                    
                     try:
+                        # Process chunk result
+                        chunk_start_time = time.time()
                         compounds_data = future.result()
+                        chunk_process_time = time.time() - chunk_start_time
                         
                         if compounds_data:
                             # Insert this chunk's data into database
+                            insert_start_time = time.time()
                             chunk_result = self._insert_compounds(compounds_data, table_name, skip_duplicates)
+                            insert_time = time.time() - insert_start_time
                             
                             if chunk_result['success']:
                                 total_compounds_added += chunk_result['compounds_added']
                                 total_duplicates_skipped += chunk_result['duplicates_skipped']
                                 total_errors += chunk_result['errors']
+                                
+                                # Detailed chunk statistics (only show every 5th chunk to avoid spam)
+                                if not TQDM_AVAILABLE and (processed_chunks + 1) % 5 == 0:
+                                    print(f"   ✅ Chunk {chunk_idx + 1}/{num_chunks}: "
+                                          f"{chunk_result['compounds_added']} added, "
+                                          f"{chunk_result['duplicates_skipped']} duplicates, "
+                                          f"{chunk_result['errors']} errors "
+                                          f"(Process: {chunk_process_time:.2f}s, Insert: {insert_time:.2f}s)")
                         
+                        processed_rows += chunk_size_actual
                         processed_chunks += 1
-                        if processed_chunks % 10 == 0 or processed_chunks == len(chunks):
-                            print(f"   ⏳ Processed {processed_chunks}/{len(chunks)} chunks")
+                        
+                        # Update progress bar or print progress
+                        if progress_bar:
+                            progress_bar.update(chunk_size_actual)
+                            progress_bar.set_postfix({
+                                'chunks': f"{processed_chunks}/{num_chunks}",
+                                'added': total_compounds_added,
+                                'duplicates': total_duplicates_skipped,
+                                'errors': total_errors
+                            })
+                        elif processed_chunks % 10 == 0 or processed_chunks == num_chunks:
+                            elapsed_time = time.time() - start_time
+                            remaining_chunks = num_chunks - processed_chunks
+                            estimated_remaining = (elapsed_time / processed_chunks) * remaining_chunks if processed_chunks > 0 else 0
+                            
+                            print(f"   ⏳ Progress: {processed_chunks}/{num_chunks} chunks "
+                                  f"({processed_rows:,}/{len(df):,} rows) "
+                                  f"[{elapsed_time:.1f}s elapsed, ~{estimated_remaining:.1f}s remaining]")
+                            print(f"      📊 Current totals: {total_compounds_added:,} added, "
+                                  f"{total_duplicates_skipped:,} duplicates, {total_errors:,} errors")
                         
                     except Exception as e:
-                        print(f"   ❌ Error processing chunk {chunk_idx}: {e}")
-                        total_errors += chunk_size  # Estimate errors for failed chunk
+                        failed_chunks += 1
+                        total_errors += chunk_size_actual  # Estimate errors for failed chunk
+                        processed_chunks += 1
+                        processed_rows += chunk_size_actual
+                        
+                        print(f"   ❌ Chunk {chunk_idx + 1} failed: {e}")
+                        
+                        # Update progress even for failed chunks
+                        if progress_bar:
+                            progress_bar.update(chunk_size_actual)
+                            progress_bar.set_postfix({
+                                'chunks': f"{processed_chunks}/{num_chunks}",
+                                'failed': failed_chunks,
+                                'errors': total_errors
+                            })
+                
+                # Close progress bar
+                if progress_bar:
+                    progress_bar.close()
+            
+            # Final timing and statistics
+            total_time = time.time() - start_time
+            rows_per_second = len(df) / total_time if total_time > 0 else 0
+            
+            print(f"\n   🏁 Parallel Processing Complete!")
+            print(f"      ⏱️  Total time: {total_time:.2f}s")
+            print(f"      📈 Processing rate: {rows_per_second:,.0f} rows/second")
+            print(f"      ✅ Successful chunks: {processed_chunks - failed_chunks}/{num_chunks}")
+            if failed_chunks > 0:
+                print(f"      ❌ Failed chunks: {failed_chunks}/{num_chunks}")
+            print(f"      📊 Final counts: {total_compounds_added:,} added, "
+                  f"{total_duplicates_skipped:,} duplicates, {total_errors:,} errors")
             
             return {
                 'success': True,
