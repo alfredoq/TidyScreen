@@ -916,3 +916,41 @@ class ChemSpace:
             table_desc = f" from table '{table_name}'" if table_name else ""
             print(f"❌ Error clearing compounds{table_desc}: {e}")
             return False
+    
+    def get_table_as_dataframe(self, table_name) -> pd.DataFrame:
+        """
+        Return a table from the database as a pandas DataFrame.
+        
+        Args:
+            table_name: Name of the table to retrieve
+            
+        Returns:
+            pd.DataFrame: DataFrame containing the table data, empty DataFrame if error occurs
+        """
+        try:
+            # Check if table exists
+            if table_name is not None:
+                tables = self.get_all_tables()
+                if table_name not in tables:
+                    print(f"⚠️  Table '{table_name}' does not exist")
+                    return pd.DataFrame()
+            
+            conn = sqlite3.connect(self.__chemspace_db)
+            
+            # Build query with filters
+            query = f"SELECT * FROM {table_name}"
+            
+            df = pd.read_sql_query(query, conn)
+            
+            conn.close()
+            
+            print(f"✅ Retrieved table '{table_name}' as DataFrame with {len(df)} rows")
+            return df
+            
+        except Exception as e:
+            print(f"❌ Error retrieving table '{table_name}' as DataFrame: {e}")
+            return pd.DataFrame()
+
+
+
+
