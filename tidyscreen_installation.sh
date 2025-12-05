@@ -12,7 +12,7 @@ if conda env list | grep -q "^$ENV_NAME "; then
     
     if [[ "$REPLACE_ENV" =~ ^[Yy]$ ]]; then
         echo "Removing existing environment: $ENV_NAME"
-        conda env remove -n $ENV_NAME -y
+        echo "y" | conda env remove -n $ENV_NAME -y
     else
         echo "Installation cancelled. Environment '$ENV_NAME' already exists."
         exit 1
@@ -27,7 +27,7 @@ if conda env list | grep -q "adt"; then
     
     if [[ "$REPLACE_ENV" =~ ^[Yy]$ ]]; then
         echo "Removing existing environment: adt"
-        conda env remove -n adt -y
+        echo "y" | conda env remove -n adt -y
     else
         echo "Installation cancelled. Environment 'adt' already exists."
         exit 1
