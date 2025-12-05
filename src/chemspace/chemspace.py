@@ -6,6 +6,9 @@ import re
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional, Any
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing import cpu_count
+import numpy as np
 
 # Add the parent directory to path to import our local tidyscreen module
 parent_dir = os.path.dirname(os.path.dirname(__file__))
@@ -14,6 +17,56 @@ sys.path.insert(0, parent_dir)
 # Import from our local tidyscreen module
 from tidyscreen import tidyscreen
 ActivateProject = tidyscreen.ActivateProject
+
+def _process_chunk_worker(chunk_df: pd.DataFrame, smiles_column: str, 
+                         name_column: Optional[str], flag_column: Optional[str],
+                         name_available: bool, flag_available: bool, 
+                         start_idx: int) -> List[Tuple[str, str, str]]:
+    """
+    Worker function to process a chunk of DataFrame in parallel.
+    This function must be at module level to be pickleable for multiprocessing.
+    
+    Args:
+        chunk_df (pd.DataFrame): Chunk of DataFrame to process
+        smiles_column (str): Name of the SMILES column
+        name_column (Optional[str]): Name of the name column
+        flag_column (Optional[str]): Name of the flag column
+        name_available (bool): Whether name column is available
+        flag_available (bool): Whether flag column is available
+        start_idx (int): Starting index for compound naming
+        
+    Returns:
+        List[Tuple[str, str, str]]: List of tuples (smiles, name, flag)
+    """
+    compounds_data = []
+    
+    for local_idx, (_, row) in enumerate(chunk_df.iterrows()):
+        global_idx = start_idx + local_idx
+        smiles = str(row[smiles_column]).strip()
+        
+        # Handle name column - use provided column or generate from index
+        if name_available:
+            name = str(row[name_column]).strip()
+            if not name or name.lower() in ['nan', 'none', '']:
+                name = f"compound_{global_idx + 1}"  # Generate name if empty
+        else:
+            name = f"compound_{global_idx + 1}"  # Generate name if column doesn't exist
+        
+        # Handle flag column - use provided column or default to "nd"
+        if flag_available:
+            flag = str(row[flag_column]).strip()
+            if not flag or flag.lower() in ['nan', 'none', '']:
+                flag = "nd"  # Default flag if empty
+        else:
+            flag = "nd"  # Default flag if column doesn't exist
+        
+        # Skip empty SMILES rows (only SMILES is mandatory)
+        if not smiles or smiles.lower() in ['nan', 'none', '']:
+            continue
+        
+        compounds_data.append((smiles, name, flag))
+    
+    return compounds_data
 
 class ChemSpace:
     """
@@ -407,11 +460,15 @@ class ChemSpace:
                      name_column: Optional[str] = 'name', 
                      flag_column: Optional[str] = 'flag',
                      skip_duplicates: bool = True,
-                     compute_inchi: bool = True) -> Dict[str, Any]:
+                     compute_inchi: bool = True,
+                     parallel_threshold: int = 10000,
+                     max_workers: Optional[int] = None,
+                     chunk_size: Optional[int] = None) -> Dict[str, Any]:
         """
         Load compounds from a CSV file into the chemspace database.
         Creates a table named after the CSV file prefix.
         Automatically computes InChI keys for loaded SMILES.
+        Uses parallel processing for large files to improve performance.
         
         Args:
             csv_file_path (str): Path to the CSV file
@@ -420,6 +477,9 @@ class ChemSpace:
             flag_column (Optional[str]): Name of the column containing flags. If None or not found, fills with "nd"
             skip_duplicates (bool): Whether to skip duplicate compounds
             compute_inchi (bool): Whether to automatically compute InChI keys after loading
+            parallel_threshold (int): Number of rows above which parallel processing is used (default: 10000)
+            max_workers (Optional[int]): Maximum number of parallel workers. If None, uses cpu_count()
+            chunk_size (Optional[int]): Size of each chunk for parallel processing. If None, automatically calculated
             
         Returns:
             dict: Results containing success status, counts, and messages
@@ -476,36 +536,61 @@ class ChemSpace:
             if not flag_available:
                 print(f"⚠️  Flag column '{flag_column}' not found. Will use 'nd' as default.")
             
-            # Prepare data for insertion
-            compounds_data = []
+            # Determine if parallel processing should be used
+            use_parallel = len(df) > parallel_threshold
             
-            for idx, row in df.iterrows():
-                smiles = str(row[smiles_column]).strip()
+            if use_parallel:
+                print(f"🚀 Large dataset detected ({len(df)} rows). Using parallel processing...")
                 
-                # Handle name column - use provided column or generate from index
-                if name_available:
-                    name = str(row[name_column]).strip()
-                    if not name or name.lower() in ['nan', 'none', '']:
-                        name = f"compound_{idx + 1}"  # Generate name if empty
-                else:
-                    name = f"compound_{idx + 1}"  # Generate name if column doesn't exist
+                # Set up parallel processing parameters
+                if max_workers is None:
+                    max_workers = min(cpu_count(), 8)  # Limit to reasonable number
                 
-                # Handle flag column - use provided column or default to "nd"
-                if flag_available:
-                    flag = str(row[flag_column]).strip()
-                    if not flag or flag.lower() in ['nan', 'none', '']:
-                        flag = "nd"  # Default flag if empty
-                else:
-                    flag = "nd"  # Default flag if column doesn't exist
+                if chunk_size is None:
+                    chunk_size = max(1000, len(df) // (max_workers * 4))  # Ensure reasonable chunk size
                 
-                # Skip empty SMILES rows (only SMILES is mandatory)
-                if not smiles or smiles.lower() in ['nan', 'none', '']:
-                    continue
+                print(f"   👥 Workers: {max_workers}")
+                print(f"   📦 Chunk size: {chunk_size}")
                 
-                compounds_data.append((smiles, name, flag))
-            
-            # Insert compounds into database
-            result = self._insert_compounds(compounds_data, table_name, skip_duplicates)
+                # Process in parallel chunks
+                result = self._process_csv_parallel(
+                    df, table_name, smiles_column, name_column, flag_column,
+                    name_available, flag_available, skip_duplicates,
+                    max_workers, chunk_size
+                )
+            else:
+                print(f"📝 Processing {len(df)} rows sequentially...")
+                
+                # Sequential processing for smaller files
+                compounds_data = []
+                
+                for idx, row in df.iterrows():
+                    smiles = str(row[smiles_column]).strip()
+                    
+                    # Handle name column - use provided column or generate from index
+                    if name_available:
+                        name = str(row[name_column]).strip()
+                        if not name or name.lower() in ['nan', 'none', '']:
+                            name = f"compound_{idx + 1}"  # Generate name if empty
+                    else:
+                        name = f"compound_{idx + 1}"  # Generate name if column doesn't exist
+                    
+                    # Handle flag column - use provided column or default to "nd"
+                    if flag_available:
+                        flag = str(row[flag_column]).strip()
+                        if not flag or flag.lower() in ['nan', 'none', '']:
+                            flag = "nd"  # Default flag if empty
+                    else:
+                        flag = "nd"  # Default flag if column doesn't exist
+                    
+                    # Skip empty SMILES rows (only SMILES is mandatory)
+                    if not smiles or smiles.lower() in ['nan', 'none', '']:
+                        continue
+                    
+                    compounds_data.append((smiles, name, flag))
+                
+                # Insert compounds into database
+                result = self._insert_compounds(compounds_data, table_name, skip_duplicates)
             
             if result['success']:
                 self._compounds_loaded = True
@@ -1562,5 +1647,111 @@ class ChemSpace:
         except Exception as e:
             print(f"❌ Error with custom query execution: {e}")
             return pd.DataFrame()
+    
+    def _process_csv_parallel(self, df: pd.DataFrame, table_name: str,
+                             smiles_column: str, name_column: Optional[str], flag_column: Optional[str],
+                             name_available: bool, flag_available: bool, skip_duplicates: bool,
+                             max_workers: int, chunk_size: int) -> Dict[str, Any]:
+        """
+        Process CSV data using parallel processing with chunks.
+        
+        Args:
+            df (pd.DataFrame): DataFrame containing the CSV data
+            table_name (str): Name of the target table
+            smiles_column (str): Name of the SMILES column
+            name_column (Optional[str]): Name of the name column
+            flag_column (Optional[str]): Name of the flag column
+            name_available (bool): Whether name column is available
+            flag_available (bool): Whether flag column is available
+            skip_duplicates (bool): Whether to skip duplicate compounds
+            max_workers (int): Maximum number of parallel workers
+            chunk_size (int): Size of each chunk
+            
+        Returns:
+            dict: Results containing counts and status
+        """
+        try:
+            # Split DataFrame into chunks
+            chunks = self._split_dataframe_into_chunks(df, chunk_size)
+            print(f"   📦 Split into {len(chunks)} chunks")
+            
+            # Process chunks in parallel
+            total_compounds_added = 0
+            total_duplicates_skipped = 0
+            total_errors = 0
+            
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                # Submit all chunk processing jobs
+                future_to_chunk = {}
+                for i, chunk in enumerate(chunks):
+                    future = executor.submit(
+                        _process_chunk_worker,
+                        chunk, smiles_column, name_column, flag_column,
+                        name_available, flag_available, i * chunk_size
+                    )
+                    future_to_chunk[future] = i
+                
+                # Collect results and insert into database
+                processed_chunks = 0
+                for future in as_completed(future_to_chunk):
+                    chunk_idx = future_to_chunk[future]
+                    try:
+                        compounds_data = future.result()
+                        
+                        if compounds_data:
+                            # Insert this chunk's data into database
+                            chunk_result = self._insert_compounds(compounds_data, table_name, skip_duplicates)
+                            
+                            if chunk_result['success']:
+                                total_compounds_added += chunk_result['compounds_added']
+                                total_duplicates_skipped += chunk_result['duplicates_skipped']
+                                total_errors += chunk_result['errors']
+                        
+                        processed_chunks += 1
+                        if processed_chunks % 10 == 0 or processed_chunks == len(chunks):
+                            print(f"   ⏳ Processed {processed_chunks}/{len(chunks)} chunks")
+                        
+                    except Exception as e:
+                        print(f"   ❌ Error processing chunk {chunk_idx}: {e}")
+                        total_errors += chunk_size  # Estimate errors for failed chunk
+            
+            return {
+                'success': True,
+                'message': f"Parallel processing completed: {total_compounds_added} compounds added",
+                'compounds_added': total_compounds_added,
+                'duplicates_skipped': total_duplicates_skipped,
+                'errors': total_errors
+            }
+            
+        except Exception as e:
+            return {
+                'success': False,
+                'message': f"Parallel processing error: {e}",
+                'compounds_added': 0,
+                'duplicates_skipped': 0,
+                'errors': len(df)
+            }
+    
+    def _split_dataframe_into_chunks(self, df: pd.DataFrame, chunk_size: int) -> List[pd.DataFrame]:
+        """
+        Split a DataFrame into chunks of specified size.
+        
+        Args:
+            df (pd.DataFrame): DataFrame to split
+            chunk_size (int): Size of each chunk
+            
+        Returns:
+            List[pd.DataFrame]: List of DataFrame chunks
+        """
+        chunks = []
+        num_chunks = len(df) // chunk_size + (1 if len(df) % chunk_size != 0 else 0)
+        
+        for i in range(num_chunks):
+            start_idx = i * chunk_size
+            end_idx = min((i + 1) * chunk_size, len(df))
+            chunk = df.iloc[start_idx:end_idx].copy()
+            chunks.append(chunk)
+        
+        return chunks
 
 
