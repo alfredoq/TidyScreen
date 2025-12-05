@@ -1,4 +1,4 @@
-from databases.DatabaseManager import DatabaseManager
+from tidyscreen.databases.DatabaseManager import DatabaseManager
 import site
 from datetime import datetime
 import os
