@@ -19,6 +19,19 @@ class ActivateProject(DatabaseManager):
         self.__projects_db = f"{site.getsitepackages()[0]}/tidyscreen/projects_db/projects_database.db" 
         self.name = name
         
+        # Check if database exists, create it if it doesn't
+        if not os.path.exists(self.__projects_db):
+            print(f"Projects database does not exist at: {self.__projects_db}")
+            print("Creating new projects database...")
+            
+            if not self.create_projects_database(self.__projects_db):
+                print("❌ Failed to create projects database. Cannot proceed.")
+                # Set attributes to indicate project doesn't exist
+                self._project_exists = False
+                return
+            
+            print("✅ Projects database created successfully.")
+        
         # Validate database structure
         self.check_db(self.__projects_db)
         
@@ -96,7 +109,7 @@ class ActivateProject(DatabaseManager):
                 query += " AND name LIKE ?"
                 params.append(f"%{name_pattern}%")
             
-            query += " ORDER BY created_date DESC"
+            query += " ORDER BY id DESC"
             
             if limit:
                 query += " LIMIT ?"
@@ -151,10 +164,6 @@ class ActivateProject(DatabaseManager):
             cursor.execute("SELECT COUNT(DISTINCT source_file) FROM compounds")
             unique_files = cursor.fetchone()[0]
             
-            # Date range
-            cursor.execute("SELECT MIN(created_date), MAX(created_date) FROM compounds")
-            date_range = cursor.fetchone()
-            
             conn.close()
             
             print("\n" + "="*60)
@@ -163,9 +172,6 @@ class ActivateProject(DatabaseManager):
             print(f"📊 Total Compounds: {total_compounds}")
             print(f"📁 Source Files: {unique_files}")
             print(f"🗄️  Database Path: {db_path}")
-            
-            if date_range[0] and date_range[1]:
-                print(f"📅 Date Range: {date_range[0]} to {date_range[1]}")
             
             if flag_counts:
                 print("\n🏷️  Compounds by Flag:")
@@ -190,6 +196,18 @@ class CreateProject(DatabaseManager):
         
         # Append project name as the last subdirectory
         self.path = os.path.join(path, name)
+        
+        # Check if database exists, create it if it doesn't
+        if not os.path.exists(self.__projects_db):
+            print(f"Projects database does not exist at: {self.__projects_db}")
+            print("Creating new projects database...")
+            
+            if not self.create_projects_database(self.__projects_db):
+                print("❌ Failed to create projects database. Cannot proceed.")
+                self._project_created = False
+                return
+            
+            print("✅ Projects database created successfully.")
         
         # Validate database structure
         self.check_db(self.__projects_db)
@@ -354,6 +372,18 @@ class DeleteProject(DatabaseManager):
         self.name = name
         self.delete_directory = delete_directory
         self.confirm = confirm
+        
+        # Check if database exists, create it if it doesn't
+        if not os.path.exists(self.__projects_db):
+            print(f"Projects database does not exist at: {self.__projects_db}")
+            print("Creating new projects database...")
+            
+            if not self.create_projects_database(self.__projects_db):
+                print("❌ Failed to create projects database. Cannot proceed.")
+                self._project_deleted = False
+                return
+            
+            print("✅ Projects database created successfully.")
         
         # Validate database structure
         self.check_db(self.__projects_db)
