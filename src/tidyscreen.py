@@ -10,11 +10,11 @@ def projects():
     projects_manager = ProjectsManagement()
     projects_manager.list_all_projects()  # This will print the formatted output
 
-class ActivateProject(DatabaseManager):
+class ActivateProject:
     
     def __init__(self, name):
-        # Initialize parent class first
-        super().__init__()
+        # Initialize database manager as a component
+        self.db_manager = DatabaseManager()
         
         self.__projects_db = f"{site.getsitepackages()[0]}/tidyscreen/projects_db/projects_database.db" 
         self.name = name
@@ -24,7 +24,7 @@ class ActivateProject(DatabaseManager):
             print(f"Projects database does not exist at: {self.__projects_db}")
             print("Creating new projects database...")
             
-            if not self.create_projects_database(self.__projects_db):
+            if not self.db_manager.create_projects_database(self.__projects_db):
                 print("❌ Failed to create projects database. Cannot proceed.")
                 # Set attributes to indicate project doesn't exist
                 self._project_exists = False
@@ -33,7 +33,7 @@ class ActivateProject(DatabaseManager):
             print("✅ Projects database created successfully.")
         
         # Validate database structure
-        self.check_db(self.__projects_db)
+        self.db_manager.check_db(self.__projects_db)
         
         # Load project information from database using ProjectsManagement
         self.load_project_info()
@@ -184,11 +184,11 @@ class ActivateProject(DatabaseManager):
         except Exception as e:
             print(f"❌ Error getting ChemSpace summary: {e}")
 
-class CreateProject(DatabaseManager):
+class CreateProject:
     
     def __init__(self, name, path, description=None):
-        # Initialize parent class first
-        super().__init__()
+        # Initialize database manager as a component
+        self.db_manager = DatabaseManager()
         
         self.__projects_db = f"{site.getsitepackages()[0]}/tidyscreen/projects_db/projects_database.db" 
         self.name = name
@@ -202,7 +202,7 @@ class CreateProject(DatabaseManager):
             print(f"Projects database does not exist at: {self.__projects_db}")
             print("Creating new projects database...")
             
-            if not self.create_projects_database(self.__projects_db):
+            if not self.db_manager.create_projects_database(self.__projects_db):
                 print("❌ Failed to create projects database. Cannot proceed.")
                 self._project_created = False
                 return
@@ -210,7 +210,7 @@ class CreateProject(DatabaseManager):
             print("✅ Projects database created successfully.")
         
         # Validate database structure
-        self.check_db(self.__projects_db)
+        self.db_manager.check_db(self.__projects_db)
         
         # Create the project directory first
         self.create_project_directory()
@@ -362,11 +362,11 @@ class CreateProject(DatabaseManager):
         """
         return getattr(self, '_directory_created', False)
 
-class DeleteProject(DatabaseManager):
+class DeleteProject:
     
     def __init__(self, name, delete_directory=True, confirm=True):
-        # Initialize parent class first
-        super().__init__()
+        # Initialize database manager as a component
+        self.db_manager = DatabaseManager()
         
         self.__projects_db = f"{site.getsitepackages()[0]}/tidyscreen/projects_db/projects_database.db"
         self.name = name
@@ -378,7 +378,7 @@ class DeleteProject(DatabaseManager):
             print(f"Projects database does not exist at: {self.__projects_db}")
             print("Creating new projects database...")
             
-            if not self.create_projects_database(self.__projects_db):
+            if not self.db_manager.create_projects_database(self.__projects_db):
                 print("❌ Failed to create projects database. Cannot proceed.")
                 self._project_deleted = False
                 return
@@ -386,7 +386,7 @@ class DeleteProject(DatabaseManager):
             print("✅ Projects database created successfully.")
         
         # Validate database structure
-        self.check_db(self.__projects_db)
+        self.db_manager.check_db(self.__projects_db)
         
         # Delete the project entry from database
         self.delete_project_entry()

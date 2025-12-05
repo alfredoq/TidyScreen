@@ -1,0 +1,173 @@
+@startuml TidyScreen_Class_Diagram
+
+!theme plain
+skinparam backgroundColor white
+skinparam classBackgroundColor white
+skinparam classBorderColor black
+skinparam classArrowColor black
+skinparam classFontColor black
+skinparam classFontStyle bold
+skinparam stereotypeCBackgroundColor white
+skinparam stereotypeCBorderColor black
+
+title TidyScreen Project - Class Diagram
+
+package "TidyScreen Core" {
+    
+    class DatabaseManager {
+        + db_path: str
+        + connection: sqlite3.Connection
+        + cursor: sqlite3.Cursor
+        --
+        + __init__(db_path: str)
+        + connect(): void
+        + disconnect(): void
+        + execute_query(query: str, params: tuple): Any
+        + create_tables(): void
+        + check_table_exists(table_name: str): bool
+    }
+    
+    class ActivateProject {
+        + db_manager: DatabaseManager
+        + name: str
+        + path: str
+        + id: int
+        + description: str
+        + created_date: str
+        --
+        + __init__(name: str)
+        + load_project_info(): void
+        + get_project_attributes(): dict
+        + project_exists(): bool
+        + get_chemspace_compounds(): list
+        + print_chemspace_summary(): void
+    }
+    
+    class CreateProject {
+        + db_manager: DatabaseManager
+        + name: str
+        + path: str
+        + description: str
+        --
+        + __init__(name: str, path: str, description: str)
+        + load_project_template(): dict
+        + create_project_directory(): void
+        + create_project_entry(): void
+        + directory_created_successfully(): bool
+    }
+    
+    class DeleteProject {
+        + db_manager: DatabaseManager
+        + name: str
+        + delete_directory: bool
+        + confirm: bool
+        --
+        + __init__(name: str, delete_directory: bool, confirm: bool)
+        + delete_project_entry(): void
+        + project_deleted_successfully(): bool
+    }
+    
+    ActivateProject --> DatabaseManager : uses
+    CreateProject --> DatabaseManager : uses
+    DeleteProject --> DatabaseManager : uses
+}
+
+package "Project Management" {
+    
+    class ProjectsManagement {
+        + projects_db_path: str
+        + active_projects: list
+        --
+        + __init__(db_path: str)
+        + list_projects(): list
+        + create_project_entry(name: str, path: str): void
+        + delete_project_entry(name: str): void
+        + get_project_details(name: str): dict
+        + update_project_status(name: str, status: str): void
+        + validate_project_name(name: str): bool
+    }
+    
+    ProjectsManagement --> DatabaseManager : uses
+    ProjectsManagement --> ActivateProject : manages
+    ProjectsManagement --> CreateProject : manages
+    ProjectsManagement --> DeleteProject : manages
+}
+
+package "ChemSpace Module" {
+    
+    class ChemSpace {
+        + project: ActivateProject
+        + molecules_df: pandas.DataFrame
+        + descriptors: list
+        + fingerprints: dict
+        --
+        + __init__(project: ActivateProject)
+        + load_molecules(): pandas.DataFrame
+        + calculate_descriptors(): void
+        + generate_fingerprints(): void
+        + perform_clustering(): dict
+        + visualize_chemical_space(): void
+        + export_results(format: str): void
+        + filter_molecules(criteria: dict): pandas.DataFrame
+    }
+    
+    ChemSpace --> ActivateProject : requires
+    ChemSpace ..> "rdkit" : uses
+    ChemSpace ..> "pandas" : uses
+}
+
+package "Configuration" {
+    
+    class ProjectTemplate <<json>> {
+        + name: str
+        + version: str
+        + directories: list
+        + database_schema: dict
+        + default_settings: dict
+        --
+        + load_template(): dict
+        + validate_structure(): bool
+    }
+    
+    CreateProject --> ProjectTemplate : uses
+}
+
+package "External Dependencies" {
+    
+    class "pandas.DataFrame" <<external>> {
+        + data manipulation
+    }
+    
+    class "sqlite3.Connection" <<external>> {
+        + database operations
+    }
+    
+    class "rdkit" <<external>> {
+        + chemical informatics
+    }
+    
+    ActivateProject ..> "pandas.DataFrame" : returns
+    ChemSpace ..> "pandas.DataFrame" : manipulates
+    DatabaseManager --> "sqlite3.Connection" : uses
+    ChemSpace ..> "rdkit" : uses
+}
+
+note top of "TidyScreen Core"
+    Core classes now use COMPOSITION instead of inheritance.
+    Each class HAS-A DatabaseManager rather than IS-A DatabaseManager.
+    This provides better separation of concerns and loose coupling.
+end note
+
+note right of ChemSpace
+    Specialized module for chemical space
+    analysis and molecular descriptor
+    calculations using RDKit
+end note
+
+note bottom of ProjectTemplate
+    JSON configuration template
+    defining project structure
+    and default settings
+end note
+
+@enduml
