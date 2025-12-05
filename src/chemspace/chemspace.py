@@ -2,6 +2,7 @@ import os
 import csv
 import sqlite3
 import pandas as pd
+import re
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional, Any
 import sys
@@ -403,8 +404,8 @@ class ChemSpace:
     
     def load_csv_file(self, csv_file_path: str, 
                      smiles_column: str = 'smiles', 
-                     name_column: str = 'name', 
-                     flag_column: str = 'flag',
+                     name_column: Optional[str] = 'name', 
+                     flag_column: Optional[str] = 'flag',
                      skip_duplicates: bool = True,
                      compute_inchi: bool = True) -> Dict[str, Any]:
         """
@@ -415,8 +416,8 @@ class ChemSpace:
         Args:
             csv_file_path (str): Path to the CSV file
             smiles_column (str): Name of the column containing SMILES strings
-            name_column (str): Name of the column containing compound names
-            flag_column (str): Name of the column containing flags
+            name_column (Optional[str]): Name of the column containing compound names. If None or not found, fills with "nd"
+            flag_column (Optional[str]): Name of the column containing flags. If None or not found, fills with "nd"
             skip_duplicates (bool): Whether to skip duplicate compounds
             compute_inchi (bool): Whether to automatically compute InChI keys after loading
             
@@ -456,34 +457,49 @@ class ChemSpace:
             print(f"📋 Target table: {table_name}")
             df = pd.read_csv(csv_file_path)
             
-            # Validate required columns
-            missing_columns = []
+            # Validate required columns (only SMILES is mandatory)
             if smiles_column not in df.columns:
-                missing_columns.append(smiles_column)
-            if name_column not in df.columns:
-                missing_columns.append(name_column)
-            if flag_column not in df.columns and flag_column != 'flag':
-                missing_columns.append(flag_column)
-            
-            if missing_columns:
                 return {
                     'success': False,
-                    'message': f"Missing required columns: {missing_columns}",
+                    'message': f"Missing required SMILES column: {smiles_column}",
                     'compounds_added': 0,
                     'duplicates_skipped': 0,
                     'errors': 1
                 }
             
+            # Check if optional columns exist and warn if they don't
+            name_available = name_column and name_column in df.columns
+            flag_available = flag_column and flag_column in df.columns
+            
+            if not name_available:
+                print(f"⚠️  Name column '{name_column}' not found. Will use 'nd' as default.")
+            if not flag_available:
+                print(f"⚠️  Flag column '{flag_column}' not found. Will use 'nd' as default.")
+            
             # Prepare data for insertion
             compounds_data = []
             
-            for _, row in df.iterrows():
+            for idx, row in df.iterrows():
                 smiles = str(row[smiles_column]).strip()
-                name = str(row[name_column]).strip()
-                flag = str(row.get(flag_column, '')).strip() if flag_column in df.columns else ''
                 
-                # Skip empty rows
-                if not smiles or not name or smiles.lower() in ['nan', 'none', '']:
+                # Handle name column - use provided column or generate from index
+                if name_available:
+                    name = str(row[name_column]).strip()
+                    if not name or name.lower() in ['nan', 'none', '']:
+                        name = f"compound_{idx + 1}"  # Generate name if empty
+                else:
+                    name = f"compound_{idx + 1}"  # Generate name if column doesn't exist
+                
+                # Handle flag column - use provided column or default to "nd"
+                if flag_available:
+                    flag = str(row[flag_column]).strip()
+                    if not flag or flag.lower() in ['nan', 'none', '']:
+                        flag = "nd"  # Default flag if empty
+                else:
+                    flag = "nd"  # Default flag if column doesn't exist
+                
+                # Skip empty SMILES rows (only SMILES is mandatory)
+                if not smiles or smiles.lower() in ['nan', 'none', '']:
                     continue
                 
                 compounds_data.append((smiles, name, flag))
@@ -1316,8 +1332,8 @@ class ChemSpace:
                              source_db_path: str,
                              target_table_name: str,
                              smiles_column: str = 'smiles',
-                             name_column: str = 'name', 
-                             flag_column: str = 'flag',
+                             name_column: Optional[str] = 'name', 
+                             flag_column: Optional[str] = 'flag',
                              compute_inchi: bool = True) -> Dict[str, Any]:
         """
         Create a molecules table in the chemspace database from an SQL query executed on an external database.
@@ -1327,8 +1343,8 @@ class ChemSpace:
             source_db_path (str): Path to the source SQLite database file
             target_table_name (str): Name for the new table in the chemspace database
             smiles_column (str): Name of the column containing SMILES strings
-            name_column (str): Name of the column containing compound names
-            flag_column (str): Name of the column containing flags (optional)
+            name_column (Optional[str]): Name of the column containing compound names. If None or not found, fills with "nd"
+            flag_column (Optional[str]): Name of the column containing flags. If None or not found, fills with "nd"
             compute_inchi (bool): Whether to automatically compute InChI keys after loading
             
         Returns:
@@ -1382,23 +1398,25 @@ class ChemSpace:
             
             print(f"📊 Query returned {len(df)} rows")
             
-            # Validate required columns exist in query result
-            missing_columns = []
+            # Validate required columns exist in query result (only SMILES is mandatory)
             if smiles_column not in df.columns:
-                missing_columns.append(smiles_column)
-            if name_column not in df.columns:
-                missing_columns.append(name_column)
-            # flag_column is optional
-            
-            if missing_columns:
                 return {
                     'success': False,
-                    'message': f"Query result missing required columns: {missing_columns}. Available columns: {list(df.columns)}",
+                    'message': f"Query result missing required SMILES column: {smiles_column}. Available columns: {list(df.columns)}",
                     'compounds_added': 0,
                     'duplicates_skipped': 0,
                     'errors': 1,
                     'inchi_keys_computed': 0
                 }
+            
+            # Check if optional columns exist and warn if they don't
+            name_available = name_column and name_column in df.columns
+            flag_available = flag_column and flag_column in df.columns
+            
+            if not name_available:
+                print(f"⚠️  Name column '{name_column}' not found in query result. Will use 'nd' as default.")
+            if not flag_available:
+                print(f"⚠️  Flag column '{flag_column}' not found in query result. Will use 'nd' as default.")
             
             # Create target table in chemspace database
             if not self._create_compounds_table(target_table_name):
