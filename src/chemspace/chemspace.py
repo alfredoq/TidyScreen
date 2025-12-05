@@ -132,6 +132,7 @@ class ChemSpace:
                 smiles TEXT NOT NULL,
                 name TEXT NOT NULL,
                 flag TEXT,
+                inchi_key TEXT,
                 UNIQUE(name, smiles)
             )
             """
@@ -142,6 +143,7 @@ class ChemSpace:
             cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_name ON {table_name}(name)")
             cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_smiles ON {table_name}(smiles)")
             cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_flag ON {table_name}(flag)")
+            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_inchi_key ON {table_name}(inchi_key)")
             
             conn.commit()
             conn.close()
@@ -187,6 +189,7 @@ class ChemSpace:
                 cursor.execute(f"DROP INDEX IF EXISTS idx_{table_name}_name")
                 cursor.execute(f"DROP INDEX IF EXISTS idx_{table_name}_smiles")
                 cursor.execute(f"DROP INDEX IF EXISTS idx_{table_name}_flag")
+                cursor.execute(f"DROP INDEX IF EXISTS idx_{table_name}_inchi_key")
             except:
                 pass  # Indexes might not exist
             
@@ -379,11 +382,13 @@ class ChemSpace:
             cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{new_name}_name ON {new_name}(name)")
             cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{new_name}_smiles ON {new_name}(smiles)")
             cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{new_name}_flag ON {new_name}(flag)")
+            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{new_name}_inchi_key ON {new_name}(inchi_key)")
             
             # Drop old table and its indexes
             cursor.execute(f"DROP INDEX IF EXISTS idx_{old_name}_name")
             cursor.execute(f"DROP INDEX IF EXISTS idx_{old_name}_smiles")
             cursor.execute(f"DROP INDEX IF EXISTS idx_{old_name}_flag")
+            cursor.execute(f"DROP INDEX IF EXISTS idx_{old_name}_inchi_key")
             cursor.execute(f"DROP TABLE {old_name}")
             
             conn.commit()
@@ -400,10 +405,12 @@ class ChemSpace:
                      smiles_column: str = 'smiles', 
                      name_column: str = 'name', 
                      flag_column: str = 'flag',
-                     skip_duplicates: bool = True) -> Dict[str, Any]:
+                     skip_duplicates: bool = True,
+                     compute_inchi: bool = True) -> Dict[str, Any]:
         """
         Load compounds from a CSV file into the chemspace database.
         Creates a table named after the CSV file prefix.
+        Automatically computes InChI keys for loaded SMILES.
         
         Args:
             csv_file_path (str): Path to the CSV file
@@ -411,6 +418,7 @@ class ChemSpace:
             name_column (str): Name of the column containing compound names
             flag_column (str): Name of the column containing flags
             skip_duplicates (bool): Whether to skip duplicate compounds
+            compute_inchi (bool): Whether to automatically compute InChI keys after loading
             
         Returns:
             dict: Results containing success status, counts, and messages
@@ -493,6 +501,28 @@ class ChemSpace:
                 print(f"   🔄 Duplicates skipped: {result['duplicates_skipped']}")
                 print(f"   ❌ Errors: {result['errors']}")
                 print(f"   📈 Total compounds in table '{table_name}': {table_count}")
+                
+                # Automatically compute InChI keys if requested
+                if compute_inchi and result['compounds_added'] > 0:
+                    print(f"\n🧪 Computing InChI keys for loaded compounds...")
+                    try:
+                        inchi_df = self.compute_inchi_keys(table_name, update_database=True)
+                        if not inchi_df.empty:
+                            # Count successful InChI computations
+                            valid_inchi_count = len(inchi_df[
+                                (inchi_df['inchi_key'].notna()) & 
+                                (~inchi_df['inchi_key'].isin(['INVALID_SMILES', 'ERROR']))
+                            ])
+                            result['inchi_keys_computed'] = valid_inchi_count
+                            print(f"   🔬 InChI keys computed: {valid_inchi_count}")
+                        else:
+                            result['inchi_keys_computed'] = 0
+                            print(f"   ⚠️  No InChI keys computed")
+                    except Exception as inchi_error:
+                        print(f"   ⚠️  Warning: InChI key computation failed: {inchi_error}")
+                        result['inchi_keys_computed'] = 0
+                else:
+                    result['inchi_keys_computed'] = 0
             
             result['table_name'] = table_name
             return result
@@ -661,17 +691,17 @@ class ChemSpace:
     
     def search_compounds(self, search_term: str, search_in: str = 'name', table_name: Optional[str] = None) -> List[Dict[str, Any]]:
         """
-        Search for compounds by name or SMILES pattern.
+        Search for compounds by name, SMILES, flag, or InChI key pattern.
         
         Args:
             search_term (str): Term to search for
-            search_in (str): Field to search in ('name', 'smiles', 'flag')
+            search_in (str): Field to search in ('name', 'smiles', 'flag', 'inchi_key')
             table_name (Optional[str]): Name of the table to search in. If None, searches all tables
             
         Returns:
             List[Dict]: List of matching compounds
         """
-        valid_fields = ['name', 'smiles', 'flag']
+        valid_fields = ['name', 'smiles', 'flag', 'inchi_key']
         if search_in not in valid_fields:
             print(f"❌ Invalid search field. Use one of: {valid_fields}")
             return []
@@ -917,7 +947,7 @@ class ChemSpace:
             print(f"❌ Error clearing compounds{table_desc}: {e}")
             return False
     
-    def get_table_as_dataframe(self, table_name) -> pd.DataFrame:
+    def _get_table_as_dataframe(self, table_name) -> pd.DataFrame:
         """
         Return a table from the database as a pandas DataFrame.
         
@@ -950,7 +980,144 @@ class ChemSpace:
         except Exception as e:
             print(f"❌ Error retrieving table '{table_name}' as DataFrame: {e}")
             return pd.DataFrame()
-
-
-
-
+    
+    def compute_inchi_keys(self, table_name: str, 
+                          update_database: bool = True) -> pd.DataFrame:
+        """
+        Retrieve a table as DataFrame and compute InChI keys for each SMILES string.
+        
+        Args:
+            table_name (str): Name of the table to retrieve
+            flag_filter (Optional[str]): Filter by specific flag value
+            name_pattern (Optional[str]): Filter by name pattern (SQL LIKE)
+            update_database (bool): Whether to add inchi_key column to the database table
+            
+        Returns:
+            pd.DataFrame: DataFrame with added 'inchi_key' column, empty DataFrame if error occurs
+        """
+        try:
+            # Import RDKit
+            try:
+                from rdkit import Chem
+                from rdkit.Chem import Descriptors
+            except ImportError:
+                print("❌ RDKit not installed. Please install RDKit to compute InChI keys:")
+                print("   conda install -c conda-forge rdkit")
+                print("   or")
+                print("   pip install rdkit")
+                return pd.DataFrame()
+            
+            # Get the DataFrame using existing method
+            print(f"📊 Retrieving table '{table_name}' for InChI key computation...")
+            df = self._get_table_as_dataframe(table_name)
+            
+            if df.empty:
+                print(f"⚠️  No data retrieved from table '{table_name}'")
+                return pd.DataFrame()
+            
+            # Check if SMILES column exists
+            if 'smiles' not in df.columns:
+                print("❌ No 'smiles' column found in the DataFrame")
+                return pd.DataFrame()
+            
+            # Initialize InChI key column
+            df['inchi_key'] = None
+            
+            print(f"🔬 Computing InChI keys for {len(df)} compounds...")
+            
+            # Compute InChI keys for each SMILES
+            successful_computations = 0
+            failed_computations = 0
+            
+            for idx, row in df.iterrows():
+                smiles = row['smiles']
+                
+                try:
+                    # Parse SMILES with RDKit
+                    mol = Chem.MolFromSmiles(smiles)
+                    
+                    if mol is not None:
+                        # Compute InChI key
+                        inchi_key = Chem.MolToInchiKey(mol)
+                        df.at[idx, 'inchi_key'] = inchi_key
+                        successful_computations += 1
+                    else:
+                        # Invalid SMILES
+                        df.at[idx, 'inchi_key'] = 'INVALID_SMILES'
+                        failed_computations += 1
+                        if failed_computations <= 5:  # Show only first 5 errors
+                            print(f"⚠️  Invalid SMILES for compound '{row.get('name', 'unknown')}': {smiles}")
+                
+                except Exception as e:
+                    df.at[idx, 'inchi_key'] = 'ERROR'
+                    failed_computations += 1
+                    if failed_computations <= 5:  # Show only first 5 errors
+                        print(f"⚠️  Error computing InChI key for '{row.get('name', 'unknown')}': {e}")
+            
+            # Print summary
+            print(f"✅ InChI key computation completed:")
+            print(f"   🎯 Successful: {successful_computations}")
+            print(f"   ❌ Failed: {failed_computations}")
+            
+            # Optionally update the database table
+            if update_database and successful_computations > 0:
+                print(f"💾 Updating database table '{table_name}' with InChI keys...")
+                success = self._update_table_with_inchi_keys(table_name, df)
+                if success:
+                    print(f"✅ Database table '{table_name}' updated with InChI keys")
+                else:
+                    print(f"❌ Failed to update database table '{table_name}'")
+            
+            return df
+            
+        except Exception as e:
+            print(f"❌ Error computing InChI keys for table '{table_name}': {e}")
+            return pd.DataFrame()
+    
+    def _update_table_with_inchi_keys(self, table_name: str, df: pd.DataFrame) -> bool:
+        """
+        Update the database table with computed InChI key values.
+        Handles both new tables (with inchi_key column) and existing tables (adds column if needed).
+        
+        Args:
+            table_name (str): Name of the table to update
+            df (pd.DataFrame): DataFrame containing the computed InChI keys
+            
+        Returns:
+            bool: True if update was successful
+        """
+        try:
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            
+            # Check if inchi_key column exists, add if it doesn't (for backward compatibility)
+            cursor.execute(f"PRAGMA table_info({table_name})")
+            columns = [row[1] for row in cursor.fetchall()]
+            
+            if 'inchi_key' not in columns:
+                try:
+                    cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN inchi_key TEXT")
+                    cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_inchi_key ON {table_name}(inchi_key)")
+                    print(f"   📋 Added 'inchi_key' column to existing table '{table_name}'")
+                except sqlite3.OperationalError as e:
+                    print(f"   ⚠️  Warning: Could not add inchi_key column: {e}")
+                    return False
+            
+            # Update each row with computed InChI key
+            update_query = f"UPDATE {table_name} SET inchi_key = ? WHERE id = ?"
+            
+            updates_made = 0
+            for _, row in df.iterrows():
+                if pd.notna(row.get('inchi_key')) and row['inchi_key'] not in ['INVALID_SMILES', 'ERROR']:
+                    cursor.execute(update_query, (row['inchi_key'], row['id']))
+                    updates_made += 1
+            
+            conn.commit()
+            conn.close()
+            
+            print(f"   📊 Updated {updates_made} rows with InChI keys")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Error updating database table '{table_name}' with InChI keys: {e}")
+            return False 
