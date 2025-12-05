@@ -1120,4 +1120,429 @@ class ChemSpace:
             
         except Exception as e:
             print(f"❌ Error updating database table '{table_name}' with InChI keys: {e}")
-            return False 
+            return False
+    
+    def _create_sql_registers_table(self) -> bool:
+        """
+        Create the sql_registers table to track SQL import operations.
+        
+        Returns:
+            bool: True if table was created successfully
+        """
+        try:
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            
+            # Create sql_registers table
+            create_table_query = """
+            CREATE TABLE IF NOT EXISTS sql_registers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sql_query TEXT NOT NULL,
+                source_db_path TEXT NOT NULL,
+                target_table_name TEXT NOT NULL,
+                creation_date TEXT NOT NULL,
+                compounds_added INTEGER DEFAULT 0,
+                duplicates_skipped INTEGER DEFAULT 0,
+                errors INTEGER DEFAULT 0,
+                inchi_keys_computed INTEGER DEFAULT 0,
+                success BOOLEAN DEFAULT 0
+            )
+            """
+            
+            cursor.execute(create_table_query)
+            
+            # Create indexes for faster searches
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_sql_registers_target_table ON sql_registers(target_table_name)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_sql_registers_creation_date ON sql_registers(creation_date)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_sql_registers_source_db ON sql_registers(source_db_path)")
+            
+            conn.commit()
+            conn.close()
+            
+            return True
+            
+        except Exception as e:
+            print(f"❌ Error creating sql_registers table: {e}")
+            return False
+    
+    def _register_sql_operation(self, sql_query: str, source_db_path: str, 
+                               target_table_name: str, result: Dict[str, Any]) -> bool:
+        """
+        Register an SQL import operation in the sql_registers table.
+        
+        Args:
+            sql_query (str): The SQL query that was executed
+            source_db_path (str): Path to the source database
+            target_table_name (str): Name of the target table created
+            result (Dict[str, Any]): Result dictionary from the import operation
+            
+        Returns:
+            bool: True if registration was successful
+        """
+        try:
+            # Ensure sql_registers table exists
+            if not self._create_sql_registers_table():
+                return False
+            
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            
+            # Get current timestamp
+            creation_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            # Insert register entry
+            insert_query = """
+            INSERT INTO sql_registers 
+            (sql_query, source_db_path, target_table_name, creation_date, 
+             compounds_added, duplicates_skipped, errors, inchi_keys_computed, success)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """
+            
+            cursor.execute(insert_query, (
+                sql_query,
+                source_db_path,
+                target_table_name,
+                creation_date,
+                result.get('compounds_added', 0),
+                result.get('duplicates_skipped', 0),
+                result.get('errors', 0),
+                result.get('inchi_keys_computed', 0),
+                result.get('success', False)
+            ))
+            
+            conn.commit()
+            conn.close()
+            
+            print(f"📝 SQL operation registered in sql_registers table")
+            return True
+            
+        except Exception as e:
+            print(f"⚠️  Warning: Failed to register SQL operation: {e}")
+            return False
+    
+    def get_sql_registers(self, limit: Optional[int] = None, 
+                         target_table_filter: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        Retrieve SQL import operation registers from the database.
+        
+        Args:
+            limit (Optional[int]): Maximum number of registers to return
+            target_table_filter (Optional[str]): Filter by target table name
+            
+        Returns:
+            List[Dict]: List of register dictionaries
+        """
+        try:
+            # Ensure sql_registers table exists
+            if not self._create_sql_registers_table():
+                return []
+            
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            
+            # Build query with filters
+            query = "SELECT * FROM sql_registers WHERE 1=1"
+            params = []
+            
+            if target_table_filter:
+                query += " AND target_table_name = ?"
+                params.append(target_table_filter)
+            
+            query += " ORDER BY creation_date DESC"
+            
+            if limit:
+                query += " LIMIT ?"
+                params.append(limit)
+            
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
+            
+            # Get column names
+            column_names = [description[0] for description in cursor.description]
+            
+            # Convert to dictionaries
+            registers = []
+            for row in rows:
+                register_dict = {}
+                for i, column_name in enumerate(column_names):
+                    register_dict[column_name] = row[i]
+                registers.append(register_dict)
+            
+            conn.close()
+            return registers
+            
+        except Exception as e:
+            print(f"❌ Error retrieving SQL registers: {e}")
+            return []
+    
+    def print_sql_registers_summary(self, limit: int = 10) -> None:
+        """
+        Print a formatted summary of SQL import operation registers.
+        
+        Args:
+            limit (int): Maximum number of recent registers to show
+        """
+        registers = self.get_sql_registers(limit=limit)
+        
+        if not registers:
+            print("📝 No SQL import operations registered yet")
+            return
+        
+        print("\n" + "="*80)
+        print(f"SQL IMPORT OPERATIONS REGISTER - Project: {self.name}")
+        print("="*80)
+        
+        for i, reg in enumerate(registers, 1):
+            success_icon = "✅" if reg.get('success') else "❌"
+            print(f"\n{success_icon} Operation {i} - {reg.get('creation_date', 'Unknown date')}")
+            print(f"   📋 Target Table: {reg.get('target_table_name', 'N/A')}")
+            print(f"   🗄️  Source Database: {reg.get('source_db_path', 'N/A')}")
+            print(f"   📊 Results: {reg.get('compounds_added', 0)} added, "
+                  f"{reg.get('duplicates_skipped', 0)} duplicates, "
+                  f"{reg.get('errors', 0)} errors")
+            print(f"   🔬 InChI Keys: {reg.get('inchi_keys_computed', 0)} computed")
+            
+            # Show truncated SQL query
+            sql_query = reg.get('sql_query', '')
+            if len(sql_query) > 100:
+                sql_display = sql_query[:97] + "..."
+            else:
+                sql_display = sql_query
+            print(f"   🔍 Query: {sql_display}")
+        
+        print("="*80)
+    
+    def create_table_from_sql(self, sql_query: str, 
+                             source_db_path: str,
+                             target_table_name: str,
+                             smiles_column: str = 'smiles',
+                             name_column: str = 'name', 
+                             flag_column: str = 'flag',
+                             compute_inchi: bool = True) -> Dict[str, Any]:
+        """
+        Create a molecules table in the chemspace database from an SQL query executed on an external database.
+        
+        Args:
+            sql_query (str): SQL SELECT query to execute on the source database
+            source_db_path (str): Path to the source SQLite database file
+            target_table_name (str): Name for the new table in the chemspace database
+            smiles_column (str): Name of the column containing SMILES strings
+            name_column (str): Name of the column containing compound names
+            flag_column (str): Name of the column containing flags (optional)
+            compute_inchi (bool): Whether to automatically compute InChI keys after loading
+            
+        Returns:
+            dict: Results containing success status, counts, and messages
+        """
+        try:
+            # Validate source database exists
+            if not os.path.exists(source_db_path):
+                return {
+                    'success': False,
+                    'message': f"Source database not found: {source_db_path}",
+                    'compounds_added': 0,
+                    'duplicates_skipped': 0,
+                    'errors': 1,
+                    'inchi_keys_computed': 0
+                }
+            
+            # Sanitize target table name
+            target_table_name = self._sanitize_table_name(target_table_name)
+            
+            print(f"📊 Executing SQL query on source database: {source_db_path}")
+            print(f"📋 Target table: {target_table_name}")
+            print(f"🔍 Query: {sql_query}")
+            
+            # Connect to source database and execute query
+            source_conn = sqlite3.connect(source_db_path)
+            
+            try:
+                df = pd.read_sql_query(sql_query, source_conn)
+                source_conn.close()
+            except Exception as e:
+                source_conn.close()
+                return {
+                    'success': False,
+                    'message': f"Error executing SQL query: {e}",
+                    'compounds_added': 0,
+                    'duplicates_skipped': 0,
+                    'errors': 1,
+                    'inchi_keys_computed': 0
+                }
+            
+            if df.empty:
+                return {
+                    'success': False,
+                    'message': "SQL query returned no results",
+                    'compounds_added': 0,
+                    'duplicates_skipped': 0,
+                    'errors': 1,
+                    'inchi_keys_computed': 0
+                }
+            
+            print(f"📊 Query returned {len(df)} rows")
+            
+            # Validate required columns exist in query result
+            missing_columns = []
+            if smiles_column not in df.columns:
+                missing_columns.append(smiles_column)
+            if name_column not in df.columns:
+                missing_columns.append(name_column)
+            # flag_column is optional
+            
+            if missing_columns:
+                return {
+                    'success': False,
+                    'message': f"Query result missing required columns: {missing_columns}. Available columns: {list(df.columns)}",
+                    'compounds_added': 0,
+                    'duplicates_skipped': 0,
+                    'errors': 1,
+                    'inchi_keys_computed': 0
+                }
+            
+            # Create target table in chemspace database
+            if not self._create_compounds_table(target_table_name):
+                return {
+                    'success': False,
+                    'message': f"Failed to create target table '{target_table_name}'",
+                    'compounds_added': 0,
+                    'duplicates_skipped': 0,
+                    'errors': 1,
+                    'inchi_keys_computed': 0
+                }
+            
+            # Prepare data for insertion
+            compounds_data = []
+            skipped_rows = 0
+            
+            for _, row in df.iterrows():
+                smiles = str(row[smiles_column]).strip()
+                name = str(row[name_column]).strip()
+                flag = str(row.get(flag_column, '')).strip() if flag_column in df.columns else ''
+                
+                # Skip empty or invalid rows
+                if not smiles or not name or smiles.lower() in ['nan', 'none', '']:
+                    skipped_rows += 1
+                    continue
+                
+                compounds_data.append((smiles, name, flag))
+            
+            if skipped_rows > 0:
+                print(f"⚠️  Skipped {skipped_rows} rows with missing/invalid data")
+            
+            if not compounds_data:
+                return {
+                    'success': False,
+                    'message': "No valid compound data found in query results",
+                    'compounds_added': 0,
+                    'duplicates_skipped': 0,
+                    'errors': 1,
+                    'inchi_keys_computed': 0
+                }
+            
+            # Insert compounds into chemspace database
+            result = self._insert_compounds(compounds_data, target_table_name, skip_duplicates=True)
+            
+            if result['success']:
+                self._compounds_loaded = True
+                table_count = self.get_compound_count(table_name=target_table_name)
+                
+                print(f"✅ Successfully created table '{target_table_name}' from SQL query")
+                print(f"   📊 Compounds added: {result['compounds_added']}")
+                print(f"   🔄 Duplicates skipped: {result['duplicates_skipped']}")
+                print(f"   ❌ Errors: {result['errors']}")
+                print(f"   📈 Total compounds in table: {table_count}")
+                
+                # Automatically compute InChI keys if requested
+                if compute_inchi and result['compounds_added'] > 0:
+                    print(f"\n🧪 Computing InChI keys for imported compounds...")
+                    try:
+                        inchi_df = self.compute_inchi_keys(target_table_name, update_database=True)
+                        if not inchi_df.empty:
+                            # Count successful InChI computations
+                            valid_inchi_count = len(inchi_df[
+                                (inchi_df['inchi_key'].notna()) & 
+                                (~inchi_df['inchi_key'].isin(['INVALID_SMILES', 'ERROR']))
+                            ])
+                            result['inchi_keys_computed'] = valid_inchi_count
+                            print(f"   🔬 InChI keys computed: {valid_inchi_count}")
+                        else:
+                            result['inchi_keys_computed'] = 0
+                            print(f"   ⚠️  No InChI keys computed")
+                    except Exception as inchi_error:
+                        print(f"   ⚠️  Warning: InChI key computation failed: {inchi_error}")
+                        result['inchi_keys_computed'] = 0
+                else:
+                    result['inchi_keys_computed'] = 0
+            
+            result['table_name'] = target_table_name
+            result['source_database'] = source_db_path
+            result['rows_processed'] = len(df)
+            result['rows_skipped'] = skipped_rows
+            
+            # Register the SQL operation
+            self._register_sql_operation(sql_query, source_db_path, target_table_name, result)
+            
+            return result
+            
+        except Exception as e:
+            error_result = {
+                'success': False,
+                'message': f"Error creating table from SQL query: {e}",
+                'compounds_added': 0,
+                'duplicates_skipped': 0,
+                'errors': 1,
+                'inchi_keys_computed': 0
+            }
+            
+            # Register the failed SQL operation
+            try:
+                self._register_sql_operation(sql_query, source_db_path, target_table_name, error_result)
+            except:
+                pass  # Don't fail if registration fails
+            
+            return error_result
+    
+    def execute_custom_query(self, sql_query: str, 
+                           source_db_path: Optional[str] = None) -> pd.DataFrame:
+        """
+        Execute a custom SQL query on either the chemspace database or an external database.
+        
+        Args:
+            sql_query (str): SQL query to execute
+            source_db_path (Optional[str]): Path to external database. If None, uses chemspace database
+            
+        Returns:
+            pd.DataFrame: Query results as DataFrame, empty DataFrame if error occurs
+        """
+        try:
+            # Determine which database to use
+            db_path = source_db_path if source_db_path else self.__chemspace_db
+            
+            if not os.path.exists(db_path):
+                print(f"❌ Database not found: {db_path}")
+                return pd.DataFrame()
+            
+            print(f"📊 Executing custom query on: {db_path}")
+            print(f"🔍 Query: {sql_query}")
+            
+            # Connect to database and execute query
+            conn = sqlite3.connect(db_path)
+            
+            try:
+                df = pd.read_sql_query(sql_query, conn)
+                conn.close()
+                
+                print(f"✅ Query executed successfully, returned {len(df)} rows")
+                return df
+                
+            except Exception as e:
+                conn.close()
+                print(f"❌ Error executing query: {e}")
+                return pd.DataFrame()
+            
+        except Exception as e:
+            print(f"❌ Error with custom query execution: {e}")
+            return pd.DataFrame()
+
+
