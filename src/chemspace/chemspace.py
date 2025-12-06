@@ -771,6 +771,233 @@ class ChemSpace:
             print(f"❌ Error exporting compounds{table_desc}: {e}")
             return False
     
+    def filter_using_smarts(self, table_name: str, id: int):
+        """
+        Filter compounds in a table using a SMARTS pattern retrieved by ID from the projects database.
+        
+        Args:
+            table_name (str): Name of the table to filter
+            id (int): ID of the SMARTS filter in the projects database
+        """
+    
+        try:
+            # Check if the table exists
+            tables = self.get_all_tables()
+            if table_name not in tables:
+                print(f"❌ Table '{table_name}' does not exist in chemspace database")
+                return
+
+            # Get the projects database path
+            import site
+            projects_db = f"{site.getsitepackages()[0]}/tidyscreen/projects_db/projects_database.db"
+            
+            if not os.path.exists(projects_db):
+                print(f"❌ Projects database not found: {projects_db}")
+                return
+            
+            # Connect to projects database and retrieve the SMARTS pattern by ID
+            projects_conn = sqlite3.connect(projects_db)
+            projects_cursor = projects_conn.cursor()
+            
+            # Query to get the SMARTS pattern and filter name by ID
+            smarts_query = "SELECT filter_name, smarts FROM chem_filters WHERE id = ?"
+            projects_cursor.execute(smarts_query, (id,))
+            smarts_result = projects_cursor.fetchone()
+            
+            projects_conn.close()
+            
+            if not smarts_result:
+                print(f"❌ No SMARTS filter found with ID {id} in projects database")
+                return
+            
+            filter_name, smarts_pattern = smarts_result
+            print(f"🔍 Found SMARTS filter: '{filter_name}' (ID: {id})")
+            print(f"🧪 SMARTS pattern: {smarts_pattern}")
+
+            # Connect to chemspace database and retrieve the table
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+
+            # Query to retrieve all compounds from the specified table
+            query = f"SELECT id, smiles, name, flag FROM {table_name}"
+            cursor.execute(query)
+            compounds = cursor.fetchall()
+        
+            conn.close()
+
+            if not compounds:
+                print(f"⚠️  No compounds found in table '{table_name}'")
+                return
+        
+            print(f"📊 Retrieved {len(compounds)} compounds from table '{table_name}' for filtering")
+            print(f"🔬 Starting SMARTS pattern matching...")
+            
+            # Import RDKit for SMARTS pattern matching
+            try:
+                from rdkit import Chem
+                from rdkit import RDLogger
+                # Suppress RDKit warnings for cleaner output
+                RDLogger.DisableLog('rdApp.*')
+            except ImportError:
+                print("❌ RDKit not installed. Please install RDKit to use SMARTS filtering:")
+                print("   conda install -c conda-forge rdkit")
+                print("   or")
+                print("   pip install rdkit")
+                return
+            
+            # Parse the SMARTS pattern
+            smarts_mol = Chem.MolFromSmarts(smarts_pattern)
+            if smarts_mol is None:
+                print(f"❌ Invalid SMARTS pattern: {smarts_pattern}")
+                return
+                
+            # Initialize counters
+            matching_compounds = []
+            invalid_smiles_count = 0
+            
+            # Process compounds and apply SMARTS filter
+            progress_bar = None
+            if TQDM_AVAILABLE:
+                progress_bar = tqdm(total=len(compounds), desc="Filtering compounds", unit="compound")
+            
+            for compound in compounds:
+                compound_id, smiles, name, flag = compound
+                
+                # Parse SMILES
+                mol = Chem.MolFromSmiles(smiles)
+                if mol is None:
+                    invalid_smiles_count += 1
+                    if progress_bar:
+                        progress_bar.update(1)
+                    continue
+                
+                # Check if compound matches the SMARTS pattern
+                if mol.HasSubstructMatch(smarts_mol):
+                    matching_compounds.append({
+                        'id': compound_id,
+                        'smiles': smiles,
+                        'name': name,
+                        'flag': flag
+                    })
+                
+                if progress_bar:
+                    progress_bar.update(1)
+            
+            if progress_bar:
+                progress_bar.close()
+            
+            # Print results summary
+            print(f"✅ SMARTS filtering completed!")
+            print(f"📋 Filter applied: '{filter_name}' (ID: {id})")
+            print(f"🔍 SMARTS pattern: {smarts_pattern}")
+            print(f"📊 Results:")
+            print(f"   • Total compounds processed: {len(compounds)}")
+            print(f"   • Matching compounds: {len(matching_compounds)}")
+            print(f"   • Non-matching compounds: {len(compounds) - len(matching_compounds) - invalid_smiles_count}")
+            print(f"   • Invalid SMILES: {invalid_smiles_count}")
+            print(f"   • Match percentage: {len(matching_compounds)/len(compounds)*100:.1f}%")
+            
+            # Optionally, save filtered results to a new table or file
+            if matching_compounds:
+                print(f"\n💾 Found {len(matching_compounds)} compounds matching the filter.")
+                save_option = input("Do you want to save the filtered compounds to a new table? (y/n): ").strip().lower()
+                if save_option in ['y', 'yes']:
+                    new_table_name = input(f"Enter new table name (default: {table_name}_filtered_{filter_name.lower().replace(' ', '_').replace('-', '_')}): ").strip()
+                    if not new_table_name:
+                        new_table_name = f"{table_name}_filtered_{filter_name.lower().replace(' ', '_').replace('-', '_')}"
+                    
+                    # Save matching compounds to new table
+                    self._save_filtered_compounds(matching_compounds, new_table_name)
+            else:
+                print("⚠️  No compounds matched the filter criteria.")
+            
+            
+        except Exception as e:
+            print(f"❌ Error retrieving SMARTS pattern or compounds for filtering: {e}")
+            return []   
+
+    def _save_filtered_compounds(self, compounds: List[Dict], table_name: str) -> bool:
+        """
+        Save filtered compounds to a new table in the database.
+        Removes duplicates based on SMILES strings before saving.
+        
+        Args:
+            compounds (List[Dict]): List of compound dictionaries with keys: id, smiles, name, flag
+            table_name (str): Name of the new table to create
+            
+        Returns:
+            bool: True if compounds were saved successfully, False otherwise
+        """
+        try:
+            # Remove duplicates based on SMILES strings
+            unique_compounds = []
+            seen_smiles = set()
+            duplicates_count = 0
+            
+            print(f"📋 Checking for duplicates among {len(compounds)} filtered compounds...")
+            
+            for compound in compounds:
+                smiles = compound['smiles']
+                if smiles not in seen_smiles:
+                    unique_compounds.append(compound)
+                    seen_smiles.add(smiles)
+                else:
+                    duplicates_count += 1
+            
+            print(f"🔍 Found {duplicates_count} duplicate compounds (removed)")
+            print(f"✨ Retaining {len(unique_compounds)} unique compounds for saving")
+            
+            if not unique_compounds:
+                print("⚠️  No unique compounds to save after duplicate removal")
+                return True
+            
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            
+            # Create the new table with the same schema as other compound tables
+            # Add UNIQUE constraint on SMILES to prevent future duplicates
+            cursor.execute(f'''
+                CREATE TABLE IF NOT EXISTS {table_name} (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    smiles TEXT NOT NULL UNIQUE,
+                    name TEXT,
+                    flag INTEGER DEFAULT 1
+                )
+            ''')
+            
+            # Create indexes for better performance
+            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_smiles ON {table_name}(smiles)")
+            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_name ON {table_name}(name)")
+            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_flag ON {table_name}(flag)")
+            
+            # Insert the unique filtered compounds
+            inserted_count = 0
+            database_duplicates = 0
+            
+            for compound in unique_compounds:
+                try:
+                    cursor.execute(f'''
+                        INSERT INTO {table_name} (smiles, name, flag)
+                        VALUES (?, ?, ?)
+                    ''', (compound['smiles'], compound['name'], compound['flag']))
+                    inserted_count += 1
+                except sqlite3.IntegrityError:
+                    # Handle case where compound already exists in database
+                    database_duplicates += 1
+            
+            conn.commit()
+            conn.close()
+            
+            print(f"✅ Successfully saved {inserted_count} unique filtered compounds to table '{table_name}'")
+            if database_duplicates > 0:
+                print(f"⚠️  Skipped {database_duplicates} compounds that were already in the database")
+            
+            return True
+            
+        except Exception as e:
+            print(f"❌ Error saving filtered compounds to table '{table_name}': {e}")
+            return False
+
     def clear_database(self, table_name: Optional[str] = None, confirm: bool = True) -> bool:
         """
         Clear compounds from the database.
