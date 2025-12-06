@@ -1,6 +1,7 @@
 import sqlite3
 import os
 import sys
+import json
 
 class DatabaseManager:
     
@@ -35,6 +36,37 @@ class DatabaseManager:
             """
             
             cursor.execute(create_table_query)
+            
+            # Create chem_filters table
+            create_chem_filters_query = """
+            CREATE TABLE IF NOT EXISTS chem_filters (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                filter_name TEXT UNIQUE NOT NULL,
+                smarts TEXT NOT NULL
+            )
+            """
+            
+            cursor.execute(create_chem_filters_query)
+            
+            # Populate chem_filters table from JSON file
+            config_dir = os.path.dirname(os.path.dirname(os.path.dirname(db_path)))
+            json_file_path = os.path.join(config_dir, 'src', 'config', 'chem_filters.json')
+            
+            if os.path.exists(json_file_path):
+                with open(json_file_path, 'r') as f:
+                    filters_data = json.load(f)
+                
+                insert_filter_query = """
+                INSERT OR IGNORE INTO chem_filters (filter_name, smarts) VALUES (?, ?)
+                """
+                
+                for filter_item in filters_data:
+                    cursor.execute(insert_filter_query, (filter_item['filter_name'], filter_item['smarts']))
+                    
+                print(f"Chemical filters populated from: {json_file_path}")
+            else:
+                print(f"Warning: Chemical filters JSON file not found at {json_file_path}")
+            
             conn.commit()
             conn.close()
             
@@ -43,6 +75,87 @@ class DatabaseManager:
             
         except Exception as e:
             print(f"Error creating database: {e}")
+            return False
+            
+    def refresh_chem_filters(self, db_path):
+        """Refresh the chem_filters table by reading the JSON file again and adding new filters."""
+        try:
+            # Connect to database
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            
+            # Create chem_filters table if it doesn't exist
+            create_chem_filters_query = """
+            CREATE TABLE IF NOT EXISTS chem_filters (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                filter_name TEXT UNIQUE NOT NULL,
+                smarts TEXT NOT NULL
+            )
+            """
+            cursor.execute(create_chem_filters_query)
+            
+            # Get the path to the JSON file
+            config_dir = os.path.dirname(os.path.dirname(os.path.dirname(db_path)))
+            json_file_path = os.path.join(config_dir, 'tidyscreen', 'config', 'chem_filters.json')
+            
+            if not os.path.exists(json_file_path):
+                print(f"Warning: Chemical filters JSON file not found at {json_file_path}")
+                conn.close()
+                return False
+            
+            # Read the JSON file
+            with open(json_file_path, 'r') as f:
+                filters_data = json.load(f)
+            
+            # Get existing filter names to avoid duplicates
+            cursor.execute("SELECT filter_name FROM chem_filters")
+            existing_filters = set(row[0] for row in cursor.fetchall())
+            
+            # Insert new filters
+            insert_filter_query = """
+            INSERT OR IGNORE INTO chem_filters (filter_name, smarts) VALUES (?, ?)
+            """
+            
+            new_filters_count = 0
+            updated_filters_count = 0
+            
+            for filter_item in filters_data:
+                filter_name = filter_item['filter_name']
+                smarts = filter_item['smarts']
+                
+                if filter_name not in existing_filters:
+                    # New filter
+                    cursor.execute(insert_filter_query, (filter_name, smarts))
+                    new_filters_count += 1
+                    print(f"  ➕ Added new filter: {filter_name}")
+                else:
+                    # Check if SMARTS pattern has changed
+                    cursor.execute("SELECT smarts FROM chem_filters WHERE filter_name = ?", (filter_name,))
+                    current_smarts = cursor.fetchone()[0]
+                    
+                    if current_smarts != smarts:
+                        # Update existing filter with new SMARTS pattern
+                        cursor.execute(
+                            "UPDATE chem_filters SET smarts = ? WHERE filter_name = ?", 
+                            (smarts, filter_name)
+                        )
+                        updated_filters_count += 1
+                        print(f"  🔄 Updated filter: {filter_name}")
+            
+            conn.commit()
+            conn.close()
+            
+            # Summary
+            print(f"\n✅ Chemical filters refresh completed:")
+            print(f"   📊 Total filters in JSON: {len(filters_data)}")
+            print(f"   ➕ New filters added: {new_filters_count}")
+            print(f"   🔄 Filters updated: {updated_filters_count}")
+            print(f"   📍 Source file: {json_file_path}")
+            
+            return True
+            
+        except Exception as e:
+            print(f"❌ Error refreshing chemical filters: {e}")
             return False
             
     def connect_db(self, db):

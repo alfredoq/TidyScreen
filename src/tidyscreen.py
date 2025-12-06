@@ -10,6 +10,166 @@ def projects():
     projects_manager = ProjectsManagement()
     projects_manager.list_all_projects()  # This will print the formatted output
 
+def refresh_filters():
+    """
+    Refresh chemical filters in the projects database by reading the JSON file again.
+    This can be called independently without activating a specific project.
+    """
+    db_manager = DatabaseManager()
+    projects_db = f"{site.getsitepackages()[0]}/tidyscreen/projects_db/projects_database.db"
+    
+    if not os.path.exists(projects_db):
+        print("❌ Projects database does not exist. Create a project first.")
+        return False
+    
+    print("🔄 Refreshing chemical filters...")
+    success = db_manager.refresh_chem_filters(projects_db)
+    
+    return success
+
+def list_chemical_filters(pattern=None):
+    """
+    List all chemical filters available in the database.
+    This can be called independently without activating a specific project.
+    
+    Args:
+        pattern (str, optional): Filter names containing this pattern
+    """
+    db_manager = DatabaseManager()
+    projects_db = f"{site.getsitepackages()[0]}/tidyscreen/projects_db/projects_database.db"
+    
+    if not os.path.exists(projects_db):
+        print("❌ Projects database does not exist. Create a project first.")
+        return
+    
+    try:
+        conn = db_manager.connect_db(projects_db)
+        cursor = conn.cursor()
+        
+        # Build query
+        if pattern:
+            query = "SELECT id, filter_name, smarts FROM chem_filters WHERE filter_name LIKE ? ORDER BY filter_name"
+            cursor.execute(query, (f"%{pattern}%",))
+        else:
+            query = "SELECT id, filter_name, smarts FROM chem_filters ORDER BY filter_name"
+            cursor.execute(query)
+        
+        filters = cursor.fetchall()
+        conn.close()
+        
+        if not filters:
+            if pattern:
+                print(f"No chemical filters found matching pattern: {pattern}")
+            else:
+                print("No chemical filters found in database.")
+            return
+        
+        print("\n" + "="*80)
+        print("CHEMICAL FILTERS")
+        print("="*80)
+        print(f"{'ID':<4} {'Filter Name':<30} {'SMARTS Pattern':<40}")
+        print("-"*80)
+        
+        for filter_id, filter_name, smarts in filters:
+            # Truncate SMARTS if too long for display
+            smarts_display = smarts[:37] + "..." if len(smarts) > 40 else smarts
+            print(f"{filter_id:<4} {filter_name:<30} {smarts_display:<40}")
+        
+        print("="*80)
+        print(f"Total filters: {len(filters)}")
+        
+        if pattern:
+            print(f"Filtered by: {pattern}")
+        
+    except Exception as e:
+        print(f"❌ Error listing chemical filters: {e}")
+
+def add_chemical_filter():
+    """
+    Add a new chemical filter by prompting user for input.
+    Updates the JSON file and refreshes the filters table.
+    This can be called independently without activating a specific project.
+    """
+    print("\n" + "="*60)
+    print("ADD NEW CHEMICAL FILTER")
+    print("="*60)
+    
+    try:
+        # Get user input
+        filter_name = input("Enter filter name: ").strip()
+        if not filter_name:
+            print("❌ Filter name cannot be empty.")
+            return False
+        
+        smarts_pattern = input("Enter SMARTS pattern: ").strip()
+        if not smarts_pattern:
+            print("❌ SMARTS pattern cannot be empty.")
+            return False
+        
+        # Confirm input
+        print(f"\n📋 Filter details:")
+        print(f"   Name: {filter_name}")
+        print(f"   SMARTS: {smarts_pattern}")
+        
+        confirm = input("\nSave this filter? (y/n): ").strip().lower()
+        if confirm not in ['y', 'yes']:
+            print("Filter addition cancelled.")
+            return False
+        
+        # Get path to JSON file
+        config_path = os.path.join(os.path.dirname(__file__), 'config', 'chem_filters.json')
+        
+        # Read existing filters
+        if os.path.exists(config_path):
+            with open(config_path, 'r', encoding='utf-8') as f:
+                filters_data = json.load(f)
+        else:
+            filters_data = []
+        
+        # Check if filter name already exists
+        existing_names = [f['filter_name'] for f in filters_data]
+        if filter_name in existing_names:
+            print(f"❌ Filter '{filter_name}' already exists in the configuration file.")
+            overwrite = input("Do you want to overwrite it? (y/n): ").strip().lower()
+            if overwrite not in ['y', 'yes']:
+                print("Filter addition cancelled.")
+                return False
+            
+            # Remove existing filter with same name
+            filters_data = [f for f in filters_data if f['filter_name'] != filter_name]
+        
+        # Add new filter
+        new_filter = {
+            "filter_name": filter_name,
+            "smarts": smarts_pattern
+        }
+        filters_data.append(new_filter)
+        
+        # Sort filters alphabetically by name
+        filters_data.sort(key=lambda x: x['filter_name'])
+        
+        # Write back to JSON file
+        with open(config_path, 'w', encoding='utf-8') as f:
+            json.dump(filters_data, f, indent=2, ensure_ascii=False)
+        
+        print(f"✅ Filter '{filter_name}' added to configuration file.")
+        print(f"📍 Updated file: {config_path}")
+        
+        # Refresh filters in database
+        print("\n🔄 Refreshing filters in database...")
+        success = refresh_filters()
+        
+        if success:
+            print("✅ Chemical filter added and database updated successfully!")
+            return True
+        else:
+            print("❌ Filter was added to configuration but database update failed.")
+            return False
+            
+    except Exception as e:
+        print(f"❌ Error adding chemical filter: {e}")
+        return False
+
 class ActivateProject:
     
     def __init__(self, name):
