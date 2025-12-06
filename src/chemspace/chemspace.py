@@ -11,13 +11,12 @@ from multiprocessing import cpu_count
 import numpy as np
 import time
 
-# Try to import tqdm for progress bars, fallback to simple progress if not available
+# Try to import tqdm for progress bars
 try:
     from tqdm import tqdm
     TQDM_AVAILABLE = True
 except ImportError:
     TQDM_AVAILABLE = False
-    print("📋 Note: Install 'tqdm' for enhanced progress bars: pip install tqdm")
 
 # Add the parent directory to path to import our local tidyscreen module
 parent_dir = os.path.dirname(os.path.dirname(__file__))
@@ -76,6 +75,58 @@ def _process_chunk_worker(chunk_df: pd.DataFrame, smiles_column: str,
         compounds_data.append((smiles, name, flag))
     
     return compounds_data
+
+def _compute_inchi_keys_worker(chunk_data: List[Tuple[int, str, str]]) -> List[Tuple[int, str, str]]:
+    """
+    Worker function to compute InChI keys for a chunk of SMILES strings in parallel.
+    This function must be at module level to be pickleable for multiprocessing.
+    
+    Args:
+        chunk_data (List[Tuple[int, str, str]]): List of tuples (row_index, smiles, compound_name)
+        
+    Returns:
+        List[Tuple[int, str, str]]: List of tuples (row_index, inchi_key, compound_name)
+    """
+    try:
+        # Import RDKit inside worker to avoid import issues
+        from rdkit import Chem
+        
+        # Suppress RDKit warnings for cleaner parallel output
+        from rdkit import RDLogger
+        RDLogger.DisableLog('rdApp.*')
+        
+    except ImportError:
+        # If RDKit is not available, return error for all compounds in chunk
+        return [(idx, 'ERROR', name) for idx, smiles, name in chunk_data]
+    
+    results = []
+    
+    for idx, smiles, name in chunk_data:
+        try:
+            # Skip empty or None SMILES
+            if not smiles or smiles.strip() == '':
+                results.append((idx, 'INVALID_SMILES', name))
+                continue
+            
+            # Parse SMILES with RDKit
+            mol = Chem.MolFromSmiles(str(smiles).strip())
+            
+            if mol is not None:
+                # Compute InChI key
+                inchi_key = Chem.MolToInchiKey(mol)
+                if inchi_key:  # Ensure InChI key is not empty
+                    results.append((idx, inchi_key, name))
+                else:
+                    results.append((idx, 'ERROR', name))
+            else:
+                # Invalid SMILES
+                results.append((idx, 'INVALID_SMILES', name))
+                
+        except Exception:
+            # Error computing InChI key
+            results.append((idx, 'ERROR', name))
+    
+    return results
 
 class ChemSpace:
     """
@@ -286,120 +337,6 @@ class ChemSpace:
         except Exception as e:
             print(f"❌ Error retrieving table list: {e}")
             return []
-    
-    def describe_table(self, table_name: str) -> Dict[str, Any]:
-        """
-        Get detailed information about a specific table.
-        
-        Args:
-            table_name (str): Name of the table to describe
-            
-        Returns:
-            Dict: Table information including schema, stats, and sample data
-        """
-        try:
-            tables = self.get_all_tables()
-            if table_name not in tables:
-                print(f"⚠️  Table '{table_name}' does not exist")
-                return {}
-            
-            conn = sqlite3.connect(self.__chemspace_db)
-            cursor = conn.cursor()
-            
-            # Get table schema
-            cursor.execute(f"PRAGMA table_info({table_name})")
-            schema = cursor.fetchall()
-            
-            # Get sample data
-            cursor.execute(f"SELECT * FROM {table_name} LIMIT 3")
-            sample_rows = cursor.fetchall()
-            column_names = [description[0] for description in cursor.description]
-            
-            # Get statistics
-            stats = self.get_database_stats(table_name)
-            
-            conn.close()
-            
-            # Format schema information
-            schema_info = []
-            for col_info in schema:
-                schema_info.append({
-                    'column_id': col_info[0],
-                    'name': col_info[1],
-                    'type': col_info[2],
-                    'not_null': bool(col_info[3]),
-                    'default_value': col_info[4],
-                    'primary_key': bool(col_info[5])
-                })
-            
-            # Format sample data
-            sample_data = []
-            for row in sample_rows:
-                row_dict = {}
-                for i, col_name in enumerate(column_names):
-                    row_dict[col_name] = row[i]
-                sample_data.append(row_dict)
-            
-            return {
-                'table_name': table_name,
-                'schema': schema_info,
-                'statistics': stats,
-                'sample_data': sample_data
-            }
-            
-        except Exception as e:
-            print(f"❌ Error describing table '{table_name}': {e}")
-            return {}
-    
-    def print_table_info(self, table_name: str) -> None:
-        """
-        Print formatted information about a specific table.
-        
-        Args:
-            table_name (str): Name of the table to describe
-        """
-        info = self.describe_table(table_name)
-        
-        if not info:
-            return
-        
-        print("\n" + "="*60)
-        print(f"TABLE INFORMATION: {table_name}")
-        print("="*60)
-        
-        # Schema
-        print("📋 Schema:")
-        for col in info['schema']:
-            pk_marker = " (PK)" if col['primary_key'] else ""
-            null_marker = " NOT NULL" if col['not_null'] else ""
-            default = f" DEFAULT {col['default_value']}" if col['default_value'] else ""
-            print(f"   {col['name']}: {col['type']}{pk_marker}{null_marker}{default}")
-        
-        # Statistics
-        if info['statistics']:
-            stats = info['statistics']
-            print(f"\n📊 Statistics:")
-            print(f"   Total compounds: {stats.get('total_compounds', 0)}")
-            if stats.get('flag_counts'):
-                print("   Compounds by flag:")
-                for flag, count in stats['flag_counts'].items():
-                    flag_display = flag if flag else '(no flag)'
-                    print(f"      {flag_display}: {count}")
-        
-        # Sample data
-        if info['sample_data']:
-            print(f"\n🔍 Sample data (first 3 rows):")
-            for i, row in enumerate(info['sample_data'], 1):
-                print(f"   Row {i}:")
-                for col, value in row.items():
-                    if col == 'smiles':
-                        # Truncate long SMILES for display
-                        display_value = value[:50] + "..." if len(str(value)) > 50 else value
-                    else:
-                        display_value = value
-                    print(f"      {col}: {display_value}")
-        
-        print("="*60)
     
     def rename_table(self, old_name: str, new_name: str) -> bool:
         """
@@ -799,71 +736,6 @@ class ChemSpace:
             print(f"❌ Error counting compounds in table '{table_name}': {e}")
             return 0
     
-    def search_compounds(self, search_term: str, search_in: str = 'name', table_name: Optional[str] = None) -> List[Dict[str, Any]]:
-        """
-        Search for compounds by name, SMILES, flag, or InChI key pattern.
-        
-        Args:
-            search_term (str): Term to search for
-            search_in (str): Field to search in ('name', 'smiles', 'flag', 'inchi_key')
-            table_name (Optional[str]): Name of the table to search in. If None, searches all tables
-            
-        Returns:
-            List[Dict]: List of matching compounds
-        """
-        valid_fields = ['name', 'smiles', 'flag', 'inchi_key']
-        if search_in not in valid_fields:
-            print(f"❌ Invalid search field. Use one of: {valid_fields}")
-            return []
-        
-        try:
-            conn = sqlite3.connect(self.__chemspace_db)
-            cursor = conn.cursor()
-            
-            if table_name:
-                # Search in specific table
-                query = f"SELECT *, '{table_name}' as table_name FROM {table_name} WHERE {search_in} LIKE ? ORDER BY id DESC"
-                cursor.execute(query, (f"%{search_term}%",))
-                rows = cursor.fetchall()
-            else:
-                # Search in all tables
-                tables = self.get_all_tables()
-                all_rows = []
-                
-                for table in tables:
-                    try:
-                        query = f"SELECT *, '{table}' as table_name FROM {table} WHERE {search_in} LIKE ? ORDER BY id DESC"
-                        cursor.execute(query, (f"%{search_term}%",))
-                        table_rows = cursor.fetchall()
-                        all_rows.extend(table_rows)
-                    except Exception as e:
-                        print(f"⚠️  Warning: Error searching table '{table}': {e}")
-                
-                rows = all_rows
-            
-            # Get column names
-            if rows:
-                cursor.execute(f"SELECT *, 'dummy' as table_name FROM {tables[0] if not table_name else table_name} LIMIT 1")
-                column_names = [description[0] for description in cursor.description]
-            else:
-                conn.close()
-                return []
-            
-            # Convert to dictionaries
-            compounds = []
-            for row in rows:
-                compound_dict = {}
-                for i, column_name in enumerate(column_names):
-                    compound_dict[column_name] = row[i]
-                compounds.append(compound_dict)
-            
-            conn.close()
-            return compounds
-            
-        except Exception as e:
-            print(f"❌ Error searching compounds: {e}")
-            return []
-    
     def export_to_csv(self, output_path: str, 
                      table_name: Optional[str] = None,
                      flag_filter: Optional[str] = None) -> bool:
@@ -898,115 +770,6 @@ class ChemSpace:
             table_desc = f" from table '{table_name}'" if table_name else ""
             print(f"❌ Error exporting compounds{table_desc}: {e}")
             return False
-    
-    def get_database_stats(self, table_name: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Get statistics about the chemspace database.
-        
-        Args:
-            table_name (Optional[str]): Specific table to analyze. If None, analyzes all tables.
-        
-        Returns:
-            Dict: Database statistics including counts by flag, total compounds, etc.
-        """
-        try:
-            conn = sqlite3.connect(self.__chemspace_db)
-            cursor = conn.cursor()
-            
-            if table_name:
-                # Stats for specific table
-                cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
-                total_compounds = cursor.fetchone()[0]
-                
-                cursor.execute(f"SELECT flag, COUNT(*) FROM {table_name} GROUP BY flag ORDER BY COUNT(*) DESC")
-                flag_counts = dict(cursor.fetchall())
-                
-                return {
-                    'table_name': table_name,
-                    'total_compounds': total_compounds,
-                    'flag_counts': flag_counts,
-                    'database_path': self.__chemspace_db
-                }
-            else:
-                # Stats for all tables
-                tables = self.get_all_tables()
-                all_stats = {}
-                total_all_compounds = 0
-                
-                for table in tables:
-                    try:
-                        cursor.execute(f"SELECT COUNT(*) FROM {table}")
-                        table_count = cursor.fetchone()[0]
-                        total_all_compounds += table_count
-                        
-                        cursor.execute(f"SELECT flag, COUNT(*) FROM {table} GROUP BY flag ORDER BY COUNT(*) DESC")
-                        table_flag_counts = dict(cursor.fetchall())
-                        
-                        all_stats[table] = {
-                            'total_compounds': table_count,
-                            'flag_counts': table_flag_counts
-                        }
-                    except Exception as e:
-                        print(f"⚠️  Warning: Error analyzing table '{table}': {e}")
-                
-                conn.close()
-                
-                return {
-                    'total_tables': len(tables),
-                    'total_compounds_all_tables': total_all_compounds,
-                    'tables': all_stats,
-                    'database_path': self.__chemspace_db
-                }
-            
-            conn.close()
-            
-        except Exception as e:
-            print(f"❌ Error getting database stats: {e}")
-            return {}
-    
-    def print_database_summary(self, table_name: Optional[str] = None) -> None:
-        """
-        Print a formatted summary of the chemspace database.
-        
-        Args:
-            table_name (Optional[str]): Specific table to summarize. If None, summarizes all tables.
-        """
-        stats = self.get_database_stats(table_name)
-        
-        if not stats:
-            print("❌ Unable to retrieve database statistics")
-            return
-        
-        print("\n" + "="*60)
-        print(f"CHEMSPACE DATABASE SUMMARY - Project: {self.name}")
-        print("="*60)
-        
-        if table_name:
-            # Summary for specific table
-            print(f"📋 Table: {stats['table_name']}")
-            print(f"📊 Total Compounds: {stats['total_compounds']}")
-            
-            if stats['flag_counts']:
-                print("\n🏷️  Compounds by Flag:")
-                for flag, count in stats['flag_counts'].items():
-                    flag_display = flag if flag else '(no flag)'
-                    print(f"   {flag_display}: {count}")
-        else:
-            # Summary for all tables
-            print(f"📊 Total Tables: {stats['total_tables']}")
-            print(f"📈 Total Compounds (All Tables): {stats['total_compounds_all_tables']}")
-            
-            if stats['tables']:
-                print("\n📋 Tables:")
-                for table, table_stats in stats['tables'].items():
-                    print(f"   {table}: {table_stats['total_compounds']} compounds")
-                    if table_stats['flag_counts']:
-                        for flag, count in table_stats['flag_counts'].items():
-                            flag_display = flag if flag else '(no flag)'
-                            print(f"      └─ {flag_display}: {count}")
-        
-        print(f"\n🗄️  Database Path: {stats['database_path']}")
-        print("="*60)
     
     def clear_database(self, table_name: Optional[str] = None, confirm: bool = True) -> bool:
         """
@@ -1092,24 +855,27 @@ class ChemSpace:
             return pd.DataFrame()
     
     def compute_inchi_keys(self, table_name: str, 
-                          update_database: bool = True) -> pd.DataFrame:
+                          update_database: bool = True,
+                          parallel_threshold: int = 1000,
+                          max_workers: Optional[int] = None,
+                          chunk_size: Optional[int] = None) -> pd.DataFrame:
         """
-        Retrieve a table as DataFrame and compute InChI keys for each SMILES string.
+        Retrieve a table as DataFrame and compute InChI keys for each SMILES string using parallel processing.
         
         Args:
             table_name (str): Name of the table to retrieve
-            flag_filter (Optional[str]): Filter by specific flag value
-            name_pattern (Optional[str]): Filter by name pattern (SQL LIKE)
             update_database (bool): Whether to add inchi_key column to the database table
+            parallel_threshold (int): Number of compounds above which parallel processing is used (default: 1000)
+            max_workers (Optional[int]): Maximum number of parallel workers. If None, uses cpu_count()
+            chunk_size (Optional[int]): Size of each chunk for parallel processing. If None, automatically calculated
             
         Returns:
             pd.DataFrame: DataFrame with added 'inchi_key' column, empty DataFrame if error occurs
         """
         try:
-            # Import RDKit
+            # Check RDKit availability early
             try:
                 from rdkit import Chem
-                from rdkit.Chem import Descriptors
             except ImportError:
                 print("❌ RDKit not installed. Please install RDKit to compute InChI keys:")
                 print("   conda install -c conda-forge rdkit")
@@ -1133,36 +899,33 @@ class ChemSpace:
             # Initialize InChI key column
             df['inchi_key'] = None
             
-            print(f"🔬 Computing InChI keys for {len(df)} compounds...")
+            num_compounds = len(df)
+            print(f"🔬 Computing InChI keys for {num_compounds} compounds...")
             
-            # Compute InChI keys for each SMILES
-            successful_computations = 0
-            failed_computations = 0
+            # Determine processing method
+            use_parallel = num_compounds > parallel_threshold
             
-            for idx, row in df.iterrows():
-                smiles = row['smiles']
+            if use_parallel:
+                print(f"🚀 Large dataset detected ({num_compounds} compounds). Using parallel processing...")
                 
-                try:
-                    # Parse SMILES with RDKit
-                    mol = Chem.MolFromSmiles(smiles)
-                    
-                    if mol is not None:
-                        # Compute InChI key
-                        inchi_key = Chem.MolToInchiKey(mol)
-                        df.at[idx, 'inchi_key'] = inchi_key
-                        successful_computations += 1
-                    else:
-                        # Invalid SMILES
-                        df.at[idx, 'inchi_key'] = 'INVALID_SMILES'
-                        failed_computations += 1
-                        if failed_computations <= 5:  # Show only first 5 errors
-                            print(f"⚠️  Invalid SMILES for compound '{row.get('name', 'unknown')}': {smiles}")
+                # Set up parallel processing parameters
+                if max_workers is None:
+                    max_workers = min(cpu_count(), 8)  # Limit to reasonable number
                 
-                except Exception as e:
-                    df.at[idx, 'inchi_key'] = 'ERROR'
-                    failed_computations += 1
-                    if failed_computations <= 5:  # Show only first 5 errors
-                        print(f"⚠️  Error computing InChI key for '{row.get('name', 'unknown')}': {e}")
+                if chunk_size is None:
+                    chunk_size = max(100, num_compounds // (max_workers * 4))  # Ensure reasonable chunk size
+                
+                print(f"   👥 Workers: {max_workers}")
+                print(f"   📦 Chunk size: {chunk_size}")
+                
+                # Process in parallel
+                successful_computations, failed_computations = self._compute_inchi_keys_parallel(
+                    df, max_workers, chunk_size
+                )
+            else:
+                print(f"📝 Processing {num_compounds} compounds sequentially...")
+                # Sequential processing for smaller datasets
+                successful_computations, failed_computations = self._compute_inchi_keys_sequential(df)
             
             # Print summary
             print(f"✅ InChI key computation completed:")
@@ -1184,6 +947,203 @@ class ChemSpace:
             print(f"❌ Error computing InChI keys for table '{table_name}': {e}")
             return pd.DataFrame()
     
+    def _compute_inchi_keys_parallel(self, df: pd.DataFrame, max_workers: int, chunk_size: int) -> Tuple[int, int]:
+        """
+        Compute InChI keys using parallel processing.
+        
+        Args:
+            df (pd.DataFrame): DataFrame containing SMILES data
+            max_workers (int): Maximum number of parallel workers
+            chunk_size (int): Size of each chunk for parallel processing
+            
+        Returns:
+            Tuple[int, int]: (successful_computations, failed_computations)
+        """
+        try:
+            start_time = time.time()
+            
+            # Prepare data for parallel processing
+            print(f"   📦 Preparing data for parallel processing...")
+            chunk_data_list = []
+            
+            # Split data into chunks
+            for i in range(0, len(df), chunk_size):
+                chunk_df = df.iloc[i:i + chunk_size]
+                chunk_data = []
+                
+                for idx, row in chunk_df.iterrows():
+                    smiles = row['smiles']
+                    name = row.get('name', 'unknown')
+                    chunk_data.append((idx, smiles, name))
+                
+                if chunk_data:  # Only add non-empty chunks
+                    chunk_data_list.append(chunk_data)
+            
+            num_chunks = len(chunk_data_list)
+            print(f"   📊 Split {len(df)} compounds into {num_chunks} chunks")
+            
+            # Initialize progress tracking
+            successful_computations = 0
+            failed_computations = 0
+            processed_chunks = 0
+            
+            # Initialize progress bar if tqdm is available
+            if TQDM_AVAILABLE:
+                progress_bar = tqdm(
+                    total=len(df),
+                    desc="Computing InChI keys",
+                    unit="compounds",
+                    bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
+                )
+            else:
+                progress_bar = None
+                print(f"   🚀 Starting parallel processing of {num_chunks} chunks...")
+            
+            # Process chunks in parallel
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                # Submit all chunk processing jobs
+                future_to_chunk = {}
+                chunk_submission_start = time.time()
+                
+                for i, chunk_data in enumerate(chunk_data_list):
+                    future = executor.submit(_compute_inchi_keys_worker, chunk_data)
+                    future_to_chunk[future] = i
+                
+                chunk_submission_time = time.time() - chunk_submission_start
+                print(f"   ⏱️  All {num_chunks} chunks submitted in {chunk_submission_time:.2f}s")
+                
+                # Collect results
+                failed_chunks = 0
+                
+                for future in as_completed(future_to_chunk):
+                    chunk_idx = future_to_chunk[future]
+                    
+                    try:
+                        chunk_results = future.result()
+                        
+                        # Update DataFrame with results
+                        chunk_successful = 0
+                        chunk_failed = 0
+                        
+                        for idx, inchi_key, name in chunk_results:
+                            df.at[idx, 'inchi_key'] = inchi_key
+                            
+                            if inchi_key in ['INVALID_SMILES', 'ERROR']:
+                                chunk_failed += 1
+                                # Show only first few errors
+                                if failed_computations + chunk_failed <= 5:
+                                    error_type = "Invalid SMILES" if inchi_key == 'INVALID_SMILES' else "Computation error"
+                                    print(f"⚠️  {error_type} for compound '{name}' (chunk {chunk_idx})")
+                            else:
+                                chunk_successful += 1
+                        
+                        successful_computations += chunk_successful
+                        failed_computations += chunk_failed
+                        processed_chunks += 1
+                        
+                        # Update progress
+                        chunk_size_actual = len(chunk_results)
+                        if progress_bar:
+                            progress_bar.update(chunk_size_actual)
+                        else:
+                            # Print progress every 5 chunks if no tqdm
+                            if processed_chunks % 5 == 0 or processed_chunks == num_chunks:
+                                progress_pct = (processed_chunks / num_chunks) * 100
+                                print(f"   📈 Progress: {processed_chunks}/{num_chunks} chunks ({progress_pct:.1f}%)")
+                    
+                    except Exception as e:
+                        failed_chunks += 1
+                        chunk_size_est = len(chunk_data_list[chunk_idx]) if chunk_idx < len(chunk_data_list) else chunk_size
+                        failed_computations += chunk_size_est
+                        processed_chunks += 1
+                        
+                        print(f"   ❌ Error processing chunk {chunk_idx}: {e}")
+                        
+                        # Update progress even for failed chunks
+                        if progress_bar:
+                            progress_bar.update(chunk_size_est)
+            
+            # Close progress bar
+            if progress_bar:
+                progress_bar.close()
+            
+            processing_time = time.time() - start_time
+            print(f"   ⏱️  Parallel processing completed in {processing_time:.2f}s")
+            
+            if failed_chunks > 0:
+                print(f"   ⚠️  {failed_chunks} chunks failed during processing")
+            
+            return successful_computations, failed_computations
+            
+        except Exception as e:
+            print(f"❌ Error in parallel InChI key computation: {e}")
+            return 0, len(df)
+    
+    def _compute_inchi_keys_sequential(self, df: pd.DataFrame) -> Tuple[int, int]:
+        """
+        Compute InChI keys using sequential processing.
+        
+        Args:
+            df (pd.DataFrame): DataFrame containing SMILES data
+            
+        Returns:
+            Tuple[int, int]: (successful_computations, failed_computations)
+        """
+        try:
+            from rdkit import Chem
+        except ImportError:
+            print("❌ RDKit not available for sequential processing")
+            return 0, len(df)
+        
+        successful_computations = 0
+        failed_computations = 0
+        
+        # Initialize progress bar if tqdm is available
+        if TQDM_AVAILABLE:
+            progress_bar = tqdm(
+                total=len(df),
+                desc="Computing InChI keys",
+                unit="compounds"
+            )
+        else:
+            progress_bar = None
+        
+        for idx, row in df.iterrows():
+            smiles = row['smiles']
+            name = row.get('name', 'unknown')
+            
+            try:
+                # Parse SMILES with RDKit
+                mol = Chem.MolFromSmiles(smiles)
+                
+                if mol is not None:
+                    # Compute InChI key
+                    inchi_key = Chem.MolToInchiKey(mol)
+                    df.at[idx, 'inchi_key'] = inchi_key
+                    successful_computations += 1
+                else:
+                    # Invalid SMILES
+                    df.at[idx, 'inchi_key'] = 'INVALID_SMILES'
+                    failed_computations += 1
+                    if failed_computations <= 5:  # Show only first 5 errors
+                        print(f"⚠️  Invalid SMILES for compound '{name}': {smiles}")
+            
+            except Exception as e:
+                df.at[idx, 'inchi_key'] = 'ERROR'
+                failed_computations += 1
+                if failed_computations <= 5:  # Show only first 5 errors
+                    print(f"⚠️  Error computing InChI key for '{name}': {e}")
+            
+            # Update progress
+            if progress_bar:
+                progress_bar.update(1)
+        
+        # Close progress bar
+        if progress_bar:
+            progress_bar.close()
+        
+        return successful_computations, failed_computations
+
     def _update_table_with_inchi_keys(self, table_name: str, df: pd.DataFrame) -> bool:
         """
         Update the database table with computed InChI key values.
