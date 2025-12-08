@@ -129,6 +129,110 @@ def _compute_inchi_keys_worker(chunk_data: List[Tuple[int, str, str]]) -> List[T
     
     return results
 
+def _filter_chunk_worker_by_instances(chunk_data: List[Tuple], filters_list: List[Tuple]) -> List[Dict]:
+    """
+    Worker function to process a chunk of compounds for SMARTS filtering by instances in parallel.
+    This function filters compounds based on exact match count requirements for each SMARTS pattern.
+    
+    Args:
+        chunk_data (List[Tuple]): List of tuples (id, smiles, name, flag, inchi_key)
+        filters_list (List[Tuple]): List of tuples (smarts_pattern, required_instances)
+        
+    Returns:
+        List[Dict]: List of compound results with filter match information
+    """
+    try:
+        from rdkit import Chem
+        from rdkit import RDLogger
+        # Suppress RDKit warnings for cleaner parallel output
+        RDLogger.DisableLog('rdApp.*')
+    except ImportError:
+        return [{"error": "RDKit not available for filtering"}]
+    
+    results = []
+    
+    for compound_id, smiles, name, flag, inchi_key in chunk_data:
+        compound_result = {
+            'id': compound_id,
+            'smiles': smiles,
+            'name': name or 'unknown',
+            'flag': flag or 'nd',
+            'inchi_key': inchi_key,
+            'passes_filters': True,
+            'match_counts': {},
+            'filter_details': {}
+        }
+        
+        try:
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is None:
+                compound_result['passes_filters'] = False
+                compound_result['error'] = 'Invalid SMILES'
+                results.append(compound_result)
+                continue
+            
+            # Apply each filter with instance requirements
+            for smarts_pattern, required_instances in filters_list:
+                try:
+                    pattern = Chem.MolFromSmarts(smarts_pattern)
+                    
+                    if pattern is None:
+                        compound_result['match_counts'][f"{smarts_pattern}_matches"] = 0
+                        compound_result['filter_details'][smarts_pattern] = {
+                            'required': required_instances,
+                            'found': 0,
+                            'passed': False,
+                            'error': 'Invalid SMARTS pattern'
+                        }
+                        # Invalid SMARTS pattern causes compound to fail
+                        compound_result['passes_filters'] = False
+                        continue
+                    
+                    # Get all substructure matches
+                    matches = mol.GetSubstructMatches(pattern)
+                    match_count = len(matches)
+                    
+                    # Store match count information
+                    compound_result['match_counts'][f"{smarts_pattern}_matches"] = match_count
+                    
+                    # Check if compound meets the instance requirement
+                    filter_passed = match_count >= required_instances
+                    
+                    compound_result['filter_details'][smarts_pattern] = {
+                        'required': required_instances,
+                        'found': match_count,
+                        'passed': filter_passed,
+                        'match_positions': [list(match) for match in matches] if matches else []
+                    }
+                    
+                    # If any filter fails to meet instance requirement, compound fails overall
+                    if not filter_passed:
+                        compound_result['passes_filters'] = False
+                
+                except Exception as filter_error:
+                    # Handle individual filter errors
+                    compound_result['match_counts'][f"{smarts_pattern}_matches"] = 0
+                    compound_result['filter_details'][smarts_pattern] = {
+                        'required': required_instances,
+                        'found': 0,
+                        'passed': False,
+                        'error': str(filter_error)
+                    }
+                    compound_result.setdefault('filter_errors', []).append(
+                        f"{smarts_pattern}: {str(filter_error)}"
+                    )
+                    # Filter error causes compound to fail
+                    compound_result['passes_filters'] = False
+            
+        except Exception as mol_error:
+            compound_result['passes_filters'] = False
+            compound_result['error'] = str(mol_error)
+        
+        results.append(compound_result)
+    
+    return results
+
+
 class ChemSpace:
     """
     ChemSpace class for managing chemical compound data within a project.
@@ -2248,3 +2352,588 @@ class ChemSpace:
             print(f"❌ Database integrity error saving workflow: {e}")
         except Exception as e:
             print(f"❌ Error saving filtering workflow: {e}")
+
+    def filter_using_workflow(self, table_name: str, workflow_name: str, 
+                     save_results: Optional[bool] = None, 
+                     result_table_name: Optional[str] = None,
+                     parallel_threshold: int = 10000,
+                     max_workers: Optional[int] = None,
+                     chunk_size: Optional[int] = None) -> pd.DataFrame:
+        """
+        Apply a chemical filtering workflow to compounds in a table with parallel processing support.
+        
+        Args:
+            table_name (str): Name of the table containing compounds to filter
+            workflow_name (str): Name of the workflow to apply
+            save_results (Optional[bool]): Whether to save filtered results to database (prompts if None)
+            result_table_name (Optional[str]): Name for the result table (prompts if save_results=True and None)
+            parallel_threshold (int): Minimum number of compounds to trigger parallel processing
+            max_workers (Optional[int]): Maximum number of worker processes (default: min(cpu_count(), 8))
+            chunk_size (Optional[int]): Size of chunks for parallel processing (auto-calculated if None)
+            
+        Returns:
+            pd.DataFrame: DataFrame containing filtered compounds with match information
+        """
+        try:
+            print(f"\n🔬 Starting workflow filtering...")
+            print(f"   📋 Table: '{table_name}'")
+            print(f"   🧪 Workflow: '{workflow_name}'")
+            
+            # Load workflow filters
+            workflow_filters, filters_dict = self._load_workflow_filters(workflow_name)
+            
+            if not workflow_filters:
+                print(f"❌ No filters found for workflow '{workflow_name}'")
+                return pd.DataFrame()
+            
+            print(f"   🔍 Filters loaded: {len(workflow_filters)}")
+            
+            # Print filters showing their corresponding key from filters_dict
+            keys = list(filters_dict.keys())
+            for i, (filter_smarts, _) in enumerate(workflow_filters, 1):
+                key = keys[i-1] if i-1 < len(keys) else f"unknown_key_{i}"
+                print(f"      {i}. {key} -> {filter_smarts}")
+            
+            # Get compounds from table
+            compounds_df = self._get_table_as_dataframe(table_name)
+            if compounds_df.empty:
+                print(f"❌ No compounds found in table '{table_name}'")
+                return pd.DataFrame()
+            
+            total_compounds = len(compounds_df)
+            print(f"   📊 Total compounds to filter: {total_compounds:,}")
+            
+            # Determine processing method
+            use_parallel = total_compounds >= parallel_threshold
+            
+            if use_parallel:
+                print(f"   🚀 Using parallel processing (threshold: {parallel_threshold:,})")
+                
+                # Set default parameters for parallel processing
+                if max_workers is None:
+                    max_workers = min(os.cpu_count() or 4, 8)
+                
+                if chunk_size is None:
+                    chunk_size = max(1000, total_compounds // (max_workers * 4))
+                
+                print(f"      👥 Workers: {max_workers}")
+                print(f"      📦 Chunk size: {chunk_size:,}")
+            
+                filtered_df = self._apply_filters_parallel(
+                    compounds_df, workflow_filters, max_workers, chunk_size
+                )
+            else:
+                print(f"   🔄 Using sequential processing")
+                filtered_df = self._apply_filters_sequential(compounds_df, workflow_filters)
+            
+            if filtered_df.empty:
+                print("❌ No compounds passed the filtering workflow")
+                return pd.DataFrame()
+            
+            # Calculate statistics
+            compounds_removed = total_compounds - len(filtered_df)
+            retention_rate = (len(filtered_df) / total_compounds) * 100
+            
+            print(f"\n📊 Filtering Results:")
+            print(f"   ✅ Compounds passed: {len(filtered_df):,}")
+            print(f"   ❌ Compounds removed: {compounds_removed:,}")
+            print(f"   📈 Retention rate: {retention_rate:.2f}%")
+            
+            # Prompt for save_results if not provided
+            if save_results is None:
+                save_choice = input("\n💾 Do you want to save the filtered results to a new table? (y/n): ").strip().lower()
+                save_results = save_choice in ['y', 'yes']
+            
+            # Save results if requested
+            if save_results:
+                # Prompt for table name if not provided
+                if result_table_name is None:
+                    default_name = f"{table_name}_filtered_{workflow_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                    user_table_name = input(f"📝 Enter table name for results (default: {default_name}): ").strip()
+                    result_table_name = user_table_name if user_table_name else default_name
+                
+                # Create filter results summary for metadata
+                filter_results = {
+                    'workflow_name': workflow_name,
+                    'initial_compounds': total_compounds,
+                    'final_compounds': len(filtered_df),
+                    'compounds_removed': compounds_removed,
+                    'retention_rate': retention_rate,
+                    'processing_method': 'parallel' if use_parallel else 'sequential'
+                }
+                
+                success = self._save_workflow_filtered_compounds(
+                    filtered_df, result_table_name, workflow_name, filter_results
+                )
+                
+                if success:
+                    print(f"   💾 Results saved to table: '{result_table_name}'")
+                else:
+                    print(f"   ❌ Failed to save results to database")
+            else:
+                print("   📄 Results not saved to database")
+            
+            return filtered_df
+            
+        except Exception as e:
+            print(f"❌ Error in filter_using_workflow: {e}")
+            return pd.DataFrame()
+
+    def _load_workflow_filters(self, workflow_name: str) -> List[Tuple[str, str]]:
+        """
+        Load workflow filters from the database and retrieve their SMARTS patterns.
+        
+        Args:
+            workflow_name (str): Name of the workflow to load
+            
+        Returns:
+            List[Tuple[str, str]]: List of (filter_name, smarts_pattern) tuples, 
+                                empty list if workflow not found or error occurs
+        """
+        try:
+            # Check if the table exists in chemspace database
+            tables = self.get_all_tables()
+            if 'filtering_workflows' not in [table.lower() for table in tables]:
+                print("❌ No filtering workflows table found in chemspace database")
+                print("   Create workflows first using create_filtering_workflow()")
+                return []
+            
+            # Connect to chemspace database to retrieve the workflow
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            
+            # Retrieve the workflow by name
+            cursor.execute(
+                "SELECT filters_dict FROM filtering_workflows WHERE workflow_name = ?", 
+                (workflow_name,)
+            )
+            workflow_result = cursor.fetchone()
+            conn.close()
+            
+            if not workflow_result:
+                print(f"❌ Workflow '{workflow_name}' not found in filtering_workflows table")
+                print("\n📋 Available workflows:")
+                self._show_available_workflows()
+                return []
+            
+            # Parse the filters dictionary from JSON string
+            try:
+                filters_dict = json.loads(workflow_result[0])
+            
+            except json.JSONDecodeError as e:
+                print(f"❌ Error parsing filters dictionary for workflow '{workflow_name}': {e}")
+                return []
+            
+            if not filters_dict:
+                print(f"⚠️  Workflow '{workflow_name}' contains no filters")
+                return []
+            
+            # Get the projects database path to retrieve SMARTS patterns
+            import site
+            projects_db = f"{site.getsitepackages()[0]}/tidyscreen/projects_db/projects_database.db"
+            
+            if not os.path.exists(projects_db):
+                print(f"❌ Projects database not found: {projects_db}")
+                return []
+            
+            # Connect to projects database and retrieve SMARTS patterns
+            projects_conn = sqlite3.connect(projects_db)
+            projects_cursor = projects_conn.cursor()
+            
+            workflow_filters = []
+            missing_filters = []
+            
+            for filter_name, required_instances in filters_dict.items():
+                # Get SMARTS pattern for this filter name
+                projects_cursor.execute(
+                    "SELECT smarts FROM chem_filters WHERE filter_name = ?", 
+                    (filter_name,)
+                )
+                smarts_result = projects_cursor.fetchone()
+                
+                if smarts_result:
+                    smarts_pattern = smarts_result[0]
+                    #workflow_filters.append((filter_name, smarts_pattern))
+                    workflow_filters.append((smarts_pattern, required_instances))
+                else:
+                    missing_filters.append(filter_name)
+            
+            projects_conn.close()
+            
+            # Report any missing filters
+            if missing_filters:
+                print(f"⚠️  Warning: {len(missing_filters)} filter(s) not found in projects database:")
+                for filter_name in missing_filters:
+                    print(f"   - '{filter_name}'")
+                print("   These filters will be skipped during workflow execution")
+            
+            if not workflow_filters:
+                print(f"❌ No valid filters found for workflow '{workflow_name}'")
+                return []
+            
+            print(f"✅ Loaded {len(workflow_filters)} valid filters for workflow '{workflow_name}'")
+            return workflow_filters, filters_dict
+            
+        except Exception as e:
+            print(f"❌ Error loading workflow filters for '{workflow_name}': {e}")
+            return []
+  
+    def _apply_filters_parallel(self, compounds_df: pd.DataFrame, 
+                           workflow_filters: List[Tuple[str, str]], 
+                           max_workers: int, chunk_size: int) -> pd.DataFrame:
+        """
+        Apply SMARTS filters using parallel processing.
+        
+        Args:
+            compounds_df (pd.DataFrame): DataFrame containing compounds
+            workflow_filters (List[Tuple]): List of (filter_name, smarts_pattern) tuples
+            max_workers (int): Number of worker processes
+            chunk_size (int): Size of chunks for processing
+            
+        Returns:
+            pd.DataFrame: Filtered DataFrame with match count columns
+        """
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        
+        try:
+            # Prepare compound data for workers
+            compound_data = []
+            for _, row in compounds_df.iterrows():
+                compound_data.append((
+                    row.get('id', 0),
+                    row['smiles'],
+                    row.get('name', 'unknown'),
+                    row.get('flag', 'nd'),
+                    row.get('inchi_key', None)
+                ))
+            
+            # Split into chunks
+            chunks = [compound_data[i:i + chunk_size] 
+                    for i in range(0, len(compound_data), chunk_size)]
+            
+            print(f"   📦 Processing {len(chunks)} chunks...")
+            
+            # Process chunks in parallel
+            all_results = []
+            
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                # Submit all chunks
+                future_to_chunk = {
+                    executor.submit(_filter_chunk_worker_by_instances, chunk, workflow_filters): i 
+                    for i, chunk in enumerate(chunks)
+                }
+                
+                # Initialize progress tracking
+                if TQDM_AVAILABLE:
+                    progress_bar = tqdm(
+                        as_completed(future_to_chunk),
+                        total=len(chunks),
+                        desc="Filtering chunks",
+                        unit="chunks"
+                    )
+                else:
+                    progress_bar = as_completed(future_to_chunk)
+                    processed_chunks = 0
+                
+                # Collect results
+                for future in progress_bar:
+                    chunk_idx = future_to_chunk[future]
+                    try:
+                        chunk_results = future.result()
+                        all_results.extend(chunk_results)
+                        
+                        if not TQDM_AVAILABLE:
+                            processed_chunks += 1
+                            if processed_chunks % max(1, len(chunks) // 10) == 0:
+                                print(f"   📊 Processed {processed_chunks}/{len(chunks)} chunks...")
+                                
+                    except Exception as e:
+                        print(f"   ❌ Error processing chunk {chunk_idx}: {e}")
+            
+            # Convert results to DataFrame
+            results_df = pd.DataFrame(all_results)
+            
+            # Filter compounds that passed all filters
+            passed_compounds = results_df[results_df['passes_filters'] == True].copy()
+            
+            # Add match count columns to the original DataFrame structure
+            for filter_name, _ in workflow_filters:
+                match_col = f"{filter_name}_matches"
+                if match_col not in passed_compounds.columns:
+                    passed_compounds[match_col] = 0
+                else:
+                    # Extract match counts from the match_counts dictionary
+                    passed_compounds[match_col] = passed_compounds['match_counts'].apply(
+                        lambda x: x.get(match_col, 0) if isinstance(x, dict) else 0
+                    )
+            
+            # Clean up the DataFrame
+            columns_to_keep = ['smiles', 'name', 'flag', 'inchi_key'] + \
+                            [f"{name}_matches" for name, _ in workflow_filters]
+            
+            final_df = passed_compounds[columns_to_keep].copy()
+            
+            print(f"   ✅ Parallel processing completed")
+            print(f"   📊 {len(final_df):,} compounds passed all filters")
+            
+            return final_df
+            
+        except Exception as e:
+            print(f"❌ Error in parallel filtering: {e}")
+            return pd.DataFrame()
+
+    def _apply_filters_sequential(self, compounds_df: pd.DataFrame, 
+                                workflow_filters: List[Tuple[str, str]]) -> pd.DataFrame:
+        """
+        Apply SMARTS filters using sequential processing.
+        
+        Args:
+            compounds_df (pd.DataFrame): DataFrame containing compounds
+            workflow_filters (List[Tuple]): List of (filter_name, smarts_pattern) tuples
+            
+        Returns:
+            pd.DataFrame: Filtered DataFrame with match count columns
+        """
+        try:
+            from rdkit import Chem
+            
+            filtered_compounds = []
+            total_compounds = len(compounds_df)
+            
+            # Initialize progress tracking
+            if TQDM_AVAILABLE:
+                progress_bar = tqdm(
+                    compounds_df.iterrows(),
+                    total=total_compounds,
+                    desc="Filtering compounds",
+                    unit="compounds"
+                )
+            else:
+                progress_bar = compounds_df.iterrows()
+                processed_count = 0
+            
+            for _, compound in progress_bar:
+                passes_all_filters = True
+                match_counts = {}
+                
+                try:
+                    mol = Chem.MolFromSmiles(compound['smiles'])
+                    if mol is None:
+                        continue
+                    
+                    # Apply each filter
+                    for filter_name, smarts_pattern in workflow_filters:
+                        try:
+                            pattern = Chem.MolFromSmarts(smarts_pattern)
+                            if pattern is None:
+                                match_counts[f"{filter_name}_matches"] = 0
+                                continue
+                            
+                            matches = mol.GetSubstructMatches(pattern)
+                            match_count = len(matches)
+                            match_counts[f"{filter_name}_matches"] = match_count
+                            
+                            # If any filter has matches, compound fails (exclusion filters)
+                            if match_count > 0:
+                                passes_all_filters = False
+                                break
+                        
+                        except Exception:
+                            match_counts[f"{filter_name}_matches"] = 0
+                    
+                    if passes_all_filters:
+                        compound_data = {
+                            'smiles': compound['smiles'],
+                            'name': compound.get('name', 'unknown'),
+                            'flag': compound.get('flag', 'nd'),
+                            'inchi_key': compound.get('inchi_key', None)
+                        }
+                        compound_data.update(match_counts)
+                        filtered_compounds.append(compound_data)
+                
+                except Exception:
+                    continue
+                
+                # Progress update for non-tqdm case
+                if not TQDM_AVAILABLE:
+                    processed_count += 1
+                    if processed_count % max(1, total_compounds // 10) == 0:
+                        print(f"   📊 Processed {processed_count:,}/{total_compounds:,} compounds...")
+            
+            print(f"   ✅ Sequential processing completed")
+            print(f"   📊 {len(filtered_compounds):,} compounds passed all filters")
+            
+            return pd.DataFrame(filtered_compounds)
+            
+        except Exception as e:
+            print(f"❌ Error in sequential filtering: {e}")
+            return pd.DataFrame()
+      
+    def list_filtering_workflows(self):
+        """
+        List all saved filtering workflows in the chemspace database.
+        
+        Returns:
+            None
+        """
+        
+        try:
+            # Connect to chemspace database
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            
+            # Check if filtering_workflows table exists
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='filtering_workflows'")
+            if not cursor.fetchone():
+                print("❌ No filtering workflows table found. Create workflows first using create_filtering_workflow()")
+                conn.close()
+                return
+            
+            # Retrieve all workflows
+            cursor.execute("SELECT workflow_name, filters_dict FROM filtering_workflows")
+            workflows = cursor.fetchall()
+            conn.close()
+            
+            if not workflows:
+                print("⚠️  No filtering workflows found in chemspace database")
+                return
+            
+            print("📋 Saved Filtering Workflows:")
+            print("=" * 50)
+            for idx, (workflow_name, filters_dict_str) in enumerate(workflows, 1):
+                try:
+                    filters_dict = json.loads(filters_dict_str)
+                    num_filters = len(filters_dict)
+                except json.JSONDecodeError:
+                    num_filters = 0
+                
+                print(f"{idx}. '{workflow_name}' - {num_filters} filters")
+            
+        except Exception as e:
+            print(f"❌ Error listing filtering workflows: {e}")
+            
+    def _save_workflow_filtered_compounds(self, compounds_df: pd.DataFrame, 
+                                    new_table_name: str, 
+                                    workflow_name: str, 
+                                    filter_results: Dict[str, Dict]) -> bool:
+        """
+        Save filtered compounds from workflow to a new table in chemspace.db with metadata.
+        
+        Args:
+            compounds_df (pd.DataFrame): DataFrame containing filtered compounds
+            new_table_name (str): Name of the new table to create
+            workflow_name (str): Name of the workflow that was applied
+            filter_results (Dict[str, Dict]): Results from each filter step
+            
+        Returns:
+            bool: True if compounds were saved successfully, False otherwise
+        """
+        try:
+            if compounds_df.empty:
+                print("⚠️  No compounds to save from the filtering workflow. Stopping")
+                sys.exit(1)
+            
+            print(f"🔍 Checking for duplicate SMILES among {len(compounds_df)} compounds...")
+        
+            # Remove duplicates based on SMILES strings
+            original_count = len(compounds_df)
+            compounds_df_unique = compounds_df.drop_duplicates(subset=['smiles'], keep='first')
+            duplicates_removed = original_count - len(compounds_df_unique)
+            
+            if duplicates_removed > 0:
+                print(f"🔄 Removed {duplicates_removed} duplicate SMILES from filtered results")
+                print(f"✨ Proceeding with {len(compounds_df_unique)} unique compounds")
+            else:
+                print(f"✅ No duplicate SMILES found in filtered results")
+            
+            # Use the deduplicated DataFrame for the rest of the process
+            compounds_df = compounds_df_unique
+            
+            if compounds_df.empty:
+                print("⚠️  No unique compounds remaining after duplicate removal")
+                return False
+            
+            # Sanitize table name
+            new_table_name = self._sanitize_table_name(new_table_name)
+            
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            
+            # Create the new table with extended schema including workflow metadata
+            cursor.execute(f'''
+                CREATE TABLE IF NOT EXISTS {new_table_name} (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    smiles TEXT NOT NULL,
+                    name TEXT,
+                    flag TEXT,
+                    inchi_key TEXT,
+                    UNIQUE(smiles)
+                )
+            ''')
+            
+            # Create indexes for better performance
+            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{new_table_name}_smiles ON {new_table_name}(smiles)")
+            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{new_table_name}_name ON {new_table_name}(name)")
+            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{new_table_name}_inchi_key ON {new_table_name}(inchi_key)")
+            
+            # Get current timestamp
+            filter_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            # Insert the filtered compounds
+            inserted_count = 0
+            database_duplicates = 0
+            errors = 0
+            
+            insert_query = f'''
+                INSERT INTO {new_table_name} 
+                (smiles, name, flag, inchi_key)
+                VALUES (?, ?, ?, ?)
+            '''
+            
+            print(f"💾 Saving {len(compounds_df)} filtered compounds to table '{new_table_name}'...")
+            
+            # Initialize progress bar if tqdm is available
+            if TQDM_AVAILABLE and len(compounds_df) > 100:
+                progress_bar = tqdm(
+                    compounds_df.iterrows(),
+                    total=len(compounds_df),
+                    desc="Saving compounds",
+                    unit="compounds"
+                )
+            else:
+                progress_bar = compounds_df.iterrows()
+            
+            for _, compound in progress_bar:
+                try:
+                    cursor.execute(insert_query, (
+                        compound.get('smiles', ''),
+                        compound.get('name', 'unknown'),
+                        compound.get('flag', 'nd'),
+                        compound.get('inchi_key', None)
+                    ))
+                    inserted_count += 1
+                except sqlite3.IntegrityError:
+                    # Handle duplicate SMILES
+                    database_duplicates += 1
+                except Exception as e:
+                    errors += 1
+                    if errors <= 5:  # Show only first few errors
+                        print(f"⚠️  Error inserting compound '{compound.get('name', 'unknown')}': {e}")
+            
+            conn.commit()
+            conn.close()
+            
+            # Print summary
+            print(f"✅ Successfully saved filtered compounds!")
+            print(f"   📋 Table name: '{new_table_name}'")
+            print(f"   📊 Compounds inserted: {inserted_count}")
+            print(f"   🔄 Duplicates skipped: {database_duplicates}")
+            print(f"   ❌ Errors: {errors}")
+            print(f"   🏷️  Workflow: '{workflow_name}'")
+            print(f"   📅 Filter date: {filter_date}")
+                       
+            return True
+            
+        except Exception as e:
+            print(f"❌ Error saving workflow filtered compounds to table '{new_table_name}': {e}")
+            return False
