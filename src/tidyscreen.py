@@ -27,6 +27,23 @@ def refresh_filters():
     
     return success
 
+def refresh_reactions():
+    """
+    Refresh chemical reactions in the projects database by reading the JSON file again.
+    This can be called independently without activating a specific project.
+    """
+    db_manager = DatabaseManager()
+    projects_db = f"{site.getsitepackages()[0]}/tidyscreen/projects_db/projects_database.db"
+    
+    if not os.path.exists(projects_db):
+        print("❌ Projects database does not exist. Create a project first.")
+        return False
+    
+    print("🔄 Refreshing chemical reactions...")
+    success = db_manager.refresh_chem_reactions(projects_db)
+    
+    return success
+
 def list_chemical_filters(pattern=None):
     """
     List all chemical filters available in the database.
@@ -70,11 +87,6 @@ def list_chemical_filters(pattern=None):
         print(f"{'ID':<4} {'Filter Name':<30} {'SMARTS Pattern':<80}")
         print("-"*80)
         
-        # for filter_id, filter_name, smarts in filters:
-        #     # Truncate SMARTS if too long for display
-        #     smarts_display = smarts[:37] + "..." if len(smarts) > 40 else smarts
-        #     print(f"{filter_id:<4} {filter_name:<30} {smarts_display:<40}")
-        
         for filter_id, filter_name, smarts in filters:
             print(f"{filter_id:<4} {filter_name:<30} {smarts:<80}")
 
@@ -86,6 +98,62 @@ def list_chemical_filters(pattern=None):
         
     except Exception as e:
         print(f"❌ Error listing chemical filters: {e}")
+
+def list_chemical_reactions(pattern=None):
+    """
+    List all chemical reactions available in the database.
+    This can be called independently without activating a specific project.
+    
+    Args:
+        pattern (str, optional): Reaction names containing this pattern
+    """
+    db_manager = DatabaseManager()
+    projects_db = f"{site.getsitepackages()[0]}/tidyscreen/projects_db/projects_database.db"
+    
+    if not os.path.exists(projects_db):
+        print("❌ Projects database does not exist. Create a project first.")
+        return
+    
+    try:
+        conn = db_manager.connect_db(projects_db)
+        cursor = conn.cursor()
+        
+        # Build query
+        if pattern:
+            query = "SELECT id, reaction_name, smarts FROM chem_reactions WHERE reaction_name LIKE ? ORDER BY reaction_name"
+            cursor.execute(query, (f"%{pattern}%",))
+        else:
+            query = "SELECT id, reaction_name, smarts FROM chem_reactions ORDER BY reaction_name"
+            cursor.execute(query)
+        
+        reactions = cursor.fetchall()
+        conn.close()
+        
+        if not reactions:
+            if pattern:
+                print(f"No chemical reactions found matching pattern: {pattern}")
+            else:
+                print("No chemical reactions found in database.")
+            return
+        
+        print("\n" + "="*80)
+        print("CHEMICAL REACTIONS")
+        print("="*80)
+        print(f"{'ID':<4} {'Reaction Name':<30} {'SMARTS Pattern':<80}")
+        print("-"*80)
+        
+        for reaction_id, reaction_name, smarts in reactions:
+            print(f"{reaction_id:<4} {reaction_name:<30} {smarts:<80}")
+
+        print("="*80)
+        print(f"Total reactions: {len(reactions)}")
+        
+        if pattern:
+            print(f"Filtered by: {pattern}")
+        
+    except Exception as e:
+        print(f"❌ Error listing chemical filters: {e}")
+
 
 def add_chemical_filter():
     """
@@ -171,6 +239,92 @@ def add_chemical_filter():
             
     except Exception as e:
         print(f"❌ Error adding chemical filter: {e}")
+        return False
+
+def add_chemical_reaction():
+    """
+    Add a new chemical reaction by prompting user for input.
+    Updates the JSON file and refreshes the filters table.
+    This can be called independently without activating a specific project.
+    """
+    print("\n" + "="*60)
+    print("ADD NEW CHEMICAL REACTION")
+    print("="*60)
+    
+    try:
+        # Get user input
+        reaction_name = input("Enter reaction name: ").strip()
+        if not reaction_name:
+            print("❌ Reaction name cannot be empty.")
+            return False
+        
+        smarts_pattern = input("Enter SMARTS pattern: ").strip()
+        if not smarts_pattern:
+            print("❌ SMARTS pattern cannot be empty.")
+            return False
+        
+        # Confirm input
+        print(f"\n📋 Reaction details:")
+        print(f"   Name: {reaction_name}")
+        print(f"   SMARTS: {smarts_pattern}")
+        
+        confirm = input("\nSave this reaction? (y/n): ").strip().lower()
+        if confirm not in ['y', 'yes']:
+            print("Reaction addition cancelled.")
+            return False
+        
+        # Get path to JSON file
+        config_path = os.path.join(os.path.dirname(__file__), 'config', 'chem_reactions.json')
+        
+        # Read existing reactions
+        if os.path.exists(config_path):
+            with open(config_path, 'r', encoding='utf-8') as f:
+                reactions_data = json.load(f)
+        else:
+            filters_data = []
+        
+        # Check if reaction name already exists
+        existing_names = [f['reaction_name'] for f in reactions_data]
+        if reaction_name in existing_names:
+            print(f"❌ Reaction '{reaction_name}' already exists in the configuration file.")
+            overwrite = input("Do you want to overwrite it? (y/n): ").strip().lower()
+            if overwrite not in ['y', 'yes']:
+                print("Reaction addition cancelled.")
+                return False
+            
+            # Remove existing reaction with same name
+            reactions_data = [f for f in reactions_data if f['reaction_name'] != reaction_name]
+        
+        # Add new reactin
+        new_reaction = {
+            "reaction_name": reaction_name,
+            "smarts": smarts_pattern
+        }
+        reactions_data.append(new_reaction)
+        
+        # Sort reactions alphabetically by name
+        reactions_data.sort(key=lambda x: x['reaction_name'])
+        
+        # Write back to JSON file
+        with open(config_path, 'w', encoding='utf-8') as f:
+            json.dump(filters_data, f, indent=2, ensure_ascii=False)
+        
+        print(f"✅ Reaction '{reaction_name}' added to configuration file.")
+        print(f"📍 Updated file: {config_path}")
+        
+        # Refresh reactions in database
+        print("\n🔄 Refreshing reactions in database...")
+        success = refresh_reactions()
+        
+        if success:
+            print("✅ Chemical reaction added and database updated successfully!")
+            return True
+        else:
+            print("❌ Reaction was added to configuration but database update failed.")
+            return False
+            
+    except Exception as e:
+        print(f"❌ Error adding chemical reaction: {e}")
         return False
 
 class ActivateProject:
