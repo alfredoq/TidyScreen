@@ -232,7 +232,6 @@ def _filter_chunk_worker_by_instances(chunk_data: List[Tuple], filters_list: Lis
     
     return results
 
-
 class ChemSpace:
     """
     ChemSpace class for managing chemical compound data within a project.
@@ -2937,3 +2936,505 @@ class ChemSpace:
         except Exception as e:
             print(f"❌ Error saving workflow filtered compounds to table '{new_table_name}': {e}")
             return False
+    
+    def depict_table(self, table_name: str, 
+                    output_dir: Optional[str] = None,
+                    image_size: Tuple[int, int] = (300, 300),
+                    molecules_per_image: int = 25,
+                    max_molecules: Optional[int] = 25,
+                    depict_random: bool = False,
+                    highlight_substructures: bool = False,
+                    smarts_pattern: Optional[str] = None) -> bool:
+        """
+        Generate chemical structure depictions from SMILES strings in a table and save as PNG images.
+        
+        Args:
+            table_name (str): Name of the table containing compounds with SMILES
+            output_dir (Optional[str]): Directory to save images. If None, creates directory named after table
+            image_size (Tuple[int, int]): Size of each molecule image (width, height)
+            molecules_per_image (int): Number of molecules per image (1 for individual, >1 for grids)
+            max_molecules (Optional[int]): Maximum number of molecules to depict. If None, depicts all
+            depict_random (bool): If True and max_molecules is set, randomly select molecules instead of taking first N
+            highlight_substructures (bool): Whether to highlight substructures matching a SMARTS pattern
+            smarts_pattern (Optional[str]): SMARTS pattern for substructure highlighting
+            
+        Returns:
+            bool: True if depiction was successful
+        """
+        try:
+            # Import RDKit for molecule depiction
+            try:
+                from rdkit import Chem
+                from rdkit.Chem import Draw
+                from rdkit.Chem.Draw import rdMolDraw2D
+                import PIL
+                from PIL import Image, ImageDraw, ImageFont
+            except ImportError:
+                print("❌ RDKit and/or PIL not installed. Please install them:")
+                print("   conda install -c conda-forge rdkit pillow")
+                print("   or")
+                print("   pip install rdkit pillow")
+                return False
+            
+            # Check if table exists
+            tables = self.get_all_tables()
+            if table_name not in tables:
+                print(f"❌ Table '{table_name}' does not exist in chemspace database")
+                return False
+            
+            # Get compounds from table
+            compounds_df = self._get_table_as_dataframe(table_name)
+            if compounds_df.empty:
+                print(f"❌ No compounds found in table '{table_name}'")
+                return False
+            
+            # Check if SMILES column exists
+            if 'smiles' not in compounds_df.columns:
+                print("❌ No 'smiles' column found in the table")
+                return False
+            
+            # Limit molecules if specified
+            if max_molecules and max_molecules > 0:
+                if depict_random:
+                    compounds_df = compounds_df.sample(n=max_molecules)
+                    print(f"🔍 Randomly selected {max_molecules} molecules for depiction")
+                else:
+                    compounds_df = compounds_df.head(max_molecules)
+                    print(f"🔍 Limited to first {max_molecules} molecules")
+            
+            total_molecules = len(compounds_df)
+            print(f"🎨 Generating depictions for {total_molecules} molecules from table '{table_name}'")
+            
+            # Set up output directory
+            if output_dir is None:
+                output_dir = os.path.join(self.path, 'chemspace', 'misc', table_name)
+            
+            os.makedirs(output_dir, exist_ok=True)
+            print(f"📁 Output directory: {output_dir}")
+            
+            # Parse SMARTS pattern for highlighting if provided
+            highlight_mol = None
+            if highlight_substructures and smarts_pattern:
+                try:
+                    highlight_mol = Chem.MolFromSmarts(smarts_pattern)
+                    if highlight_mol:
+                        print(f"🎯 Highlighting substructures matching: {smarts_pattern}")
+                    else:
+                        print(f"⚠️  Invalid SMARTS pattern: {smarts_pattern}")
+                        highlight_substructures = False
+                except:
+                    print(f"⚠️  Error parsing SMARTS pattern: {smarts_pattern}")
+                    highlight_substructures = False
+            
+            # Generate depictions
+            successful_depictions = 0
+            failed_depictions = 0
+            invalid_smiles = 0
+            
+            if molecules_per_image == 1:
+                # Individual molecule images
+                successful_depictions, failed_depictions, invalid_smiles = self._depict_individual_molecules(
+                    compounds_df, output_dir, image_size, highlight_mol, highlight_substructures
+                )
+            else:
+                # Grid images with multiple molecules
+                successful_depictions, failed_depictions, invalid_smiles = self._depict_molecule_grids(
+                    compounds_df, output_dir, image_size, molecules_per_image, highlight_mol, highlight_substructures
+                )
+            
+            # Generate summary report
+            self._generate_depiction_report(
+                table_name, output_dir, total_molecules, successful_depictions, 
+                failed_depictions, invalid_smiles, image_size, molecules_per_image
+            )
+            
+            print(f"\n✅ Depiction completed!")
+            print(f"   🎨 Successful depictions: {successful_depictions}")
+            print(f"   ❌ Failed depictions: {failed_depictions}")
+            print(f"   ⚠️  Invalid SMILES: {invalid_smiles}")
+            print(f"   📁 Images saved in: {output_dir}")
+            
+            return successful_depictions > 0
+            
+        except Exception as e:
+            print(f"❌ Error in depict_table: {e}")
+            return False
+    
+    def _depict_individual_molecules(self, compounds_df: pd.DataFrame, output_dir: str, 
+                                   image_size: Tuple[int, int], highlight_mol, 
+                                   highlight_substructures: bool) -> Tuple[int, int, int]:
+        """
+        Generate individual PNG images for each molecule.
+        
+        Args:
+            compounds_df (pd.DataFrame): DataFrame containing compounds
+            output_dir (str): Directory to save images
+            image_size (Tuple[int, int]): Size of each image
+            highlight_mol: RDKit molecule object for highlighting
+            highlight_substructures (bool): Whether to highlight substructures
+            
+        Returns:
+            Tuple[int, int, int]: (successful_depictions, failed_depictions, invalid_smiles)
+        """
+        from rdkit import Chem
+        from rdkit.Chem import Draw
+        
+        successful_depictions = 0
+        failed_depictions = 0
+        invalid_smiles = 0
+        
+        # Initialize progress tracking
+        if TQDM_AVAILABLE:
+            progress_bar = tqdm(
+                compounds_df.iterrows(),
+                total=len(compounds_df),
+                desc="Generating images",
+                unit="molecules"
+            )
+        else:
+            progress_bar = compounds_df.iterrows()
+            processed = 0
+        
+        for idx, compound in progress_bar:
+            try:
+                smiles = compound['smiles']
+                name = compound.get('name', f'compound_{idx}')
+                compound_id = compound.get('id', idx)
+                
+                # Parse SMILES
+                mol = Chem.MolFromSmiles(smiles)
+                if mol is None:
+                    invalid_smiles += 1
+                    continue
+                
+                # Prepare highlighting if requested
+                highlight_atoms = []
+                if highlight_substructures and highlight_mol:
+                    try:
+                        matches = mol.GetSubstructMatches(highlight_mol)
+                        if matches:
+                            # Flatten all match tuples to get highlighted atoms
+                            highlight_atoms = [atom for match in matches for atom in match]
+                    except:
+                        pass
+                
+                # Generate image
+                if highlight_atoms:
+                    img = Draw.MolToImage(
+                        mol, 
+                        size=image_size, 
+                        highlightAtoms=highlight_atoms,
+                        highlightColor=(1, 0.8, 0.8)  # Light red highlighting
+                    )
+                else:
+                    img = Draw.MolToImage(mol, size=image_size)
+                
+                # Create filename
+                safe_name = self._sanitize_filename(name)
+                filename = f"{compound_id:06d}_{safe_name}.png"
+                filepath = os.path.join(output_dir, filename)
+                
+                # Save image
+                img.save(filepath)
+                successful_depictions += 1
+                
+            except Exception as e:
+                failed_depictions += 1
+                if failed_depictions <= 5:  # Show first few errors
+                    print(f"⚠️  Error depicting molecule '{name}': {e}")
+            
+            # Update progress for non-tqdm case
+            if not TQDM_AVAILABLE:
+                processed += 1
+                if processed % max(1, len(compounds_df) // 10) == 0:
+                    print(f"   📊 Processed {processed}/{len(compounds_df)} molecules...")
+        
+        return successful_depictions, failed_depictions, invalid_smiles
+    
+    def _depict_molecule_grids(self, compounds_df: pd.DataFrame, output_dir: str, 
+                             image_size: Tuple[int, int], molecules_per_image: int,
+                             highlight_mol, highlight_substructures: bool) -> Tuple[int, int, int]:
+        """
+        Generate grid images with multiple molecules per image.
+        
+        Args:
+            compounds_df (pd.DataFrame): DataFrame containing compounds
+            output_dir (str): Directory to save images
+            image_size (Tuple[int, int]): Size of each molecule in the grid
+            molecules_per_image (int): Number of molecules per grid image
+            highlight_mol: RDKit molecule object for highlighting
+            highlight_substructures (bool): Whether to highlight substructures
+            
+        Returns:
+            Tuple[int, int, int]: (successful_depictions, failed_depictions, invalid_smiles)
+        """
+        from rdkit import Chem
+        from rdkit.Chem import Draw
+        
+        successful_depictions = 0
+        failed_depictions = 0
+        invalid_smiles = 0
+        
+        # Calculate grid dimensions
+        grid_cols = int(molecules_per_image ** 0.5)
+        grid_rows = (molecules_per_image + grid_cols - 1) // grid_cols
+        
+        print(f"   📐 Grid layout: {grid_rows}x{grid_cols} ({molecules_per_image} molecules per image)")
+        
+        # Process molecules in batches
+        total_molecules = len(compounds_df)
+        num_grids = (total_molecules + molecules_per_image - 1) // molecules_per_image
+        
+        if TQDM_AVAILABLE:
+            progress_bar = tqdm(range(num_grids), desc="Generating grid images", unit="grids")
+        else:
+            progress_bar = range(num_grids)
+        
+        for grid_idx in progress_bar:
+            try:
+                start_idx = grid_idx * molecules_per_image
+                end_idx = min(start_idx + molecules_per_image, total_molecules)
+                batch_df = compounds_df.iloc[start_idx:end_idx]
+                
+                mols = []
+                legends = []
+                highlight_atoms_list = []
+                
+                # Process each molecule in the batch
+                for _, compound in batch_df.iterrows():
+                    try:
+                        smiles = compound['smiles']
+                        name = compound.get('name', f'compound_{compound.get("id", "")}')
+                        
+                        mol = Chem.MolFromSmiles(smiles)
+                        if mol is None:
+                            invalid_smiles += 1
+                            continue
+                        
+                        mols.append(mol)
+                        legends.append(name[:20])  # Truncate long names
+                        
+                        # Prepare highlighting
+                        highlight_atoms = []
+                        if highlight_substructures and highlight_mol:
+                            try:
+                                matches = mol.GetSubstructMatches(highlight_mol)
+                                if matches:
+                                    highlight_atoms = [atom for match in matches for atom in match]
+                            except:
+                                pass
+                        
+                        highlight_atoms_list.append(highlight_atoms)
+                        
+                    except Exception:
+                        failed_depictions += 1
+                        continue
+                
+                if mols:
+                    # Generate grid image
+                    if highlight_substructures and any(highlight_atoms_list):
+                        img = Draw.MolsToGridImage(
+                            mols,
+                            molsPerRow=grid_cols,
+                            subImgSize=image_size,
+                            legends=legends,
+                            highlightAtomLists=highlight_atoms_list
+                        )
+                    else:
+                        img = Draw.MolsToGridImage(
+                            mols,
+                            molsPerRow=grid_cols,
+                            subImgSize=image_size,
+                            legends=legends
+                        )
+                    
+                    # Save grid image
+                    filename = f"grid_{grid_idx + 1:04d}_{len(mols)}molecules.png"
+                    filepath = os.path.join(output_dir, filename)
+                    img.save(filepath)
+                    
+                    successful_depictions += len(mols)
+                
+            except Exception as e:
+                failed_depictions += molecules_per_image
+                print(f"⚠️  Error generating grid {grid_idx + 1}: {e}")
+            
+            # Progress update for non-tqdm case
+            if not TQDM_AVAILABLE and (grid_idx + 1) % max(1, num_grids // 10) == 0:
+                print(f"   📊 Generated {grid_idx + 1}/{num_grids} grid images...")
+        
+        return successful_depictions, failed_depictions, invalid_smiles
+    
+    def _sanitize_filename(self, filename: str) -> str:
+        """
+        Sanitize a string to be safe for use as a filename.
+        
+        Args:
+            filename (str): Original filename
+            
+        Returns:
+            str: Sanitized filename
+        """
+        import re
+        
+        # Replace problematic characters with underscores
+        sanitized = re.sub(r'[<>:"/\\|?*\n\r\t]', '_', filename)
+        
+        # Remove multiple consecutive underscores
+        sanitized = re.sub(r'_+', '_', sanitized)
+        
+        # Remove leading/trailing underscores and spaces
+        sanitized = sanitized.strip('_ ')
+        
+        # Limit length
+        if len(sanitized) > 50:
+            sanitized = sanitized[:50]
+        
+        # Ensure it's not empty
+        if not sanitized:
+            sanitized = 'compound'
+        
+        return sanitized
+    
+    def _generate_depiction_report(self, table_name: str, output_dir: str, 
+                                 total_molecules: int, successful_depictions: int,
+                                 failed_depictions: int, invalid_smiles: int,
+                                 image_size: Tuple[int, int], molecules_per_image: int) -> None:
+        """
+        Generate a summary report for the depiction process.
+        
+        Args:
+            table_name (str): Name of the source table
+            output_dir (str): Directory where images were saved
+            total_molecules (int): Total number of molecules processed
+            successful_depictions (int): Number of successful depictions
+            failed_depictions (int): Number of failed depictions
+            invalid_smiles (int): Number of invalid SMILES
+            image_size (Tuple[int, int]): Size of each image
+            molecules_per_image (int): Molecules per image
+        """
+        try:
+            report_path = os.path.join(output_dir, 'depiction_report.txt')
+            
+            with open(report_path, 'w') as f:
+                f.write("CHEMICAL STRUCTURE DEPICTION REPORT\n")
+                f.write("=" * 50 + "\n\n")
+                f.write(f"Project: {self.name}\n")
+                f.write(f"Source Table: {table_name}\n")
+                f.write(f"Generation Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"Output Directory: {output_dir}\n\n")
+                
+                f.write("PROCESSING SUMMARY\n")
+                f.write("-" * 20 + "\n")
+                f.write(f"Total molecules processed: {total_molecules}\n")
+                f.write(f"Successful depictions: {successful_depictions}\n")
+                f.write(f"Failed depictions: {failed_depictions}\n")
+                f.write(f"Invalid SMILES: {invalid_smiles}\n")
+                f.write(f"Success rate: {(successful_depictions/total_molecules)*100:.1f}%\n\n")
+                
+                f.write("IMAGE SETTINGS\n")
+                f.write("-" * 15 + "\n")
+                f.write(f"Image size: {image_size[0]}x{image_size[1]} pixels\n")
+                f.write(f"Molecules per image: {molecules_per_image}\n")
+                
+                if molecules_per_image == 1:
+                    f.write("Format: Individual molecule images\n")
+                else:
+                    f.write("Format: Grid images\n")
+                
+                f.write(f"\nImage format: PNG\n")
+                
+                # List generated files
+                f.write(f"\nGENERATED FILES\n")
+                f.write("-" * 15 + "\n")
+                
+                try:
+                    files = sorted([f for f in os.listdir(output_dir) if f.endswith('.png')])
+                    f.write(f"Total PNG files: {len(files)}\n\n")
+                    
+                    if len(files) <= 20:  # List all files if not too many
+                        for file in files:
+                            f.write(f"  {file}\n")
+                    else:  # List first 10 and last 10
+                        f.write("First 10 files:\n")
+                        for file in files[:10]:
+                            f.write(f"  {file}\n")
+                        f.write(f"  ... ({len(files)-20} files omitted) ...\n")
+                        f.write("Last 10 files:\n")
+                        for file in files[-10:]:
+                            f.write(f"  {file}\n")
+                except:
+                    f.write("Could not list generated files\n")
+            
+            print(f"📋 Depiction report saved: {report_path}")
+            
+        except Exception as e:
+            print(f"⚠️  Warning: Could not generate depiction report: {e}")
+    
+    def depict_filtered_compounds(self, table_name: str, workflow_name: str,
+                                save_images: bool = True, **kwargs) -> pd.DataFrame:
+        """
+        Apply a filtering workflow and then generate depictions of the filtered compounds.
+        
+        Args:
+            table_name (str): Name of the table to filter and depict
+            workflow_name (str): Name of the filtering workflow to apply
+            save_images (bool): Whether to save structure images
+            **kwargs: Additional arguments passed to depict_table()
+            
+        Returns:
+            pd.DataFrame: Filtered compounds DataFrame
+        """
+        try:
+            print(f"🔬 Filtering and depicting compounds from table '{table_name}'")
+            
+            # Apply filtering workflow
+            filtered_df = self.filter_using_workflow(
+                table_name, workflow_name, 
+                save_results=False,  # Don't save to database, just get DataFrame
+                **{k: v for k, v in kwargs.items() if k in ['parallel_threshold', 'max_workers', 'chunk_size']}
+            )
+            
+            if filtered_df.empty:
+                print("❌ No compounds passed the filtering workflow")
+                return pd.DataFrame()
+            
+            if save_images:
+                # Create temporary table for depiction
+                temp_table_name = f"temp_filtered_{workflow_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                
+                # Save filtered compounds to temporary table
+                filter_results = {'workflow_name': workflow_name}
+                success = self._save_workflow_filtered_compounds(
+                    filtered_df, temp_table_name, workflow_name, filter_results
+                )
+                
+                if success:
+                    # Generate depictions
+                    depiction_kwargs = {k: v for k, v in kwargs.items() 
+                                      if k in ['output_dir', 'image_size', 'molecules_per_image', 
+                                             'max_molecules', 'highlight_substructures', 'smarts_pattern']}
+                    
+                    # Set default output directory if not specified
+                    if 'output_dir' not in depiction_kwargs:
+                        depiction_kwargs['output_dir'] = os.path.join(
+                            self.path, 'chemspace', 'depictions', f"{table_name}_filtered_{workflow_name}"
+                        )
+                    
+                    depiction_success = self.depict_table(temp_table_name, **depiction_kwargs)
+                    
+                    # Clean up temporary table
+                    self.drop_table(temp_table_name, confirm=False)
+                    
+                    if depiction_success:
+                        print(f"✅ Filtered compounds depicted successfully")
+                    else:
+                        print(f"❌ Failed to generate depictions for filtered compounds")
+                else:
+                    print(f"❌ Failed to save filtered compounds for depiction")
+            
+            return filtered_df
+            
+        except Exception as e:
+            print(f"❌ Error in depict_filtered_compounds: {e}")
+            return pd.DataFrame()

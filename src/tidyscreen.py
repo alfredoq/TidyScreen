@@ -67,14 +67,17 @@ def list_chemical_filters(pattern=None):
         print("\n" + "="*80)
         print("CHEMICAL FILTERS")
         print("="*80)
-        print(f"{'ID':<4} {'Filter Name':<30} {'SMARTS Pattern':<40}")
+        print(f"{'ID':<4} {'Filter Name':<30} {'SMARTS Pattern':<80}")
         print("-"*80)
         
-        for filter_id, filter_name, smarts in filters:
-            # Truncate SMARTS if too long for display
-            smarts_display = smarts[:37] + "..." if len(smarts) > 40 else smarts
-            print(f"{filter_id:<4} {filter_name:<30} {smarts_display:<40}")
+        # for filter_id, filter_name, smarts in filters:
+        #     # Truncate SMARTS if too long for display
+        #     smarts_display = smarts[:37] + "..." if len(smarts) > 40 else smarts
+        #     print(f"{filter_id:<4} {filter_name:<30} {smarts_display:<40}")
         
+        for filter_id, filter_name, smarts in filters:
+            print(f"{filter_id:<4} {filter_name:<30} {smarts:<80}")
+
         print("="*80)
         print(f"Total filters: {len(filters)}")
         
