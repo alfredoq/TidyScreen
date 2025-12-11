@@ -1674,7 +1674,6 @@ class ChemSpace:
         except Exception as e:
             print(f"❌ Error retrieving SQL registers: {e}")
             return []
-    
 
     def print_sql_registers_summary(self, limit: int = 10) -> None:
         """
@@ -2151,206 +2150,6 @@ class ChemSpace:
             chunks.append(chunk)
         
         return chunks
-
-    def create_filtering_workflow(self):
-        """
-        Create a filtering dictionary for compounds selection from a table in chemspace database. A series of id are requested to the user to build the filtering workflow, until a -1 is provided. id are used to as key to retrieve the smarts value from chem_filters table in the main projects database.
-        
-        Returns:
-            dictionary of filters to be applied in the filtering workflow
-        """
-        
-        try:
-            # Get the projects database path
-            import site
-            projects_db = f"{site.getsitepackages()[0]}/tidyscreen/projects_db/projects_database.db"
-            
-            if not os.path.exists(projects_db):
-                print(f"❌ Projects database not found: {projects_db}")
-                return {}
-            
-            print("🔧 Creating Filtering Workflow")
-            print("=" * 50)
-            print("Enter filter IDs to build your filtering workflow.")
-            print("Enter -1 when you're done adding filters.")
-            print("=" * 50)
-             
-            workflow_filters = {}
-            filter_counter = 1
-            
-            while True:
-                try:
-                    # Request filter ID from user
-                    user_input = int(input(f"\n🔍 Enter filter ID #{filter_counter} (or -1 to finish): ").strip())
-                    
-                    # Check if user wants to finish
-                    if user_input == -1:
-                        break
-                    
-                    instances = int(input(f"\n🔍 Enter the number of required instances of the filter: ").strip())
-                    
-                    # Validate input is a number
-                    try:
-                        filter_id = int(user_input)
-                    except ValueError:
-                        print("❌ Please enter a valid number or -1 to finish")
-                        continue
-                    
-                    # Skip if already added
-                    if filter_id in workflow_filters:
-                        print(f"⚠️  Filter ID {filter_id} is already in the workflow")
-                        continue
-                    
-                    # Retrieve filter from projects database
-                    filter_info = self._get_filter_by_id(projects_db, filter_id)
-                    
-                    if filter_info:
-                        filter_name, smarts_pattern = filter_info
-                        workflow_filters[filter_name] = instances
-                        
-                        print(f"✅ Added filter: '{filter_name}' (ID: {filter_id})")
-                        print(f"   🧪 SMARTS: {smarts_pattern}")
-                        filter_counter += 1
-                    else:
-                        print(f"❌ No filter found with ID {filter_id}")
-                        
-                except KeyboardInterrupt:
-                    print("\n\n⏹️  Workflow creation cancelled by user")
-                    return {}
-                except Exception as e:
-                    print(f"❌ Error processing input: {e}")
-                    continue
-            
-            # Display final workflow summary
-            if workflow_filters:
-                print(f"\n✅ Filtering Workflow Created!")
-                print("=" * 50)
-                print(f"📊 Total filters: {len(workflow_filters)}")
-                print("\n📋 Workflow Summary:")
-                
-                # # Ask if user wants to test the workflow
-                # test_workflow = input("\n🧪 Do you want to test this workflow on a table? (y/n): ").strip().lower()
-                # if test_workflow in ['y', 'yes']:
-                #     self._test_filtering_workflow(workflow_filters)
-                    
-            else:
-                print("\n⚠️  No filters were added to the workflow")
-            
-            self._save_filtering_workflow(workflow_filters)
-            
-            print("Finished creating filtering workflow.")
-
-        except Exception as e:
-            print(e)
-            print(f"❌ Error creating filtering workflow: {e}")
-            return {}
-        
-    def _get_filter_by_id(self, projects_db_path: str, filter_id: int) -> Optional[Tuple[str, str]]:
-        """
-        Retrieve a specific filter by ID from the projects database.
-        
-        Args:
-            projects_db_path (str): Path to the projects database
-            filter_id (int): ID of the filter to retrieve
-            
-        Returns:
-            Optional[Tuple[str, str]]: (filter_name, smarts_pattern) or None if not found
-        """
-        try:
-            conn = sqlite3.connect(projects_db_path)
-            cursor = conn.cursor()
-            
-            cursor.execute("SELECT filter_name, smarts FROM chem_filters WHERE id = ?", (filter_id,))
-            result = cursor.fetchone()
-            conn.close()
-            
-            return result if result else None
-            
-        except Exception as e:
-            print(f"❌ Error retrieving filter ID {filter_id}: {e}")
-            return None
-        
-    def _save_filtering_workflow(self, workflow_filters: Dict[str, int]):
-        """
-        Save the filtering workflow to a table named 'filtering_workflows' within chemspace.db.
-        
-        Args:
-            workflow_filters (Dict[str, int]): Dictionary of filters and their required instances
-            
-        Returns:
-            None
-        """
-        
-        try:
-            if not workflow_filters:
-                print("⚠️  No workflow filters to save")
-                return
-            
-            # Get workflow name from user
-            workflow_name = input("📝 Enter a name for this filtering workflow: ").strip()
-            if not workflow_name:
-                workflow_name = "Default_Workflow"
-                print(f"📋 Using default name: {workflow_name}")
-            
-            conn = sqlite3.connect(self.__chemspace_db)
-            cursor = conn.cursor()
-            
-            # Create filtering_workflows table if it doesn't exist
-            create_table_query = """
-            CREATE TABLE IF NOT EXISTS filtering_workflows (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                workflow_name TEXT NOT NULL UNIQUE,
-                filters_dict TEXT NOT NULL
-            )
-            """
-            
-            cursor.execute(create_table_query)
-                        
-            # Get optional description from user
-            description = input("📄 Enter a description for this workflow (optional): ").strip()
-            if not description:
-                description = f"Filtering workflow with {len(workflow_filters)} filters"
-            
-            # Check if workflow name already exists
-            cursor.execute("SELECT COUNT(*) FROM filtering_workflows WHERE workflow_name = ?", (workflow_name,))
-            if cursor.fetchone()[0] > 0:
-                overwrite = input(f"⚠️  Workflow '{workflow_name}' already exists. Overwrite? (y/n): ").strip().lower()
-                if overwrite in ['y', 'yes']:
-                    # Delete existing workflow entries
-                    cursor.execute("DELETE FROM filtering_workflows WHERE workflow_name = ?", (workflow_name,))
-                    print(f"🔄 Overwriting existing workflow '{workflow_name}'")
-                else:
-                    # Generate unique name
-                    counter = 1
-                    original_name = workflow_name
-                    while True:
-                        new_name = f"{original_name}_{counter}"
-                        cursor.execute("SELECT COUNT(*) FROM filtering_workflows WHERE workflow_name = ?", (new_name,))
-                        if cursor.fetchone()[0] == 0:
-                            workflow_name = new_name
-                            break
-                        counter += 1
-                    print(f"📝 Using name: {workflow_name}")
-            
-            # Insert workflow filters
-            insert_query = """
-            INSERT INTO filtering_workflows 
-            (workflow_name, filters_dict)
-            VALUES (?, ?)
-            """
-            
-            cursor.execute(insert_query, (workflow_name, json.dumps(workflow_filters)))            
-            conn.commit()
-            conn.close()
-            
-            print(f"✅ Successfully saved filtering workflow!")
-            print(f"   📋 Workflow name: '{workflow_name}'")
-            print(f"   📄 Description: {description}")
-            
-        except sqlite3.IntegrityError as e:
-            print(f"❌ Database integrity error saving workflow: {e}")
-        except Exception as e:
-            print(f"❌ Error saving filtering workflow: {e}")
 
     def filter_using_workflow(self, table_name: str, workflow_name: str, 
                      save_results: Optional[bool] = None, 
@@ -3438,3 +3237,1498 @@ class ChemSpace:
         except Exception as e:
             print(f"❌ Error in depict_filtered_compounds: {e}")
             return pd.DataFrame()
+        
+    def create_reaction_workflow(self):
+        """
+        Create a reaction workflow dictionary by selecting reactions stored in the chem_reactions table in the projects database. A series of id are requested to the user to build the reaction workflow, until a -1 is provided. id are used to as key to retrieve the smarts value from chem_reactions table in the main projects database.
+        
+        Returns:
+            dictionary of reactions to be applied in the reaction workflow
+        """
+        try:
+            # Get the projects database path
+            import site
+            projects_db = f"{site.getsitepackages()[0]}/tidyscreen/projects_db/projects_database.db"
+            
+            if not os.path.exists(projects_db):
+                print(f"❌ Projects database not found: {projects_db}")
+                return {}
+            
+            print("🧪 Creating Reaction Workflow")
+            print("=" * 80)
+            print("Enter reaction IDs to build your reaction workflow.")
+            print("Enter -1 when you're done adding reactions.")
+            print("=" * 80)
+            
+            workflow_reactions = {}
+            reaction_counter = 1
+            
+            while True:
+                try:
+                    # Request reaction ID from user
+                    user_input = input(f"\n🔬 Enter reaction ID #{reaction_counter} (or -1 to finish): ").strip()
+                    
+                    # Check if user wants to finish
+                    if user_input == "-1":
+                        break
+                    
+                    # Validate input is a number
+                    try:
+                        reaction_id = int(user_input)
+                    except ValueError:
+                        print("❌ Please enter a valid number or -1 to finish")
+                        continue
+                    
+                    # Skip if already added
+                    if reaction_id in workflow_reactions:
+                        print(f"⚠️  Reaction ID {reaction_id} is already in the workflow")
+                        continue
+                    
+                    # Retrieve reaction from projects database
+                    reaction_info = self._get_reaction_by_id(projects_db, reaction_id)
+                    
+                    if reaction_info:
+                        reaction_name, reaction_smarts = reaction_info
+                        workflow_reactions[reaction_id] = {
+                            'name': reaction_name,
+                            'smarts': reaction_smarts,
+                            'order': reaction_counter
+                        }
+                        
+                        print(f"✅ Added reaction: '{reaction_name}' (ID: {reaction_id})")
+                        print(f"   🧪 Reaction SMARTS: {reaction_smarts}")
+                        reaction_counter += 1
+                    else:
+                        print(f"❌ No reaction found with ID {reaction_id}")
+                        
+                except KeyboardInterrupt:
+                    print("\n\n⏹️  Reaction workflow creation cancelled by user")
+                    return {}
+                except Exception as e:
+                    print(f"❌ Error processing input: {e}")
+                    continue
+            
+            # Display final workflow summary
+            if workflow_reactions:
+                print(f"\n✅ Reaction Workflow Created!")
+                print("=" * 80)
+                print(f"🧪 Total reactions: {len(workflow_reactions)}")
+                print("\n📋 Workflow Summary:")
+                
+                for reaction_id, info in workflow_reactions.items():
+                    print(f"   {info['order']}. '{info['name']}' (ID: {reaction_id})")
+                    print(f"      🧪 SMARTS: {info['smarts']}")
+                
+                print("=" * 80)
+                
+                # Ask if user wants to save the workflow
+                save_workflow = input("\n💾 Do you want to save this reaction workflow? (y/n): ").strip().lower()
+                if save_workflow in ['y', 'yes']:
+                    self._save_reaction_workflow(workflow_reactions)
+                    
+            else:
+                print("\n⚠️  No reactions were added to the workflow")
+            
+            return workflow_reactions
+            
+        except Exception as e:
+            print(f"❌ Error creating reaction workflow: {e}")
+            return {}
+    
+    def _get_reaction_by_id(self, projects_db_path: str, reaction_id: int) -> Optional[Tuple[str, str]]:
+        """
+        Retrieve a specific reaction by ID from the projects database.
+        
+        Args:
+            projects_db_path (str): Path to the projects database
+            reaction_id (int): ID of the reaction to retrieve
+            
+        Returns:
+            Optional[Tuple[str, str]]: (reaction_name, reaction_smarts) or None if not found
+        """
+        try:
+            conn = sqlite3.connect(projects_db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT reaction_name, smarts FROM chem_reactions WHERE id = ?", (reaction_id,))
+            result = cursor.fetchone()
+            conn.close()
+            
+            return result if result else None
+            
+        except Exception as e:
+            print(f"❌ Error retrieving reaction ID {reaction_id}: {e}")
+            return None
+    
+    def _save_reaction_workflow(self, workflow_reactions: Dict[int, Dict[str, Any]]) -> None:
+        """
+        Save the reaction workflow to a table named 'reaction_workflows' within chemspace.db.
+        
+        Args:
+            workflow_reactions (Dict[int, Dict]): Dictionary of reaction workflow data
+        """
+        try:
+            if not workflow_reactions:
+                print("⚠️  No workflow reactions to save")
+                return
+            
+            # Get workflow name from user
+            workflow_name = input("📝 Enter a name for this reaction workflow: ").strip()
+            if not workflow_name:
+                workflow_name = f"reaction_workflow_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                print(f"📋 Using default name: {workflow_name}")
+            
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            
+            # Create reaction_workflows table if it doesn't exist
+            create_table_query = """
+            CREATE TABLE IF NOT EXISTS reaction_workflows (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workflow_name TEXT NOT NULL UNIQUE,
+                reactions_dict TEXT NOT NULL,
+                creation_date TEXT NOT NULL,
+                description TEXT
+            )
+            """
+            
+            cursor.execute(create_table_query)
+            
+            # Create index for faster searches
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_reaction_workflows_name ON reaction_workflows(workflow_name)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_reaction_workflows_date ON reaction_workflows(creation_date)")
+            
+            # Get current timestamp
+            creation_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            # Get optional description from user
+            description = input("📄 Enter a description for this reaction workflow (optional): ").strip()
+            if not description:
+                description = f"Reaction workflow with {len(workflow_reactions)} reactions"
+            
+            # Check if workflow name already exists
+            cursor.execute("SELECT COUNT(*) FROM reaction_workflows WHERE workflow_name = ?", (workflow_name,))
+            if cursor.fetchone()[0] > 0:
+                overwrite = input(f"⚠️  Reaction workflow '{workflow_name}' already exists. Overwrite? (y/n): ").strip().lower()
+                if overwrite in ['y', 'yes']:
+                    # Delete existing workflow
+                    cursor.execute("DELETE FROM reaction_workflows WHERE workflow_name = ?", (workflow_name,))
+                    print(f"🔄 Overwriting existing reaction workflow '{workflow_name}'")
+                else:
+                    # Generate unique name
+                    counter = 1
+                    original_name = workflow_name
+                    while True:
+                        new_name = f"{original_name}_{counter}"
+                        cursor.execute("SELECT COUNT(*) FROM reaction_workflows WHERE workflow_name = ?", (new_name,))
+                        if cursor.fetchone()[0] == 0:
+                            workflow_name = new_name
+                            break
+                        counter += 1
+                    print(f"📝 Using name: {workflow_name}")
+            
+            # Convert workflow to JSON string for storage
+            reactions_json = json.dumps(workflow_reactions, sort_keys=True)
+            
+            # Insert workflow
+            insert_query = """
+            INSERT INTO reaction_workflows 
+            (workflow_name, reactions_dict, creation_date, description)
+            VALUES (?, ?, ?, ?)
+            """
+            
+            cursor.execute(insert_query, (workflow_name, reactions_json, creation_date, description))
+            
+            conn.commit()
+            conn.close()
+            
+            print(f"✅ Successfully saved reaction workflow!")
+            print(f"   📋 Workflow name: '{workflow_name}'")
+            print(f"   🧪 Reactions saved: {len(workflow_reactions)}")
+            print(f"   📅 Created: {creation_date}")
+            print(f"   📄 Description: {description}")
+            
+        except sqlite3.IntegrityError as e:
+            print(f"❌ Database integrity error saving reaction workflow: {e}")
+        except Exception as e:
+            print(f"❌ Error saving reaction workflow: {e}")
+    
+    def list_reaction_workflows(self) -> None:
+        """
+        Display all saved reaction workflows in a formatted table.
+        """
+        try:
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            
+            # Check if reaction_workflows table exists
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='reaction_workflows'")
+            if not cursor.fetchone():
+                print("📝 No reaction workflows table found")
+                conn.close()
+                return
+            
+            # Get all workflows with summary information
+            cursor.execute("""
+            SELECT workflow_name, creation_date, description, reactions_dict
+            FROM reaction_workflows 
+            ORDER BY creation_date DESC
+            """)
+            
+            workflows = cursor.fetchall()
+            conn.close()
+            
+            if not workflows:
+                print("📝 No saved reaction workflows found")
+                return
+            
+            print("\n" + "="*100)
+            print(f"SAVED REACTION WORKFLOWS - Project: {self.name}")
+            print("="*100)
+            
+            for i, (name, date, desc, reactions_dict_str) in enumerate(workflows, 1):
+                try:
+                    reactions_dict = json.loads(reactions_dict_str)
+                    reaction_count = len(reactions_dict)
+                    
+                    # Get reaction names for summary
+                    reaction_names = [info['name'] for info in reactions_dict.values()]
+                    reactions_summary = ', '.join(reaction_names[:3])
+                    if len(reaction_names) > 3:
+                        reactions_summary += f" and {len(reaction_names) - 3} more..."
+                    
+                except json.JSONDecodeError:
+                    reaction_count = 0
+                    reactions_summary = "Error parsing reactions"
+                
+                print(f"\n🧪 Workflow {i}: '{name}'")
+                print(f"   📅 Created: {date}")
+                print(f"   🔬 Reactions: {reaction_count}")
+                print(f"   📄 Description: {desc}")
+                print(f"   🧪 Reactions: {reactions_summary}")
+            
+            print("="*100)
+            
+        except Exception as e:
+            print(f"❌ Error listing reaction workflows: {e}")
+
+    def apply_reaction_workflow(self, workflow_id: int):
+        """
+        Apply a saved reaction workflow to compounds to a list of user specified tables. The function retrieves the reaction workflow by its ID from the chemspace database and applies each reaction in sequence to the compounds in the specified tables. The reactions are applied using RDKit's reaction capabilities, and the resulting products are stored in new tables.
+        
+        Args:
+            workflow_id (int): ID of the reaction workflow to apply
+        """
+
+        pass
+
+    #### Constructucted using AI
+
+    def apply_reaction_workflow(self, workflow_id: int):
+        """
+        Apply a saved reaction workflow to compounds on a list of user specified tables. The function retrieves the reaction workflow by its ID from the chemspace database and applies each reaction in sequence to the compounds in the specified tables. The reactions are applied using RDKit's reaction capabilities, and the resulting products are stored in new tables.
+        
+        Args:
+            workflow_id (int): ID of the reaction workflow to apply
+        """
+        try:
+            print(f"🔬 Starting reaction workflow application...")
+            print(f"   🆔 Workflow ID: {workflow_id}")
+            
+            # Load the reaction workflow by ID
+            workflow_data = self._load_reaction_workflow_by_id(workflow_id)
+            if not workflow_data:
+                print(f"❌ No reaction workflow found with ID {workflow_id}")
+                return
+            
+            workflow_name = workflow_data['workflow_name']
+            reactions_dict = workflow_data['reactions_dict']
+            
+            print(f"   📋 Workflow: '{workflow_name}'")
+            print(f"   🧪 Reactions to apply: {len(reactions_dict)}")
+            
+            # Display workflow details
+            print("\n📋 Workflow Reactions:")
+            for reaction_id, reaction_info in reactions_dict.items():
+                print(f"   {reaction_info['order']}. '{reaction_info['name']}' (ID: {reaction_id})")
+                print(f"      🧪 SMARTS: {reaction_info['smarts']}")
+            
+            # Get available tables and let user select
+            available_tables = self.get_all_tables()
+            if not available_tables:
+                print("❌ No tables available in chemspace database")
+                return
+            
+            # Show available tables
+            print(f"\n📊 Available Tables ({len(available_tables)} total):")
+            for i, table in enumerate(available_tables, 1):
+                compound_count = self.get_compound_count(table_name=table)
+                print(f"   {i}. {table} ({compound_count} compounds)")
+            
+            # Let user select tables
+            selected_tables = self._select_tables_for_reaction(available_tables)
+            if not selected_tables:
+                print("❌ No tables selected for reaction workflow")
+                return
+            
+            print(f"✅ Selected {len(selected_tables)} tables for reaction processing")
+            
+            # # Import RDKit for reaction processing
+            # try:
+            #     from rdkit import Chem
+            #     from rdkit.Chem import AllChem
+            #     from rdkit import RDLogger
+            #     RDLogger.DisableLog('rdApp.*')  # Suppress RDKit warnings
+            # except ImportError:
+            #     print("❌ RDKit not installed. Please install RDKit to use reaction workflows:")
+            #     print("   conda install -c conda-forge rdkit")
+            #     print("   or")
+            #     print("   pip install rdkit")
+            #     return
+            
+            # # Process each selected table
+            # total_processed_compounds = 0
+            # total_products_generated = 0
+            
+            # for table_name in selected_tables:
+            #     print(f"\n🔬 Processing table: '{table_name}'")
+                
+            #     # Get compounds from table
+            #     compounds_df = self._get_table_as_dataframe(table_name)
+            #     if compounds_df.empty:
+            #         print(f"   ⚠️  No compounds found in table '{table_name}', skipping...")
+            #         continue
+                
+            #     print(f"   📊 Processing {len(compounds_df)} compounds...")
+                
+            #     # Apply reaction workflow to this table
+            #     table_results = self._apply_reactions_to_table(
+            #         compounds_df, reactions_dict, workflow_name, table_name
+            #     )
+                
+            #     total_processed_compounds += table_results['compounds_processed']
+            #     total_products_generated += table_results['products_generated']
+                
+            #     print(f"   ✅ Table '{table_name}' processed:")
+            #     print(f"      📊 Compounds processed: {table_results['compounds_processed']}")
+            #     print(f"      🧪 Products generated: {table_results['products_generated']}")
+            #     print(f"      ❌ Failed reactions: {table_results['failed_reactions']}")
+                
+            #     if table_results['products_generated'] > 0:
+            #         print(f"      💾 Products saved to: '{table_results['output_table']}'")
+            
+            # # Final summary
+            # print(f"\n" + "="*80)
+            # print(f"🏁 REACTION WORKFLOW APPLICATION COMPLETED")
+            # print("="*80)
+            # print(f"   📋 Workflow: '{workflow_name}' (ID: {workflow_id})")
+            # print(f"   📊 Tables processed: {len(selected_tables)}")
+            # print(f"   🧬 Total compounds processed: {total_processed_compounds}")
+            # print(f"   🧪 Total products generated: {total_products_generated}")
+            # print(f"   📈 Overall success rate: {(total_products_generated/total_processed_compounds*100):.1f}%" 
+            #       if total_processed_compounds > 0 else "   📈 Overall success rate: 0.0%")
+            # print("="*80)
+            
+        except Exception as e:
+            print(f"❌ Error applying reaction workflow {workflow_id}: {e}")
+    
+    def _load_reaction_workflow_by_id(self, workflow_id: int) -> Optional[Dict[str, Any]]:
+        """
+        Load a reaction workflow from the database by its ID.
+        
+        Args:
+            workflow_id (int): ID of the reaction workflow to load
+            
+        Returns:
+            Optional[Dict]: Workflow data dictionary or None if not found
+        """
+        try:
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            
+            # Check if reaction_workflows table exists
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='reaction_workflows'")
+            if not cursor.fetchone():
+                print("❌ No reaction workflows table found")
+                conn.close()
+                return None
+            
+            # Load workflow by ID
+            cursor.execute("""
+            SELECT workflow_name, reactions_dict, creation_date, description
+            FROM reaction_workflows 
+            WHERE id = ?
+            """, (workflow_id,))
+            
+            result = cursor.fetchone()
+            conn.close()
+            
+            if not result:
+                # Show available workflows if ID not found
+                print(f"❌ No workflow found with ID {workflow_id}")
+                self._show_available_reaction_workflows()
+                return None
+            
+            workflow_name, reactions_dict_str, creation_date, description = result
+            
+            # Parse reactions dictionary
+            try:
+                reactions_dict = json.loads(reactions_dict_str)
+            except json.JSONDecodeError as e:
+                print(f"❌ Error parsing workflow data: {e}")
+                return None
+            
+            return {
+                'workflow_name': workflow_name,
+                'reactions_dict': reactions_dict,
+                'creation_date': creation_date,
+                'description': description
+            }
+            
+        except Exception as e:
+            print(f"❌ Error loading reaction workflow {workflow_id}: {e}")
+            return None
+    
+    def _show_available_reaction_workflows(self) -> None:
+        """
+        Display available reaction workflows with their IDs.
+        """
+        try:
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+            SELECT id, workflow_name, creation_date, description
+            FROM reaction_workflows 
+            ORDER BY creation_date DESC
+            """)
+            
+            workflows = cursor.fetchall()
+            conn.close()
+            
+            if workflows:
+                print("\n📋 Available Reaction Workflows:")
+                print("-" * 70)
+                print(f"{'ID':<4} {'Name':<25} {'Created':<12} {'Description':<25}")
+                print("-" * 70)
+                
+                for wf_id, name, date, desc in workflows:
+                    date_short = date[:10] if date else "Unknown"
+                    desc_short = desc[:22] + "..." if len(desc) > 25 else desc
+                    print(f"{wf_id:<4} {name[:24]:<25} {date_short:<12} {desc_short:<25}")
+                
+                print("-" * 70)
+            else:
+                print("📝 No reaction workflows found.")
+                
+        except Exception as e:
+            print(f"❌ Error showing available workflows: {e}")
+    
+    def _select_tables_for_reaction(self, available_tables: List[str]) -> List[str]:
+        """
+        Let user select tables for reaction processing.
+        
+        Args:
+            available_tables (List[str]): List of available table names
+            
+        Returns:
+            List[str]: List of selected table names
+        """
+        try:
+            print(f"\n📋 Table Selection for Reaction Workflow")
+            print("-" * 50)
+            print("Enter table numbers or names (comma-separated).")
+            
+            user_input = input("Selection: ").strip()
+            
+            if not user_input:
+                print("No tables selected. Stopping.")
+                sys.exit(0)
+            
+            selected_tables = []
+            selections = [s.strip() for s in user_input.split(',')]
+            
+            for selection in selections:
+                try:
+                    # Try as table number first
+                    table_idx = int(selection) - 1
+                    if 0 <= table_idx < len(available_tables):
+                        table_name = available_tables[table_idx]
+                        if table_name not in selected_tables:
+                            selected_tables.append(table_name)
+                    else:
+                        print(f"⚠️  Invalid table number: {selection}")
+                except ValueError:
+                    # Treat as table name
+                    if selection in available_tables:
+                        if selection not in selected_tables:
+                            selected_tables.append(selection)
+                    else:
+                        print(f"⚠️  Table '{selection}' not found")
+            
+            return selected_tables
+            
+        except Exception as e:
+            print(f"❌ Error selecting tables: {e}")
+            return []
+    
+    def _apply_reactions_to_table(self, compounds_df: pd.DataFrame, 
+                                reactions_dict: Dict[int, Dict[str, Any]], 
+                                workflow_name: str, 
+                                source_table_name: str) -> Dict[str, int]:
+        """
+        Apply reaction workflow to compounds in a table.
+        
+        Args:
+            compounds_df (pd.DataFrame): DataFrame containing compounds
+            reactions_dict (Dict): Dictionary of reactions to apply
+            workflow_name (str): Name of the workflow
+            source_table_name (str): Name of the source table
+            
+        Returns:
+            Dict[str, int]: Results dictionary with counts
+        """
+        try:
+            from rdkit import Chem
+            from rdkit.Chem import AllChem
+            
+            # Sort reactions by order
+            sorted_reactions = sorted(reactions_dict.items(), 
+                                    key=lambda x: x[1]['order'])
+            
+            # Initialize tracking
+            all_products = []
+            compounds_processed = 0
+            products_generated = 0
+            failed_reactions = 0
+            
+            # Process each compound through the reaction sequence
+            if TQDM_AVAILABLE:
+                progress_bar = tqdm(
+                    compounds_df.iterrows(),
+                    total=len(compounds_df),
+                    desc=f"Processing {source_table_name}",
+                    unit="compounds"
+                )
+            else:
+                progress_bar = compounds_df.iterrows()
+                processed_count = 0
+            
+            for _, compound in progress_bar:
+                compounds_processed += 1
+                
+                try:
+                    # Start with original compound
+                    reactant_smiles = compound['smiles']
+                    compound_name = compound.get('name', f'compound_{compound.get("id", compounds_processed)}')
+                    
+                    # Parse reactant molecule
+                    reactant_mol = Chem.MolFromSmiles(reactant_smiles)
+                    if reactant_mol is None:
+                        failed_reactions += 1
+                        continue
+                    
+                    # Apply each reaction in sequence
+                    current_products = [(reactant_mol, compound_name, 0)]  # (mol, name, reaction_step)
+                    
+                    for reaction_id, reaction_info in sorted_reactions:
+                        new_products = []
+                        reaction_smarts = reaction_info['smarts']
+                        reaction_name = reaction_info['name']
+                        step = reaction_info['order']
+                        
+                        try:
+                            # Parse reaction SMARTS
+                            rxn = AllChem.ReactionFromSmarts(reaction_smarts)
+                            if rxn is None:
+                                print(f"   ⚠️  Invalid reaction SMARTS: {reaction_smarts}")
+                                continue
+                            
+                            # Apply reaction to all current products
+                            for product_mol, product_name, prev_step in current_products:
+                                try:
+                                    # Run reaction
+                                    reaction_products = rxn.RunReactants((product_mol,))
+                                    
+                                    for product_set_idx, product_set in enumerate(reaction_products):
+                                        for product_idx, product_mol_new in enumerate(product_set):
+                                            # Sanitize product
+                                            try:
+                                                Chem.SanitizeMol(product_mol_new)
+                                                
+                                                # Generate new product name
+                                                new_product_name = f"{product_name}_{reaction_name}_{step}_{product_set_idx}_{product_idx}"
+                                                new_products.append((product_mol_new, new_product_name, step))
+                                                
+                                            except:
+                                                # Skip invalid products
+                                                continue
+                                                
+                                except Exception:
+                                    # Skip failed reactions
+                                    continue
+                        
+                        except Exception:
+                            print(f"   ⚠️  Error with reaction '{reaction_name}': skipping")
+                            continue
+                        
+                        # Update current products for next reaction
+                        if new_products:
+                            current_products = new_products
+                        # If no new products, keep current products for next reaction
+                    
+                    # Add final products to results
+                    for product_mol, product_name, step in current_products:
+                        if step > 0:  # Only count products from actual reactions
+                            try:
+                                product_smiles = Chem.MolToSmiles(product_mol)
+                                all_products.append({
+                                    'smiles': product_smiles,
+                                    'name': product_name,
+                                    'flag': 'reaction_product',
+                                    'source_compound': compound_name,
+                                    'source_table': source_table_name,
+                                    'workflow': workflow_name,
+                                    'final_step': step
+                                })
+                                products_generated += 1
+                            except:
+                                failed_reactions += 1
+                    
+                except Exception:
+                    failed_reactions += 1
+                
+                # Progress update for non-tqdm case
+                if not TQDM_AVAILABLE:
+                    processed_count += 1
+                    if processed_count % max(1, len(compounds_df) // 10) == 0:
+                        print(f"      📊 Processed {processed_count}/{len(compounds_df)} compounds...")
+            
+            # Save products to new table
+            output_table_name = None
+            if all_products:
+                output_table_name = self._save_reaction_products(
+                    all_products, workflow_name, source_table_name
+                )
+            
+            return {
+                'compounds_processed': compounds_processed,
+                'products_generated': products_generated,
+                'failed_reactions': failed_reactions,
+                'output_table': output_table_name
+            }
+            
+        except Exception as e:
+            print(f"   ❌ Error processing table reactions: {e}")
+            return {
+                'compounds_processed': 0,
+                'products_generated': 0,
+                'failed_reactions': len(compounds_df),
+                'output_table': None
+            }
+    
+    def _save_reaction_products(self, products: List[Dict[str, Any]], 
+                              workflow_name: str, 
+                              source_table_name: str) -> Optional[str]:
+        """
+        Save reaction products to a new table.
+        
+        Args:
+            products (List[Dict]): List of product dictionaries
+            workflow_name (str): Name of the workflow
+            source_table_name (str): Name of the source table
+            
+        Returns:
+            Optional[str]: Name of the created table or None if failed
+        """
+        try:
+            if not products:
+                return None
+            
+            # Generate output table name
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            output_table_name = f"{source_table_name}_products_{workflow_name}_{timestamp}"
+            output_table_name = self._sanitize_table_name(output_table_name)
+            
+            # Create table
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            
+            # Create products table with extended schema
+            cursor.execute(f'''
+                CREATE TABLE IF NOT EXISTS {output_table_name} (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    smiles TEXT NOT NULL,
+                    name TEXT,
+                    flag TEXT,
+                    source_compound TEXT,
+                    source_table TEXT,
+                    workflow TEXT,
+                    final_step INTEGER,
+                    creation_date TEXT,
+                    UNIQUE(smiles, name)
+                )
+            ''')
+            
+            # Create indexes
+            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{output_table_name}_smiles ON {output_table_name}(smiles)")
+            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{output_table_name}_source ON {output_table_name}(source_compound)")
+            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{output_table_name}_workflow ON {output_table_name}(workflow)")
+            
+            # Insert products
+            insert_query = f'''
+                INSERT OR IGNORE INTO {output_table_name} 
+                (smiles, name, flag, source_compound, source_table, workflow, final_step, creation_date)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            '''
+            
+            creation_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            inserted_count = 0
+            
+            for product in products:
+                try:
+                    cursor.execute(insert_query, (
+                        product['smiles'],
+                        product['name'],
+                        product.get('flag', 'reaction_product'),
+                        product.get('source_compound', 'unknown'),
+                        product.get('source_table', source_table_name),
+                        product.get('workflow', workflow_name),
+                        product.get('final_step', 1),
+                        creation_date
+                    ))
+                    inserted_count += 1
+                except sqlite3.IntegrityError:
+                    # Skip duplicates
+                    continue
+            
+            conn.commit()
+            conn.close()
+            
+            print(f"      💾 Created table '{output_table_name}' with {inserted_count} products")
+            return output_table_name
+            
+        except Exception as e:
+            print(f"      ❌ Error saving reaction products: {e}")
+            return None
+    
+    def list_reaction_products_tables(self) -> None:
+        """
+        List all tables containing reaction products.
+        """
+        try:
+            all_tables = self.get_all_tables()
+            product_tables = [table for table in all_tables if '_products_' in table]
+            
+            if not product_tables:
+                print("📝 No reaction product tables found")
+                return
+            
+            print(f"\n📋 Reaction Product Tables ({len(product_tables)} found):")
+            print("=" * 80)
+            
+            for i, table_name in enumerate(product_tables, 1):
+                compound_count = self.get_compound_count(table_name=table_name)
+                
+                # Try to extract workflow info from table name
+                parts = table_name.split('_products_')
+                source_table = parts[0] if len(parts) > 1 else "unknown"
+                workflow_info = parts[1] if len(parts) > 1 else "unknown"
+                
+                print(f"{i:2d}. {table_name}")
+                print(f"     📊 Products: {compound_count}")
+                print(f"     📋 Source: {source_table}")
+                print(f"     🧪 Workflow: {workflow_info}")
+                print()
+            
+        except Exception as e:
+            print(f"❌ Error listing product tables: {e}")    
+
+    def create_filtering_workflow(self):
+        """
+        Create a filtering workflow dictionary by selecting filters stored in the chem_filters table in the projects database. A series of id are requested to the user to build the filtering workflow, until a -1 is provided. id are used to as key to retrieve the smarts value from chem_filters table in the main projects database.
+        
+        Returns:
+            dict: Dictionary of filters to be applied in the filtering workflow
+        """
+        try:
+            # Get the projects database path
+            import site
+            projects_db = f"{site.getsitepackages()[0]}/tidyscreen/projects_db/projects_database.db"
+            
+            if not os.path.exists(projects_db):
+                print(f"❌ Projects database not found: {projects_db}")
+                return {}
+            
+            # Show available filters with enhanced display
+            self._display_available_filters_enhanced(projects_db)
+            
+            workflow_filters = {}
+            filter_counter = 1
+            
+            print(f"\n📋 Building Filtering Workflow")
+            print("=" * 80)
+            print("Commands:")
+            print("   • Enter filter ID to add a filter")
+            print("   • Type 'list' to show available filters again")
+            print("   • Type 'search <term>' to search filters by name")
+            print("   • Type 'preview <id>' to preview a filter")
+            print("   • Type 'batch <id1,id2,id3>' to add multiple filters")
+            print("   • Type 'remove <filter_name>' to remove a filter")
+            print("   • Type 'show' to display current workflow")
+            print("   • Type '-1' or 'done' to finish")
+            print("=" * 80)
+            
+            while True:
+                try:
+                    # Enhanced command input
+                    user_input = input(f"\n🔍 Command or Filter ID #{filter_counter}: ").strip().lower()
+                    
+                    # Handle different commands
+                    if user_input in ['-1', 'done', 'finish', 'exit']:
+                        break
+                    elif user_input == 'list':
+                        self._display_available_filters_enhanced(projects_db)
+                        continue
+                    elif user_input.startswith('search '):
+                        search_term = user_input[7:].strip()
+                        self._search_filters(projects_db, search_term)
+                        continue
+                    elif user_input.startswith('preview '):
+                        try:
+                            preview_id = int(user_input[8:].strip())
+                            self._preview_filter(projects_db, preview_id)
+                        except ValueError:
+                            print("❌ Invalid filter ID for preview")
+                        continue
+                    elif user_input.startswith('batch '):
+                        batch_ids = user_input[6:].strip()
+                        self._add_batch_filters(projects_db, batch_ids, workflow_filters)
+                        filter_counter += len([id for id in batch_ids.split(',') if id.strip().isdigit()])
+                        continue
+                    elif user_input.startswith('remove '):
+                        filter_name = user_input[7:].strip()
+                        if filter_name in workflow_filters:
+                            del workflow_filters[filter_name]
+                            print(f"✅ Removed filter: '{filter_name}'")
+                        else:
+                            print(f"❌ Filter '{filter_name}' not found in workflow")
+                        continue
+                    elif user_input == 'show':
+                        self._show_current_workflow(workflow_filters)
+                        continue
+                    elif user_input == 'help':
+                        self._show_workflow_help()
+                        continue
+                    
+                    # Handle numeric filter ID input
+                    try:
+                        filter_id = int(user_input)
+                    except ValueError:
+                        print("❌ Invalid command. Type 'help' for available commands or enter a filter ID")
+                        continue
+                    
+                    # Skip if already added
+                    filter_exists = any(fid == filter_id for fid in [self._get_filter_id_by_name(projects_db, name) 
+                                        for name in workflow_filters.keys()])
+                    
+                    if filter_exists:
+                        print(f"⚠️  Filter ID {filter_id} is already in the workflow")
+                        continue
+                    
+                    # Get required instances with validation
+                    instances = self._get_required_instances()
+                    if instances is None:
+                        continue
+                    
+                    # Retrieve and validate filter from projects database
+                    filter_info = self._get_filter_by_id_enhanced(projects_db, filter_id)
+                    
+                    if filter_info:
+                        filter_name, smarts_pattern = filter_info
+                        
+                        # Validate SMARTS pattern
+                        if self._validate_smarts_pattern(smarts_pattern):
+                            workflow_filters[filter_name] = {
+                                'instances': instances,
+                                'smarts': smarts_pattern,
+                                'filter_id': filter_id
+                            }
+                            
+                            print(f"✅ Added filter #{filter_counter}: '{filter_name}' (ID: {filter_id})")
+                            print(f"   🧪 SMARTS: {smarts_pattern}")
+                            print(f"   🔢 Required instances: {instances}")
+                            filter_counter += 1
+                        else:
+                            print(f"❌ Invalid SMARTS pattern for filter ID {filter_id}")
+                    else:
+                        print(f"❌ No filter found with ID {filter_id}")
+                        
+                except KeyboardInterrupt:
+                    print("\n\n⏹️  Workflow creation cancelled by user")
+                    return {}
+                except Exception as e:
+                    print(f"❌ Error processing input: {e}")
+                    continue
+            
+            # Display final workflow summary
+            if workflow_filters:
+                print(f"\n✅ Enhanced Filtering Workflow Created!")
+                print("=" * 70)
+                print(f"📊 Total filters: {len(workflow_filters)}")
+                print(f"🧪 Total required instances: {sum(f['instances'] for f in workflow_filters.values())}")
+                
+                self._display_workflow_summary(workflow_filters)
+                
+                # Enhanced workflow options
+                print("\n📋 Workflow Options:")
+                print("=" * 30)
+                
+                # Option to save workflow
+                save_workflow = input("💾 Save this workflow? (y/n): ").strip().lower()
+                if save_workflow in ['y', 'yes']:
+                    # Convert to simple format for compatibility
+                    simple_workflow = {name: info['instances'] for name, info in workflow_filters.items()}
+                    self._save_filtering_workflow(simple_workflow)
+                    
+            else:
+                print("\n⚠️  No filters were added to the workflow")
+            
+            print("\n🏁 Filtering workflow creation completed.")
+            
+            # Return simple format for compatibility with existing methods
+            return {name: info['instances'] for name, info in workflow_filters.items()}
+
+        except Exception as e:
+            print(f"❌ Error creating filtering workflow: {e}")
+            return {}
+    
+    def _display_available_filters_enhanced(self, projects_db_path: str) -> None:
+        """
+        Display available filters with enhanced formatting and pagination.
+        
+        Args:
+            projects_db_path (str): Path to the projects database
+        """
+        try:
+            conn = sqlite3.connect(projects_db_path)
+            cursor = conn.cursor()
+            
+            # Get all available filters with additional info
+            cursor.execute("""
+                SELECT id, filter_name, smarts 
+                FROM chem_filters 
+                ORDER BY id
+            """)
+            filters = cursor.fetchall()
+            conn.close()
+            
+            if not filters:
+                print("⚠️  No chemical filters found in projects database")
+                return
+            
+            print(f"\n📋 Available Chemical Filters ({len(filters)} total)")
+            print("=" * 90)
+            print(f"{'ID':<4} {'Filter Name':<25} {'SMARTS Preview':<30}")
+            print("=" * 90)
+            
+            # Display filters with pagination
+            page_size = 15
+            total_pages = (len(filters) + page_size - 1) // page_size
+            
+            for page in range(total_pages):
+                start_idx = page * page_size
+                end_idx = min(start_idx + page_size, len(filters))
+                
+                for filter_id, filter_name, smarts in filters[start_idx:end_idx]:
+                    # Truncate long strings for display
+                    name_display = filter_name[:24] if len(filter_name) > 24 else filter_name
+                    smarts_display = smarts[:29] + "..." if len(smarts) > 30 else smarts
+                    
+                    
+                    print(f"{filter_id:<4} {name_display:<25} {smarts_display:<30}")
+                
+                # Show pagination info
+                if total_pages > 1:
+                    print(f"\n📄 Page {page + 1}/{total_pages} - Showing filters {start_idx + 1}-{end_idx}")
+                    if page < total_pages - 1:
+                        continue_display = input("Press Enter to see more filters, or 'q' to stop: ").strip().lower()
+                        if continue_display == 'q':
+                            break
+            
+            print("=" * 90)
+            
+        except Exception as e:
+            print(f"❌ Error displaying available filters: {e}")
+    
+    def _search_filters(self, projects_db_path: str, search_term: str) -> None:
+        """
+        Search filters by name or description.
+        
+        Args:
+            projects_db_path (str): Path to the projects database
+            search_term (str): Term to search for
+        """
+        try:
+            conn = sqlite3.connect(projects_db_path)
+            cursor = conn.cursor()
+            
+            # Search in filter name and description
+            cursor.execute("""
+                SELECT id, filter_name, smarts, description 
+                FROM chem_filters 
+                WHERE filter_name LIKE ? OR description LIKE ?
+                ORDER BY filter_name
+            """, (f"%{search_term}%", f"%{search_term}%"))
+            
+            results = cursor.fetchall()
+            conn.close()
+            
+            if results:
+                print(f"\n🔍 Search Results for '{search_term}' ({len(results)} found):")
+                print("-" * 80)
+                print(f"{'ID':<4} {'Filter Name':<25} {'SMARTS Preview':<30} {'Description':<25}")
+                print("-" * 80)
+                
+                for filter_id, filter_name, smarts, description in results:
+                    name_display = filter_name[:24] if len(filter_name) > 24 else filter_name
+                    smarts_display = smarts[:29] + "..." if len(smarts) > 30 else smarts
+                    desc_display = (description or "No description")[:24]
+                    if len(desc_display) > 24:
+                        desc_display = desc_display[:21] + "..."
+                    
+                    print(f"{filter_id:<4} {name_display:<25} {smarts_display:<30} {desc_display:<25}")
+                print("-" * 80)
+            else:
+                print(f"🔍 No filters found matching '{search_term}'")
+                
+        except Exception as e:
+            print(f"❌ Error searching filters: {e}")
+    
+    def _preview_filter(self, projects_db_path: str, filter_id: int) -> None:
+        """
+        Display detailed preview of a specific filter.
+        
+        Args:
+            projects_db_path (str): Path to the projects database
+            filter_id (int): ID of the filter to preview
+        """
+        try:
+            filter_info = self._get_filter_by_id_enhanced(projects_db_path, filter_id)
+            
+            if filter_info:
+                filter_name, smarts_pattern, description = filter_info
+                
+                print(f"\n🔍 Filter Preview - ID: {filter_id}")
+                print("=" * 50)
+                print(f"📋 Name: {filter_name}")
+                print(f"🧪 SMARTS: {smarts_pattern}")
+                print(f"📝 Description: {description or 'No description available'}")
+                
+                # Validate SMARTS pattern
+                is_valid = self._validate_smarts_pattern(smarts_pattern)
+                validity_icon = "✅" if is_valid else "❌"
+                print(f"{validity_icon} SMARTS Validity: {'Valid' if is_valid else 'Invalid'}")
+                
+                # Show pattern complexity
+                complexity = len(smarts_pattern)
+                if complexity < 20:
+                    complexity_level = "Simple"
+                elif complexity < 50:
+                    complexity_level = "Moderate"
+                else:
+                    complexity_level = "Complex"
+                
+                print(f"📏 Pattern Complexity: {complexity_level} ({complexity} characters)")
+                print("=" * 50)
+            else:
+                print(f"❌ No filter found with ID {filter_id}")
+                
+        except Exception as e:
+            print(f"❌ Error previewing filter: {e}")
+    
+    def _add_batch_filters(self, projects_db_path: str, batch_ids: str, workflow_filters: Dict) -> None:
+        """
+        Add multiple filters at once using batch input.
+        
+        Args:
+            projects_db_path (str): Path to the projects database
+            batch_ids (str): Comma-separated filter IDs
+            workflow_filters (Dict): Current workflow filters dictionary
+        """
+        try:
+            ids = [id_str.strip() for id_str in batch_ids.split(',') if id_str.strip()]
+            valid_ids = []
+            
+            # Validate all IDs first
+            for id_str in ids:
+                try:
+                    filter_id = int(id_str)
+                    if self._get_filter_by_id_enhanced(projects_db_path, filter_id):
+                        valid_ids.append(filter_id)
+                    else:
+                        print(f"⚠️  Invalid filter ID: {filter_id}")
+                except ValueError:
+                    print(f"⚠️  Invalid ID format: {id_str}")
+            
+            if not valid_ids:
+                print("❌ No valid filter IDs provided")
+                return
+            
+            # Get default instances for batch
+            print(f"\n📦 Adding {len(valid_ids)} filters in batch mode")
+            default_instances = self._get_required_instances("Enter default instances for all filters")
+            if default_instances is None:
+                return
+            
+            added_count = 0
+            for filter_id in valid_ids:
+                filter_info = self._get_filter_by_id_enhanced(projects_db_path, filter_id)
+                if filter_info:
+                    filter_name, smarts_pattern, description = filter_info
+                    
+                    # Skip if already exists
+                    if filter_name in workflow_filters:
+                        print(f"⚠️  Filter '{filter_name}' already in workflow, skipping")
+                        continue
+                    
+                    # Validate SMARTS
+                    if self._validate_smarts_pattern(smarts_pattern):
+                        workflow_filters[filter_name] = {
+                            'instances': default_instances,
+                            'smarts': smarts_pattern,
+                            'description': description or 'No description available',
+                            'filter_id': filter_id
+                        }
+                        added_count += 1
+                        print(f"✅ Added: '{filter_name}' (ID: {filter_id})")
+                    else:
+                        print(f"❌ Invalid SMARTS for filter ID {filter_id}, skipped")
+            
+            print(f"📦 Batch operation completed: {added_count} filters added")
+            
+        except Exception as e:
+            print(f"❌ Error in batch filter addition: {e}")
+    
+    def _get_required_instances(self, prompt: str = "🔢 Enter required instances") -> Optional[int]:
+        """
+        Get required instances with validation.
+        
+        Args:
+            prompt (str): Custom prompt text
+            
+        Returns:
+            Optional[int]: Number of required instances or None if invalid
+        """
+        try:
+            while True:
+                user_input = input(f"{prompt}: ").strip()
+                
+                if user_input.lower() in ['cancel', 'skip', 'back']:
+                    return None
+                
+                try:
+                    instances = int(user_input)
+                    if instances < 0:
+                        print("❌ Instances must be non-negative")
+                        continue
+                    return instances
+                except ValueError:
+                    print("❌ Please enter a valid number")
+                    continue
+        except KeyboardInterrupt:
+            return None
+    
+    def _get_filter_by_id_enhanced(self, projects_db_path: str, filter_id: int) -> Optional[Tuple[str, str, str]]:
+        """
+        Enhanced version of filter retrieval with description.
+        
+        Args:
+            projects_db_path (str): Path to the projects database
+            filter_id (int): ID of the filter to retrieve
+            
+        Returns:
+            Optional[Tuple[str, str, str]]: (filter_name, smarts_pattern, description) or None if not found
+        """
+        try:
+            conn = sqlite3.connect(projects_db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                SELECT filter_name, smarts 
+                FROM chem_filters 
+                WHERE id = ?
+            """, (filter_id,))
+            result = cursor.fetchone()
+            conn.close()
+            
+            return result if result else None
+            
+        except Exception as e:
+            print(f"❌ Error retrieving filter ID {filter_id}: {e}")
+            return None
+    
+    def _validate_smarts_pattern(self, smarts_pattern: str) -> bool:
+        """
+        Validate a SMARTS pattern using RDKit.
+        
+        Args:
+            smarts_pattern (str): SMARTS pattern to validate
+            
+        Returns:
+            bool: True if valid, False otherwise
+        """
+        try:
+            from rdkit import Chem
+            mol = Chem.MolFromSmarts(smarts_pattern)
+            return mol is not None
+        except:
+            return False
+    
+    def _show_current_workflow(self, workflow_filters: Dict) -> None:
+        """
+        Display the current workflow being built.
+        
+        Args:
+            workflow_filters (Dict): Current workflow filters
+        """
+        if not workflow_filters:
+            print("📋 Current workflow is empty")
+            return
+        
+        print(f"\n📋 Current Filtering Workflow ({len(workflow_filters)} filters)")
+        print("=" * 80)
+        print(f"{'#':<3} {'Filter Name':<25} {'Instances':<10} {'SMARTS Preview':<35}")
+        print("=" * 80)
+        
+        for i, (name, info) in enumerate(workflow_filters.items(), 1):
+            smarts_preview = info['smarts'][:34] + "..." if len(info['smarts']) > 35 else info['smarts']
+            print(f"{i:<3} {name[:24]:<25} {info['instances']:<10} {smarts_preview:<35}")
+        
+        print("=" * 80)
+        total_instances = sum(info['instances'] for info in workflow_filters.values())
+        print(f"📊 Total filters: {len(workflow_filters)} | Total instances: {total_instances}")
+    
+    def _show_workflow_help(self) -> None:
+        """
+        Display help information for workflow creation commands.
+        """
+        print("\n📖 Enhanced Filtering Workflow Help")
+        print("=" * 50)
+        print("Available Commands:")
+        print("   list                    - Show all available filters")
+        print("   search <term>          - Search filters by name/description")
+        print("   preview <id>           - Preview detailed filter information")
+        print("   batch <id1,id2,id3>    - Add multiple filters at once")
+        print("   remove <filter_name>   - Remove a filter from workflow")
+        print("   show                   - Display current workflow")
+        print("   help                   - Show this help message")
+        print("   done / -1              - Finish workflow creation")
+        print("\nFilter Management:")
+        print("   • Enter a number to add a filter by ID")
+        print("   • Each filter requires a number of instances")
+        print("   • SMARTS patterns are validated automatically")
+        print("   • Duplicate filters are automatically detected")
+        print("=" * 50)
+    
+    def _display_workflow_summary(self, workflow_filters: Dict) -> None:
+        """
+        Display a comprehensive summary of the created workflow.
+        
+        Args:
+            workflow_filters (Dict): Complete workflow filters with metadata
+        """
+        print("\n📋 Workflow Summary:")
+        print("-" * 60)
+        
+        for i, (name, info) in enumerate(workflow_filters.items(), 1):
+            print(f"\n{i}. {name} (ID: {info['filter_id']})")
+            print(f"   🔢 Required instances: {info['instances']}")
+            print(f"   🧪 SMARTS: {info['smarts']}")
+        
+        print("-" * 60)
+        
+        # Calculate workflow statistics
+        total_instances = sum(info['instances'] for info in workflow_filters.values())
+        avg_instances = total_instances / len(workflow_filters) if workflow_filters else 0
+        
+        print(f"\n📊 Workflow Statistics:")
+        print(f"   • Total filters: {len(workflow_filters)}")
+        print(f"   • Total instances: {total_instances}")
+        print(f"   • Average instances per filter: {avg_instances:.1f}")
+        
+        # Pattern complexity analysis
+        simple_patterns = sum(1 for info in workflow_filters.values() if len(info['smarts']) < 20)
+        moderate_patterns = sum(1 for info in workflow_filters.values() if 20 <= len(info['smarts']) < 50)
+        complex_patterns = sum(1 for info in workflow_filters.values() if len(info['smarts']) >= 50)
+        
+        print(f"   • Simple patterns: {simple_patterns}")
+        print(f"   • Moderate patterns: {moderate_patterns}")
+        print(f"   • Complex patterns: {complex_patterns}")
+    
+    def _save_filtering_workflow(self, workflow_filters: Dict[str, int]) -> None:
+        """
+        Save a filtering workflow to the chemspace database.
+        
+        Args:
+            workflow_filters (Dict[str, int]): Dictionary mapping filter names to required instances
+        """
+        try:
+            if not workflow_filters:
+                print("⚠️  No workflow filters to save")
+                return
+            
+            # Get workflow name from user
+            workflow_name = input("📝 Enter a name for this filtering workflow: ").strip()
+            if not workflow_name:
+                workflow_name = f"filtering_workflow_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                print(f"📋 Using default name: {workflow_name}")
+            
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            
+            # Create filtering_workflows table if it doesn't exist
+            create_table_query = """
+            CREATE TABLE IF NOT EXISTS filtering_workflows (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workflow_name TEXT NOT NULL UNIQUE,
+                filters_dict TEXT NOT NULL,
+                creation_date TEXT NOT NULL,
+                description TEXT,
+                filter_count INTEGER DEFAULT 0,
+                total_instances INTEGER DEFAULT 0
+            )
+            """
+            
+            cursor.execute(create_table_query)
+            
+            # Create indexes for faster searches
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_filtering_workflows_name ON filtering_workflows(workflow_name)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_filtering_workflows_date ON filtering_workflows(creation_date)")
+            
+            # Get current timestamp
+            creation_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            # Get optional description from user
+            description = input("📄 Enter a description for this filtering workflow (optional): ").strip()
+            if not description:
+                filter_count = len(workflow_filters)
+                total_instances = sum(workflow_filters.values())
+                description = f"Filtering workflow with {filter_count} filters and {total_instances} total instances"
+            
+            # Check if workflow name already exists
+            cursor.execute("SELECT COUNT(*) FROM filtering_workflows WHERE workflow_name = ?", (workflow_name,))
+            if cursor.fetchone()[0] > 0:
+                overwrite = input(f"⚠️  Filtering workflow '{workflow_name}' already exists. Overwrite? (y/n): ").strip().lower()
+                if overwrite in ['y', 'yes']:
+                    # Delete existing workflow
+                    cursor.execute("DELETE FROM filtering_workflows WHERE workflow_name = ?", (workflow_name,))
+                    print(f"🔄 Overwriting existing filtering workflow '{workflow_name}'")
+                else:
+                    # Generate unique name
+                    counter = 1
+                    original_name = workflow_name
+                    while True:
+                        new_name = f"{original_name}_{counter}"
+                        cursor.execute("SELECT COUNT(*) FROM filtering_workflows WHERE workflow_name = ?", (new_name,))
+                        if cursor.fetchone()[0] == 0:
+                            workflow_name = new_name
+                            break
+                        counter += 1
+                    print(f"📝 Using name: {workflow_name}")
+            
+            # Calculate statistics
+            filter_count = len(workflow_filters)
+            total_instances = sum(workflow_filters.values())
+            
+            # Convert workflow to JSON string for storage
+            filters_json = json.dumps(workflow_filters, sort_keys=True)
+            
+            # Insert workflow
+            insert_query = """
+            INSERT INTO filtering_workflows 
+            (workflow_name, filters_dict, creation_date, description, filter_count, total_instances)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """
+            
+            cursor.execute(insert_query, (
+                workflow_name, 
+                filters_json, 
+                creation_date, 
+                description,
+                filter_count,
+                total_instances
+            ))
+            
+            conn.commit()
+            conn.close()
+            
+            print(f"✅ Successfully saved filtering workflow!")
+            print(f"   📋 Workflow name: '{workflow_name}'")
+            print(f"   🔍 Filters saved: {filter_count}")
+            print(f"   🔢 Total instances: {total_instances}")
+            print(f"   📅 Created: {creation_date}")
+            print(f"   📄 Description: {description}")
+            
+        except sqlite3.IntegrityError as e:
+            print(f"❌ Database integrity error saving filtering workflow: {e}")
+        except Exception as e:
+            print(f"❌ Error saving filtering workflow: {e}")
+    
+    def _save_workflow_metadata(self, workflow_filters: Dict) -> None:
+        """
+        Save additional workflow metadata.
+        
+        Args:
+            workflow_filters (Dict): Full workflow with metadata
+        """
+        try:
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            
+            # Create enhanced metadata table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS workflow_metadata (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    workflow_name TEXT,
+                    filter_name TEXT,
+                    filter_id INTEGER,
+                    smarts_pattern TEXT,
+                    description TEXT,
+                    instances INTEGER,
+                    creation_date TEXT
+                )
+            """)
+            
+            # This would store detailed metadata for each filter
+            # Implementation details would depend on specific requirements
+            
+            conn.commit()
+            conn.close()
+            
+        except Exception as e:
+            print(f"⚠️  Warning: Could not save enhanced metadata: {e}")
+    
+    def _get_filter_id_by_name(self, projects_db_path: str, filter_name: str) -> Optional[int]:
+        """
+        Helper method to get filter ID by name.
+        
+        Args:
+            projects_db_path (str): Path to projects database
+            filter_name (str): Name of the filter
+            
+        Returns:
+            Optional[int]: Filter ID or None if not found
+        """
+        try:
+            conn = sqlite3.connect(projects_db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT id FROM chem_filters WHERE filter_name = ?", (filter_name,))
+            result = cursor.fetchone()
+            conn.close()
+            
+            return result[0] if result else None
+            
+        except Exception:
+            return None

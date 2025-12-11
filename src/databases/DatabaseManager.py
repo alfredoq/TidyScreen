@@ -260,7 +260,6 @@ class DatabaseManager:
         except sqlite3.Error as e:
             print(f"An error occurred while executing the query: {e}")
             sys.exit(1)
-            
 
 def connect_db(db):
     try:
