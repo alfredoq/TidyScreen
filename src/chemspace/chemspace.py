@@ -2567,48 +2567,48 @@ class ChemSpace:
             print(f"❌ Error in sequential filtering: {e}")
             return pd.DataFrame()
       
-    def list_filtering_workflows(self):
-        """
-        List all saved filtering workflows in the chemspace database.
+    # def list_filtering_workflows(self):
+    #     """
+    #     List all saved filtering workflows in the chemspace database.
         
-        Returns:
-            None
-        """
+    #     Returns:
+    #         None
+    #     """
         
-        try:
-            # Connect to chemspace database
-            conn = sqlite3.connect(self.__chemspace_db)
-            cursor = conn.cursor()
+    #     try:
+    #         # Connect to chemspace database
+    #         conn = sqlite3.connect(self.__chemspace_db)
+    #         cursor = conn.cursor()
             
-            # Check if filtering_workflows table exists
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='filtering_workflows'")
-            if not cursor.fetchone():
-                print("❌ No filtering workflows table found. Create workflows first using create_filtering_workflow()")
-                conn.close()
-                return
+    #         # Check if filtering_workflows table exists
+    #         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='filtering_workflows'")
+    #         if not cursor.fetchone():
+    #             print("❌ No filtering workflows table found. Create workflows first using create_filtering_workflow()")
+    #             conn.close()
+    #             return
             
-            # Retrieve all workflows
-            cursor.execute("SELECT workflow_name, filters_dict FROM filtering_workflows")
-            workflows = cursor.fetchall()
-            conn.close()
+    #         # Retrieve all workflows
+    #         cursor.execute("SELECT workflow_name, filters_dict FROM filtering_workflows")
+    #         workflows = cursor.fetchall()
+    #         conn.close()
             
-            if not workflows:
-                print("⚠️  No filtering workflows found in chemspace database")
-                return
+    #         if not workflows:
+    #             print("⚠️  No filtering workflows found in chemspace database")
+    #             return
             
-            print("📋 Saved Filtering Workflows:")
-            print("=" * 50)
-            for idx, (workflow_name, filters_dict_str) in enumerate(workflows, 1):
-                try:
-                    filters_dict = json.loads(filters_dict_str)
-                    num_filters = len(filters_dict)
-                except json.JSONDecodeError:
-                    num_filters = 0
+    #         print("📋 Saved Filtering Workflows:")
+    #         print("=" * 50)
+    #         for idx, (workflow_name, filters_dict_str) in enumerate(workflows, 1):
+    #             try:
+    #                 filters_dict = json.loads(filters_dict_str)
+    #                 num_filters = len(filters_dict)
+    #             except json.JSONDecodeError:
+    #                 num_filters = 0
                 
-                print(f"{idx}. '{workflow_name}' - {num_filters} filters")
+    #             print(f"{idx}. '{workflow_name}' - {num_filters} filters")
             
-        except Exception as e:
-            print(f"❌ Error listing filtering workflows: {e}")
+    #     except Exception as e:
+    #         print(f"❌ Error listing filtering workflows: {e}")
             
     def _save_workflow_filtered_compounds(self, compounds_df: pd.DataFrame, 
                                     new_table_name: str, 
@@ -3521,8 +3521,6 @@ class ChemSpace:
         """
 
         pass
-
-    #### Constructucted using AI
 
     def apply_reaction_workflow(self, workflow_id: int):
         """
@@ -4732,3 +4730,66 @@ class ChemSpace:
             
         except Exception:
             return None
+        
+    def list_filtering_workflows(self) -> None:
+        """
+        Display all saved filtering workflows in a formatted table.
+        """
+        try:
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            
+            # Check if filtering_workflows table exists
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='filtering_workflows'")
+            if not cursor.fetchone():
+                print("📝 No filtering workflows table found")
+                conn.close()
+                return
+            
+            # Get all workflows with summary information
+            cursor.execute("""
+            SELECT workflow_name, creation_date, description, filters_dict, filter_count, total_instances
+            FROM filtering_workflows 
+            ORDER BY creation_date DESC
+            """)
+            
+            workflows = cursor.fetchall()
+            conn.close()
+            
+            if not workflows:
+                print("📝 No saved filtering workflows found")
+                return
+            
+            print("\n" + "="*100)
+            print(f"SAVED FILTERING WORKFLOWS - Project: {self.name}")
+            print("="*100)
+            
+            for i, (name, date, desc, filters_dict_str, filter_count, total_instances) in enumerate(workflows, 1):
+                try:
+                    filters_dict = json.loads(filters_dict_str)
+                    actual_filter_count = len(filters_dict) if filters_dict else filter_count
+                    
+                    # Get filter names for summary
+                    filter_names = list(filters_dict.keys()) if filters_dict else []
+                    filters_summary = ', '.join(filter_names[:3])
+                    if len(filter_names) > 3:
+                        filters_summary += f" and {len(filter_names) - 3} more..."
+                    elif not filters_summary:
+                        filters_summary = "No filters available"
+                    
+                except json.JSONDecodeError:
+                    actual_filter_count = filter_count or 0
+                    filters_summary = "Error parsing filters"
+                
+                print(f"\n🔍 Workflow {i}: '{name}'")
+                print(f"   📅 Created: {date}")
+                print(f"   🔬 Filters: {actual_filter_count}")
+                print(f"   🔢 Total instances: {total_instances or 0}")
+                print(f"   📄 Description: {desc}")
+                print(f"   🔍 Filters: {filters_summary}")
+                print(f"   🔍 Filters dictionary: {filters_dict}")
+            
+            print("="*100)
+            
+        except Exception as e:
+            print(f"❌ Error listing filtering workflows: {e}")
