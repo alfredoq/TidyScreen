@@ -2567,49 +2567,6 @@ class ChemSpace:
             print(f"❌ Error in sequential filtering: {e}")
             return pd.DataFrame()
       
-    # def list_filtering_workflows(self):
-    #     """
-    #     List all saved filtering workflows in the chemspace database.
-        
-    #     Returns:
-    #         None
-    #     """
-        
-    #     try:
-    #         # Connect to chemspace database
-    #         conn = sqlite3.connect(self.__chemspace_db)
-    #         cursor = conn.cursor()
-            
-    #         # Check if filtering_workflows table exists
-    #         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='filtering_workflows'")
-    #         if not cursor.fetchone():
-    #             print("❌ No filtering workflows table found. Create workflows first using create_filtering_workflow()")
-    #             conn.close()
-    #             return
-            
-    #         # Retrieve all workflows
-    #         cursor.execute("SELECT workflow_name, filters_dict FROM filtering_workflows")
-    #         workflows = cursor.fetchall()
-    #         conn.close()
-            
-    #         if not workflows:
-    #             print("⚠️  No filtering workflows found in chemspace database")
-    #             return
-            
-    #         print("📋 Saved Filtering Workflows:")
-    #         print("=" * 50)
-    #         for idx, (workflow_name, filters_dict_str) in enumerate(workflows, 1):
-    #             try:
-    #                 filters_dict = json.loads(filters_dict_str)
-    #                 num_filters = len(filters_dict)
-    #             except json.JSONDecodeError:
-    #                 num_filters = 0
-                
-    #             print(f"{idx}. '{workflow_name}' - {num_filters} filters")
-            
-    #     except Exception as e:
-    #         print(f"❌ Error listing filtering workflows: {e}")
-            
     def _save_workflow_filtered_compounds(self, compounds_df: pd.DataFrame, 
                                     new_table_name: str, 
                                     workflow_name: str, 
