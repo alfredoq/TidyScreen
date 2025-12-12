@@ -5614,85 +5614,6 @@ class ChemSpace:
             print(f"❌ Error clearing all reaction workflows: {e}")
             return False
         
-    def apply_reaction_workflow(self, workflow_id: int):
-        """
-        Apply a saved reaction workflow to compounds on a list of user specified tables. The function retrieves the reaction workflow by its ID from the chemspace database and applies each reaction in sequence to the compounds in the specified tables. The reactions are applied using RDKit's reaction capabilities, and the resulting products are stored in new tables.
-        
-        Args:
-            workflow_id (int): ID of the reaction workflow to apply
-        """
-        try:
-            print(f"🔬 Starting reaction workflow application...")
-            print(f"   🆔 Workflow ID: {workflow_id}")
-            
-            # Load the reaction workflow by ID
-            workflow_data = self._load_reaction_workflow_by_id(workflow_id)
-            if not workflow_data:
-                print(f"❌ No reaction workflow found with ID {workflow_id}")
-                return
-            
-            workflow_name = workflow_data['workflow_name']
-            reactions_dict = workflow_data['reactions_dict']
-            
-            print(f"   📋 Workflow: '{workflow_name}'")
-            print(f"   🧪 Reactions to apply: {len(reactions_dict)}")
-            
-            # Analyze reaction types and display workflow details
-            reaction_analysis = self._analyze_reaction_types(reactions_dict)
-            self._display_reaction_analysis(reaction_analysis)
-            
-            # Get available tables and let user select
-            available_tables = self.get_all_tables()
-            if not available_tables:
-                print("❌ No tables available in chemspace database")
-                return
-            
-            # Show available tables
-            print(f"\n📊 Available Tables ({len(available_tables)} total):")
-            for i, table in enumerate(available_tables, 1):
-                compound_count = self.get_compound_count(table_name=table)
-                print(f"   {i}. {table} ({compound_count} compounds)")
-            
-            # Select tables based on reaction types
-            if reaction_analysis['has_bimolecular']:
-                selected_tables = self._select_tables_for_bimolecular_reactions(
-                    available_tables, reaction_analysis
-                )
-            else:
-                selected_tables = self._select_tables_for_unimolecular_reactions(available_tables)
-            
-            if not selected_tables:
-                print("❌ No tables selected for reaction workflow")
-                return
-            
-            print(f"✅ Selected tables for reaction processing")
-            
-            # Import RDKit for reaction processing
-            try:
-                from rdkit import Chem
-                from rdkit.Chem import AllChem
-                from rdkit import RDLogger
-                RDLogger.DisableLog('rdApp.*')  # Suppress RDKit warnings
-            except ImportError:
-                print("❌ RDKit not installed. Please install RDKit to use reaction workflows:")
-                print("   conda install -c conda-forge rdkit")
-                print("   or")
-                print("   pip install rdkit")
-                return
-            
-            # Process reactions based on type
-            if reaction_analysis['has_bimolecular']:
-                self._process_bimolecular_workflow(
-                    selected_tables, reactions_dict, workflow_name, reaction_analysis
-                )
-            else:
-                self._process_unimolecular_workflow(
-                    selected_tables, reactions_dict, workflow_name
-                )
-            
-        except Exception as e:
-            print(f"❌ Error applying reaction workflow {workflow_id}: {e}")
-
     def _analyze_reaction_types(self, reactions_dict: Dict[int, Dict[str, Any]]) -> Dict[str, Any]:
         """
         Analyze the reaction workflow to identify bimolecular and unimolecular reactions.
@@ -6389,3 +6310,715 @@ class ChemSpace:
         except Exception as e:
             print(f"   ❌ Error in unimolecular reaction {reaction_info['name']}: {e}")
             return []
+
+    def apply_reaction_workflow(self, workflow_id: int):
+        """
+        Apply a saved reaction workflow to compounds with support for sequential multi-step reactions.
+        Each reaction step is analyzed separately for unimolecular/bimolecular nature, and users can
+        choose to use products from previous steps as inputs for subsequent reactions.
+        
+        Args:
+            workflow_id (int): ID of the reaction workflow to apply
+        """
+        try:
+            print(f"🔬 Starting sequential reaction workflow application...")
+            print(f"   🆔 Workflow ID: {workflow_id}")
+            
+            # Load the reaction workflow by ID
+            workflow_data = self._load_reaction_workflow_by_id(workflow_id)
+            if not workflow_data:
+                print(f"❌ No reaction workflow found with ID {workflow_id}")
+                return
+            
+            workflow_name = workflow_data['workflow_name']
+            reactions_dict = workflow_data['reactions_dict']
+            
+            print(f"   📋 Workflow: '{workflow_name}'")
+            print(f"   🧪 Total reactions: {len(reactions_dict)}")
+            
+            # Sort reactions by order for sequential processing
+            sorted_reactions = sorted(reactions_dict.items(), key=lambda x: x[1]['order'])
+            
+            print(f"\n🔄 SEQUENTIAL REACTION ANALYSIS")
+            print("=" * 60)
+            for i, (reaction_id, reaction_info) in enumerate(sorted_reactions, 1):
+                reaction_type = self._analyze_single_reaction_type(reaction_info['smarts'])
+                print(f"   Step {i}: {reaction_info['name']} ({reaction_type})")
+            print("=" * 60)
+            
+            # Import RDKit for reaction processing
+            try:
+                from rdkit import Chem
+                from rdkit.Chem import AllChem
+                from rdkit import RDLogger
+                RDLogger.DisableLog('rdApp.*')  # Suppress RDKit warnings
+            except ImportError:
+                print("❌ RDKit not installed. Please install RDKit to use reaction workflows:")
+                print("   conda install -c conda-forge rdkit")
+                print("   or")
+                print("   pip install rdkit")
+                return
+            
+            # Initialize workflow state
+            workflow_state = {
+                'step_results': {},
+                'available_tables': self.get_all_tables(),
+                'step_products': {}
+            }
+            
+            if not workflow_state['available_tables']:
+                print("❌ No tables available in chemspace database")
+                return
+            
+            print(f"\n📊 Available Tables ({len(workflow_state['available_tables'])} total):")
+            for i, table in enumerate(workflow_state['available_tables'], 1):
+                compound_count = self.get_compound_count(table_name=table)
+                print(f"   {i}. {table} ({compound_count} compounds)")
+            
+            # Process each reaction step sequentially
+            for step_num, (reaction_id, reaction_info) in enumerate(sorted_reactions, 1):
+                print(f"\n{'='*80}")
+                print(f"🔬 REACTION STEP {step_num}/{len(sorted_reactions)}: {reaction_info['name']}")
+                print(f"{'='*80}")
+                
+                step_result = self._process_sequential_reaction_step(
+                    step_num, reaction_id, reaction_info, workflow_name, workflow_state
+                )
+                
+                workflow_state['step_results'][step_num] = step_result
+                
+                if not step_result['success']:
+                    print(f"❌ Step {step_num} failed. Stopping workflow execution.")
+                    break
+                
+                # Store step products for potential use in next steps
+                if step_result['products_generated'] > 0:
+                    workflow_state['step_products'][step_num] = {
+                        'table_name': step_result.get('output_table'),
+                        'product_count': step_result['products_generated'],
+                        'reaction_name': reaction_info['name']
+                    }
+            
+            # Display final workflow summary
+            self._display_workflow_summary(workflow_state, workflow_name)
+            
+        except Exception as e:
+            print(f"❌ Error applying sequential reaction workflow {workflow_id}: {e}")
+
+    def _process_sequential_reaction_step(self, step_num: int, reaction_id: int, 
+                                        reaction_info: Dict[str, Any], workflow_name: str,
+                                        workflow_state: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Process a single reaction step in the sequential workflow.
+        
+        Args:
+            step_num (int): Current step number
+            reaction_id (int): ID of the reaction
+            reaction_info (Dict): Reaction information
+            workflow_name (str): Name of the workflow
+            workflow_state (Dict): Current workflow state
+            
+        Returns:
+            Dict[str, Any]: Step execution results
+        """
+        try:
+            reaction_name = reaction_info['name']
+            reaction_smarts = reaction_info['smarts']
+            
+            # Analyze this specific reaction
+            reaction_type = self._analyze_single_reaction_type(reaction_smarts)
+            
+            print(f"🔍 Reaction Analysis:")
+            print(f"   📋 Name: {reaction_name}")
+            print(f"   🧪 Type: {reaction_type}")
+            print(f"   ⚗️  SMARTS: {reaction_smarts}")
+            
+            # Get available input sources
+            input_sources = self._get_available_input_sources(step_num, workflow_state)
+            
+            if not input_sources:
+                return {
+                    'success': False,
+                    'message': 'No input sources available',
+                    'products_generated': 0
+                }
+            
+            # Select input tables based on reaction type and available sources
+            if reaction_type == 'bimolecular':
+                table_config = self._select_tables_for_step_bimolecular(
+                    input_sources, step_num, reaction_name
+                )
+            else:  # unimolecular
+                table_config = self._select_tables_for_step_unimolecular(
+                    input_sources, step_num, reaction_name
+                )
+            
+            if not table_config:
+                return {
+                    'success': False,
+                    'message': 'No tables selected for reaction step',
+                    'products_generated': 0
+                }
+            
+            # Apply the reaction
+            if reaction_type == 'bimolecular':
+                step_result = self._apply_step_bimolecular_reaction(
+                    table_config, reaction_info, workflow_name, step_num
+                )
+            else:  # unimolecular
+                step_result = self._apply_step_unimolecular_reaction(
+                    table_config, reaction_info, workflow_name, step_num
+                )
+            
+            return step_result
+            
+        except Exception as e:
+            print(f"❌ Error processing reaction step {step_num}: {e}")
+            return {
+                'success': False,
+                'message': f'Error in step {step_num}: {e}',
+                'products_generated': 0
+            }
+
+    def _analyze_single_reaction_type(self, smarts: str) -> str:
+        """
+        Analyze a single reaction SMARTS to determine if it's unimolecular or bimolecular.
+        
+        Args:
+            smarts (str): SMARTS pattern of the reaction
+            
+        Returns:
+            str: 'unimolecular', 'bimolecular', or 'invalid'
+        """
+        try:
+            if '>>' not in smarts:
+                return 'invalid'
+            
+            reactants_part = smarts.split('>>')[0]
+            dot_count = reactants_part.count('.')
+            
+            if dot_count >= 1:
+                return 'bimolecular'
+            else:
+                return 'unimolecular'
+                
+        except Exception:
+            return 'invalid'
+
+    def _get_available_input_sources(self, step_num: int, workflow_state: Dict[str, Any]) -> Dict[str, List[str]]:
+        """
+        Get available input sources for the current reaction step.
+        
+        Args:
+            step_num (int): Current step number
+            workflow_state (Dict): Current workflow state
+            
+        Returns:
+            Dict[str, List[str]]: Dictionary of available input sources
+        """
+        input_sources = {
+            'original_tables': workflow_state['available_tables'],
+            'previous_products': []
+        }
+        
+        # Add previous step products as potential inputs
+        for prev_step, product_info in workflow_state['step_products'].items():
+            if prev_step < step_num and product_info.get('table_name'):
+                input_sources['previous_products'].append({
+                    'table_name': product_info['table_name'],
+                    'step': prev_step,
+                    'reaction_name': product_info['reaction_name'],
+                    'count': product_info['product_count']
+                })
+        
+        return input_sources
+
+    def _select_tables_for_step_bimolecular(self, input_sources: Dict[str, Any], 
+                                        step_num: int, reaction_name: str) -> Dict[str, Any]:
+        """
+        Select tables for a bimolecular reaction step.
+        
+        Args:
+            input_sources (Dict): Available input sources
+            step_num (int): Current step number
+            reaction_name (str): Name of the reaction
+            
+        Returns:
+            Dict[str, Any]: Table configuration
+        """
+        try:
+            print(f"\n🧬 BIMOLECULAR REACTION STEP {step_num} SETUP")
+            print("=" * 60)
+            print(f"Reaction: {reaction_name}")
+            print("This reaction requires two reactant sources.")
+            
+            # Display available sources
+            print(f"\n📋 Available Input Sources:")
+            all_sources = []
+            
+            print(f"\n🗂️  Original Tables:")
+            for i, table in enumerate(input_sources['original_tables'], 1):
+                compound_count = self.get_compound_count(table_name=table)
+                print(f"   {len(all_sources)+1}. {table} ({compound_count} compounds) [Original]")
+                all_sources.append({
+                    'name': table,
+                    'type': 'original',
+                    'count': compound_count
+                })
+            
+            if input_sources['previous_products']:
+                print(f"\n🔬 Previous Step Products:")
+                for product_info in input_sources['previous_products']:
+                    print(f"   {len(all_sources)+1}. {product_info['table_name']} "
+                        f"({product_info['count']} products from Step {product_info['step']}: "
+                        f"{product_info['reaction_name']}) [Products]")
+                    all_sources.append({
+                        'name': product_info['table_name'],
+                        'type': 'products',
+                        'count': product_info['count'],
+                        'step': product_info['step']
+                    })
+            
+            # Select primary reactant source
+            print(f"\n📋 Select PRIMARY reactant source:")
+            primary_idx = self._select_source_by_index(all_sources, "primary reactant")
+            if primary_idx is None:
+                return {}
+            
+            primary_source = all_sources[primary_idx]
+            
+            # Select secondary reactant source
+            print(f"\n📋 Select SECONDARY reactant source:")
+            remaining_sources = [source for i, source in enumerate(all_sources) if i != primary_idx]
+            secondary_idx = self._select_source_by_index(remaining_sources, "secondary reactant")
+            if secondary_idx is None:
+                return {}
+            
+            secondary_source = remaining_sources[secondary_idx]
+            
+            print(f"\n✅ Bimolecular Reaction Configuration:")
+            print(f"   🅰️  Primary: '{primary_source['name']}' ({primary_source['count']} compounds)")
+            print(f"   🅱️  Secondary: '{secondary_source['name']}' ({secondary_source['count']} compounds)")
+            
+            # Estimate computational load
+            combinations = primary_source['count'] * secondary_source['count']
+            print(f"   🔢 Potential combinations: {combinations:,}")
+            
+            if combinations > 1000000:
+                print(f"   ⚠️  WARNING: Large number of combinations may take significant time!")
+                proceed = input("   Continue anyway? (y/n): ").strip().lower()
+                if proceed not in ['y', 'yes']:
+                    return {}
+            
+            return {
+                'type': 'bimolecular',
+                'primary_table': primary_source['name'],
+                'secondary_table': secondary_source['name'],
+                'primary_source_type': primary_source['type'],
+                'secondary_source_type': secondary_source['type'],
+                'step_num': step_num
+            }
+            
+        except Exception as e:
+            print(f"❌ Error selecting tables for bimolecular step: {e}")
+            return {}
+
+    def _select_tables_for_step_unimolecular(self, input_sources: Dict[str, Any], 
+                                            step_num: int, reaction_name: str) -> Dict[str, Any]:
+        """
+        Select tables for a unimolecular reaction step.
+        
+        Args:
+            input_sources (Dict): Available input sources
+            step_num (int): Current step number
+            reaction_name (str): Name of the reaction
+            
+        Returns:
+            Dict[str, Any]: Table configuration
+        """
+        try:
+            print(f"\n🧪 UNIMOLECULAR REACTION STEP {step_num} SETUP")
+            print("=" * 60)
+            print(f"Reaction: {reaction_name}")
+            print("This reaction processes compounds individually.")
+            
+            # Display available sources
+            print(f"\n📋 Available Input Sources:")
+            all_sources = []
+            
+            print(f"\n🗂️  Original Tables:")
+            for table in input_sources['original_tables']:
+                compound_count = self.get_compound_count(table_name=table)
+                print(f"   {len(all_sources)+1}. {table} ({compound_count} compounds) [Original]")
+                all_sources.append({
+                    'name': table,
+                    'type': 'original',
+                    'count': compound_count
+                })
+            
+            if input_sources['previous_products']:
+                print(f"\n🔬 Previous Step Products:")
+                for product_info in input_sources['previous_products']:
+                    print(f"   {len(all_sources)+1}. {product_info['table_name']} "
+                        f"({product_info['count']} products from Step {product_info['step']}: "
+                        f"{product_info['reaction_name']}) [Products]")
+                    all_sources.append({
+                        'name': product_info['table_name'],
+                        'type': 'products',
+                        'count': product_info['count'],
+                        'step': product_info['step']
+                    })
+            
+            # Select input sources
+            selected_sources = []
+            
+            if step_num == 1:
+                # First step: allow multiple original tables
+                print(f"\nSelect input sources (comma-separated numbers or 'all'):")
+                selection = input("Selection: ").strip().lower()
+                
+                if selection == 'all':
+                    selected_sources = all_sources
+                else:
+                    try:
+                        indices = [int(x.strip()) - 1 for x in selection.split(',')]
+                        selected_sources = [all_sources[i] for i in indices if 0 <= i < len(all_sources)]
+                    except:
+                        print("❌ Invalid selection")
+                        return {}
+            else:
+                # Later steps: offer choice between original tables and previous products
+                print(f"\nChoose input strategy:")
+                print(f"   1. Use original tables")
+                print(f"   2. Use products from previous steps")
+                print(f"   3. Use both original tables and previous products")
+                
+                strategy = input("Enter choice (1-3): ").strip()
+                
+                if strategy == '1':
+                    selected_sources = [s for s in all_sources if s['type'] == 'original']
+                elif strategy == '2':
+                    selected_sources = [s for s in all_sources if s['type'] == 'products']
+                elif strategy == '3':
+                    selected_sources = all_sources
+                else:
+                    print("❌ Invalid strategy selection")
+                    return {}
+            
+            if not selected_sources:
+                print("❌ No sources selected")
+                return {}
+            
+            print(f"\n✅ Selected {len(selected_sources)} input source(s):")
+            total_compounds = 0
+            for source in selected_sources:
+                source_type_label = "Products" if source['type'] == 'products' else "Original"
+                print(f"   • {source['name']} ({source['count']} compounds) [{source_type_label}]")
+                total_compounds += source['count']
+            
+            print(f"   📊 Total compounds to process: {total_compounds:,}")
+            
+            return {
+                'type': 'unimolecular',
+                'sources': selected_sources,
+                'total_compounds': total_compounds,
+                'step_num': step_num
+            }
+            
+        except Exception as e:
+            print(f"❌ Error selecting tables for unimolecular step: {e}")
+            return {}
+
+    def _select_source_by_index(self, sources: List[Dict], source_type: str) -> Optional[int]:
+        """
+        Select a source by index from available options.
+        
+        Args:
+            sources (List[Dict]): List of available sources
+            source_type (str): Description of source type
+            
+        Returns:
+            Optional[int]: Selected index or None if cancelled
+        """
+        try:
+            while True:
+                selection = input(f"Select {source_type} (1-{len(sources)} or 'cancel'): ").strip()
+                
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    return None
+                
+                try:
+                    idx = int(selection) - 1
+                    if 0 <= idx < len(sources):
+                        return idx
+                    else:
+                        print(f"❌ Invalid selection. Please enter 1-{len(sources)}")
+                except ValueError:
+                    print("❌ Please enter a valid number or 'cancel'")
+                    
+        except KeyboardInterrupt:
+            return None
+
+    def _apply_step_bimolecular_reaction(self, table_config: Dict[str, Any], 
+                                    reaction_info: Dict[str, Any], 
+                                    workflow_name: str, step_num: int) -> Dict[str, Any]:
+        """
+        Apply a bimolecular reaction for a specific step.
+        
+        Args:
+            table_config (Dict): Table configuration
+            reaction_info (Dict): Reaction information
+            workflow_name (str): Workflow name
+            step_num (int): Current step number
+            
+        Returns:
+            Dict[str, Any]: Step execution results
+        """
+        try:
+            from rdkit import Chem
+            from rdkit.Chem import AllChem
+            
+            print(f"\n🧬 Executing Bimolecular Reaction - Step {step_num}")
+            print("-" * 50)
+            
+            # Get compound data
+            primary_df = self._get_table_as_dataframe(table_config['primary_table'])
+            secondary_df = self._get_table_as_dataframe(table_config['secondary_table'])
+            
+            print(f"📊 Primary reactants: {len(primary_df)} compounds")
+            print(f"📊 Secondary reactants: {len(secondary_df)} compounds")
+            
+            # Apply the bimolecular reaction
+            products = self._apply_bimolecular_reaction(
+                primary_df, secondary_df, reaction_info, workflow_name
+            )
+            
+            # Save products if any were generated
+            output_table_name = None
+            if products:
+                print(f"\n💾 Generated {len(products)} products from bimolecular reaction")
+                
+                save_choice = input("Save products to a new table? (y/n): ").strip().lower()
+                if save_choice in ['y', 'yes']:
+                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    output_table_name = f"step{step_num}_{reaction_info['name']}_{timestamp}"
+                    output_table_name = self._sanitize_table_name(output_table_name)
+                    
+                    success = self._save_step_products(
+                        products, output_table_name, workflow_name, step_num
+                    )
+                    
+                    if not success:
+                        output_table_name = None
+            
+            return {
+                'success': True,
+                'products_generated': len(products),
+                'output_table': output_table_name,
+                'reaction_type': 'bimolecular',
+                'step_num': step_num
+            }
+            
+        except Exception as e:
+            print(f"❌ Error applying bimolecular reaction: {e}")
+            return {
+                'success': False,
+                'products_generated': 0,
+                'error': str(e)
+            }
+
+    def _apply_step_unimolecular_reaction(self, table_config: Dict[str, Any], 
+                                        reaction_info: Dict[str, Any], 
+                                        workflow_name: str, step_num: int) -> Dict[str, Any]:
+        """
+        Apply a unimolecular reaction for a specific step.
+        
+        Args:
+            table_config (Dict): Table configuration
+            reaction_info (Dict): Reaction information
+            workflow_name (str): Workflow name
+            step_num (int): Current step number
+            
+        Returns:
+            Dict[str, Any]: Step execution results
+        """
+        try:
+            print(f"\n🧪 Executing Unimolecular Reaction - Step {step_num}")
+            print("-" * 50)
+            
+            all_products = []
+            
+            # Process each selected source
+            for source in table_config['sources']:
+                print(f"\n🔬 Processing source: '{source['name']}'")
+                compounds_df = self._get_table_as_dataframe(source['name'])
+                
+                if compounds_df.empty:
+                    print(f"   ⚠️  No compounds found, skipping...")
+                    continue
+                
+                print(f"   📊 Processing {len(compounds_df)} compounds...")
+                
+                # Apply unimolecular reaction
+                source_prefix = f"step{step_num}_{source['name']}_"
+                products = self._apply_unimolecular_reaction(
+                    compounds_df, reaction_info, workflow_name, source_prefix
+                )
+                
+                all_products.extend(products)
+                print(f"   ✅ Generated {len(products)} products")
+            
+            # Save products if any were generated
+            output_table_name = None
+            if all_products:
+                print(f"\n💾 Total products generated: {len(all_products)}")
+                
+                save_choice = input("Save products to a new table? (y/n): ").strip().lower()
+                if save_choice in ['y', 'yes']:
+                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    output_table_name = f"step{step_num}_{reaction_info['name']}_{timestamp}"
+                    output_table_name = self._sanitize_table_name(output_table_name)
+                    
+                    success = self._save_step_products(
+                        all_products, output_table_name, workflow_name, step_num
+                    )
+                    
+                    if not success:
+                        output_table_name = None
+            
+            return {
+                'success': True,
+                'products_generated': len(all_products),
+                'output_table': output_table_name,
+                'reaction_type': 'unimolecular',
+                'step_num': step_num
+            }
+            
+        except Exception as e:
+            print(f"❌ Error applying unimolecular reaction: {e}")
+            return {
+                'success': False,
+                'products_generated': 0,
+                'error': str(e)
+            }
+
+    def _save_step_products(self, products: List[Dict[str, Any]], table_name: str, 
+                        workflow_name: str, step_num: int) -> bool:
+        """
+        Save products from a reaction step to a new table.
+        
+        Args:
+            products (List[Dict]): List of product dictionaries
+            table_name (str): Name for the new table
+            workflow_name (str): Name of the workflow
+            step_num (int): Current step number
+            
+        Returns:
+            bool: True if saved successfully
+        """
+        try:
+            if not products:
+                return False
+            
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            
+            # Create products table with step metadata
+            cursor.execute(f'''
+                CREATE TABLE IF NOT EXISTS {table_name} (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    smiles TEXT NOT NULL,
+                    name TEXT,
+                    flag TEXT,
+                    workflow_step INTEGER,
+                    workflow_name TEXT,
+                    creation_date TEXT,
+                    UNIQUE(smiles, name)
+                )
+            ''')
+            
+            # Create indexes
+            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_smiles ON {table_name}(smiles)")
+            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_step ON {table_name}(workflow_step)")
+            
+            # Insert products
+            insert_query = f'''
+                INSERT OR IGNORE INTO {table_name} 
+                (smiles, name, flag, workflow_step, workflow_name, creation_date)
+                VALUES (?, ?, ?, ?, ?, ?)
+            '''
+            
+            creation_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            inserted_count = 0
+            
+            for product in products:
+                try:
+                    cursor.execute(insert_query, (
+                        product['smiles'],
+                        product['name'],
+                        product.get('flag', 'step_product'),
+                        step_num,
+                        workflow_name,
+                        creation_date
+                    ))
+                    inserted_count += 1
+                except sqlite3.IntegrityError:
+                    continue
+            
+            conn.commit()
+            conn.close()
+            
+            print(f"   💾 Saved {inserted_count} products to table '{table_name}'")
+            return True
+            
+        except Exception as e:
+            print(f"   ❌ Error saving step products: {e}")
+            return False
+
+    def _display_workflow_summary(self, workflow_state: Dict[str, Any], workflow_name: str) -> None:
+        """
+        Display a comprehensive summary of the sequential workflow execution.
+        
+        Args:
+            workflow_state (Dict): Final workflow state
+            workflow_name (str): Name of the workflow
+        """
+        try:
+            print(f"\n{'='*80}")
+            print(f"🎯 SEQUENTIAL WORKFLOW SUMMARY: '{workflow_name}'")
+            print(f"{'='*80}")
+            
+            total_products = 0
+            successful_steps = 0
+            
+            for step_num, result in workflow_state['step_results'].items():
+                status_icon = "✅" if result['success'] else "❌"
+                products = result.get('products_generated', 0)
+                total_products += products
+                
+                if result['success']:
+                    successful_steps += 1
+                
+                print(f"\n{status_icon} Step {step_num}: {products:,} products generated")
+                
+                if result.get('output_table'):
+                    print(f"   💾 Saved to: '{result['output_table']}'")
+                
+                if not result['success']:
+                    print(f"   ❌ Error: {result.get('error', 'Unknown error')}")
+            
+            print(f"\n📊 FINAL RESULTS:")
+            print(f"   🔬 Total steps: {len(workflow_state['step_results'])}")
+            print(f"   ✅ Successful steps: {successful_steps}")
+            print(f"   🧪 Total products generated: {total_products:,}")
+            
+            if workflow_state['step_products']:
+                print(f"\n📋 Product Tables Created:")
+                for step, product_info in workflow_state['step_products'].items():
+                    print(f"   Step {step}: {product_info['table_name']} "
+                        f"({product_info['product_count']} products)")
+            
+            print(f"{'='*80}")
+            
+        except Exception as e:
+            print(f"❌ Error displaying workflow summary: {e}")
