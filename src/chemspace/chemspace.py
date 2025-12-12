@@ -3403,10 +3403,10 @@ class ChemSpace:
             print(f"❌ Database integrity error saving reaction workflow: {e}")
         except Exception as e:
             print(f"❌ Error saving reaction workflow: {e}")
-    
+
     def list_reaction_workflows(self) -> None:
         """
-        Display all saved reaction workflows in a formatted table.
+        Display all saved reaction workflows in a formatted table with IDs.
         """
         try:
             conn = sqlite3.connect(self.__chemspace_db)
@@ -3419,9 +3419,9 @@ class ChemSpace:
                 conn.close()
                 return
             
-            # Get all workflows with summary information
+            # Get all workflows with summary information including ID
             cursor.execute("""
-            SELECT workflow_name, creation_date, description, reactions_dict
+            SELECT id, workflow_name, creation_date, description, reactions_dict
             FROM reaction_workflows 
             ORDER BY creation_date DESC
             """)
@@ -3437,7 +3437,7 @@ class ChemSpace:
             print(f"SAVED REACTION WORKFLOWS - Project: {self.name}")
             print("="*100)
             
-            for i, (name, date, desc, reactions_dict_str) in enumerate(workflows, 1):
+            for i, (workflow_id, name, date, desc, reactions_dict_str) in enumerate(workflows, 1):
                 try:
                     reactions_dict = json.loads(reactions_dict_str)
                     reaction_count = len(reactions_dict)
@@ -3452,7 +3452,7 @@ class ChemSpace:
                     reaction_count = 0
                     reactions_summary = "Error parsing reactions"
                 
-                print(f"\n🧪 Workflow {i}: '{name}'")
+                print(f"\n🧪 Workflow name: '{name}' (ID: {workflow_id})")
                 print(f"   📅 Created: {date}")
                 print(f"   🔬 Reactions: {reaction_count}")
                 print(f"   📄 Description: {desc}")
