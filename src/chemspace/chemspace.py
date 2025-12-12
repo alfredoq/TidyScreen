@@ -3463,114 +3463,6 @@ class ChemSpace:
         except Exception as e:
             print(f"❌ Error listing reaction workflows: {e}")
 
-    def apply_reaction_workflow(self, workflow_id: int):
-        """
-        Apply a saved reaction workflow to compounds on a list of user specified tables. The function retrieves the reaction workflow by its ID from the chemspace database and applies each reaction in sequence to the compounds in the specified tables. The reactions are applied using RDKit's reaction capabilities, and the resulting products are stored in new tables.
-        
-        Args:
-            workflow_id (int): ID of the reaction workflow to apply
-        """
-        try:
-            print(f"🔬 Starting reaction workflow application...")
-            print(f"   🆔 Workflow ID: {workflow_id}")
-            
-            # Load the reaction workflow by ID
-            workflow_data = self._load_reaction_workflow_by_id(workflow_id)
-            if not workflow_data:
-                print(f"❌ No reaction workflow found with ID {workflow_id}")
-                return
-            
-            workflow_name = workflow_data['workflow_name']
-            reactions_dict = workflow_data['reactions_dict']
-            
-            print(f"   📋 Workflow: '{workflow_name}'")
-            print(f"   🧪 Reactions to apply: {len(reactions_dict)}")
-            
-            # Display workflow details
-            print("\n📋 Workflow Reactions:")
-            for reaction_id, reaction_info in reactions_dict.items():
-                print(f"   {reaction_info['order']}. '{reaction_info['name']}' (ID: {reaction_id})")
-                print(f"      🧪 SMARTS: {reaction_info['smarts']}")
-            
-            # Get available tables and let user select
-            available_tables = self.get_all_tables()
-            if not available_tables:
-                print("❌ No tables available in chemspace database")
-                return
-            
-            # Show available tables
-            print(f"\n📊 Available Tables ({len(available_tables)} total):")
-            for i, table in enumerate(available_tables, 1):
-                compound_count = self.get_compound_count(table_name=table)
-                print(f"   {i}. {table} ({compound_count} compounds)")
-            
-            # Let user select tables
-            selected_tables = self._select_tables_for_reaction(available_tables)
-            if not selected_tables:
-                print("❌ No tables selected for reaction workflow")
-                return
-            
-            print(f"✅ Selected {len(selected_tables)} tables for reaction processing")
-            
-            # Import RDKit for reaction processing
-            try:
-                from rdkit import Chem
-                from rdkit.Chem import AllChem
-                from rdkit import RDLogger
-                RDLogger.DisableLog('rdApp.*')  # Suppress RDKit warnings
-            except ImportError:
-                print("❌ RDKit not installed. Please install RDKit to use reaction workflows:")
-                print("   conda install -c conda-forge rdkit")
-                print("   or")
-                print("   pip install rdkit")
-                return
-            
-            # Process each selected table
-            total_processed_compounds = 0
-            total_products_generated = 0
-            
-            for table_name in selected_tables:
-                print(f"\n🔬 Processing table: '{table_name}'")
-                
-                # Get compounds from table
-                compounds_df = self._get_table_as_dataframe(table_name)
-                if compounds_df.empty:
-                    print(f"   ⚠️  No compounds found in table '{table_name}', skipping...")
-                    continue
-                
-                print(f"   📊 Processing {len(compounds_df)} compounds...")
-                
-                # Apply reaction workflow to this table
-                table_results = self._apply_reactions_to_table(
-                    compounds_df, reactions_dict, workflow_name, table_name
-                )
-                
-                total_processed_compounds += table_results['compounds_processed']
-                total_products_generated += table_results['products_generated']
-                
-            #     print(f"   ✅ Table '{table_name}' processed:")
-            #     print(f"      📊 Compounds processed: {table_results['compounds_processed']}")
-            #     print(f"      🧪 Products generated: {table_results['products_generated']}")
-            #     print(f"      ❌ Failed reactions: {table_results['failed_reactions']}")
-                
-            #     if table_results['products_generated'] > 0:
-            #         print(f"      💾 Products saved to: '{table_results['output_table']}'")
-            
-            # # Final summary
-            # print(f"\n" + "="*80)
-            # print(f"🏁 REACTION WORKFLOW APPLICATION COMPLETED")
-            # print("="*80)
-            # print(f"   📋 Workflow: '{workflow_name}' (ID: {workflow_id})")
-            # print(f"   📊 Tables processed: {len(selected_tables)}")
-            # print(f"   🧬 Total compounds processed: {total_processed_compounds}")
-            # print(f"   🧪 Total products generated: {total_products_generated}")
-            # print(f"   📈 Overall success rate: {(total_products_generated/total_processed_compounds*100):.1f}%" 
-            #       if total_processed_compounds > 0 else "   📈 Overall success rate: 0.0%")
-            # print("="*80)
-            
-        except Exception as e:
-            print(f"❌ Error applying reaction workflow {workflow_id}: {e}")
-    
     def _load_reaction_workflow_by_id(self, workflow_id: int) -> Optional[Dict[str, Any]]:
         """
         Load a reaction workflow from the database by its ID.
@@ -4623,64 +4515,6 @@ class ChemSpace:
         except Exception as e:
             print(f"❌ Error saving filtering workflow: {e}")
     
-    def _save_workflow_metadata(self, workflow_filters: Dict) -> None:
-        """
-        Save additional workflow metadata.
-        
-        Args:
-            workflow_filters (Dict): Full workflow with metadata
-        """
-        try:
-            conn = sqlite3.connect(self.__chemspace_db)
-            cursor = conn.cursor()
-            
-            # Create enhanced metadata table
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS workflow_metadata (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    workflow_name TEXT,
-                    filter_name TEXT,
-                    filter_id INTEGER,
-                    smarts_pattern TEXT,
-                    description TEXT,
-                    instances INTEGER,
-                    creation_date TEXT
-                )
-            """)
-            
-            # This would store detailed metadata for each filter
-            # Implementation details would depend on specific requirements
-            
-            conn.commit()
-            conn.close()
-            
-        except Exception as e:
-            print(f"⚠️  Warning: Could not save enhanced metadata: {e}")
-    
-    def _get_filter_id_by_name(self, projects_db_path: str, filter_name: str) -> Optional[int]:
-        """
-        Helper method to get filter ID by name.
-        
-        Args:
-            projects_db_path (str): Path to projects database
-            filter_name (str): Name of the filter
-            
-        Returns:
-            Optional[int]: Filter ID or None if not found
-        """
-        try:
-            conn = sqlite3.connect(projects_db_path)
-            cursor = conn.cursor()
-            
-            cursor.execute("SELECT id FROM chem_filters WHERE filter_name = ?", (filter_name,))
-            result = cursor.fetchone()
-            conn.close()
-            
-            return result[0] if result else None
-            
-        except Exception:
-            return None
-        
     def list_filtering_workflows(self) -> None:
         """
         Display all saved filtering workflows in a formatted table.
@@ -5779,3 +5613,779 @@ class ChemSpace:
         except Exception as e:
             print(f"❌ Error clearing all reaction workflows: {e}")
             return False
+        
+    def apply_reaction_workflow(self, workflow_id: int):
+        """
+        Apply a saved reaction workflow to compounds on a list of user specified tables. The function retrieves the reaction workflow by its ID from the chemspace database and applies each reaction in sequence to the compounds in the specified tables. The reactions are applied using RDKit's reaction capabilities, and the resulting products are stored in new tables.
+        
+        Args:
+            workflow_id (int): ID of the reaction workflow to apply
+        """
+        try:
+            print(f"🔬 Starting reaction workflow application...")
+            print(f"   🆔 Workflow ID: {workflow_id}")
+            
+            # Load the reaction workflow by ID
+            workflow_data = self._load_reaction_workflow_by_id(workflow_id)
+            if not workflow_data:
+                print(f"❌ No reaction workflow found with ID {workflow_id}")
+                return
+            
+            workflow_name = workflow_data['workflow_name']
+            reactions_dict = workflow_data['reactions_dict']
+            
+            print(f"   📋 Workflow: '{workflow_name}'")
+            print(f"   🧪 Reactions to apply: {len(reactions_dict)}")
+            
+            # Analyze reaction types and display workflow details
+            reaction_analysis = self._analyze_reaction_types(reactions_dict)
+            self._display_reaction_analysis(reaction_analysis)
+            
+            # Get available tables and let user select
+            available_tables = self.get_all_tables()
+            if not available_tables:
+                print("❌ No tables available in chemspace database")
+                return
+            
+            # Show available tables
+            print(f"\n📊 Available Tables ({len(available_tables)} total):")
+            for i, table in enumerate(available_tables, 1):
+                compound_count = self.get_compound_count(table_name=table)
+                print(f"   {i}. {table} ({compound_count} compounds)")
+            
+            # Select tables based on reaction types
+            if reaction_analysis['has_bimolecular']:
+                selected_tables = self._select_tables_for_bimolecular_reactions(
+                    available_tables, reaction_analysis
+                )
+            else:
+                selected_tables = self._select_tables_for_unimolecular_reactions(available_tables)
+            
+            if not selected_tables:
+                print("❌ No tables selected for reaction workflow")
+                return
+            
+            print(f"✅ Selected tables for reaction processing")
+            
+            # Import RDKit for reaction processing
+            try:
+                from rdkit import Chem
+                from rdkit.Chem import AllChem
+                from rdkit import RDLogger
+                RDLogger.DisableLog('rdApp.*')  # Suppress RDKit warnings
+            except ImportError:
+                print("❌ RDKit not installed. Please install RDKit to use reaction workflows:")
+                print("   conda install -c conda-forge rdkit")
+                print("   or")
+                print("   pip install rdkit")
+                return
+            
+            # Process reactions based on type
+            if reaction_analysis['has_bimolecular']:
+                self._process_bimolecular_workflow(
+                    selected_tables, reactions_dict, workflow_name, reaction_analysis
+                )
+            else:
+                self._process_unimolecular_workflow(
+                    selected_tables, reactions_dict, workflow_name
+                )
+            
+        except Exception as e:
+            print(f"❌ Error applying reaction workflow {workflow_id}: {e}")
+
+    def _analyze_reaction_types(self, reactions_dict: Dict[int, Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Analyze the reaction workflow to identify bimolecular and unimolecular reactions.
+        
+        Args:
+            reactions_dict (Dict): Dictionary of reactions in the workflow
+            
+        Returns:
+            Dict[str, Any]: Analysis results including reaction types and details
+        """
+        try:
+            analysis = {
+                'has_bimolecular': False,
+                'has_unimolecular': False,
+                'bimolecular_reactions': [],
+                'unimolecular_reactions': [],
+                'invalid_reactions': [],
+                'total_reactions': len(reactions_dict)
+            }
+            
+            for reaction_id, reaction_info in reactions_dict.items():
+                smarts = reaction_info.get('smarts', '')
+                name = reaction_info.get('name', f'reaction_{reaction_id}')
+                
+                # Check if SMARTS contains reactant separator (dot)
+                if '>>' in smarts:
+                    reactants_part = smarts.split('>>')[0]
+                    
+                    # Count dots in reactants part to determine if bimolecular
+                    dot_count = reactants_part.count('.')
+                    
+                    if dot_count >= 1:
+                        # Bimolecular or multi-molecular reaction
+                        analysis['has_bimolecular'] = True
+                        analysis['bimolecular_reactions'].append({
+                            'id': reaction_id,
+                            'name': name,
+                            'smarts': smarts,
+                            'reactant_count': dot_count + 1,
+                            'order': reaction_info.get('order', 0)
+                        })
+                    else:
+                        # Unimolecular reaction
+                        analysis['has_unimolecular'] = True
+                        analysis['unimolecular_reactions'].append({
+                            'id': reaction_id,
+                            'name': name,
+                            'smarts': smarts,
+                            'order': reaction_info.get('order', 0)
+                        })
+                else:
+                    # Invalid SMARTS format
+                    analysis['invalid_reactions'].append({
+                        'id': reaction_id,
+                        'name': name,
+                        'smarts': smarts,
+                        'error': 'Missing reaction arrow (>>)'
+                    })
+            
+            return analysis
+            
+        except Exception as e:
+            print(f"❌ Error analyzing reaction types: {e}")
+            return {
+                'has_bimolecular': False,
+                'has_unimolecular': False,
+                'bimolecular_reactions': [],
+                'unimolecular_reactions': [],
+                'invalid_reactions': [],
+                'total_reactions': 0
+            }
+
+    def _display_reaction_analysis(self, analysis: Dict[str, Any]) -> None:
+        """
+        Display the analysis results of reaction types in the workflow.
+        
+        Args:
+            analysis (Dict): Analysis results from _analyze_reaction_types
+        """
+        print(f"\n🔬 REACTION WORKFLOW ANALYSIS")
+        print("=" * 60)
+        print(f"📊 Total reactions: {analysis['total_reactions']}")
+        print(f"🧪 Unimolecular reactions: {len(analysis['unimolecular_reactions'])}")
+        print(f"🧬 Bimolecular reactions: {len(analysis['bimolecular_reactions'])}")
+        
+        if analysis['invalid_reactions']:
+            print(f"❌ Invalid reactions: {len(analysis['invalid_reactions'])}")
+        
+        # Display bimolecular reactions details
+        if analysis['bimolecular_reactions']:
+            print(f"\n🧬 BIMOLECULAR REACTIONS DETECTED:")
+            print("-" * 40)
+            for reaction in analysis['bimolecular_reactions']:
+                print(f"   {reaction['order']}. {reaction['name']} (ID: {reaction['id']})")
+                print(f"      🔗 Requires {reaction['reactant_count']} reactants")
+                print(f"      🧪 SMARTS: {reaction['smarts']}")
+        
+        # Display unimolecular reactions
+        if analysis['unimolecular_reactions']:
+            print(f"\n🧪 UNIMOLECULAR REACTIONS:")
+            print("-" * 25)
+            for reaction in analysis['unimolecular_reactions']:
+                print(f"   {reaction['order']}. {reaction['name']} (ID: {reaction['id']})")
+        
+        # Display invalid reactions
+        if analysis['invalid_reactions']:
+            print(f"\n❌ INVALID REACTIONS:")
+            print("-" * 20)
+            for reaction in analysis['invalid_reactions']:
+                print(f"   ⚠️  {reaction['name']} (ID: {reaction['id']})")
+                print(f"      Error: {reaction['error']}")
+                print(f"      SMARTS: {reaction['smarts']}")
+        
+        print("=" * 60)
+
+    def _select_tables_for_bimolecular_reactions(self, available_tables: List[str], 
+                                            analysis: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Select tables for workflows containing bimolecular reactions.
+        
+        Args:
+            available_tables (List[str]): List of available table names
+            analysis (Dict): Reaction analysis results
+            
+        Returns:
+            Dict[str, Any]: Selected tables configuration for bimolecular reactions
+        """
+        try:
+            print(f"\n🧬 BIMOLECULAR REACTION WORKFLOW SETUP")
+            print("=" * 50)
+            print("This workflow contains bimolecular reactions that require two reactant tables.")
+            print("You need to specify:")
+            print("   • Primary reactant table (Table A)")
+            print("   • Secondary reactant table (Table B)")
+            print("   • How to handle unimolecular reactions (if present)")
+            
+            # Select primary reactant table
+            print(f"\n📋 Select PRIMARY reactant table (Table A):")
+            primary_table = self._select_single_table(available_tables, "primary reactant")
+            if not primary_table:
+                return {}
+            
+            # Select secondary reactant table
+            print(f"\n📋 Select SECONDARY reactant table (Table B):")
+            remaining_tables = [t for t in available_tables if t != primary_table]
+            secondary_table = self._select_single_table(remaining_tables, "secondary reactant")
+            if not secondary_table:
+                return {}
+            
+            # Handle unimolecular reactions if present
+            unimolecular_strategy = 'primary'  # Default
+            if analysis['has_unimolecular']:
+                print(f"\n🧪 This workflow also contains {len(analysis['unimolecular_reactions'])} unimolecular reaction(s).")
+                print("Which table should be used for unimolecular reactions?")
+                print("   1. Primary table (Table A)")
+                print("   2. Secondary table (Table B)")
+                print("   3. Both tables separately")
+                
+                choice = input("Enter choice (1-3): ").strip()
+                if choice == '2':
+                    unimolecular_strategy = 'secondary'
+                elif choice == '3':
+                    unimolecular_strategy = 'both'
+                else:
+                    unimolecular_strategy = 'primary'
+            
+            # Validate table selections
+            primary_count = self.get_compound_count(table_name=primary_table)
+            secondary_count = self.get_compound_count(table_name=secondary_table)
+            
+            print(f"\n✅ Table Selection Summary:")
+            print(f"   🅰️  Primary table: '{primary_table}' ({primary_count} compounds)")
+            print(f"   🅱️  Secondary table: '{secondary_table}' ({secondary_count} compounds)")
+            print(f"   🧪 Unimolecular strategy: {unimolecular_strategy}")
+            
+            # Estimate computational complexity
+            if analysis['has_bimolecular']:
+                combinations = primary_count * secondary_count
+                print(f"   🔢 Potential combinations: {combinations:,}")
+                
+                if combinations > 1000000:
+                    print(f"   ⚠️  WARNING: Large number of combinations may take significant time!")
+                    proceed = input("   Continue anyway? (y/n): ").strip().lower()
+                    if proceed not in ['y', 'yes']:
+                        return {}
+            
+            return {
+                'type': 'bimolecular',
+                'primary_table': primary_table,
+                'secondary_table': secondary_table,
+                'unimolecular_strategy': unimolecular_strategy,
+                'primary_count': primary_count,
+                'secondary_count': secondary_count
+            }
+            
+        except Exception as e:
+            print(f"❌ Error selecting tables for bimolecular reactions: {e}")
+            return {}
+
+    def _select_tables_for_unimolecular_reactions(self, available_tables: List[str]) -> Dict[str, Any]:
+        """
+        Select tables for workflows containing only unimolecular reactions.
+        
+        Args:
+            available_tables (List[str]): List of available table names
+            
+        Returns:
+            Dict[str, Any]: Selected tables configuration for unimolecular reactions
+        """
+        try:
+            print(f"\n🧪 UNIMOLECULAR REACTION WORKFLOW SETUP")
+            print("=" * 50)
+            print("This workflow contains only unimolecular reactions.")
+            print("Select one or more tables to process:")
+            
+            selected_tables = self._select_multiple_tables(available_tables)
+            
+            if selected_tables:
+                total_compounds = sum(self.get_compound_count(table_name=table) for table in selected_tables)
+                print(f"\n✅ Selected {len(selected_tables)} table(s) ({total_compounds} total compounds)")
+                
+                return {
+                    'type': 'unimolecular',
+                    'tables': selected_tables,
+                    'total_compounds': total_compounds
+                }
+            else:
+                return {}
+            
+        except Exception as e:
+            print(f"❌ Error selecting tables for unimolecular reactions: {e}")
+            return {}
+
+    def _select_single_table(self, available_tables: List[str], table_type: str) -> Optional[str]:
+        """
+        Select a single table from available options.
+        
+        Args:
+            available_tables (List[str]): List of available table names
+            table_type (str): Description of table type for user prompt
+            
+        Returns:
+            Optional[str]: Selected table name or None if cancelled
+        """
+        try:
+            if not available_tables:
+                print(f"❌ No tables available for {table_type} selection")
+                return None
+            
+            print(f"\nAvailable tables for {table_type}:")
+            for i, table in enumerate(available_tables, 1):
+                compound_count = self.get_compound_count(table_name=table)
+                print(f"   {i}. {table} ({compound_count} compounds)")
+            
+            while True:
+                try:
+                    selection = input(f"\nSelect {table_type} table (1-{len(available_tables)} or table name): ").strip()
+                    
+                    if selection.lower() in ['cancel', 'quit', 'exit']:
+                        return None
+                    
+                    # Try as number first
+                    try:
+                        table_idx = int(selection) - 1
+                        if 0 <= table_idx < len(available_tables):
+                            selected_table = available_tables[table_idx]
+                            print(f"✅ Selected {table_type} table: '{selected_table}'")
+                            return selected_table
+                        else:
+                            print(f"❌ Invalid selection. Please enter 1-{len(available_tables)}")
+                            continue
+                    except ValueError:
+                        # Treat as table name
+                        if selection in available_tables:
+                            print(f"✅ Selected {table_type} table: '{selection}'")
+                            return selection
+                        else:
+                            print(f"❌ Table '{selection}' not found")
+                            continue
+                            
+                except KeyboardInterrupt:
+                    print(f"\n❌ {table_type} table selection cancelled")
+                    return None
+                    
+        except Exception as e:
+            print(f"❌ Error selecting {table_type} table: {e}")
+            return None
+
+    def _select_multiple_tables(self, available_tables: List[str]) -> List[str]:
+        """
+        Select multiple tables from available options.
+        
+        Args:
+            available_tables (List[str]): List of available table names
+            
+        Returns:
+            List[str]: List of selected table names
+        """
+        try:
+            print("Enter table numbers or names (comma-separated), or 'all' for all tables:")
+            
+            user_input = input("Selection: ").strip().lower()
+            
+            if not user_input or user_input in ['cancel', 'quit', 'exit']:
+                return []
+            
+            if user_input == 'all':
+                print(f"✅ Selected all {len(available_tables)} tables")
+                return available_tables
+            
+            selected_tables = []
+            selections = [s.strip() for s in user_input.split(',')]
+            
+            for selection in selections:
+                try:
+                    # Try as table number first
+                    table_idx = int(selection) - 1
+                    if 0 <= table_idx < len(available_tables):
+                        table_name = available_tables[table_idx]
+                        if table_name not in selected_tables:
+                            selected_tables.append(table_name)
+                    else:
+                        print(f"⚠️  Invalid table number: {selection}")
+                except ValueError:
+                    # Treat as table name
+                    if selection in available_tables:
+                        if selection not in selected_tables:
+                            selected_tables.append(selection)
+                    else:
+                        print(f"⚠️  Table '{selection}' not found")
+            
+            return selected_tables
+            
+        except Exception as e:
+            print(f"❌ Error selecting multiple tables: {e}")
+            return []
+
+    def _process_bimolecular_workflow(self, table_config: Dict[str, Any], 
+                                    reactions_dict: Dict[int, Dict[str, Any]], 
+                                    workflow_name: str, 
+                                    analysis: Dict[str, Any]) -> None:
+        """
+        Process a workflow containing bimolecular reactions.
+        
+        Args:
+            table_config (Dict): Table configuration for bimolecular reactions
+            reactions_dict (Dict): Dictionary of reactions
+            workflow_name (str): Name of the workflow
+            analysis (Dict): Reaction analysis results
+        """
+        try:
+            print(f"\n🧬 PROCESSING BIMOLECULAR REACTION WORKFLOW")
+            print("=" * 50)
+            
+            primary_table = table_config['primary_table']
+            secondary_table = table_config['secondary_table']
+            
+            # Get compound data
+            primary_df = self._get_table_as_dataframe(primary_table)
+            secondary_df = self._get_table_as_dataframe(secondary_table)
+            
+            print(f"📊 Primary reactants: {len(primary_df)} compounds")
+            print(f"📊 Secondary reactants: {len(secondary_df)} compounds")
+            
+            # Process bimolecular reactions
+            bimolecular_products = []
+            for reaction_info in analysis['bimolecular_reactions']:
+                print(f"\n🔬 Processing bimolecular reaction: {reaction_info['name']}")
+                
+                reaction_products = self._apply_bimolecular_reaction(
+                    primary_df, secondary_df, reaction_info, workflow_name
+                )
+                bimolecular_products.extend(reaction_products)
+            
+            # Process unimolecular reactions if present
+            unimolecular_products = []
+            if analysis['has_unimolecular']:
+                strategy = table_config['unimolecular_strategy']
+                
+                for reaction_info in analysis['unimolecular_reactions']:
+                    print(f"\n🧪 Processing unimolecular reaction: {reaction_info['name']}")
+                    
+                    if strategy == 'both':
+                        # Apply to both tables separately
+                        products_a = self._apply_unimolecular_reaction(
+                            primary_df, reaction_info, workflow_name, f"{primary_table}_"
+                        )
+                        products_b = self._apply_unimolecular_reaction(
+                            secondary_df, reaction_info, workflow_name, f"{secondary_table}_"
+                        )
+                        unimolecular_products.extend(products_a)
+                        unimolecular_products.extend(products_b)
+                    elif strategy == 'secondary':
+                        products = self._apply_unimolecular_reaction(
+                            secondary_df, reaction_info, workflow_name, f"{secondary_table}_"
+                        )
+                        unimolecular_products.extend(products)
+                    else:  # primary
+                        products = self._apply_unimolecular_reaction(
+                            primary_df, reaction_info, workflow_name, f"{primary_table}_"
+                        )
+                        unimolecular_products.extend(products)
+            
+            # Combine and save all products
+            all_products = bimolecular_products + unimolecular_products
+            
+            print(f"\n📊 REACTION WORKFLOW RESULTS:")
+            print(f"   🧬 Bimolecular products: {len(bimolecular_products)}")
+            print(f"   🧪 Unimolecular products: {len(unimolecular_products)}")
+            print(f"   🎯 Total products: {len(all_products)}")
+            
+            if all_products:
+                save_choice = input("\n💾 Save all products to a new table? (y/n): ").strip().lower()
+                if save_choice in ['y', 'yes']:
+                    self._save_reaction_products(
+                        all_products, workflow_name, f"{primary_table}_and_{secondary_table}"
+                    )
+            
+        except Exception as e:
+            print(f"❌ Error processing bimolecular workflow: {e}")
+
+    def _process_unimolecular_workflow(self, table_config: Dict[str, Any], 
+                                    reactions_dict: Dict[int, Dict[str, Any]], 
+                                    workflow_name: str) -> None:
+        """
+        Process a workflow containing only unimolecular reactions.
+        
+        Args:
+            table_config (Dict): Table configuration for unimolecular reactions
+            reactions_dict (Dict): Dictionary of reactions
+            workflow_name (str): Name of the workflow
+        """
+        try:
+            print(f"\n🧪 PROCESSING UNIMOLECULAR REACTION WORKFLOW")
+            print("=" * 50)
+            
+            tables = table_config['tables']
+            all_products = []
+            
+            # Process each table
+            for table_name in tables:
+                print(f"\n🔬 Processing table: '{table_name}'")
+                compounds_df = self._get_table_as_dataframe(table_name)
+                
+                if compounds_df.empty:
+                    print(f"   ⚠️  No compounds in table '{table_name}', skipping...")
+                    continue
+                
+                print(f"   📊 Processing {len(compounds_df)} compounds...")
+                
+                # Apply each unimolecular reaction
+                table_products = []
+                sorted_reactions = sorted(reactions_dict.items(), key=lambda x: x[1]['order'])
+                
+                for reaction_id, reaction_info in sorted_reactions:
+                    print(f"   🧪 Applying reaction: {reaction_info['name']}")
+                    
+                    reaction_products = self._apply_unimolecular_reaction(
+                        compounds_df, reaction_info, workflow_name, f"{table_name}_"
+                    )
+                    table_products.extend(reaction_products)
+                
+                all_products.extend(table_products)
+                print(f"   ✅ Generated {len(table_products)} products from '{table_name}'")
+            
+            # Final results
+            print(f"\n📊 UNIMOLECULAR WORKFLOW RESULTS:")
+            print(f"   📋 Tables processed: {len(tables)}")
+            print(f"   🎯 Total products: {len(all_products)}")
+            
+            if all_products:
+                save_choice = input("\n💾 Save all products to a new table? (y/n): ").strip().lower()
+                if save_choice in ['y', 'yes']:
+                    combined_source = "_".join(tables[:3])  # Limit length
+                    if len(tables) > 3:
+                        combined_source += f"_and_{len(tables)-3}_more"
+                    
+                    self._save_reaction_products(all_products, workflow_name, combined_source)
+            
+        except Exception as e:
+            print(f"❌ Error processing unimolecular workflow: {e}")
+
+    def _apply_bimolecular_reaction(self, primary_df: pd.DataFrame, secondary_df: pd.DataFrame,
+                                reaction_info: Dict[str, Any], workflow_name: str) -> List[Dict[str, Any]]:
+        """
+        Apply a bimolecular reaction between compounds from two tables.
+        
+        Args:
+            primary_df (pd.DataFrame): Primary reactants dataframe
+            secondary_df (pd.DataFrame): Secondary reactants dataframe  
+            reaction_info (Dict): Reaction information
+            workflow_name (str): Name of the workflow
+            
+        Returns:
+            List[Dict]: List of reaction products
+        """
+        try:
+            from rdkit import Chem
+            from rdkit.Chem import AllChem
+            
+            reaction_smarts = reaction_info['smarts']
+            reaction_name = reaction_info['name']
+            products = []
+            
+            # Parse reaction
+            rxn = AllChem.ReactionFromSmarts(reaction_smarts)
+            if rxn is None:
+                print(f"   ❌ Invalid reaction SMARTS: {reaction_smarts}")
+                return []
+            
+            # Get expected number of reactants
+            expected_reactants = rxn.GetNumReactantTemplates()
+            print(f"   🔗 Reaction expects {expected_reactants} reactants")
+            
+            # Process combinations with progress tracking
+            total_combinations = len(primary_df) * len(secondary_df)
+            print(f"   📊 Processing {total_combinations:,} reactant combinations...")
+            
+            processed = 0
+            successful_reactions = 0
+            
+            # Use progress bar if available
+            if TQDM_AVAILABLE and total_combinations > 1000:
+                progress_bar = tqdm(
+                    total=total_combinations,
+                    desc=f"Bimolecular {reaction_name}",
+                    unit="combinations"
+                )
+            else:
+                progress_bar = None
+            
+            for _, primary_compound in primary_df.iterrows():
+                primary_mol = Chem.MolFromSmiles(primary_compound['smiles'])
+                if primary_mol is None:
+                    if progress_bar:
+                        progress_bar.update(len(secondary_df))
+                    processed += len(secondary_df)
+                    continue
+                
+                for _, secondary_compound in secondary_df.iterrows():
+                    secondary_mol = Chem.MolFromSmiles(secondary_compound['smiles'])
+                    if secondary_mol is None:
+                        if progress_bar:
+                            progress_bar.update(1)
+                        processed += 1
+                        continue
+                    
+                    try:
+                        # Run bimolecular reaction
+                        if expected_reactants >= 2:
+                            reaction_results = rxn.RunReactants((primary_mol, secondary_mol))
+                        else:
+                            # Fallback for reactions that might work with single reactant
+                            reaction_results = rxn.RunReactants((primary_mol,))
+                        
+                        # Process products
+                        for product_set_idx, product_set in enumerate(reaction_results):
+                            for product_idx, product_mol in enumerate(product_set):
+                                try:
+                                    Chem.SanitizeMol(product_mol)
+                                    product_smiles = Chem.MolToSmiles(product_mol)
+                                    
+                                    # Generate product name
+                                    primary_name = primary_compound.get('name', f"cpd_{primary_compound.get('id', 'unk')}")
+                                    secondary_name = secondary_compound.get('name', f"cpd_{secondary_compound.get('id', 'unk')}")
+                                    product_name = f"{primary_name}+{secondary_name}_{reaction_name}_{product_set_idx}_{product_idx}"
+                                    
+                                    products.append({
+                                        'smiles': product_smiles,
+                                        'name': product_name,
+                                        'flag': 'bimolecular_product',
+                                        'reactant1_name': primary_name,
+                                        'reactant1_smiles': primary_compound['smiles'],
+                                        'reactant2_name': secondary_name,
+                                        'reactant2_smiles': secondary_compound['smiles'],
+                                        'reaction_name': reaction_name,
+                                        'workflow': workflow_name
+                                    })
+                                    successful_reactions += 1
+                                    
+                                except Exception:
+                                    continue  # Skip invalid products
+                                    
+                    except Exception:
+                        pass  # Skip failed reactions
+                    
+                    processed += 1
+                    if progress_bar:
+                        progress_bar.update(1)
+                    elif processed % max(1, total_combinations // 20) == 0:
+                        progress_pct = (processed / total_combinations) * 100
+                        print(f"      📊 Progress: {progress_pct:.1f}% ({successful_reactions} products so far)")
+            
+            if progress_bar:
+                progress_bar.close()
+            
+            print(f"   ✅ Generated {len(products)} products from {successful_reactions} successful reactions")
+            return products
+            
+        except Exception as e:
+            print(f"   ❌ Error in bimolecular reaction {reaction_info['name']}: {e}")
+            return []
+
+    def _apply_unimolecular_reaction(self, compounds_df: pd.DataFrame, reaction_info: Dict[str, Any],
+                                workflow_name: str, name_prefix: str = "") -> List[Dict[str, Any]]:
+        """
+        Apply a unimolecular reaction to compounds from a table.
+        
+        Args:
+            compounds_df (pd.DataFrame): Compounds dataframe
+            reaction_info (Dict): Reaction information
+            workflow_name (str): Name of the workflow
+            name_prefix (str): Prefix for product names
+            
+        Returns:
+            List[Dict]: List of reaction products
+        """
+        try:
+            from rdkit import Chem
+            from rdkit.Chem import AllChem
+            
+            reaction_smarts = reaction_info['smarts']
+            reaction_name = reaction_info['name']
+            products = []
+            
+            # Parse reaction
+            rxn = AllChem.ReactionFromSmarts(reaction_smarts)
+            if rxn is None:
+                print(f"   ❌ Invalid reaction SMARTS: {reaction_smarts}")
+                return []
+            
+            print(f"   📊 Processing {len(compounds_df)} compounds...")
+            
+            successful_reactions = 0
+            
+            # Use progress bar if available
+            if TQDM_AVAILABLE and len(compounds_df) > 100:
+                progress_bar = tqdm(
+                    compounds_df.iterrows(),
+                    total=len(compounds_df),
+                    desc=f"Unimolecular {reaction_name}",
+                    unit="compounds"
+                )
+            else:
+                progress_bar = compounds_df.iterrows()
+                processed_count = 0
+            
+            for _, compound in progress_bar:
+                try:
+                    reactant_mol = Chem.MolFromSmiles(compound['smiles'])
+                    if reactant_mol is None:
+                        continue
+                    
+                    # Run unimolecular reaction
+                    reaction_results = rxn.RunReactants((reactant_mol,))
+                    
+                    # Process products
+                    for product_set_idx, product_set in enumerate(reaction_results):
+                        for product_idx, product_mol in enumerate(product_set):
+                            try:
+                                Chem.SanitizeMol(product_mol)
+                                product_smiles = Chem.MolToSmiles(product_mol)
+                                
+                                # Generate product name
+                                original_name = compound.get('name', f"cpd_{compound.get('id', 'unk')}")
+                                product_name = f"{name_prefix}{original_name}_{reaction_name}_{product_set_idx}_{product_idx}"
+                                
+                                products.append({
+                                    'smiles': product_smiles,
+                                    'name': product_name,
+                                    'flag': 'unimolecular_product',
+                                    'reactant_name': original_name,
+                                    'reactant_smiles': compound['smiles'],
+                                    'reaction_name': reaction_name,
+                                    'workflow': workflow_name
+                                })
+                                successful_reactions += 1
+                                
+                            except Exception:
+                                continue  # Skip invalid products
+                                
+                except Exception:
+                    continue  # Skip failed reactions
+                
+                # Progress update for non-tqdm case
+                if not TQDM_AVAILABLE:
+                    processed_count += 1
+                    if processed_count % max(1, len(compounds_df) // 10) == 0:
+                        print(f"      📊 Processed {processed_count}/{len(compounds_df)} compounds ({successful_reactions} products)")
+            
+            print(f"   ✅ Generated {len(products)} products from {successful_reactions} successful reactions")
+            return products
+            
+        except Exception as e:
+            print(f"   ❌ Error in unimolecular reaction {reaction_info['name']}: {e}")
+            return []
