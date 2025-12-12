@@ -6314,8 +6314,7 @@ class ChemSpace:
     def apply_reaction_workflow(self, workflow_id: int):
         """
         Apply a saved reaction workflow to compounds with support for sequential multi-step reactions.
-        Each reaction step is analyzed separately for unimolecular/bimolecular nature, and users can
-        choose to use products from previous steps as inputs for subsequent reactions.
+        Each reaction step is analyzed separately for unimolecular/bimolecular nature, and users can choose to use products from previous steps as inputs for subsequent reactions.
         
         Args:
             workflow_id (int): ID of the reaction workflow to apply
@@ -6346,6 +6345,9 @@ class ChemSpace:
                 print(f"   Step {i}: {reaction_info['name']} ({reaction_type})")
             print("=" * 60)
             
+            # Give a pause in the printing for the user to read the workflow analysis
+            input("Press Enter to continue with workflow execution...")
+            
             # Import RDKit for reaction processing
             try:
                 from rdkit import Chem
@@ -6370,11 +6372,6 @@ class ChemSpace:
                 print("❌ No tables available in chemspace database")
                 return
             
-            print(f"\n📊 Available Tables ({len(workflow_state['available_tables'])} total):")
-            for i, table in enumerate(workflow_state['available_tables'], 1):
-                compound_count = self.get_compound_count(table_name=table)
-                print(f"   {i}. {table} ({compound_count} compounds)")
-            
             # Process each reaction step sequentially
             for step_num, (reaction_id, reaction_info) in enumerate(sorted_reactions, 1):
                 print(f"\n{'='*80}")
@@ -6398,6 +6395,12 @@ class ChemSpace:
                         'product_count': step_result['products_generated'],
                         'reaction_name': reaction_info['name']
                     }
+            
+            # Helper: ask user whether to delete intermediate product tables from previous steps
+            
+
+            # Invoke helper to offer deletion of intermediate step tables
+            self._query_and_delete_prev_step_tables(workflow_state)
             
             # Display final workflow summary
             self._display_workflow_summary(workflow_state, workflow_name)
@@ -6800,9 +6803,12 @@ class ChemSpace:
                 
                 save_choice = input("Save products to a new table? (y/n): ").strip().lower()
                 if save_choice in ['y', 'yes']:
+                    # Ask user for a table name, use default if empty
                     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                    output_table_name = f"step{step_num}_{reaction_info['name']}_{timestamp}"
-                    output_table_name = self._sanitize_table_name(output_table_name)
+                    default_name = f"step{step_num}_{reaction_info['name']}_{timestamp}"
+                    user_table_name = input(f"Enter table name (default: {default_name}): ").strip()
+                    chosen_name = user_table_name if user_table_name else default_name
+                    output_table_name = self._sanitize_table_name(chosen_name)
                     
                     success = self._save_step_products(
                         products, output_table_name, workflow_name, step_num
@@ -6810,14 +6816,24 @@ class ChemSpace:
                     
                     if not success:
                         output_table_name = None
-            
-            return {
-                'success': True,
-                'products_generated': len(products),
-                'output_table': output_table_name,
-                'reaction_type': 'bimolecular',
-                'step_num': step_num
-            }
+                    
+                    # Return now to avoid running the default-save block below
+                    return {
+                        'success': True,
+                        'products_generated': len(products),
+                        'output_table': output_table_name,
+                        'reaction_type': 'bimolecular',
+                        'step_num': step_num
+                    }
+                else:
+                    # User chose not to save; return without creating a table
+                    return {
+                        'success': True,
+                        'products_generated': len(products),
+                        'output_table': None,
+                        'reaction_type': 'bimolecular',
+                        'step_num': step_num
+                    }
             
         except Exception as e:
             print(f"❌ Error applying bimolecular reaction: {e}")
@@ -6875,9 +6891,12 @@ class ChemSpace:
                 
                 save_choice = input("Save products to a new table? (y/n): ").strip().lower()
                 if save_choice in ['y', 'yes']:
+                    # Ask user for a table name, use default if empty
                     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                    output_table_name = f"step{step_num}_{reaction_info['name']}_{timestamp}"
-                    output_table_name = self._sanitize_table_name(output_table_name)
+                    default_name = f"step{step_num}_{reaction_info['name']}_{timestamp}"
+                    user_table_name = input(f"Enter table name (default: {default_name}): ").strip()
+                    chosen_name = user_table_name if user_table_name else default_name
+                    output_table_name = self._sanitize_table_name(chosen_name)
                     
                     success = self._save_step_products(
                         all_products, output_table_name, workflow_name, step_num
@@ -7022,3 +7041,85 @@ class ChemSpace:
             
         except Exception as e:
             print(f"❌ Error displaying workflow summary: {e}")
+            
+    def _query_and_delete_prev_step_tables(self, state: Dict[str, Any]) -> None:
+                try:
+                    step_products = state.get('step_products', {})
+                    if not step_products:
+                        print("\nℹ️  No step product tables recorded; nothing to delete.")
+                        return
+
+                    # Collect valid tables
+                    tables = []
+                    for step, info in sorted(step_products.items()):
+                        tbl = info.get('table_name')
+                        cnt = info.get('product_count', 0)
+                        if tbl:
+                            tables.append((int(step), tbl, int(cnt)))
+
+                    if not tables:
+                        print("\nℹ️  No named product tables found for previous steps.")
+                        return
+
+                    print("\n🗂️  Intermediate product tables from previous steps:")
+                    for step, tbl, cnt in tables:
+                        print(f"   • Step {step}: {tbl} ({cnt} products)")
+
+                    choice = input("\n❓ Delete intermediate product tables? (y = all / n = none / s = select): ").strip().lower()
+                    if choice in ['', 'n', 'no']:
+                        print("✅ Keeping all intermediate tables.")
+                        return
+
+                    to_delete = []
+                    if choice in ['y', 'yes', 'all']:
+                        to_delete = [tbl for _, tbl, _ in tables]
+                    elif choice in ['s', 'select']:
+                        sel = input("Enter step numbers or table names (comma-separated): ").strip()
+                        if not sel:
+                            print("⚠️  No selection provided. Aborting deletion.")
+                            return
+                        items = [s.strip() for s in sel.split(',') if s.strip()]
+                        # map selection to table names
+                        step_map = {str(step): tbl for step, tbl, _ in tables}
+                        name_set = {tbl for _, tbl, _ in tables}
+                        for it in items:
+                            if it in step_map:
+                                to_delete.append(step_map[it])
+                            elif it in name_set:
+                                to_delete.append(it)
+                            else:
+                                print(f"⚠️  Ignoring unknown selection: {it}")
+                        to_delete = list(dict.fromkeys(to_delete))  # preserve order, remove duplicates
+                    else:
+                        print("⚠️  Unknown choice, aborting deletion.")
+                        return
+
+                    if not to_delete:
+                        print("ℹ️  No tables selected for deletion.")
+                        return
+
+                    # Final confirmation
+                    print("\n⚠️  Tables to be deleted:")
+                    for tbl in to_delete:
+                        print(f"   - {tbl}")
+                    confirm = input(f"❗ Confirm deletion of {len(to_delete)} table(s)? This cannot be undone (yes/no): ").strip().lower()
+                    if confirm not in ['yes', 'y']:
+                        print("❌ Deletion cancelled by user.")
+                        return
+
+                    deleted = []
+                    for tbl in to_delete:
+                        try:
+                            # Use confirm=False to avoid nested prompts; drop_table already prints status
+                            success = self.drop_table(tbl, confirm=False)
+                            if success:
+                                deleted.append(tbl)
+                        except Exception as e:
+                            print(f"❌ Failed to delete table '{tbl}': {e}")
+
+                    # Record deletions in workflow state
+                    state.setdefault('deleted_step_tables', []).extend(deleted)
+
+                    print(f"🗑️  Deleted {len(deleted)}/{len(to_delete)} requested tables.")
+                except Exception as e:
+                    print(f"⚠️  Error during deletion query: {e}")
