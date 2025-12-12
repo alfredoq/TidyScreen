@@ -196,7 +196,7 @@ def _filter_chunk_worker_by_instances(chunk_data: List[Tuple], filters_list: Lis
                     compound_result['match_counts'][f"{smarts_pattern}_matches"] = match_count
                     
                     # Check if compound meets the instance requirement
-                    filter_passed = match_count >= required_instances
+                    filter_passed = match_count == required_instances
                     
                     compound_result['filter_details'][smarts_pattern] = {
                         'required': required_instances,
@@ -356,12 +356,6 @@ class ChemSpace:
             """
             
             cursor.execute(create_table_query)
-            
-            # Create indexes for faster searches
-            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_name ON {table_name}(name)")
-            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_smiles ON {table_name}(smiles)")
-            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_flag ON {table_name}(flag)")
-            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_inchi_key ON {table_name}(inchi_key)")
             
             conn.commit()
             conn.close()
@@ -3471,16 +3465,6 @@ class ChemSpace:
 
     def apply_reaction_workflow(self, workflow_id: int):
         """
-        Apply a saved reaction workflow to compounds to a list of user specified tables. The function retrieves the reaction workflow by its ID from the chemspace database and applies each reaction in sequence to the compounds in the specified tables. The reactions are applied using RDKit's reaction capabilities, and the resulting products are stored in new tables.
-        
-        Args:
-            workflow_id (int): ID of the reaction workflow to apply
-        """
-
-        pass
-
-    def apply_reaction_workflow(self, workflow_id: int):
-        """
         Apply a saved reaction workflow to compounds on a list of user specified tables. The function retrieves the reaction workflow by its ID from the chemspace database and applies each reaction in sequence to the compounds in the specified tables. The reactions are applied using RDKit's reaction capabilities, and the resulting products are stored in new tables.
         
         Args:
@@ -3528,41 +3512,41 @@ class ChemSpace:
             
             print(f"✅ Selected {len(selected_tables)} tables for reaction processing")
             
-            # # Import RDKit for reaction processing
-            # try:
-            #     from rdkit import Chem
-            #     from rdkit.Chem import AllChem
-            #     from rdkit import RDLogger
-            #     RDLogger.DisableLog('rdApp.*')  # Suppress RDKit warnings
-            # except ImportError:
-            #     print("❌ RDKit not installed. Please install RDKit to use reaction workflows:")
-            #     print("   conda install -c conda-forge rdkit")
-            #     print("   or")
-            #     print("   pip install rdkit")
-            #     return
+            # Import RDKit for reaction processing
+            try:
+                from rdkit import Chem
+                from rdkit.Chem import AllChem
+                from rdkit import RDLogger
+                RDLogger.DisableLog('rdApp.*')  # Suppress RDKit warnings
+            except ImportError:
+                print("❌ RDKit not installed. Please install RDKit to use reaction workflows:")
+                print("   conda install -c conda-forge rdkit")
+                print("   or")
+                print("   pip install rdkit")
+                return
             
-            # # Process each selected table
-            # total_processed_compounds = 0
-            # total_products_generated = 0
+            # Process each selected table
+            total_processed_compounds = 0
+            total_products_generated = 0
             
-            # for table_name in selected_tables:
-            #     print(f"\n🔬 Processing table: '{table_name}'")
+            for table_name in selected_tables:
+                print(f"\n🔬 Processing table: '{table_name}'")
                 
-            #     # Get compounds from table
-            #     compounds_df = self._get_table_as_dataframe(table_name)
-            #     if compounds_df.empty:
-            #         print(f"   ⚠️  No compounds found in table '{table_name}', skipping...")
-            #         continue
+                # Get compounds from table
+                compounds_df = self._get_table_as_dataframe(table_name)
+                if compounds_df.empty:
+                    print(f"   ⚠️  No compounds found in table '{table_name}', skipping...")
+                    continue
                 
-            #     print(f"   📊 Processing {len(compounds_df)} compounds...")
+                print(f"   📊 Processing {len(compounds_df)} compounds...")
                 
-            #     # Apply reaction workflow to this table
-            #     table_results = self._apply_reactions_to_table(
-            #         compounds_df, reactions_dict, workflow_name, table_name
-            #     )
+                # Apply reaction workflow to this table
+                table_results = self._apply_reactions_to_table(
+                    compounds_df, reactions_dict, workflow_name, table_name
+                )
                 
-            #     total_processed_compounds += table_results['compounds_processed']
-            #     total_products_generated += table_results['products_generated']
+                total_processed_compounds += table_results['compounds_processed']
+                total_products_generated += table_results['products_generated']
                 
             #     print(f"   ✅ Table '{table_name}' processed:")
             #     print(f"      📊 Compounds processed: {table_results['compounds_processed']}")
@@ -3757,6 +3741,7 @@ class ChemSpace:
             products_generated = 0
             failed_reactions = 0
             
+
             # Process each compound through the reaction sequence
             if TQDM_AVAILABLE:
                 progress_bar = tqdm(
@@ -3771,7 +3756,6 @@ class ChemSpace:
             
             for _, compound in progress_bar:
                 compounds_processed += 1
-                
                 try:
                     # Start with original compound
                     reactant_smiles = compound['smiles']
@@ -3805,6 +3789,8 @@ class ChemSpace:
                                     # Run reaction
                                     reaction_products = rxn.RunReactants((product_mol,))
                                     
+                                    
+
                                     for product_set_idx, product_set in enumerate(reaction_products):
                                         for product_idx, product_mol_new in enumerate(product_set):
                                             # Sanitize product
@@ -3834,7 +3820,7 @@ class ChemSpace:
                     
                     # Add final products to results
                     for product_mol, product_name, step in current_products:
-                        if step > 0:  # Only count products from actual reactions
+                        if step > 0:  # Only count products from actual
                             try:
                                 product_smiles = Chem.MolToSmiles(product_mol)
                                 all_products.append({
@@ -3862,9 +3848,16 @@ class ChemSpace:
             # Save products to new table
             output_table_name = None
             if all_products:
-                output_table_name = self._save_reaction_products(
-                    all_products, workflow_name, source_table_name
-                )
+
+                print(f"\n💾 Found {products_generated} reaction products from table '{source_table_name}'")
+
+                save_choice = input("Do you want to save these products to a new table? (y/n): ").strip().lower()
+
+                if save_choice in ['y', 'yes']:
+
+                    output_table_name = self._save_reaction_products(
+                        all_products, workflow_name, source_table_name
+                    )
             
             return {
                 'compounds_processed': compounds_processed,
@@ -4750,3 +4743,1039 @@ class ChemSpace:
             
         except Exception as e:
             print(f"❌ Error listing filtering workflows: {e}")
+
+    def check_duplicates(self, table_name: str, 
+                    duplicate_by: str = 'smiles',
+                    show_duplicates: bool = True,
+                    remove_duplicates: bool = False,
+                    keep_first: bool = True,
+                    export_duplicates: bool = False,
+                    export_path: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Check for duplicate molecules in a table based on specified criteria.
+        
+        Args:
+            table_name (str): Name of the table to check for duplicates
+            duplicate_by (str): Column to check for duplicates ('smiles', 'inchi_key', 'name', or 'all')
+            show_duplicates (bool): Whether to display duplicate entries
+            remove_duplicates (bool): Whether to remove duplicate entries from the table
+            keep_first (bool): If removing duplicates, whether to keep first occurrence (True) or last (False)
+            export_duplicates (bool): Whether to export duplicate entries to CSV
+            export_path (Optional[str]): Path for export file. If None, uses default naming
+            
+        Returns:
+            Dict[str, Any]: Results dictionary with duplicate statistics and details
+        """
+        try:
+            # Check if table exists
+            tables = self.get_all_tables()
+            if table_name not in tables:
+                print(f"❌ Table '{table_name}' does not exist in chemspace database")
+                return {'success': False, 'message': f"Table '{table_name}' not found"}
+            
+            # Get table data
+            compounds_df = self._get_table_as_dataframe(table_name)
+            if compounds_df.empty:
+                print(f"❌ No compounds found in table '{table_name}'")
+                return {'success': False, 'message': f"No compounds in table '{table_name}'"}
+            
+            print(f"🔍 Checking for duplicates in table '{table_name}'")
+            print(f"   📊 Total compounds: {len(compounds_df):,}")
+            print(f"   🎯 Duplicate criteria: {duplicate_by}")
+            
+            # Initialize results
+            results = {
+                'success': True,
+                'table_name': table_name,
+                'total_compounds': len(compounds_df),
+                'duplicate_by': duplicate_by,
+                'duplicates_found': {},
+                'unique_compounds': 0,
+                'removed_duplicates': 0,
+                'export_path': None
+            }
+            
+            # Check duplicates based on specified criteria
+            if duplicate_by == 'all':
+                # Check all available columns for duplicates
+                duplicate_results = self._check_all_duplicate_types(compounds_df)
+                results['duplicates_found'] = duplicate_results
+                
+                # Display comprehensive results
+                self._display_comprehensive_duplicate_report(duplicate_results, len(compounds_df))
+                
+            else:
+                # Check specific column for duplicates
+                duplicate_info = self._check_column_duplicates(compounds_df, duplicate_by)
+                results['duplicates_found'][duplicate_by] = duplicate_info
+                
+                # Display results for specific column
+                self._display_column_duplicate_report(duplicate_by, duplicate_info, len(compounds_df))
+                
+                # Show duplicate entries if requested
+                if show_duplicates and duplicate_info['duplicate_count'] > 0:
+                    self._show_duplicate_entries(compounds_df, duplicate_by, duplicate_info)
+                
+                # Export duplicates if requested
+                if export_duplicates and duplicate_info['duplicate_count'] > 0:
+                    export_success, export_file = self._export_duplicates(
+                        compounds_df, duplicate_by, duplicate_info, export_path, table_name
+                    )
+                    if export_success:
+                        results['export_path'] = export_file
+                
+                # Remove duplicates if requested
+                if remove_duplicates and duplicate_info['duplicate_count'] > 0:
+                    removed_count = self._remove_duplicates_from_table(
+                        table_name, duplicate_by, keep_first
+                    )
+                    results['removed_duplicates'] = removed_count
+                    results['unique_compounds'] = len(compounds_df) - removed_count
+            
+            return results
+            
+        except Exception as e:
+            print(f"❌ Error checking duplicates in table '{table_name}': {e}")
+            return {'success': False, 'message': f"Error checking duplicates: {e}"}
+
+    def _check_all_duplicate_types(self, df: pd.DataFrame) -> Dict[str, Dict]:
+        """
+        Check for duplicates in all available columns.
+        
+        Args:
+            df (pd.DataFrame): DataFrame to check
+            
+        Returns:
+            Dict[str, Dict]: Dictionary of duplicate information for each column
+        """
+        duplicate_results = {}
+        
+        # Define columns to check and their priorities
+        columns_to_check = {
+            'smiles': 'SMILES strings',
+            'inchi_key': 'InChI keys', 
+            'name': 'Compound names'
+        }
+        
+        for column, description in columns_to_check.items():
+            if column in df.columns:
+                print(f"   🔍 Checking {description}...")
+                duplicate_info = self._check_column_duplicates(df, column)
+                duplicate_results[column] = duplicate_info
+                duplicate_results[column]['description'] = description
+        
+        return duplicate_results
+
+    def _check_column_duplicates(self, df: pd.DataFrame, column: str) -> Dict[str, Any]:
+        """
+        Check for duplicates in a specific column.
+        
+        Args:
+            df (pd.DataFrame): DataFrame to check
+            column (str): Column name to check for duplicates
+            
+        Returns:
+            Dict[str, Any]: Dictionary with duplicate information
+        """
+        if column not in df.columns:
+            return {
+                'column_exists': False,
+                'duplicate_count': 0,
+                'unique_count': 0,
+                'duplicate_groups': [],
+                'duplicate_values': []
+            }
+        
+        # Remove null/empty values for duplicate checking
+        valid_data = df[df[column].notna() & (df[column] != '') & (df[column] != 'nan')]
+        
+        if valid_data.empty:
+            return {
+                'column_exists': True,
+                'duplicate_count': 0,
+                'unique_count': 0,
+                'duplicate_groups': [],
+                'duplicate_values': [],
+                'null_count': len(df) - len(valid_data)
+            }
+        
+        # Find duplicates
+        value_counts = valid_data[column].value_counts()
+        duplicated_values = value_counts[value_counts > 1]
+        
+        # Get duplicate groups with details
+        duplicate_groups = []
+        for value, count in duplicated_values.items():
+            duplicate_rows = valid_data[valid_data[column] == value]
+            group_info = {
+                'value': value,
+                'count': count,
+                'indices': duplicate_rows.index.tolist(),
+                'compounds': []
+            }
+            
+            # Add compound details for each duplicate
+            for _, row in duplicate_rows.iterrows():
+                compound_info = {
+                    'id': row.get('id', 'N/A'),
+                    'name': row.get('name', 'N/A'),
+                    'smiles': row.get('smiles', 'N/A'),
+                    'inchi_key': row.get('inchi_key', 'N/A')
+                }
+                group_info['compounds'].append(compound_info)
+            
+            duplicate_groups.append(group_info)
+        
+        # Sort duplicate groups by count (highest first)
+        duplicate_groups.sort(key=lambda x: x['count'], reverse=True)
+        
+        return {
+            'column_exists': True,
+            'duplicate_count': sum(duplicated_values) - len(duplicated_values),  # Total duplicate entries
+            'unique_count': len(value_counts),
+            'duplicate_groups_count': len(duplicated_values),
+            'duplicate_groups': duplicate_groups,
+            'duplicate_values': duplicated_values.index.tolist(),
+            'null_count': len(df) - len(valid_data),
+            'valid_entries': len(valid_data)
+        }
+
+    def _display_comprehensive_duplicate_report(self, duplicate_results: Dict, total_compounds: int) -> None:
+        """
+        Display comprehensive duplicate report for all columns.
+        
+        Args:
+            duplicate_results (Dict): Results from checking all columns
+            total_compounds (int): Total number of compounds
+        """
+        print(f"\n📊 COMPREHENSIVE DUPLICATE ANALYSIS")
+        print("=" * 70)
+        
+        for column, info in duplicate_results.items():
+            if not info.get('column_exists', False):
+                print(f"\n❌ {info.get('description', column)}: Column not found")
+                continue
+            
+            print(f"\n🔍 {info.get('description', column)}:")
+            print(f"   📊 Valid entries: {info.get('valid_entries', 0):,}")
+            print(f"   🔄 Duplicate entries: {info.get('duplicate_count', 0):,}")
+            print(f"   📋 Unique values: {info.get('unique_count', 0):,}")
+            print(f"   🗂️  Duplicate groups: {info.get('duplicate_groups_count', 0):,}")
+            
+            if info.get('null_count', 0) > 0:
+                print(f"   ⚠️  Null/empty entries: {info.get('null_count', 0):,}")
+            
+            if info.get('duplicate_count', 0) > 0:
+                duplicate_rate = (info['duplicate_count'] / info['valid_entries']) * 100
+                print(f"   📈 Duplication rate: {duplicate_rate:.2f}%")
+        
+        print("=" * 70)
+
+    def _display_column_duplicate_report(self, column: str, duplicate_info: Dict, total_compounds: int) -> None:
+        """
+        Display duplicate report for a specific column.
+        
+        Args:
+            column (str): Column name
+            duplicate_info (Dict): Duplicate information for the column
+            total_compounds (int): Total number of compounds
+        """
+        if not duplicate_info.get('column_exists', False):
+            print(f"❌ Column '{column}' not found in table")
+            return
+        
+        print(f"\n📊 DUPLICATE ANALYSIS - {column.upper()}")
+        print("=" * 50)
+        print(f"📊 Total compounds: {total_compounds:,}")
+        print(f"📋 Valid entries: {duplicate_info.get('valid_entries', 0):,}")
+        print(f"🔄 Duplicate entries: {duplicate_info.get('duplicate_count', 0):,}")
+        print(f"📝 Unique values: {duplicate_info.get('unique_count', 0):,}")
+        print(f"🗂️  Duplicate groups: {duplicate_info.get('duplicate_groups_count', 0):,}")
+        
+        if duplicate_info.get('null_count', 0) > 0:
+            print(f"⚠️  Null/empty entries: {duplicate_info.get('null_count', 0):,}")
+        
+        if duplicate_info.get('duplicate_count', 0) > 0:
+            duplicate_rate = (duplicate_info['duplicate_count'] / duplicate_info['valid_entries']) * 100
+            print(f"📈 Duplication rate: {duplicate_rate:.2f}%")
+            
+            # Show top duplicate groups
+            top_groups = duplicate_info.get('duplicate_groups', [])[:5]
+            if top_groups:
+                print(f"\n🔝 Top duplicate groups:")
+                for i, group in enumerate(top_groups, 1):
+                    value_display = group['value'][:50] + "..." if len(str(group['value'])) > 50 else group['value']
+                    print(f"   {i}. '{value_display}' - {group['count']} occurrences")
+        else:
+            print("✅ No duplicates found!")
+        
+        print("=" * 50)
+
+    def _show_duplicate_entries(self, df: pd.DataFrame, column: str, duplicate_info: Dict) -> None:
+        """
+        Display detailed information about duplicate entries.
+        
+        Args:
+            df (pd.DataFrame): DataFrame containing the data
+            column (str): Column being checked
+            duplicate_info (Dict): Duplicate information
+        """
+        duplicate_groups = duplicate_info.get('duplicate_groups', [])
+        
+        if not duplicate_groups:
+            return
+        
+        print(f"\n📋 DUPLICATE ENTRIES DETAILS - {column.upper()}")
+        print("=" * 80)
+        
+        # Show first 10 duplicate groups
+        max_groups_to_show = min(10, len(duplicate_groups))
+        
+        for i, group in enumerate(duplicate_groups[:max_groups_to_show], 1):
+            value_display = str(group['value'])[:60] + "..." if len(str(group['value'])) > 60 else str(group['value'])
+            print(f"\n🔄 Group {i}: '{value_display}' ({group['count']} occurrences)")
+            print("-" * 60)
+            
+            for j, compound in enumerate(group['compounds'], 1):
+                print(f"   {j}. ID: {compound.get('id', 'N/A')} | "
+                    f"Name: {str(compound.get('name', 'N/A'))[:20]} | "
+                    f"SMILES: {str(compound.get('smiles', 'N/A'))[:30]}")
+        
+        if len(duplicate_groups) > max_groups_to_show:
+            remaining = len(duplicate_groups) - max_groups_to_show
+            print(f"\n... and {remaining} more duplicate groups")
+        
+        print("=" * 80)
+
+    def _export_duplicates(self, df: pd.DataFrame, column: str, duplicate_info: Dict, 
+                        export_path: Optional[str], table_name: str) -> Tuple[bool, Optional[str]]:
+        """
+        Export duplicate entries to a CSV file.
+        
+        Args:
+            df (pd.DataFrame): DataFrame containing the data
+            column (str): Column being checked
+            duplicate_info (Dict): Duplicate information
+            export_path (Optional[str]): Custom export path
+            table_name (str): Name of the source table
+            
+        Returns:
+            Tuple[bool, Optional[str]]: (success, export_file_path)
+        """
+        try:
+            if duplicate_info.get('duplicate_count', 0) == 0:
+                print("⚠️  No duplicates to export")
+                return False, None
+            
+            # Generate export filename
+            if export_path is None:
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                export_filename = f"{table_name}_duplicates_{column}_{timestamp}.csv"
+                export_path = os.path.join(self.path, 'chemspace', 'reports', export_filename)
+            
+            # Ensure directory exists
+            os.makedirs(os.path.dirname(export_path), exist_ok=True)
+            
+            # Collect all duplicate entries
+            duplicate_rows = []
+            
+            for group in duplicate_info.get('duplicate_groups', []):
+                for idx in group['indices']:
+                    row_data = df.loc[idx].to_dict()
+                    row_data['duplicate_group'] = group['value']
+                    row_data['duplicate_count'] = group['count']
+                    duplicate_rows.append(row_data)
+            
+            # Create DataFrame and export
+            duplicates_df = pd.DataFrame(duplicate_rows)
+            duplicates_df.to_csv(export_path, index=False)
+            
+            print(f"📤 Duplicates exported to: {export_path}")
+            print(f"   📊 Exported {len(duplicate_rows)} duplicate entries")
+            
+            return True, export_path
+            
+        except Exception as e:
+            print(f"❌ Error exporting duplicates: {e}")
+            return False, None
+
+    def _remove_duplicates_from_table(self, table_name: str, column: str, keep_first: bool = True) -> int:
+        """
+        Remove duplicate entries from the database table.
+        
+        Args:
+            table_name (str): Name of the table
+            column (str): Column to use for duplicate detection
+            keep_first (bool): Whether to keep first occurrence (True) or last (False)
+            
+        Returns:
+            int: Number of duplicate entries removed
+        """
+        try:
+            print(f"\n🗑️  Removing duplicates from table '{table_name}' based on '{column}'...")
+            
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            
+            # Get duplicate entries to remove
+            if keep_first:
+                # Keep first occurrence, remove subsequent ones
+                delete_query = f"""
+                DELETE FROM {table_name} 
+                WHERE id NOT IN (
+                    SELECT MIN(id) 
+                    FROM {table_name} 
+                    WHERE {column} IS NOT NULL AND {column} != '' AND {column} != 'nan'
+                    GROUP BY {column}
+                )
+                AND {column} IS NOT NULL AND {column} != '' AND {column} != 'nan'
+                """
+            else:
+                # Keep last occurrence, remove previous ones
+                delete_query = f"""
+                DELETE FROM {table_name} 
+                WHERE id NOT IN (
+                    SELECT MAX(id) 
+                    FROM {table_name} 
+                    WHERE {column} IS NOT NULL AND {column} != '' AND {column} != 'nan'
+                    GROUP BY {column}
+                )
+                AND {column} IS NOT NULL AND {column} != '' AND {column} != 'nan'
+                """
+            
+            # Execute deletion
+            cursor.execute(delete_query)
+            removed_count = cursor.rowcount
+            
+            conn.commit()
+            conn.close()
+            
+            print(f"✅ Removed {removed_count} duplicate entries")
+            print(f"   📋 Strategy: Keep {'first' if keep_first else 'last'} occurrence")
+            
+            return removed_count
+            
+        except Exception as e:
+            print(f"❌ Error removing duplicates: {e}")
+            return 0
+
+    def find_similar_molecules(self, table_name: str, 
+                            similarity_threshold: float = 0.8,
+                            fingerprint_type: str = 'morgan',
+                            max_comparisons: Optional[int] = None) -> pd.DataFrame:
+        """
+        Find chemically similar molecules in a table using molecular fingerprints.
+        
+        Args:
+            table_name (str): Name of the table to analyze
+            similarity_threshold (float): Minimum Tanimoto similarity (0.0 to 1.0)
+            fingerprint_type (str): Type of fingerprint ('morgan', 'rdkit', 'maccs')
+            max_comparisons (Optional[int]): Maximum number of molecules to compare (for performance)
+            
+        Returns:
+            pd.DataFrame: DataFrame with similar molecule pairs
+        """
+        try:
+            # Import required libraries
+            try:
+                from rdkit import Chem
+                from rdkit.Chem import rdMolDescriptors, DataStructs
+                from rdkit import RDLogger
+                RDLogger.DisableLog('rdApp.*')
+            except ImportError:
+                print("❌ RDKit not installed. Cannot perform similarity analysis.")
+                return pd.DataFrame()
+            
+            # Get compounds from table
+            compounds_df = self._get_table_as_dataframe(table_name)
+            if compounds_df.empty:
+                print(f"❌ No compounds found in table '{table_name}'")
+                return pd.DataFrame()
+            
+            # Limit for performance if specified
+            if max_comparisons and len(compounds_df) > max_comparisons:
+                compounds_df = compounds_df.head(max_comparisons)
+                print(f"🔍 Limited analysis to first {max_comparisons} molecules for performance")
+            
+            print(f"🧬 Analyzing molecular similarity in table '{table_name}'")
+            print(f"   📊 Compounds: {len(compounds_df):,}")
+            print(f"   🎯 Similarity threshold: {similarity_threshold:.2f}")
+            print(f"   🔬 Fingerprint type: {fingerprint_type}")
+            
+            # Generate molecular fingerprints
+            print("🔬 Computing molecular fingerprints...")
+            fingerprints = []
+            valid_molecules = []
+            
+            for idx, row in compounds_df.iterrows():
+                try:
+                    mol = Chem.MolFromSmiles(row['smiles'])
+                    if mol is not None:
+                        # Generate fingerprint based on type
+                        if fingerprint_type == 'morgan':
+                            fp = rdMolDescriptors.GetMorganFingerprintAsBitVect(mol, 2, nBits=2048)
+                        elif fingerprint_type == 'rdkit':
+                            fp = Chem.RDKFingerprint(mol)
+                        elif fingerprint_type == 'maccs':
+                            fp = rdMolDescriptors.GetMACCSKeysFingerprint(mol)
+                        else:
+                            fp = rdMolDescriptors.GetMorganFingerprintAsBitVect(mol, 2, nBits=2048)
+                        
+                        fingerprints.append(fp)
+                        valid_molecules.append(row)
+                except Exception:
+                    continue
+            
+            print(f"   ✅ Generated {len(fingerprints)} valid fingerprints")
+            
+            # Find similar pairs
+            print("🔍 Finding similar molecule pairs...")
+            similar_pairs = []
+            
+            if TQDM_AVAILABLE:
+                progress_bar = tqdm(
+                    total=len(fingerprints) * (len(fingerprints) - 1) // 2,
+                    desc="Comparing molecules",
+                    unit="comparisons"
+                )
+            else:
+                progress_bar = None
+                comparisons_done = 0
+                total_comparisons = len(fingerprints) * (len(fingerprints) - 1) // 2
+            
+            for i in range(len(fingerprints)):
+                for j in range(i + 1, len(fingerprints)):
+                    # Calculate Tanimoto similarity
+                    similarity = DataStructs.TanimotoSimilarity(fingerprints[i], fingerprints[j])
+                    
+                    if similarity >= similarity_threshold:
+                        mol1 = valid_molecules[i]
+                        mol2 = valid_molecules[j]
+                        
+                        similar_pairs.append({
+                            'molecule1_id': mol1.get('id', 'N/A'),
+                            'molecule1_name': mol1.get('name', 'N/A'),
+                            'molecule1_smiles': mol1['smiles'],
+                            'molecule2_id': mol2.get('id', 'N/A'),
+                            'molecule2_name': mol2.get('name', 'N/A'),
+                            'molecule2_smiles': mol2['smiles'],
+                            'similarity': similarity,
+                            'fingerprint_type': fingerprint_type
+                        })
+                    
+                    if progress_bar:
+                        progress_bar.update(1)
+                    else:
+                        comparisons_done += 1
+                        if comparisons_done % max(1, total_comparisons // 20) == 0:
+                            progress = (comparisons_done / total_comparisons) * 100
+                            print(f"   📊 Progress: {progress:.1f}%")
+            
+            if progress_bar:
+                progress_bar.close()
+            
+            # Create results DataFrame
+            results_df = pd.DataFrame(similar_pairs)
+            
+            if not results_df.empty:
+                # Sort by similarity (highest first)
+                results_df = results_df.sort_values('similarity', ascending=False)
+                
+                print(f"\n✅ Similarity analysis completed!")
+                print(f"   🎯 Similar pairs found: {len(results_df):,}")
+                print(f"   📈 Highest similarity: {results_df['similarity'].max():.4f}")
+                print(f"   📉 Lowest similarity: {results_df['similarity'].min():.4f}")
+                
+                # Show top 5 most similar pairs
+                if len(results_df) > 0:
+                    print(f"\n🔝 Top 5 most similar pairs:")
+                    for i, (_, pair) in enumerate(results_df.head(5).iterrows(), 1):
+                        print(f"   {i}. {pair['molecule1_name']} ↔ {pair['molecule2_name']}")
+                        print(f"      Similarity: {pair['similarity']:.4f}")
+            else:
+                print(f"\n📊 No similar pairs found above threshold {similarity_threshold:.2f}")
+            
+            return results_df
+            
+        except Exception as e:
+            print(f"❌ Error in similarity analysis: {e}")
+            return pd.DataFrame()
+
+    def generate_duplicate_report(self, table_name: str, output_path: Optional[str] = None) -> bool:
+        """
+        Generate a comprehensive duplicate analysis report.
+        
+        Args:
+            table_name (str): Name of the table to analyze
+            output_path (Optional[str]): Path for the report file
+            
+        Returns:
+            bool: True if report was generated successfully
+        """
+        try:
+            # Run comprehensive duplicate check
+            results = self.check_duplicates(table_name, duplicate_by='all', show_duplicates=False)
+            
+            if not results['success']:
+                return False
+            
+            # Generate report filename
+            if output_path is None:
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                report_filename = f"{table_name}_duplicate_report_{timestamp}.txt"
+                output_path = os.path.join(self.path, 'chemspace', 'reports', report_filename)
+            
+            # Ensure directory exists
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            
+            # Write comprehensive report
+            with open(output_path, 'w') as f:
+                f.write("MOLECULAR DUPLICATE ANALYSIS REPORT\n")
+                f.write("=" * 50 + "\n\n")
+                f.write(f"Project: {self.name}\n")
+                f.write(f"Table: {table_name}\n")
+                f.write(f"Analysis Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"Total Compounds: {results['total_compounds']:,}\n\n")
+                
+                # Summary section
+                f.write("DUPLICATE SUMMARY\n")
+                f.write("-" * 20 + "\n")
+                
+                for column, info in results['duplicates_found'].items():
+                    if info.get('column_exists', False):
+                        f.write(f"\n{info.get('description', column)}:\n")
+                        f.write(f"  Valid entries: {info.get('valid_entries', 0):,}\n")
+                        f.write(f"  Duplicate entries: {info.get('duplicate_count', 0):,}\n")
+                        f.write(f"  Unique values: {info.get('unique_count', 0):,}\n")
+                        f.write(f"  Duplicate groups: {info.get('duplicate_groups_count', 0):,}\n")
+                        
+                        if info.get('duplicate_count', 0) > 0:
+                            duplicate_rate = (info['duplicate_count'] / info['valid_entries']) * 100
+                            f.write(f"  Duplication rate: {duplicate_rate:.2f}%\n")
+                
+                # Detailed duplicate groups
+                f.write(f"\nDETAILED DUPLICATE GROUPS\n")
+                f.write("-" * 30 + "\n")
+                
+                for column, info in results['duplicates_found'].items():
+                    if info.get('column_exists', False) and info.get('duplicate_count', 0) > 0:
+                        f.write(f"\n{column.upper()} DUPLICATES:\n")
+                        
+                        for i, group in enumerate(info.get('duplicate_groups', [])[:20], 1):
+                            f.write(f"\nGroup {i}: '{group['value']}' ({group['count']} occurrences)\n")
+                            for j, compound in enumerate(group['compounds'], 1):
+                                f.write(f"  {j}. ID: {compound.get('id', 'N/A')} | "
+                                    f"Name: {compound.get('name', 'N/A')} | "
+                                    f"SMILES: {compound.get('smiles', 'N/A')}\n")
+                        
+                        if len(info.get('duplicate_groups', [])) > 20:
+                            remaining = len(info['duplicate_groups']) - 20
+                            f.write(f"\n... and {remaining} more duplicate groups\n")
+            
+            print(f"📋 Duplicate analysis report generated: {output_path}")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Error generating duplicate report: {e}")
+            return False
+        
+        
+    def delete_reaction_workflow(self, workflow_identifier: Optional[str] = None) -> bool:
+        """
+        Delete a reaction workflow from the chemspace database.
+        Can delete by workflow name or ID, or show interactive selection.
+        
+        Args:
+            workflow_identifier (Optional[str]): Workflow name or ID to delete. If None, shows interactive selection.
+            
+        Returns:
+            bool: True if workflow was deleted successfully, False otherwise
+        """
+        try:
+            # Check if reaction_workflows table exists
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='reaction_workflows'")
+            if not cursor.fetchone():
+                print("📝 No reaction workflows table found - no workflows to delete")
+                conn.close()
+                return False
+            
+            # Get all available workflows
+            cursor.execute("""
+                SELECT id, workflow_name, creation_date, description, reactions_dict
+                FROM reaction_workflows 
+                ORDER BY creation_date DESC
+            """)
+            workflows = cursor.fetchall()
+            
+            if not workflows:
+                print("📝 No reaction workflows found to delete")
+                conn.close()
+                return False
+            
+            # If no identifier provided, show interactive selection
+            if workflow_identifier is None:
+                workflow_to_delete = self._select_workflow_for_deletion(workflows)
+                if workflow_to_delete is None:
+                    conn.close()
+                    return False
+            else:
+                # Find workflow by name or ID
+                workflow_to_delete = self._find_workflow_by_identifier(workflows, workflow_identifier)
+                if workflow_to_delete is None:
+                    print(f"❌ No workflow found with identifier '{workflow_identifier}'")
+                    self._show_available_reaction_workflows()
+                    conn.close()
+                    return False
+            
+            # Extract workflow information
+            workflow_id, workflow_name, creation_date, description, reactions_dict_str = workflow_to_delete
+            
+            # Parse reactions for display
+            try:
+                reactions_dict = json.loads(reactions_dict_str)
+                reaction_count = len(reactions_dict)
+            except json.JSONDecodeError:
+                reactions_dict = {}
+                reaction_count = 0
+            
+            # Show workflow details and confirm deletion
+            print(f"\n⚠️  WORKFLOW DELETION CONFIRMATION")
+            print("=" * 60)
+            print(f"🆔 ID: {workflow_id}")
+            print(f"📋 Name: '{workflow_name}'")
+            print(f"📅 Created: {creation_date}")
+            print(f"🧪 Reactions: {reaction_count}")
+            print(f"📄 Description: {description or 'No description'}")
+            
+            if reaction_count > 0:
+                print(f"\n🧪 Reactions in this workflow:")
+                for reaction_id, reaction_info in list(reactions_dict.items())[:5]:  # Show first 5
+                    print(f"   • {reaction_info.get('name', 'Unknown')} (ID: {reaction_id})")
+                if reaction_count > 5:
+                    print(f"   ... and {reaction_count - 5} more reactions")
+            
+            print("=" * 60)
+            
+            # Double confirmation for safety
+            confirm1 = input(f"❓ Are you sure you want to delete workflow '{workflow_name}'? (yes/no): ").strip().lower()
+            if confirm1 not in ['yes', 'y']:
+                print("❌ Workflow deletion cancelled")
+                conn.close()
+                return False
+            
+            confirm2 = input(f"❓ Type the workflow name '{workflow_name}' to confirm deletion: ").strip()
+            if confirm2 != workflow_name:
+                print("❌ Workflow name doesn't match. Deletion cancelled for safety.")
+                conn.close()
+                return False
+            
+            # Perform deletion
+            print(f"🗑️  Deleting workflow '{workflow_name}'...")
+            
+            cursor.execute("DELETE FROM reaction_workflows WHERE id = ?", (workflow_id,))
+            deleted_rows = cursor.rowcount
+            
+            conn.commit()
+            conn.close()
+            
+            if deleted_rows > 0:
+                print(f"✅ Successfully deleted reaction workflow!")
+                print(f"   📋 Workflow: '{workflow_name}' (ID: {workflow_id})")
+                print(f"   🧪 Reactions removed: {reaction_count}")
+                print(f"   📅 Original creation date: {creation_date}")
+                
+                # Show remaining workflows
+                remaining_count = self._count_remaining_workflows()
+                if remaining_count > 0:
+                    print(f"   📊 Remaining workflows: {remaining_count}")
+                else:
+                    print("   📝 No reaction workflows remaining in database")
+                
+                return True
+            else:
+                print(f"❌ Failed to delete workflow (no rows affected)")
+                return False
+            
+        except Exception as e:
+            print(f"❌ Error deleting reaction workflow: {e}")
+            return False
+
+    def _select_workflow_for_deletion(self, workflows: List[Tuple]) -> Optional[Tuple]:
+        """
+        Interactive workflow selection for deletion.
+        
+        Args:
+            workflows (List[Tuple]): List of workflow tuples from database
+            
+        Returns:
+            Optional[Tuple]: Selected workflow tuple or None if cancelled
+        """
+        try:
+            print(f"\n🗑️  SELECT WORKFLOW FOR DELETION")
+            print("=" * 60)
+            print(f"📋 Available Reaction Workflows ({len(workflows)} total):")
+            print("-" * 60)
+            print(f"{'#':<3} {'Name':<25} {'Created':<12} {'Reactions':<10}")
+            print("-" * 60)
+            
+            workflow_map = {}
+            for i, (wf_id, name, date, desc, reactions_dict_str) in enumerate(workflows, 1):
+                try:
+                    reactions_dict = json.loads(reactions_dict_str)
+                    reaction_count = len(reactions_dict)
+                except json.JSONDecodeError:
+                    reaction_count = 0
+                
+                date_short = date[:10] if date else "Unknown"
+                name_display = name[:24] if len(name) <= 24 else name[:21] + "..."
+                
+                print(f"{i:<3} {name_display:<25} {date_short:<12} {reaction_count:<10}")
+                workflow_map[str(i)] = workflows[i-1]
+            
+            print("-" * 60)
+            print("Commands: Enter workflow number, 'cancel' to abort, 'list' to show details")
+            
+            while True:
+                selection = input("\n🔍 Select workflow to delete: ").strip().lower()
+                
+                if selection in ['cancel', 'abort', 'exit', 'quit']:
+                    print("❌ Workflow deletion cancelled by user")
+                    return None
+                elif selection == 'list':
+                    self._show_detailed_workflow_list(workflows)
+                    continue
+                elif selection in workflow_map:
+                    return workflow_map[selection]
+                else:
+                    try:
+                        selection_int = int(selection)
+                        if 1 <= selection_int <= len(workflows):
+                            return workflows[selection_int - 1]
+                        else:
+                            print(f"❌ Invalid selection. Please enter 1-{len(workflows)}")
+                    except ValueError:
+                        print("❌ Invalid input. Please enter a number, 'list', or 'cancel'")
+            
+        except KeyboardInterrupt:
+            print("\n❌ Selection cancelled by user")
+            return None
+        except Exception as e:
+            print(f"❌ Error in workflow selection: {e}")
+            return None
+
+    def _find_workflow_by_identifier(self, workflows: List[Tuple], identifier: str) -> Optional[Tuple]:
+        """
+        Find workflow by name or ID.
+        
+        Args:
+            workflows (List[Tuple]): List of workflow tuples
+            identifier (str): Workflow name or ID to search for
+            
+        Returns:
+            Optional[Tuple]: Matching workflow tuple or None if not found
+        """
+        try:
+            # Try to find by ID first
+            try:
+                search_id = int(identifier)
+                for workflow in workflows:
+                    if workflow[0] == search_id:  # workflow[0] is the ID
+                        return workflow
+            except ValueError:
+                pass  # Not a number, continue to name search
+            
+            # Search by name (case-insensitive)
+            identifier_lower = identifier.lower()
+            for workflow in workflows:
+                workflow_name = workflow[1].lower()  # workflow[1] is the name
+                if workflow_name == identifier_lower:
+                    return workflow
+            
+            # Partial name match if exact match not found
+            for workflow in workflows:
+                workflow_name = workflow[1].lower()
+                if identifier_lower in workflow_name:
+                    return workflow
+            
+            return None
+            
+        except Exception as e:
+            print(f"❌ Error searching for workflow: {e}")
+            return None
+
+    def _show_detailed_workflow_list(self, workflows: List[Tuple]) -> None:
+        """
+        Show detailed information about available workflows.
+        
+        Args:
+            workflows (List[Tuple]): List of workflow tuples
+        """
+        try:
+            print(f"\n📋 DETAILED WORKFLOW INFORMATION")
+            print("=" * 80)
+            
+            for i, (wf_id, name, date, desc, reactions_dict_str) in enumerate(workflows, 1):
+                try:
+                    reactions_dict = json.loads(reactions_dict_str)
+                    reaction_count = len(reactions_dict)
+                    
+                    # Get reaction names for preview
+                    reaction_names = [info.get('name', 'Unknown') for info in reactions_dict.values()]
+                    reactions_preview = ', '.join(reaction_names[:3])
+                    if len(reaction_names) > 3:
+                        reactions_preview += f" and {len(reaction_names) - 3} more..."
+                except json.JSONDecodeError:
+                    reaction_count = 0
+                    reactions_preview = "Error parsing reactions"
+                
+                print(f"\n{i}. {name} (ID: {wf_id})")
+                print(f"   📅 Created: {date}")
+                print(f"   🧪 Reactions: {reaction_count}")
+                print(f"   📄 Description: {desc or 'No description'}")
+                print(f"   🔬 Reactions: {reactions_preview}")
+            
+            print("=" * 80)
+            
+        except Exception as e:
+            print(f"❌ Error showing detailed workflow list: {e}")
+
+    def _count_remaining_workflows(self) -> int:
+        """
+        Count remaining workflows after deletion.
+        
+        Returns:
+            int: Number of remaining workflows
+        """
+        try:
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT COUNT(*) FROM reaction_workflows")
+            count = cursor.fetchone()[0]
+            
+            conn.close()
+            return count
+            
+        except Exception:
+            return 0
+
+    def delete_multiple_reaction_workflows(self, workflow_identifiers: List[str]) -> Dict[str, bool]:
+        """
+        Delete multiple reaction workflows in batch.
+        
+        Args:
+            workflow_identifiers (List[str]): List of workflow names or IDs to delete
+            
+        Returns:
+            Dict[str, bool]: Dictionary mapping workflow identifiers to deletion success status
+        """
+        try:
+            print(f"🗑️  BATCH WORKFLOW DELETION")
+            print("=" * 50)
+            print(f"📋 Workflows to delete: {len(workflow_identifiers)}")
+            
+            results = {}
+            successful_deletions = 0
+            failed_deletions = 0
+            
+            for identifier in workflow_identifiers:
+                print(f"\n🔍 Processing workflow: '{identifier}'")
+                success = self.delete_reaction_workflow(identifier)
+                results[identifier] = success
+                
+                if success:
+                    successful_deletions += 1
+                else:
+                    failed_deletions += 1
+            
+            # Summary
+            print(f"\n📊 BATCH DELETION SUMMARY")
+            print("=" * 30)
+            print(f"✅ Successful deletions: {successful_deletions}")
+            print(f"❌ Failed deletions: {failed_deletions}")
+            print(f"📋 Total processed: {len(workflow_identifiers)}")
+            
+            return results
+            
+        except Exception as e:
+            print(f"❌ Error in batch workflow deletion: {e}")
+            return {identifier: False for identifier in workflow_identifiers}
+
+    def clear_all_reaction_workflows(self, confirm_with_count: bool = True) -> bool:
+        """
+        Delete all reaction workflows from the database.
+        
+        Args:
+            confirm_with_count (bool): Require user to enter the exact count for confirmation
+            
+        Returns:
+            bool: True if all workflows were cleared successfully
+        """
+        try:
+            # Check if table exists and get workflow count
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='reaction_workflows'")
+            if not cursor.fetchone():
+                print("📝 No reaction workflows table found")
+                conn.close()
+                return True
+            
+            cursor.execute("SELECT COUNT(*) FROM reaction_workflows")
+            workflow_count = cursor.fetchone()[0]
+            
+            if workflow_count == 0:
+                print("📝 No reaction workflows found to clear")
+                conn.close()
+                return True
+            
+            # Show warning and get confirmation
+            print(f"⚠️  CLEAR ALL REACTION WORKFLOWS")
+            print("=" * 50)
+            print(f"🚨 WARNING: This will permanently delete ALL {workflow_count} reaction workflows!")
+            print("🚨 This action cannot be undone!")
+            print("=" * 50)
+            
+            # First confirmation
+            confirm1 = input(f"❓ Are you sure you want to delete all {workflow_count} workflows? (yes/no): ").strip().lower()
+            if confirm1 not in ['yes', 'y']:
+                print("❌ Operation cancelled")
+                conn.close()
+                return False
+            
+            # Second confirmation with count
+            if confirm_with_count:
+                confirm2 = input(f"❓ Type the number {workflow_count} to confirm deletion of all workflows: ").strip()
+                if confirm2 != str(workflow_count):
+                    print("❌ Count doesn't match. Operation cancelled for safety.")
+                    conn.close()
+                    return False
+            
+            # Third confirmation
+            confirm3 = input("❓ Type 'DELETE ALL WORKFLOWS' in capitals to proceed: ").strip()
+            if confirm3 != 'DELETE ALL WORKFLOWS':
+                print("❌ Confirmation phrase doesn't match. Operation cancelled.")
+                conn.close()
+                return False
+            
+            # Perform deletion
+            print(f"🗑️  Clearing all reaction workflows...")
+            cursor.execute("DELETE FROM reaction_workflows")
+            deleted_count = cursor.rowcount
+            
+            conn.commit()
+            conn.close()
+            
+            print(f"✅ Successfully cleared all reaction workflows!")
+            print(f"   🗑️  Workflows deleted: {deleted_count}")
+            print(f"   📊 Database is now empty of reaction workflows")
+            
+            return True
+            
+        except Exception as e:
+            print(f"❌ Error clearing all reaction workflows: {e}")
+            return False

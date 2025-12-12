@@ -154,7 +154,6 @@ def list_chemical_reactions(pattern=None):
     except Exception as e:
         print(f"❌ Error listing chemical filters: {e}")
 
-
 def add_chemical_filter():
     """
     Add a new chemical filter by prompting user for input.

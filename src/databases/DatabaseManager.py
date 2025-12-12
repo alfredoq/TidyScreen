@@ -161,6 +161,87 @@ class DatabaseManager:
             print(f"❌ Error refreshing chemical filters: {e}")
             return False
 
+    # def refresh_chem_reactions(self, db_path):
+    #     """Refresh the chem_reactions table by reading the JSON file again and adding new reaction types."""
+    #     try:
+    #         # Connect to database
+    #         conn = sqlite3.connect(db_path)
+    #         cursor = conn.cursor()
+            
+    #         # Create chem_filters table if it doesn't exist
+    #         create_chem_filters_query = """
+    #         CREATE TABLE IF NOT EXISTS chem_reactions (
+    #             id INTEGER PRIMARY KEY AUTOINCREMENT,
+    #             reaction_name TEXT UNIQUE NOT NULL,
+    #             smarts TEXT NOT NULL
+    #         )
+    #         """
+    #         cursor.execute(create_chem_filters_query)
+            
+    #         # Get the path to the JSON file
+    #         config_dir = os.path.dirname(os.path.dirname(os.path.dirname(db_path)))
+    #         json_file_path = os.path.join(config_dir, 'tidyscreen', 'config', 'chem_reactions.json')
+            
+    #         if not os.path.exists(json_file_path):
+    #             print(f"Warning: Chemical reactions JSON file not found at {json_file_path}")
+    #             conn.close()
+    #             return False
+            
+    #         # Read the JSON file
+    #         with open(json_file_path, 'r') as f:
+    #             reactions_data = json.load(f)
+            
+    #         # Get existing filter names to avoid duplicates
+    #         cursor.execute("SELECT reaction_name FROM chem_reactions")
+    #         existing_reactions = set(row[0] for row in cursor.fetchall())
+            
+    #         # Insert new filters
+    #         insert_reaction_query = """
+    #         INSERT OR IGNORE INTO chem_reactions (reaction_name, smarts) VALUES (?, ?)
+    #         """
+            
+    #         new_reactions_count = 0
+    #         updated_reactions_count = 0
+            
+    #         for reaction_item in reactions_data:
+    #             reaction_name = reaction_item['reaction_name']
+    #             smarts = reaction_item['smarts']
+                
+    #             if reaction_name not in existing_reactions:
+    #                 # New filter
+    #                 cursor.execute(insert_reaction_query, (reaction_name, smarts))
+    #                 new_reactions_count += 1
+    #                 print(f"  ➕ Added new reaction: {reaction_name}")
+    #             else:
+    #                 # Check if SMARTS pattern has changed
+    #                 cursor.execute("SELECT smarts FROM chem_reactions WHERE reaction_name = ?", (reaction_name,))
+    #                 current_smarts = cursor.fetchone()[0]
+                    
+    #                 if current_smarts != smarts:
+    #                     # Update existing reaction with new SMARTS pattern
+    #                     cursor.execute(
+    #                         "UPDATE chem_reactions SET smarts = ? WHERE reaction_name = ?", 
+    #                         (smarts, reaction_name)
+    #                     )
+    #                     updated_filters_count += 1
+    #                     print(f"  🔄 Updated reaction: {reaction_name}")
+            
+    #         conn.commit()
+    #         conn.close()
+            
+    #         # Summary
+    #         print(f"\n✅ Chemical reactions refresh completed:")
+    #         print(f"   📊 Total reactions in JSON: {len(reactions_data)}")
+    #         print(f"   ➕ New reactions added: {new_reactions_count}")
+    #         print(f"   🔄 Reactions updated: {updated_reactions_count}")
+    #         print(f"   📍 Source file: {json_file_path}")
+            
+    #         return True
+            
+    #     except Exception as e:
+    #         print(f"❌ Error refreshing chemical reactions: {e}")
+    #         return False
+
     def refresh_chem_reactions(self, db_path):
         """Refresh the chem_reactions table by reading the JSON file again and adding new reaction types."""
         try:
@@ -168,15 +249,15 @@ class DatabaseManager:
             conn = sqlite3.connect(db_path)
             cursor = conn.cursor()
             
-            # Create chem_filters table if it doesn't exist
-            create_chem_filters_query = """
+            # Create chem_reactions table if it doesn't exist
+            create_chem_reactions_query = """
             CREATE TABLE IF NOT EXISTS chem_reactions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 reaction_name TEXT UNIQUE NOT NULL,
                 smarts TEXT NOT NULL
             )
             """
-            cursor.execute(create_chem_filters_query)
+            cursor.execute(create_chem_reactions_query)
             
             # Get the path to the JSON file
             config_dir = os.path.dirname(os.path.dirname(os.path.dirname(db_path)))
@@ -191,40 +272,70 @@ class DatabaseManager:
             with open(json_file_path, 'r') as f:
                 reactions_data = json.load(f)
             
-            # Get existing filter names to avoid duplicates
-            cursor.execute("SELECT reaction_name FROM chem_reactions")
-            existing_reactions = set(row[0] for row in cursor.fetchall())
+            # Get existing reactions with their SMARTS patterns
+            cursor.execute("SELECT reaction_name, smarts FROM chem_reactions")
+            existing_reactions = {row[0]: row[1] for row in cursor.fetchall()}
             
-            # Insert new filters
+            # Insert new reactions
             insert_reaction_query = """
             INSERT OR IGNORE INTO chem_reactions (reaction_name, smarts) VALUES (?, ?)
             """
             
             new_reactions_count = 0
             updated_reactions_count = 0
+            skipped_reactions_count = 0
             
             for reaction_item in reactions_data:
                 reaction_name = reaction_item['reaction_name']
-                smarts = reaction_item['smarts']
+                new_smarts = reaction_item['smarts']
                 
                 if reaction_name not in existing_reactions:
-                    # New filter
-                    cursor.execute(insert_reaction_query, (reaction_name, smarts))
+                    # New reaction - add it
+                    cursor.execute(insert_reaction_query, (reaction_name, new_smarts))
                     new_reactions_count += 1
                     print(f"  ➕ Added new reaction: {reaction_name}")
-                else:
-                    # Check if SMARTS pattern has changed
-                    cursor.execute("SELECT smarts FROM chem_reactions WHERE reaction_name = ?", (reaction_name,))
-                    current_smarts = cursor.fetchone()[0]
                     
-                    if current_smarts != smarts:
-                        # Update existing reaction with new SMARTS pattern
-                        cursor.execute(
-                            "UPDATE chem_reactions SET smarts = ? WHERE reaction_name = ?", 
-                            (smarts, reaction_name)
-                        )
-                        updated_filters_count += 1
-                        print(f"  🔄 Updated reaction: {reaction_name}")
+                else:
+                    # Reaction exists - check if SMARTS pattern is different
+                    current_smarts = existing_reactions[reaction_name]
+                    
+                    if current_smarts != new_smarts:
+                        # SMARTS pattern has changed - ask user for confirmation
+                        print(f"\n🔄 Reaction '{reaction_name}' already exists with different SMARTS:")
+                        print(f"   📋 Current SMARTS: {current_smarts}")
+                        print(f"   🆕 New SMARTS:     {new_smarts}")
+                        print(f"   📍 Source: {json_file_path}")
+                        
+                        while True:
+                            user_choice = input("\n❓ Do you want to replace the existing SMARTS pattern? (y/n/s=skip): ").strip().lower()
+                            
+                            if user_choice in ['y', 'yes']:
+                                # U pdate existing reaction with new SMARTS pattern
+                                cursor.execute(
+                                    "UPDATE chem_reactions SET smarts = ? WHERE reaction_name = ?", 
+                                    (new_smarts, reaction_name)
+                                )
+                                updated_reactions_count += 1
+                                print(f"  ✅ Updated reaction: {reaction_name}")
+                                break
+                                
+                            elif user_choice in ['n', 'no']:
+                                # Keep existing SMARTS pattern
+                                print(f"  ⏭️  Keeping existing SMARTS for: {reaction_name}")
+                                skipped_reactions_count += 1
+                                break
+                                
+                            elif user_choice in ['s', 'skip']:
+                                # Skip this reaction entirely
+                                print(f"  ⏭️  Skipped reaction: {reaction_name}")
+                                skipped_reactions_count += 1
+                                break
+                                
+                            else:
+                                print("  ❌ Invalid choice. Please enter 'y' (yes), 'n' (no), or 's' (skip)")
+                    else:
+                        # SMARTS pattern is the same - no action needed
+                        print(f"  ✅ Reaction '{reaction_name}' already up to date")
             
             conn.commit()
             conn.close()
@@ -234,13 +345,23 @@ class DatabaseManager:
             print(f"   📊 Total reactions in JSON: {len(reactions_data)}")
             print(f"   ➕ New reactions added: {new_reactions_count}")
             print(f"   🔄 Reactions updated: {updated_reactions_count}")
+            print(f"   ⏭️  Reactions skipped: {skipped_reactions_count}")
             print(f"   📍 Source file: {json_file_path}")
             
             return True
             
+        except KeyboardInterrupt:
+            print(f"\n\n⏹️  Operation cancelled by user")
+            if 'conn' in locals():
+                conn.close()
+            return False
+            
         except Exception as e:
             print(f"❌ Error refreshing chemical reactions: {e}")
+            if 'conn' in locals():
+                conn.close()
             return False
+
 
     def connect_db(self, db):
         try:
