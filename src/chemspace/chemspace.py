@@ -135,6 +135,7 @@ def _filter_chunk_worker_by_instances(chunk_data: List[Tuple], filters_list: Lis
     """
     Worker function to process a chunk of compounds for SMARTS filtering by instances in parallel.
     This function filters compounds based on exact match count requirements for each SMARTS pattern.
+    Filters with one or more instances are applied first to reduce the compound set early.
     
     Args:
         chunk_data (List[Tuple]): List of tuples (id, smiles, name, flag, inchi_key)
@@ -153,6 +154,10 @@ def _filter_chunk_worker_by_instances(chunk_data: List[Tuple], filters_list: Lis
     
     results = []
     
+    # Sort filters by required instances: filters with 1+ instances first, then 0-instance filters
+    # This ensures exclusion filters (instances > 0) run first to reduce the compound set
+    sorted_filters = sorted(filters_list, key=lambda x: (x[1] == 0, x[1]))
+    
     for compound_id, smiles, name, flag, inchi_key in chunk_data:
         compound_result = {
             'id': compound_id,
@@ -162,7 +167,8 @@ def _filter_chunk_worker_by_instances(chunk_data: List[Tuple], filters_list: Lis
             'inchi_key': inchi_key,
             'passes_filters': True,
             'match_counts': {},
-            'filter_details': {}
+            'filter_details': {},
+            'early_termination': False  # Track if compound was eliminated early
         }
         
         try:
@@ -173,8 +179,8 @@ def _filter_chunk_worker_by_instances(chunk_data: List[Tuple], filters_list: Lis
                 results.append(compound_result)
                 continue
             
-            # Apply each filter with instance requirements
-            for smarts_pattern, required_instances in filters_list:
+            # Apply filters in optimized order (exclusion filters first)
+            for filter_idx, (smarts_pattern, required_instances) in enumerate(sorted_filters):
                 try:
                     pattern = Chem.MolFromSmarts(smarts_pattern)
                     
@@ -188,7 +194,9 @@ def _filter_chunk_worker_by_instances(chunk_data: List[Tuple], filters_list: Lis
                         }
                         # Invalid SMARTS pattern causes compound to fail
                         compound_result['passes_filters'] = False
-                        continue
+                        compound_result['early_termination'] = True
+                        compound_result['termination_filter'] = smarts_pattern
+                        break  # No need to process remaining filters
                     
                     # Get all substructure matches
                     matches = mol.GetSubstructMatches(pattern)
@@ -204,12 +212,30 @@ def _filter_chunk_worker_by_instances(chunk_data: List[Tuple], filters_list: Lis
                         'required': required_instances,
                         'found': match_count,
                         'passed': filter_passed,
-                        'match_positions': [list(match) for match in matches] if matches else []
+                        'match_positions': [list(match) for match in matches] if matches else [],
+                        'filter_order': filter_idx + 1  # Track processing order
                     }
                     
                     # If any filter fails to meet instance requirement, compound fails overall
                     if not filter_passed:
                         compound_result['passes_filters'] = False
+                        compound_result['early_termination'] = True
+                        compound_result['termination_filter'] = smarts_pattern
+                        compound_result['termination_reason'] = (
+                            f"Required {required_instances} instances, found {match_count}"
+                        )
+                        
+                        # Early termination: skip remaining filters for this compound
+                        # Mark remaining filters as not processed
+                        for remaining_smarts, remaining_instances in sorted_filters[filter_idx + 1:]:
+                            compound_result['filter_details'][remaining_smarts] = {
+                                'required': remaining_instances,
+                                'found': -1,  # -1 indicates not processed due to early termination
+                                'passed': False,
+                                'skipped': True,
+                                'reason': 'Early termination after previous filter failure'
+                            }
+                        break  # Exit filter loop early
                 
                 except Exception as filter_error:
                     # Handle individual filter errors
@@ -225,14 +251,33 @@ def _filter_chunk_worker_by_instances(chunk_data: List[Tuple], filters_list: Lis
                     )
                     # Filter error causes compound to fail
                     compound_result['passes_filters'] = False
+                    compound_result['early_termination'] = True
+                    compound_result['termination_filter'] = smarts_pattern
+                    compound_result['termination_reason'] = f"Filter error: {str(filter_error)}"
+                    break  # Exit filter loop early
+            
+            # Add optimization statistics
+            compound_result['filters_processed'] = len([
+                details for details in compound_result['filter_details'].values() 
+                if not details.get('skipped', False)
+            ])
+            compound_result['total_filters'] = len(sorted_filters)
+            
+            # Calculate processing efficiency
+            if compound_result['total_filters'] > 0:
+                efficiency = (compound_result['filters_processed'] / compound_result['total_filters']) * 100
+                compound_result['processing_efficiency'] = round(efficiency, 1)
             
         except Exception as mol_error:
             compound_result['passes_filters'] = False
             compound_result['error'] = str(mol_error)
+            compound_result['early_termination'] = True
+            compound_result['termination_reason'] = f"Molecule error: {str(mol_error)}"
         
         results.append(compound_result)
     
     return results
+
 
 class ChemSpace:
     """
