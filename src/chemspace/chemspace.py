@@ -11,6 +11,8 @@ from multiprocessing import cpu_count
 import numpy as np
 import time
 import json
+from tidyscreen import tidyscreen
+
 
 # Try to import tqdm for progress bars
 try:
@@ -2096,18 +2098,19 @@ class ChemSpace:
         
         return chunks
 
-    def filter_using_workflow(self, table_name: str, workflow_name: str, 
-                     save_results: Optional[bool] = None, 
-                     result_table_name: Optional[str] = None,
-                     parallel_threshold: int = 10000,
-                     max_workers: Optional[int] = None,
-                     chunk_size: Optional[int] = None) -> pd.DataFrame:
+    def filter_using_workflow(self, table_name: Optional[str] = None, workflow_name: Optional[str] = None, 
+                    save_results: Optional[bool] = None, 
+                    result_table_name: Optional[str] = None,
+                    parallel_threshold: int = 10000,
+                    max_workers: Optional[int] = None,
+                    chunk_size: Optional[int] = None) -> pd.DataFrame:
         """
         Apply a chemical filtering workflow to compounds in a table with parallel processing support.
+        Shows available tables and workflows for interactive selection if not provided.
         
         Args:
-            table_name (str): Name of the table containing compounds to filter
-            workflow_name (str): Name of the workflow to apply
+            table_name (Optional[str]): Name of the table containing compounds to filter. If None, shows selection.
+            workflow_name (Optional[str]): Name of the workflow to apply. If None, shows selection.
             save_results (Optional[bool]): Whether to save filtered results to database (prompts if None)
             result_table_name (Optional[str]): Name for the result table (prompts if save_results=True and None)
             parallel_threshold (int): Minimum number of compounds to trigger parallel processing
@@ -2119,6 +2122,21 @@ class ChemSpace:
         """
         try:
             print(f"\n🔬 Starting workflow filtering...")
+            
+            # Interactive table selection if not provided
+            if table_name is None:
+                table_name = self._select_table_for_filtering()
+                if not table_name:
+                    print("❌ No table selected for filtering")
+                    return pd.DataFrame()
+            
+            # Interactive workflow selection if not provided
+            if workflow_name is None:
+                workflow_name = self._select_workflow_for_filtering()
+                if not workflow_name:
+                    print("❌ No workflow selected for filtering")
+                    return pd.DataFrame()
+            
             print(f"   📋 Table: '{table_name}'")
             print(f"   🧪 Workflow: '{workflow_name}'")
             
@@ -2221,6 +2239,232 @@ class ChemSpace:
         except Exception as e:
             print(f"❌ Error in filter_using_workflow: {e}")
             return pd.DataFrame()
+
+    def _select_table_for_filtering(self) -> Optional[str]:
+        """
+        Interactive selection of table for filtering.
+        
+        Returns:
+            Optional[str]: Selected table name or None if cancelled
+        """
+        try:
+            available_tables = self.get_all_tables()
+            
+            if not available_tables:
+                print("❌ No tables available for filtering")
+                return None
+            
+            print(f"\n📋 SELECT TABLE FOR FILTERING")
+            print("=" * 60)
+            print(f"Available tables ({len(available_tables)} total):")
+            print("-" * 60)
+            
+            # Display tables with compound counts and types
+            table_info = []
+            for i, table_name in enumerate(available_tables, 1):
+                try:
+                    compound_count = self.get_compound_count(table_name=table_name)
+                    table_type = self._classify_table_type(table_name)
+                    type_icon = self._get_table_type_icon(table_type)
+                    
+                    print(f"{i:3d}. {type_icon} {table_name:<35} ({compound_count:>6,} compounds) [{table_type}]")
+                    table_info.append({
+                        'name': table_name,
+                        'count': compound_count,
+                        'type': table_type
+                    })
+                except Exception as e:
+                    print(f"{i:3d}. ❓ {table_name:<35} (Error: {e})")
+                    table_info.append({
+                        'name': table_name,
+                        'count': 0,
+                        'type': 'unknown'
+                    })
+            
+            print("-" * 60)
+            print("Commands: Enter table number, table name, or 'cancel' to abort")
+            
+            while True:
+                try:
+                    selection = input(f"\n🔍 Select table for filtering: ").strip()
+                    
+                    if selection.lower() in ['cancel', 'quit', 'exit']:
+                        return None
+                    
+                    # Try as number first
+                    try:
+                        table_idx = int(selection) - 1
+                        if 0 <= table_idx < len(available_tables):
+                            selected_table = available_tables[table_idx]
+                            selected_info = table_info[table_idx]
+                            
+                            print(f"\n✅ Selected table: '{selected_table}'")
+                            print(f"   📊 Compounds: {selected_info['count']:,}")
+                            print(f"   🏷️  Type: {selected_info['type']}")
+                            return selected_table
+                        else:
+                            print(f"❌ Invalid selection. Please enter 1-{len(available_tables)}")
+                            continue
+                    except ValueError:
+                        # Try as table name
+                        matching_tables = [t for t in available_tables if t.lower() == selection.lower()]
+                        if matching_tables:
+                            selected_table = matching_tables[0]
+                            # Find table info
+                            selected_info = next((info for info in table_info if info['name'] == selected_table), 
+                                            {'count': 0, 'type': 'unknown'})
+                            
+                            print(f"\n✅ Selected table: '{selected_table}'")
+                            print(f"   📊 Compounds: {selected_info['count']:,}")
+                            print(f"   🏷️  Type: {selected_info['type']}")
+                            return selected_table
+                        else:
+                            print(f"❌ Table '{selection}' not found")
+                            continue
+                            
+                except KeyboardInterrupt:
+                    print("\n❌ Table selection cancelled")
+                    return None
+                    
+        except Exception as e:
+            print(f"❌ Error selecting table for filtering: {e}")
+            return None
+
+    def _select_workflow_for_filtering(self) -> Optional[str]:
+        """
+        Interactive selection of workflow for filtering.
+        
+        Returns:
+            Optional[str]: Selected workflow name or None if cancelled
+        """
+        try:
+            # Get available filtering workflows
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            
+            # Check if filtering_workflows table exists
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='filtering_workflows'")
+            if not cursor.fetchone():
+                print("❌ No filtering workflows table found")
+                print("   Create workflows first using create_filtering_workflow()")
+                conn.close()
+                return None
+            
+            # Get all workflows
+            cursor.execute("""
+                SELECT workflow_name, creation_date, description, filter_count, total_instances
+                FROM filtering_workflows 
+                ORDER BY creation_date DESC
+            """)
+            workflows = cursor.fetchall()
+            conn.close()
+            
+            if not workflows:
+                print("❌ No filtering workflows found")
+                print("   Create workflows first using create_filtering_workflow()")
+                return None
+            
+            print(f"\n🧪 SELECT FILTERING WORKFLOW")
+            print("=" * 80)
+            print(f"Available workflows ({len(workflows)} total):")
+            print("-" * 80)
+            print(f"{'#':<3} {'Workflow Name':<25} {'Filters':<8} {'Instances':<10} {'Created':<12} {'Description':<50}")
+            print("-" * 80)
+            
+            workflow_info = []
+            for i, (name, date, desc, filter_count, total_instances) in enumerate(workflows, 1):
+                date_short = date[:10] if date else "Unknown"
+                name_display = name[:24] if len(name) <= 24 else name[:21] + "..."
+                desc_display = (desc or "No description")[:50]
+                if len(desc_display) > 50:
+                    desc_display = desc_display[:50] + "..."
+                
+                print(f"{i:<3} {name_display:<25} {filter_count or 0:<8} {total_instances or 0:<10} "
+                    f"{date_short:<12} {desc_display:<25}")
+                workflow_info.append({
+                    'name': name,
+                    'filter_count': filter_count or 0,
+                    'total_instances': total_instances or 0,
+                    'description': desc or "No description",
+                    'date': date
+                })
+            
+            print("-" * 80)
+            print("Commands: Enter workflow number, workflow name, 'list' for details, or 'cancel' to abort")
+            
+            while True:
+                try:
+                    selection = input(f"\n🔍 Select filtering workflow: ").strip()
+                    
+                    if selection.lower() in ['cancel', 'quit', 'exit']:
+                        return None
+                    elif selection.lower() == 'list':
+                        self._show_detailed_workflow_info(workflow_info)
+                        continue
+                    
+                    # Try as number first
+                    try:
+                        workflow_idx = int(selection) - 1
+                        if 0 <= workflow_idx < len(workflows):
+                            selected_workflow = workflows[workflow_idx][0]  # workflow name
+                            selected_info = workflow_info[workflow_idx]
+                            
+                            print(f"\n✅ Selected workflow: '{selected_workflow}'")
+                            print(f"   🔍 Filters: {selected_info['filter_count']}")
+                            print(f"   🔢 Total instances: {selected_info['total_instances']}")
+                            print(f"   📄 Description: {selected_info['description']}")
+                            return selected_workflow
+                        else:
+                            print(f"❌ Invalid selection. Please enter 1-{len(workflows)}")
+                            continue
+                    except ValueError:
+                        # Try as workflow name
+                        matching_workflows = [w[0] for w in workflows if w[0].lower() == selection.lower()]
+                        if matching_workflows:
+                            selected_workflow = matching_workflows[0]
+                            # Find workflow info
+                            selected_info = next((info for info in workflow_info if info['name'] == selected_workflow), 
+                                            {'filter_count': 0, 'total_instances': 0, 'description': 'Unknown'})
+                            
+                            print(f"\n✅ Selected workflow: '{selected_workflow}'")
+                            print(f"   🔍 Filters: {selected_info['filter_count']}")
+                            print(f"   🔢 Total instances: {selected_info['total_instances']}")
+                            print(f"   📄 Description: {selected_info['description']}")
+                            return selected_workflow
+                        else:
+                            print(f"❌ Workflow '{selection}' not found")
+                            continue
+                            
+                except KeyboardInterrupt:
+                    print("\n❌ Workflow selection cancelled")
+                    return None
+                    
+        except Exception as e:
+            print(f"❌ Error selecting workflow for filtering: {e}")
+            return None
+
+    def _show_detailed_workflow_info(self, workflow_info: List[Dict]) -> None:
+        """
+        Show detailed information about filtering workflows.
+        
+        Args:
+            workflow_info (List[Dict]): List of workflow information dictionaries
+        """
+        try:
+            print(f"\n📋 DETAILED WORKFLOW INFORMATION")
+            print("=" * 80)
+            
+            for i, info in enumerate(workflow_info, 1):
+                print(f"\n{i}. {info['name']}")
+                print(f"   📅 Created: {info['date'] or 'Unknown'}")
+                print(f"   🔍 Filters: {info['filter_count']}")
+                print(f"   🔢 Total instances: {info['total_instances']}")
+                print(f"   📄 Description: {info['description']}")
+            
+            print("=" * 80)
+            
+        except Exception as e:
+            print(f"❌ Error showing detailed workflow information: {e}")
 
     def _load_workflow_filters(self, workflow_name: str) -> List[Tuple[str, str]]:
         """
@@ -3852,7 +4096,8 @@ class ChemSpace:
                 return {}
             
             # Show available filters with enhanced display
-            self._display_available_filters_enhanced(projects_db)
+            #self._display_available_filters_enhanced(projects_db)
+            tidyscreen.list_chemical_filters()
             
             workflow_filters = {}
             filter_counter = 1
@@ -3920,7 +4165,7 @@ class ChemSpace:
                         continue
                     
                     # Skip if already added
-                    filter_exists = any(fid == filter_id for fid in [self._get_filter_id_by_name(projects_db, name) 
+                    filter_exists = any(fid == filter_id for fid in [self._get_filter_id_by_name(name, projects_db) 
                                         for name in workflow_filters.keys()])
                     
                     if filter_exists:
@@ -3969,7 +4214,7 @@ class ChemSpace:
                 print(f"📊 Total filters: {len(workflow_filters)}")
                 print(f"🧪 Total required instances: {sum(f['instances'] for f in workflow_filters.values())}")
                 
-                self._display_workflow_summary(workflow_filters)
+                self._display_filtering_workflow_summary(workflow_filters)
                 
                 # Enhanced workflow options
                 print("\n📋 Workflow Options:")
@@ -4039,8 +4284,6 @@ class ChemSpace:
         except Exception as e:
             print(f"❌ Error retrieving filter ID for '{filter_name}': {e}")
             return None
-
-
 
     def _display_available_filters_enhanced(self, projects_db_path: str) -> None:
         """
@@ -4370,7 +4613,7 @@ class ChemSpace:
         print("   • Duplicate filters are automatically detected")
         print("=" * 50)
     
-    def _display_workflow_summary(self, workflow_filters: Dict) -> None:
+    def _display_filtering_workflow_summary(self, workflow_filters: Dict) -> None:
         """
         Display a comprehensive summary of the created workflow.
         
@@ -6402,7 +6645,7 @@ class ChemSpace:
             self._query_and_delete_prev_step_tables(workflow_state)
             
             # Display final workflow summary
-            self._display_workflow_summary(workflow_state, workflow_name)
+            self._display_reaction_workflow_summary(workflow_state, workflow_name)
             
         except Exception as e:
             print(f"❌ Error applying sequential reaction workflow {workflow_id}: {e}")
@@ -7003,7 +7246,7 @@ class ChemSpace:
             print(f"   ❌ Error saving step products: {e}")
             return False
 
-    def _display_workflow_summary(self, workflow_state: Dict[str, Any], workflow_name: str) -> None:
+    def _display_reaction_workflow_summary(self, workflow_state: Dict[str, Any], workflow_name: str) -> None:
         """
         Display a comprehensive summary of the sequential workflow execution.
         
