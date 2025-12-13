@@ -3993,7 +3993,55 @@ class ChemSpace:
         except Exception as e:
             print(f"❌ Error creating filtering workflow: {e}")
             return {}
-    
+
+
+    def _get_filter_id_by_name(self, filter_name: str, projects_db_path: str = None) -> Optional[int]:
+        """
+        Get filter ID from the projects database by filter name.
+        
+        Args:
+            filter_name (str): Name of the filter to search for
+            projects_db_path (str, optional): Path to projects database. If None, uses default path
+            
+        Returns:
+            Optional[int]: Filter ID if found, None otherwise
+        """
+        try:
+            # Get projects database path if not provided
+            if projects_db_path is None:
+                import site
+                projects_db_path = f"{site.getsitepackages()[0]}/tidyscreen/projects_db/projects_database.db"
+            
+            # Check if database exists
+            if not os.path.exists(projects_db_path):
+                print(f"❌ Projects database not found: {projects_db_path}")
+                return None
+            
+            # Connect to database and search for filter
+            conn = sqlite3.connect(projects_db_path)
+            cursor = conn.cursor()
+            
+            # Query for exact filter name match
+            cursor.execute(
+                "SELECT id FROM chem_filters WHERE filter_name = ? LIMIT 1",
+                (filter_name,)
+            )
+            
+            result = cursor.fetchone()
+            conn.close()
+            
+            if result:
+                filter_id = result[0]
+                return filter_id
+            else:
+                return None
+                
+        except Exception as e:
+            print(f"❌ Error retrieving filter ID for '{filter_name}': {e}")
+            return None
+
+
+
     def _display_available_filters_enhanced(self, projects_db_path: str) -> None:
         """
         Display available filters with enhanced formatting and pagination.
