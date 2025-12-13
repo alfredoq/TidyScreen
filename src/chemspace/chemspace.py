@@ -365,56 +365,7 @@ class ChemSpace:
         except Exception as e:
             print(f"❌ Error creating table '{table_name}': {e}")
             return False
-    
-    def drop_table(self, table_name: str, confirm: bool = True) -> bool:
-        """
-        Drop a specific table from the database.
-        
-        Args:
-            table_name (str): Name of the table to drop
-            confirm (bool): Whether to ask for confirmation
-            
-        Returns:
-            bool: True if table was dropped successfully
-        """
-        try:
-            # Check if table exists
-            tables = self.get_all_tables()
-            if table_name not in tables:
-                print(f"⚠️  Table '{table_name}' does not exist")
-                return False
-            
-            if confirm:
-                response = input(f"⚠️  Are you sure you want to drop table '{table_name}'? This cannot be undone! (yes/no): ").strip().lower()
-                if response not in ['yes', 'y']:
-                    print("Table drop operation cancelled.")
-                    return False
-            
-            conn = sqlite3.connect(self.__chemspace_db)
-            cursor = conn.cursor()
-            
-            # Drop the table
-            cursor.execute(f"DROP TABLE {table_name}")
-            
-            # Also drop associated indexes
-            try:
-                cursor.execute(f"DROP INDEX IF EXISTS idx_{table_name}_name")
-                cursor.execute(f"DROP INDEX IF EXISTS idx_{table_name}_smiles")
-                cursor.execute(f"DROP INDEX IF EXISTS idx_{table_name}_flag")
-                cursor.execute(f"DROP INDEX IF EXISTS idx_{table_name}_inchi_key")
-            except:
-                pass  # Indexes might not exist
-            
-            conn.commit()
-            conn.close()
-            
-            print(f"✅ Table '{table_name}' dropped successfully")
-            return True
-            
-        except Exception as e:
-            print(f"❌ Error dropping table '{table_name}': {e}")
-            return False
-    
+
     def get_all_tables(self) -> List[str]:
         """
         Get list of all compound tables in the database.
@@ -7160,3 +7111,491 @@ class ChemSpace:
                     print(f"🗑️  Deleted {len(deleted)}/{len(to_delete)} requested tables.")
                 except Exception as e:
                     print(f"⚠️  Error during deletion query: {e}")
+
+    def drop_tables(self, confirm_each: bool = True) -> Dict[str, bool]:
+        """
+        Interactive method to list and delete multiple tables from the chemspace database.
+        
+        Args:
+            confirm_each (bool): Whether to confirm each individual table deletion
+            
+        Returns:
+            Dict[str, bool]: Dictionary mapping table names to deletion success status
+        """
+        try:
+            # Get all available tables
+            all_tables = self.get_all_tables()
+            
+            if not all_tables:
+                print("📝 No tables found in chemspace database")
+                return {}
+            
+            print(f"\n🗂️  CHEMSPACE DATABASE TABLES")
+            print("=" * 80)
+            print(f"📊 Total tables: {len(all_tables)}")
+            print("=" * 80)
+            
+            # Display tables with details
+            table_info = []
+            for i, table_name in enumerate(all_tables, 1):
+                try:
+                    compound_count = self.get_compound_count(table_name=table_name)
+                    table_type = self._classify_table_type(table_name)
+                    table_info.append({
+                        'index': i,
+                        'name': table_name,
+                        'count': compound_count,
+                        'type': table_type
+                    })
+                    
+                    type_icon = self._get_table_type_icon(table_type)
+                    print(f"{i:3d}. {type_icon} {table_name:<35} ({compound_count:>6,} compounds) [{table_type}]")
+                    
+                except Exception as e:
+                    print(f"{i:3d}. ❓ {table_name:<35} (Error: {e}) [Unknown]")
+                    table_info.append({
+                        'index': i,
+                        'name': table_name,
+                        'count': 0,
+                        'type': 'unknown',
+                        'error': str(e)
+                    })
+            
+            print("=" * 80)
+            
+            # Interactive table selection
+            print(f"\n🗑️  TABLE DELETION INTERFACE")
+            print("-" * 50)
+            print("Commands:")
+            print("   • Enter table numbers (comma-separated): 1,3,5")
+            print("   • Enter table names (comma-separated): table1,table2")
+            print("   • Type 'all' to delete all tables")
+            print("   • Type 'filter <type>' to delete by type: filter products")
+            print("   • Type 'range <start>-<end>' to delete range: range 1-5")
+            print("   • Type 'show' to display table list again")
+            print("   • Type 'cancel' to abort")
+            print("-" * 50)
+            
+            while True:
+                try:
+                    user_input = input("\n🔍 Select tables to delete: ").strip()
+                    
+                    if not user_input or user_input.lower() == 'cancel':
+                        print("❌ Table deletion cancelled by user")
+                        return {}
+                    elif user_input.lower() == 'show':
+                        self._redisplay_table_list(table_info)
+                        continue
+                    
+                    # Parse user selection
+                    selected_tables = self._parse_table_selection(user_input, table_info)
+                    
+                    if not selected_tables:
+                        print("❌ No valid tables selected. Try again or type 'cancel'")
+                        continue
+                    
+                    # Confirm selection
+                    if not self._confirm_table_deletion(selected_tables, all_tables):
+                        continue
+                    
+                    # Perform deletions
+                    return self._execute_table_deletions(selected_tables, confirm_each)
+                    
+                except KeyboardInterrupt:
+                    print("\n❌ Table deletion cancelled by user")
+                    return {}
+                except Exception as e:
+                    print(f"❌ Error in table selection: {e}")
+                    continue
+        
+        except Exception as e:
+            print(f"❌ Error in drop_tables method: {e}")
+            return {}
+
+    def _classify_table_type(self, table_name: str) -> str:
+        """
+        Classify table type based on naming patterns.
+        
+        Args:
+            table_name (str): Name of the table
+            
+        Returns:
+            str: Table type classification
+        """
+        name_lower = table_name.lower()
+        
+        if '_products_' in name_lower:
+            return 'reaction_products'
+        elif '_filtered_' in name_lower:
+            return 'filtered_compounds'
+        elif 'step' in name_lower and any(x in name_lower for x in ['reaction', 'product']):
+            return 'step_products'
+        elif name_lower.startswith('temp_') or name_lower.startswith('tmp_'):
+            return 'temporary'
+        elif any(word in name_lower for word in ['workflow', 'batch', 'processed']):
+            return 'processed'
+        else:
+            return 'original'
+
+    def _get_table_type_icon(self, table_type: str) -> str:
+        """
+        Get emoji icon for table type.
+        
+        Args:
+            table_type (str): Table type
+            
+        Returns:
+            str: Emoji icon
+        """
+        icons = {
+            'original': '📋',
+            'reaction_products': '🧪',
+            'filtered_compounds': '🔍',
+            'step_products': '⚗️',
+            'processed': '🔄',
+            'temporary': '📄',
+            'unknown': '❓'
+        }
+        return icons.get(table_type, '📊')
+
+    def _redisplay_table_list(self, table_info: List[Dict]) -> None:
+        """
+        Redisplay the table list.
+        
+        Args:
+            table_info (List[Dict]): Table information list
+        """
+        print(f"\n📋 TABLE LIST:")
+        print("-" * 80)
+        for info in table_info:
+            type_icon = self._get_table_type_icon(info['type'])
+            if 'error' in info:
+                print(f"{info['index']:3d}. ❓ {info['name']:<35} (Error) [Unknown]")
+            else:
+                print(f"{info['index']:3d}. {type_icon} {info['name']:<35} ({info['count']:>6,} compounds) [{info['type']}]")
+        print("-" * 80)
+
+    def _parse_table_selection(self, user_input: str, table_info: List[Dict]) -> List[str]:
+        """
+        Parse user input to determine selected tables.
+        
+        Args:
+            user_input (str): User input string
+            table_info (List[Dict]): Table information list
+            
+        Returns:
+            List[str]: List of selected table names
+        """
+        try:
+            user_input = user_input.strip().lower()
+            selected_tables = []
+            
+            if user_input == 'all':
+                # Select all tables
+                selected_tables = [info['name'] for info in table_info]
+                print(f"✅ Selected all {len(selected_tables)} tables")
+                
+            elif user_input.startswith('filter '):
+                # Filter by table type
+                table_type = user_input[7:].strip()
+                type_mapping = {
+                    'original': 'original',
+                    'products': 'reaction_products',
+                    'reaction': 'reaction_products',
+                    'filtered': 'filtered_compounds',
+                    'step': 'step_products',
+                    'processed': 'processed',
+                    'temp': 'temporary',
+                    'temporary': 'temporary',
+                    'unknown': 'unknown'
+                }
+                
+                target_type = type_mapping.get(table_type)
+                if target_type:
+                    selected_tables = [info['name'] for info in table_info if info['type'] == target_type]
+                    print(f"✅ Selected {len(selected_tables)} tables of type '{table_type}'")
+                else:
+                    print(f"❌ Unknown table type: '{table_type}'")
+                    print(f"   Available types: {', '.join(type_mapping.keys())}")
+                    
+            elif user_input.startswith('range '):
+                # Range selection
+                range_part = user_input[6:].strip()
+                if '-' in range_part:
+                    try:
+                        start_str, end_str = range_part.split('-', 1)
+                        start_idx = int(start_str.strip())
+                        end_idx = int(end_str.strip())
+                        
+                        if 1 <= start_idx <= len(table_info) and 1 <= end_idx <= len(table_info):
+                            if start_idx <= end_idx:
+                                selected_tables = [table_info[i-1]['name'] for i in range(start_idx, end_idx + 1)]
+                                print(f"✅ Selected range {start_idx}-{end_idx}: {len(selected_tables)} tables")
+                            else:
+                                print("❌ Invalid range: start must be <= end")
+                        else:
+                            print(f"❌ Range out of bounds. Valid range: 1-{len(table_info)}")
+                    except ValueError:
+                        print("❌ Invalid range format. Use: range 1-5")
+                else:
+                    print("❌ Invalid range format. Use: range 1-5")
+                    
+            else:
+                # Parse comma-separated values (numbers or names)
+                items = [item.strip() for item in user_input.split(',') if item.strip()]
+                
+                for item in items:
+                    try:
+                        # Try as table number first
+                        table_idx = int(item) - 1
+                        if 0 <= table_idx < len(table_info):
+                            table_name = table_info[table_idx]['name']
+                            if table_name not in selected_tables:
+                                selected_tables.append(table_name)
+                        else:
+                            print(f"⚠️  Invalid table number: {item} (valid: 1-{len(table_info)})")
+                    except ValueError:
+                        # Treat as table name
+                        matching_tables = [info['name'] for info in table_info if info['name'].lower() == item.lower()]
+                        if matching_tables:
+                            for table_name in matching_tables:
+                                if table_name not in selected_tables:
+                                    selected_tables.append(table_name)
+                        else:
+                            print(f"⚠️  Table not found: '{item}'")
+            
+            return selected_tables
+            
+        except Exception as e:
+            print(f"❌ Error parsing table selection: {e}")
+            return []
+
+    def _confirm_table_deletion(self, selected_tables: List[str], all_tables: List[str]) -> bool:
+        """
+        Confirm table deletion with user.
+        
+        Args:
+            selected_tables (List[str]): Tables selected for deletion
+            all_tables (List[str]): All available tables
+            
+        Returns:
+            bool: True if confirmed, False otherwise
+        """
+        try:
+            print(f"\n⚠️  DELETION CONFIRMATION")
+            print("=" * 50)
+            print(f"🗑️  Tables to delete: {len(selected_tables)}")
+            print(f"📊 Remaining tables: {len(all_tables) - len(selected_tables)}")
+            print("=" * 50)
+            
+            # Show tables to be deleted with their compound counts
+            total_compounds = 0
+            for i, table_name in enumerate(selected_tables, 1):
+                try:
+                    compound_count = self.get_compound_count(table_name=table_name)
+                    table_type = self._classify_table_type(table_name)
+                    type_icon = self._get_table_type_icon(table_type)
+                    total_compounds += compound_count
+                    
+                    print(f"   {i:2d}. {type_icon} {table_name} ({compound_count:,} compounds)")
+                except Exception:
+                    print(f"   {i:2d}. ❓ {table_name} (unknown count)")
+            
+            print("=" * 50)
+            print(f"📊 Total compounds to be deleted: {total_compounds:,}")
+            print("🚨 WARNING: This action cannot be undone!")
+            print("=" * 50)
+            
+            # Multiple confirmation steps
+            confirm1 = input(f"❓ Delete {len(selected_tables)} tables? (yes/no): ").strip().lower()
+            if confirm1 not in ['yes', 'y']:
+                print("❌ Deletion cancelled")
+                return False
+            
+            # Show critical warnings for important table types
+            critical_tables = []
+            for table_name in selected_tables:
+                table_type = self._classify_table_type(table_name)
+                if table_type == 'original':
+                    critical_tables.append(table_name)
+            
+            if critical_tables:
+                print(f"\n🚨 CRITICAL WARNING:")
+                print(f"   You are about to delete {len(critical_tables)} ORIGINAL compound table(s)!")
+                print(f"   This will permanently remove your source data!")
+                
+                for table in critical_tables:
+                    print(f"   📋 {table}")
+                
+                confirm2 = input(f"\n❗ Type 'DELETE ORIGINAL TABLES' to confirm: ").strip()
+                if confirm2 != 'DELETE ORIGINAL TABLES':
+                    print("❌ Critical table deletion cancelled")
+                    return False
+            
+            # Final confirmation with count
+            confirm3 = input(f"❓ Type the number {len(selected_tables)} to proceed: ").strip()
+            if confirm3 != str(len(selected_tables)):
+                print("❌ Count confirmation failed. Deletion cancelled.")
+                return False
+            
+            return True
+            
+        except KeyboardInterrupt:
+            print("\n❌ Deletion cancelled by user")
+            return False
+        except Exception as e:
+            print(f"❌ Error in deletion confirmation: {e}")
+            return False
+
+    def _execute_table_deletions(self, selected_tables: List[str], confirm_each: bool) -> Dict[str, bool]:
+        """
+        Execute the deletion of selected tables.
+        
+        Args:
+            selected_tables (List[str]): Tables to delete
+            confirm_each (bool): Whether to confirm each deletion
+            
+        Returns:
+            Dict[str, bool]: Deletion results
+        """
+        try:
+            results = {}
+            successful_deletions = 0
+            failed_deletions = 0
+            
+            print(f"\n🗑️  EXECUTING TABLE DELETIONS")
+            print("=" * 50)
+            
+            # Use progress bar if many tables
+            if TQDM_AVAILABLE and len(selected_tables) > 5:
+                progress_bar = tqdm(
+                    selected_tables,
+                    desc="Deleting tables",
+                    unit="tables"
+                )
+            else:
+                progress_bar = selected_tables
+            
+            for table_name in progress_bar:
+                try:
+                    print(f"\n🗑️  Deleting table: '{table_name}'")
+                    
+                    # Use existing drop_table method with appropriate confirmation
+                    success = self.drop_table(table_name, confirm=confirm_each)
+                    results[table_name] = success
+                    
+                    if success:
+                        successful_deletions += 1
+                        if not TQDM_AVAILABLE:
+                            print(f"   ✅ Successfully deleted '{table_name}'")
+                    else:
+                        failed_deletions += 1
+                        if not TQDM_AVAILABLE:
+                            print(f"   ❌ Failed to delete '{table_name}'")
+                    
+                except Exception as e:
+                    results[table_name] = False
+                    failed_deletions += 1
+                    print(f"   ❌ Error deleting '{table_name}': {e}")
+            
+            # Display summary
+            print(f"\n📊 DELETION SUMMARY")
+            print("=" * 30)
+            print(f"✅ Successfully deleted: {successful_deletions}")
+            print(f"❌ Failed deletions: {failed_deletions}")
+            print(f"📊 Total processed: {len(selected_tables)}")
+            
+            if successful_deletions > 0:
+                print(f"🗑️  {successful_deletions} table(s) have been permanently removed")
+            
+            if failed_deletions > 0:
+                print(f"\n❌ Failed deletions:")
+                for table_name, success in results.items():
+                    if not success:
+                        print(f"   • {table_name}")
+            
+            print("=" * 30)
+            
+            return results
+            
+        except Exception as e:
+            print(f"❌ Error executing table deletions: {e}")
+            return {table: False for table in selected_tables}
+
+    def clear_all_tables(self, confirm_with_project_name: bool = True) -> bool:
+        """
+        Delete ALL tables from the chemspace database.
+        
+        Args:
+            confirm_with_project_name (bool): Require typing project name for confirmation
+            
+        Returns:
+            bool: True if all tables were cleared successfully
+        """
+        try:
+            all_tables = self.get_all_tables()
+            
+            if not all_tables:
+                print("📝 No tables found in chemspace database")
+                return True
+            
+            # Calculate total compounds
+            total_compounds = 0
+            for table_name in all_tables:
+                try:
+                    total_compounds += self.get_compound_count(table_name=table_name)
+                except:
+                    pass
+            
+            print(f"🚨 CLEAR ALL CHEMSPACE TABLES")
+            print("=" * 60)
+            print(f"⚠️  WARNING: This will delete ALL {len(all_tables)} tables!")
+            print(f"📊 Total compounds to be lost: {total_compounds:,}")
+            print(f"🗂️  Project: {self.name}")
+            print(f"🚨 THIS ACTION CANNOT BE UNDONE!")
+            print("=" * 60)
+            
+            # Multiple confirmation steps
+            confirm1 = input(f"❓ Delete ALL {len(all_tables)} tables? (yes/no): ").strip().lower()
+            if confirm1 not in ['yes', 'y']:
+                print("❌ Operation cancelled")
+                return False
+            
+            if confirm_with_project_name:
+                confirm2 = input(f"❓ Type the project name '{self.name}' to confirm: ").strip()
+                if confirm2 != self.name:
+                    print("❌ Project name doesn't match. Operation cancelled.")
+                    return False
+            
+            confirm3 = input("❓ Type 'CLEAR ALL CHEMSPACE TABLES' in capitals to proceed: ").strip()
+            if confirm3 != 'CLEAR ALL CHEMSPACE TABLES':
+                print("❌ Confirmation phrase doesn't match. Operation cancelled.")
+                return False
+            
+            # Execute mass deletion
+            print(f"\n🗑️  Clearing all chemspace tables...")
+            
+            deleted_count = 0
+            failed_count = 0
+            
+            for table_name in all_tables:
+                try:
+                    success = self.drop_table(table_name, confirm=False)
+                    if success:
+                        deleted_count += 1
+                    else:
+                        failed_count += 1
+                except Exception as e:
+                    print(f"❌ Error deleting '{table_name}': {e}")
+                    failed_count += 1
+            
+            print(f"\n✅ Chemspace database cleared!")
+            print(f"   🗑️  Tables deleted: {deleted_count}")
+            print(f"   ❌ Deletion failures: {failed_count}")
+            print(f"   📊 Compounds removed: {total_compounds:,}")
+            
+            return failed_count == 0
+            
+        except Exception as e:
+            print(f"❌ Error clearing all tables: {e}")
+            return False
