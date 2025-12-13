@@ -6801,7 +6801,12 @@ class ChemSpace:
             if products:
                 print(f"\n💾 Generated {len(products)} products from bimolecular reaction")
                 
-                save_choice = input("Save products to a new table? (y/n): ").strip().lower()
+                while True:
+                    save_choice = input("Save products to a new table? (y/n): ").strip().lower()
+                    if save_choice in ['y', 'yes', 'n', 'no']:
+                        break
+                    print("❗ Please answer 'y'/'yes' or 'n'/'no'.")
+                
                 if save_choice in ['y', 'yes']:
                     # Ask user for a table name, use default if empty
                     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -6889,7 +6894,12 @@ class ChemSpace:
             if all_products:
                 print(f"\n💾 Total products generated: {len(all_products)}")
                 
-                save_choice = input("Save products to a new table? (y/n): ").strip().lower()
+                while True:
+                    save_choice = input("Save products to a new table? (y/n): ").strip().lower()
+                    if save_choice in ['y', 'yes', 'n', 'no']:
+                        break
+                    print("❗ Please answer 'y'/'yes' or 'n'/'no'.")
+                
                 if save_choice in ['y', 'yes']:
                     # Ask user for a table name, use default if empty
                     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -7049,13 +7059,33 @@ class ChemSpace:
                         print("\nℹ️  No step product tables recorded; nothing to delete.")
                         return
 
-                    # Collect valid tables
+                    # Collect valid tables excluding the last step since it is considered to be the final products
                     tables = []
-                    for step, info in sorted(step_products.items()):
+                    step_items = []
+                    for step, info in step_products.items():
+                        try:
+                            step_int = int(step)
+                        except Exception:
+                            try:
+                                step_int = int(str(step))
+                            except Exception:
+                                continue
                         tbl = info.get('table_name')
-                        cnt = info.get('product_count', 0)
-                        if tbl:
-                            tables.append((int(step), tbl, int(cnt)))
+                        try:
+                            cnt = int(info.get('product_count', 0) or 0)
+                        except Exception:
+                            cnt = 0
+                        step_items.append((step_int, tbl, cnt))
+
+                    if step_items:
+                        # determine the highest step number and skip it
+                        max_step = max(s for s, _, _ in step_items)
+                        for s, tbl, cnt in sorted(step_items):
+                            if s == max_step:
+                                # skip the table corresponding to the last step
+                                continue
+                            if tbl:
+                                tables.append((s, tbl, cnt))
 
                     if not tables:
                         print("\nℹ️  No named product tables found for previous steps.")
@@ -7065,7 +7095,14 @@ class ChemSpace:
                     for step, tbl, cnt in tables:
                         print(f"   • Step {step}: {tbl} ({cnt} products)")
 
-                    choice = input("\n❓ Delete intermediate product tables? (y = all / n = none / s = select): ").strip().lower()
+                    
+                    while True:
+                        choice = input("\n❓ Delete intermediate product tables? (y = all / n = none / s = select): ").strip().lower()
+                        if choice in ['y', 'yes', 'n', 'no', 's', 'select']:
+                            break
+                        print("❗ Please answer 'y'/'yes' , 'n'/'no' or 's'/'select'.")
+                    
+                    
                     if choice in ['', 'n', 'no']:
                         print("✅ Keeping all intermediate tables.")
                         return
