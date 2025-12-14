@@ -131,150 +131,209 @@ def _compute_inchi_keys_worker(chunk_data: List[Tuple[int, str, str]]) -> List[T
     
     return results
 
+# def _filter_chunk_worker_by_instances(chunk_data: List[Tuple], filters_list: List[Tuple]) -> List[Dict]:
+#     """
+#     Worker function to process a chunk of compounds for SMARTS filtering by instances in parallel.
+#     This function filters compounds based on exact match count requirements for each SMARTS pattern.
+#     Filters with one or more instances are applied first to reduce the compound set early.
+    
+#     Args:
+#         chunk_data (List[Tuple]): List of tuples (id, smiles, name, flag, inchi_key)
+#         filters_list (List[Tuple]): List of tuples (smarts_pattern, required_instances)
+        
+#     Returns:
+#         List[Dict]: List of compound results with filter match information
+#     """
+#     try:
+#         from rdkit import Chem
+#         from rdkit import RDLogger
+#         # Suppress RDKit warnings for cleaner parallel output
+#         RDLogger.DisableLog('rdApp.*')
+#     except ImportError:
+#         return [{"error": "RDKit not available for filtering"}]
+    
+#     results = []
+    
+#     # Sort filters by required instances: filters with 1+ instances first, then 0-instance filters
+#     # This ensures exclusion filters (instances > 0) run first to reduce the compound set
+#     sorted_filters = sorted(filters_list, key=lambda x: (x[1] == 0, x[1]))
+    
+#     for compound_id, smiles, name, flag, inchi_key in chunk_data:
+#         compound_result = {
+#             'id': compound_id,
+#             'smiles': smiles,
+#             'name': name or 'unknown',
+#             'flag': flag or 'nd',
+#             'inchi_key': inchi_key,
+#             'passes_filters': True,
+#             'match_counts': {},
+#             'filter_details': {},
+#             'early_termination': False  # Track if compound was eliminated early
+#         }
+        
+#         try:
+#             mol = Chem.MolFromSmiles(smiles)
+#             if mol is None:
+#                 compound_result['passes_filters'] = False
+#                 compound_result['error'] = 'Invalid SMILES'
+#                 results.append(compound_result)
+#                 continue
+            
+#             # Apply filters in optimized order (exclusion filters first)
+#             for filter_idx, (smarts_pattern, required_instances) in enumerate(sorted_filters):
+#                 try:
+#                     pattern = Chem.MolFromSmarts(smarts_pattern)
+                    
+#                     if pattern is None:
+#                         compound_result['match_counts'][f"{smarts_pattern}_matches"] = 0
+#                         compound_result['filter_details'][smarts_pattern] = {
+#                             'required': required_instances,
+#                             'found': 0,
+#                             'passed': False,
+#                             'error': 'Invalid SMARTS pattern'
+#                         }
+#                         # Invalid SMARTS pattern causes compound to fail
+#                         compound_result['passes_filters'] = False
+#                         compound_result['early_termination'] = True
+#                         compound_result['termination_filter'] = smarts_pattern
+#                         break  # No need to process remaining filters
+                    
+#                     # Get all substructure matches
+#                     matches = mol.GetSubstructMatches(pattern)
+#                     match_count = len(matches)
+                    
+#                     # Store match count information
+#                     compound_result['match_counts'][f"{smarts_pattern}_matches"] = match_count
+                    
+#                     # Check if compound meets the instance requirement
+#                     filter_passed = match_count == required_instances
+                    
+#                     compound_result['filter_details'][smarts_pattern] = {
+#                         'required': required_instances,
+#                         'found': match_count,
+#                         'passed': filter_passed,
+#                         'match_positions': [list(match) for match in matches] if matches else [],
+#                         'filter_order': filter_idx + 1  # Track processing order
+#                     }
+                    
+#                     # If any filter fails to meet instance requirement, compound fails overall
+#                     if not filter_passed:
+#                         compound_result['passes_filters'] = False
+#                         compound_result['early_termination'] = True
+#                         compound_result['termination_filter'] = smarts_pattern
+#                         compound_result['termination_reason'] = (
+#                             f"Required {required_instances} instances, found {match_count}"
+#                         )
+                        
+#                         # Early termination: skip remaining filters for this compound
+#                         # Mark remaining filters as not processed
+#                         for remaining_smarts, remaining_instances in sorted_filters[filter_idx + 1:]:
+#                             compound_result['filter_details'][remaining_smarts] = {
+#                                 'required': remaining_instances,
+#                                 'found': -1,  # -1 indicates not processed due to early termination
+#                                 'passed': False,
+#                                 'skipped': True,
+#                                 'reason': 'Early termination after previous filter failure'
+#                             }
+#                         break  # Exit filter loop early
+                
+#                 except Exception as filter_error:
+#                     # Handle individual filter errors
+#                     compound_result['match_counts'][f"{smarts_pattern}_matches"] = 0
+#                     compound_result['filter_details'][smarts_pattern] = {
+#                         'required': required_instances,
+#                         'found': 0,
+#                         'passed': False,
+#                         'error': str(filter_error)
+#                     }
+#                     compound_result.setdefault('filter_errors', []).append(
+#                         f"{smarts_pattern}: {str(filter_error)}"
+#                     )
+#                     # Filter error causes compound to fail
+#                     compound_result['passes_filters'] = False
+#                     compound_result['early_termination'] = True
+#                     compound_result['termination_filter'] = smarts_pattern
+#                     compound_result['termination_reason'] = f"Filter error: {str(filter_error)}"
+#                     break  # Exit filter loop early
+            
+#             # Add optimization statistics
+#             compound_result['filters_processed'] = len([
+#                 details for details in compound_result['filter_details'].values() 
+#                 if not details.get('skipped', False)
+#             ])
+#             compound_result['total_filters'] = len(sorted_filters)
+            
+#             # Calculate processing efficiency
+#             if compound_result['total_filters'] > 0:
+#                 efficiency = (compound_result['filters_processed'] / compound_result['total_filters']) * 100
+#                 compound_result['processing_efficiency'] = round(efficiency, 1)
+            
+#         except Exception as mol_error:
+#             compound_result['passes_filters'] = False
+#             compound_result['error'] = str(mol_error)
+#             compound_result['early_termination'] = True
+#             compound_result['termination_reason'] = f"Molecule error: {str(mol_error)}"
+        
+#         results.append(compound_result)
+    
+#     return results
+
+
+### Generated using IA to reduce memory consumption during parallel processing
+
 def _filter_chunk_worker_by_instances(chunk_data: List[Tuple], filters_list: List[Tuple]) -> List[Dict]:
     """
-    Worker function to process a chunk of compounds for SMARTS filtering by instances in parallel.
-    This function filters compounds based on exact match count requirements for each SMARTS pattern.
-    Filters with one or more instances are applied first to reduce the compound set early.
-    
-    Args:
-        chunk_data (List[Tuple]): List of tuples (id, smiles, name, flag, inchi_key)
-        filters_list (List[Tuple]): List of tuples (smarts_pattern, required_instances)
-        
-    Returns:
-        List[Dict]: List of compound results with filter match information
+    Memory-optimized version that only returns essential data.
     """
     try:
-        from rdkit import Chem
-        from rdkit import RDLogger
-        # Suppress RDKit warnings for cleaner parallel output
+        from rdkit import Chem, RDLogger
         RDLogger.DisableLog('rdApp.*')
     except ImportError:
-        return [{"error": "RDKit not available for filtering"}]
+        return [{"error": "RDKit not available"}]
     
     results = []
-    
-    # Sort filters by required instances: filters with 1+ instances first, then 0-instance filters
-    # This ensures exclusion filters (instances > 0) run first to reduce the compound set
     sorted_filters = sorted(filters_list, key=lambda x: (x[1] == 0, x[1]))
     
     for compound_id, smiles, name, flag, inchi_key in chunk_data:
-        compound_result = {
-            'id': compound_id,
-            'smiles': smiles,
-            'name': name or 'unknown',
-            'flag': flag or 'nd',
-            'inchi_key': inchi_key,
-            'passes_filters': True,
-            'match_counts': {},
-            'filter_details': {},
-            'early_termination': False  # Track if compound was eliminated early
-        }
-        
         try:
             mol = Chem.MolFromSmiles(smiles)
             if mol is None:
-                compound_result['passes_filters'] = False
-                compound_result['error'] = 'Invalid SMILES'
-                results.append(compound_result)
-                continue
+                continue  # Skip invalid compounds entirely
             
-            # Apply filters in optimized order (exclusion filters first)
-            for filter_idx, (smarts_pattern, required_instances) in enumerate(sorted_filters):
+            passes_all_filters = True
+            
+            # Apply filters with early termination but minimal metadata
+            for smarts_pattern, required_instances in sorted_filters:
                 try:
                     pattern = Chem.MolFromSmarts(smarts_pattern)
-                    
                     if pattern is None:
-                        compound_result['match_counts'][f"{smarts_pattern}_matches"] = 0
-                        compound_result['filter_details'][smarts_pattern] = {
-                            'required': required_instances,
-                            'found': 0,
-                            'passed': False,
-                            'error': 'Invalid SMARTS pattern'
-                        }
-                        # Invalid SMARTS pattern causes compound to fail
-                        compound_result['passes_filters'] = False
-                        compound_result['early_termination'] = True
-                        compound_result['termination_filter'] = smarts_pattern
-                        break  # No need to process remaining filters
+                        passes_all_filters = False
+                        break
                     
-                    # Get all substructure matches
                     matches = mol.GetSubstructMatches(pattern)
                     match_count = len(matches)
                     
-                    # Store match count information
-                    compound_result['match_counts'][f"{smarts_pattern}_matches"] = match_count
-                    
-                    # Check if compound meets the instance requirement
-                    filter_passed = match_count == required_instances
-                    
-                    compound_result['filter_details'][smarts_pattern] = {
-                        'required': required_instances,
-                        'found': match_count,
-                        'passed': filter_passed,
-                        'match_positions': [list(match) for match in matches] if matches else [],
-                        'filter_order': filter_idx + 1  # Track processing order
-                    }
-                    
-                    # If any filter fails to meet instance requirement, compound fails overall
-                    if not filter_passed:
-                        compound_result['passes_filters'] = False
-                        compound_result['early_termination'] = True
-                        compound_result['termination_filter'] = smarts_pattern
-                        compound_result['termination_reason'] = (
-                            f"Required {required_instances} instances, found {match_count}"
-                        )
+                    if match_count != required_instances:
+                        passes_all_filters = False
+                        break  # Early exit - don't process more filters
                         
-                        # Early termination: skip remaining filters for this compound
-                        # Mark remaining filters as not processed
-                        for remaining_smarts, remaining_instances in sorted_filters[filter_idx + 1:]:
-                            compound_result['filter_details'][remaining_smarts] = {
-                                'required': remaining_instances,
-                                'found': -1,  # -1 indicates not processed due to early termination
-                                'passed': False,
-                                'skipped': True,
-                                'reason': 'Early termination after previous filter failure'
-                            }
-                        break  # Exit filter loop early
+                except Exception:
+                    passes_all_filters = False
+                    break
+            
+            # Only store compounds that pass ALL filters
+            if passes_all_filters:
+                results.append({
+                    'id': compound_id,
+                    'smiles': smiles,
+                    'name': name or 'unknown',
+                    'flag': flag or 'nd',
+                    'inchi_key': inchi_key
+                    # Remove all the heavy metadata
+                })
                 
-                except Exception as filter_error:
-                    # Handle individual filter errors
-                    compound_result['match_counts'][f"{smarts_pattern}_matches"] = 0
-                    compound_result['filter_details'][smarts_pattern] = {
-                        'required': required_instances,
-                        'found': 0,
-                        'passed': False,
-                        'error': str(filter_error)
-                    }
-                    compound_result.setdefault('filter_errors', []).append(
-                        f"{smarts_pattern}: {str(filter_error)}"
-                    )
-                    # Filter error causes compound to fail
-                    compound_result['passes_filters'] = False
-                    compound_result['early_termination'] = True
-                    compound_result['termination_filter'] = smarts_pattern
-                    compound_result['termination_reason'] = f"Filter error: {str(filter_error)}"
-                    break  # Exit filter loop early
-            
-            # Add optimization statistics
-            compound_result['filters_processed'] = len([
-                details for details in compound_result['filter_details'].values() 
-                if not details.get('skipped', False)
-            ])
-            compound_result['total_filters'] = len(sorted_filters)
-            
-            # Calculate processing efficiency
-            if compound_result['total_filters'] > 0:
-                efficiency = (compound_result['filters_processed'] / compound_result['total_filters']) * 100
-                compound_result['processing_efficiency'] = round(efficiency, 1)
-            
-        except Exception as mol_error:
-            compound_result['passes_filters'] = False
-            compound_result['error'] = str(mol_error)
-            compound_result['early_termination'] = True
-            compound_result['termination_reason'] = f"Molecule error: {str(mol_error)}"
-        
-        results.append(compound_result)
+        except Exception:
+            continue  # Skip problematic compounds
     
     return results
 
@@ -2610,109 +2669,191 @@ class ChemSpace:
             print(f"❌ Error loading workflow filters for '{workflow_name}': {e}")
             return []
   
-    def _apply_filters_parallel(self, compounds_df: pd.DataFrame, 
-                           workflow_filters: List[Tuple[str, str]], 
-                           max_workers: int, chunk_size: int) -> pd.DataFrame:
-        """
-        Apply SMARTS filters using parallel processing.
+    # def _apply_filters_parallel(self, compounds_df: pd.DataFrame, 
+    #                        workflow_filters: List[Tuple[str, str]], 
+    #                        max_workers: int, chunk_size: int) -> pd.DataFrame:
+    #     """
+    #     Apply SMARTS filters using parallel processing.
         
-        Args:
-            compounds_df (pd.DataFrame): DataFrame containing compounds
-            workflow_filters (List[Tuple]): List of (filter_name, smarts_pattern) tuples
-            max_workers (int): Number of worker processes
-            chunk_size (int): Size of chunks for processing
+    #     Args:
+    #         compounds_df (pd.DataFrame): DataFrame containing compounds
+    #         workflow_filters (List[Tuple]): List of (filter_name, smarts_pattern) tuples
+    #         max_workers (int): Number of worker processes
+    #         chunk_size (int): Size of chunks for processing
             
-        Returns:
-            pd.DataFrame: Filtered DataFrame with match count columns
+    #     Returns:
+    #         pd.DataFrame: Filtered DataFrame with match count columns
+    #     """
+    #     from concurrent.futures import ProcessPoolExecutor, as_completed
+        
+    #     try:
+    #         # Prepare compound data for workers
+    #         compound_data = []
+    #         for _, row in compounds_df.iterrows():
+    #             compound_data.append((
+    #                 row.get('id', 0),
+    #                 row['smiles'],
+    #                 row.get('name', 'unknown'),
+    #                 row.get('flag', 'nd'),
+    #                 row.get('inchi_key', None)
+    #             ))
+            
+    #         # Split into chunks
+    #         chunks = [compound_data[i:i + chunk_size] 
+    #                 for i in range(0, len(compound_data), chunk_size)]
+            
+    #         print(f"   📦 Processing {len(chunks)} chunks...")
+            
+    #         # Process chunks in parallel
+    #         all_results = []
+            
+    #         with ProcessPoolExecutor(max_workers=max_workers) as executor:
+    #             # Submit all chunks
+    #             future_to_chunk = {
+    #                 executor.submit(_filter_chunk_worker_by_instances, chunk, workflow_filters): i 
+    #                 for i, chunk in enumerate(chunks)
+    #             }
+                
+    #             # Initialize progress tracking
+    #             if TQDM_AVAILABLE:
+    #                 progress_bar = tqdm(
+    #                     as_completed(future_to_chunk),
+    #                     total=len(chunks),
+    #                     desc="Filtering chunks",
+    #                     unit="chunks"
+    #                 )
+    #             else:
+    #                 progress_bar = as_completed(future_to_chunk)
+    #                 processed_chunks = 0
+                
+    #             # Collect results
+    #             for future in progress_bar:
+    #                 chunk_idx = future_to_chunk[future]
+    #                 try:
+    #                     chunk_results = future.result()
+    #                     all_results.extend(chunk_results)
+                        
+    #                     if not TQDM_AVAILABLE:
+    #                         processed_chunks += 1
+    #                         if processed_chunks % max(1, len(chunks) // 10) == 0:
+    #                             print(f"   📊 Processed {processed_chunks}/{len(chunks)} chunks...")
+                                
+    #                 except Exception as e:
+    #                     print(f"   ❌ Error processing chunk {chunk_idx}: {e}")
+            
+    #         # Convert results to DataFrame
+    #         results_df = pd.DataFrame(all_results)
+            
+    #         # Filter compounds that passed all filters
+    #         passed_compounds = results_df[results_df['passes_filters'] == True].copy()
+            
+    #         # Add match count columns to the original DataFrame structure
+    #         for filter_name, _ in workflow_filters:
+    #             match_col = f"{filter_name}_matches"
+    #             if match_col not in passed_compounds.columns:
+    #                 passed_compounds[match_col] = 0
+    #             else:
+    #                 # Extract match counts from the match_counts dictionary
+    #                 passed_compounds[match_col] = passed_compounds['match_counts'].apply(
+    #                     lambda x: x.get(match_col, 0) if isinstance(x, dict) else 0
+    #                 )
+            
+    #         # Clean up the DataFrame
+    #         columns_to_keep = ['smiles', 'name', 'flag', 'inchi_key'] + \
+    #                         [f"{name}_matches" for name, _ in workflow_filters]
+            
+    #         final_df = passed_compounds[columns_to_keep].copy()
+            
+    #         print(f"   ✅ Parallel processing completed")
+    #         print(f"   📊 {len(final_df):,} compounds passed all filters")
+            
+    #         return final_df
+            
+    #     except Exception as e:
+    #         print(f"❌ Error in parallel filtering: {e}")
+    #         return pd.DataFrame()
+
+### Created with IA to stream results to disk in order to manage large datasets
+
+    def _apply_filters_parallel(self, compounds_df: pd.DataFrame, 
+                                    workflow_filters: List[Tuple[str, str]], 
+                                    max_workers: int, chunk_size: int) -> pd.DataFrame:
         """
-        from concurrent.futures import ProcessPoolExecutor, as_completed
+        Ultra-memory-efficient version that streams results to temporary files.
+        """
+        import tempfile
+        import os
         
         try:
-            # Prepare compound data for workers
-            compound_data = []
-            for _, row in compounds_df.iterrows():
-                compound_data.append((
-                    row.get('id', 0),
-                    row['smiles'],
-                    row.get('name', 'unknown'),
-                    row.get('flag', 'nd'),
-                    row.get('inchi_key', None)
-                ))
+            # Create temporary file for results
+            temp_dir = tempfile.mkdtemp(prefix='chemspace_filter_')
+            temp_file = os.path.join(temp_dir, 'filtered_results.csv')
             
-            # Split into chunks
+            # Write header
+            with open(temp_file, 'w') as f:
+                f.write('id,smiles,name,flag,inchi_key\n')
+            
+            # Process in batches and append to file
+            compound_data = [(row.get('id', 0), row['smiles'], row.get('name', 'unknown'),
+                            row.get('flag', 'nd'), row.get('inchi_key', None))
+                            for _, row in compounds_df.iterrows()]
+            
             chunks = [compound_data[i:i + chunk_size] 
                     for i in range(0, len(compound_data), chunk_size)]
             
-            print(f"   📦 Processing {len(chunks)} chunks...")
-            
-            # Process chunks in parallel
-            all_results = []
+            total_passed = 0
             
             with ProcessPoolExecutor(max_workers=max_workers) as executor:
-                # Submit all chunks
+                # Process chunks and write results immediately
                 future_to_chunk = {
                     executor.submit(_filter_chunk_worker_by_instances, chunk, workflow_filters): i 
-                    for i, chunk in enumerate(chunks)
+                    for i, chunk in enumerate(chunks[:max_workers])  # Start with first batch
                 }
                 
-                # Initialize progress tracking
-                if TQDM_AVAILABLE:
-                    progress_bar = tqdm(
-                        as_completed(future_to_chunk),
-                        total=len(chunks),
-                        desc="Filtering chunks",
-                        unit="chunks"
-                    )
-                else:
-                    progress_bar = as_completed(future_to_chunk)
-                    processed_chunks = 0
+                remaining_chunks = chunks[max_workers:]
                 
-                # Collect results
-                for future in progress_bar:
-                    chunk_idx = future_to_chunk[future]
-                    try:
-                        chunk_results = future.result()
-                        all_results.extend(chunk_results)
-                        
-                        if not TQDM_AVAILABLE:
-                            processed_chunks += 1
-                            if processed_chunks % max(1, len(chunks) // 10) == 0:
-                                print(f"   📊 Processed {processed_chunks}/{len(chunks)} chunks...")
+                with open(temp_file, 'a') as f:
+                    while future_to_chunk:
+                        for future in as_completed(list(future_to_chunk.keys())):
+                            chunk_idx = future_to_chunk.pop(future)
+                            
+                            try:
+                                chunk_results = future.result()
                                 
-                    except Exception as e:
-                        print(f"   ❌ Error processing chunk {chunk_idx}: {e}")
+                                # Write results immediately to disk
+                                for result in chunk_results:
+                                    f.write(f"{result['id']},{result['smiles']},{result['name']},"
+                                        f"{result['flag']},{result.get('inchi_key', '')}\n")
+                                    total_passed += 1
+                                
+                                # Submit next chunk if available
+                                if remaining_chunks:
+                                    next_chunk = remaining_chunks.pop(0)
+                                    new_future = executor.submit(
+                                        _filter_chunk_worker_by_instances, next_chunk, workflow_filters
+                                    )
+                                    future_to_chunk[new_future] = len(chunks) - len(remaining_chunks) - 1
+                                    
+                            except Exception as e:
+                                print(f"   ❌ Chunk {chunk_idx} error: {e}")
             
-            # Convert results to DataFrame
-            results_df = pd.DataFrame(all_results)
-            
-            # Filter compounds that passed all filters
-            passed_compounds = results_df[results_df['passes_filters'] == True].copy()
-            
-            # Add match count columns to the original DataFrame structure
-            for filter_name, _ in workflow_filters:
-                match_col = f"{filter_name}_matches"
-                if match_col not in passed_compounds.columns:
-                    passed_compounds[match_col] = 0
-                else:
-                    # Extract match counts from the match_counts dictionary
-                    passed_compounds[match_col] = passed_compounds['match_counts'].apply(
-                        lambda x: x.get(match_col, 0) if isinstance(x, dict) else 0
-                    )
-            
-            # Clean up the DataFrame
-            columns_to_keep = ['smiles', 'name', 'flag', 'inchi_key'] + \
-                            [f"{name}_matches" for name, _ in workflow_filters]
-            
-            final_df = passed_compounds[columns_to_keep].copy()
-            
-            print(f"   ✅ Parallel processing completed")
-            print(f"   📊 {len(final_df):,} compounds passed all filters")
-            
-            return final_df
-            
+            # Read results back from file
+            print(f"   📊 Reading {total_passed} filtered compounds from disk...")
+            try:
+                result_df = pd.read_csv(temp_file)
+                return result_df
+            finally:
+                # Clean up temporary files
+                try:
+                    os.unlink(temp_file)
+                    os.rmdir(temp_dir)
+                except:
+                    pass
+                    
         except Exception as e:
-            print(f"❌ Error in parallel filtering: {e}")
+            print(f"❌ Error in streaming parallel filtering: {e}")
             return pd.DataFrame()
+
 
     def _apply_filters_sequential(self, compounds_df: pd.DataFrame, 
                                 workflow_filters: List[Tuple[str, str]]) -> pd.DataFrame:
