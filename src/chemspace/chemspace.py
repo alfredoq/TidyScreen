@@ -2344,6 +2344,98 @@ class ChemSpace:
             print(f"❌ Error in filter_using_workflow: {e}")
             return pd.DataFrame()
 
+    # def _select_table_for_filtering(self) -> Optional[str]:
+    #     """
+    #     Interactive selection of table for filtering.
+        
+    #     Returns:
+    #         Optional[str]: Selected table name or None if cancelled
+    #     """
+    #     try:
+    #         available_tables = self.get_all_tables()
+            
+    #         if not available_tables:
+    #             print("❌ No tables available for filtering")
+    #             return None
+            
+    #         print(f"\n📋 SELECT TABLE FOR FILTERING")
+    #         print("=" * 60)
+    #         print(f"Available tables ({len(available_tables)} total):")
+    #         print("-" * 60)
+            
+    #         # Display tables with compound counts and types
+    #         table_info = []
+    #         for i, table_name in enumerate(available_tables, 1):
+    #             try:
+    #                 compound_count = self.get_compound_count(table_name=table_name)
+    #                 table_type = self._classify_table_type(table_name)
+    #                 type_icon = self._get_table_type_icon(table_type)
+                    
+    #                 print(f"{i:3d}. {type_icon} {table_name:<35} ({compound_count:>6,} compounds) [{table_type}]")
+    #                 table_info.append({
+    #                     'name': table_name,
+    #                     'count': compound_count,
+    #                     'type': table_type
+    #                 })
+    #             except Exception as e:
+    #                 print(f"{i:3d}. ❓ {table_name:<35} (Error: {e})")
+    #                 table_info.append({
+    #                     'name': table_name,
+    #                     'count': 0,
+    #                     'type': 'unknown'
+    #                 })
+            
+    #         print("-" * 60)
+    #         print("Commands: Enter table number, table name, or 'cancel' to abort")
+            
+    #         while True:
+    #             try:
+    #                 selection = input(f"\n🔍 Select table for filtering: ").strip()
+                    
+    #                 if selection.lower() in ['cancel', 'quit', 'exit']:
+    #                     return None
+                    
+    #                 # Try as number first
+    #                 try:
+    #                     table_idx = int(selection) - 1
+    #                     if 0 <= table_idx < len(available_tables):
+    #                         selected_table = available_tables[table_idx]
+    #                         selected_info = table_info[table_idx]
+                            
+    #                         print(f"\n✅ Selected table: '{selected_table}'")
+    #                         print(f"   📊 Compounds: {selected_info['count']:,}")
+    #                         print(f"   🏷️  Type: {selected_info['type']}")
+    #                         return selected_table
+    #                     else:
+    #                         print(f"❌ Invalid selection. Please enter 1-{len(available_tables)}")
+    #                         continue
+    #                 except ValueError:
+    #                     # Try as table name
+    #                     matching_tables = [t for t in available_tables if t.lower() == selection.lower()]
+    #                     if matching_tables:
+    #                         selected_table = matching_tables[0]
+    #                         # Find table info
+    #                         selected_info = next((info for info in table_info if info['name'] == selected_table), 
+    #                                         {'count': 0, 'type': 'unknown'})
+                            
+    #                         print(f"\n✅ Selected table: '{selected_table}'")
+    #                         print(f"   📊 Compounds: {selected_info['count']:,}")
+    #                         print(f"   🏷️  Type: {selected_info['type']}")
+    #                         return selected_table
+    #                     else:
+    #                         print(f"❌ Table '{selection}' not found")
+    #                         continue
+                            
+    #             except KeyboardInterrupt:
+    #                 print("\n❌ Table selection cancelled")
+    #                 return None
+                    
+    #     except Exception as e:
+    #         print(f"❌ Error selecting table for filtering: {e}")
+    #         return None
+
+### Updated with IA
+
     def _select_table_for_filtering(self) -> Optional[str]:
         """
         Interactive selection of table for filtering.
@@ -2363,25 +2455,23 @@ class ChemSpace:
             print(f"Available tables ({len(available_tables)} total):")
             print("-" * 60)
             
-            # Display tables with compound counts and types
+            # Display tables without compound counts for better performance
             table_info = []
             for i, table_name in enumerate(available_tables, 1):
                 try:
-                    compound_count = self.get_compound_count(table_name=table_name)
                     table_type = self._classify_table_type(table_name)
                     type_icon = self._get_table_type_icon(table_type)
                     
-                    print(f"{i:3d}. {type_icon} {table_name:<35} ({compound_count:>6,} compounds) [{table_type}]")
+                    print(f"{i:3d}. {type_icon} {table_name:<35} [{table_type}]")
                     table_info.append({
                         'name': table_name,
-                        'count': compound_count,
                         'type': table_type
                     })
+                    
                 except Exception as e:
-                    print(f"{i:3d}. ❓ {table_name:<35} (Error: {e})")
+                    print(f"{i:3d}. ❓ {table_name:<35} [Error: {e}]")
                     table_info.append({
                         'name': table_name,
-                        'count': 0,
                         'type': 'unknown'
                     })
             
@@ -2403,7 +2493,6 @@ class ChemSpace:
                             selected_info = table_info[table_idx]
                             
                             print(f"\n✅ Selected table: '{selected_table}'")
-                            print(f"   📊 Compounds: {selected_info['count']:,}")
                             print(f"   🏷️  Type: {selected_info['type']}")
                             return selected_table
                         else:
@@ -2416,10 +2505,9 @@ class ChemSpace:
                             selected_table = matching_tables[0]
                             # Find table info
                             selected_info = next((info for info in table_info if info['name'] == selected_table), 
-                                            {'count': 0, 'type': 'unknown'})
+                                            {'type': 'unknown'})
                             
                             print(f"\n✅ Selected table: '{selected_table}'")
-                            print(f"   📊 Compounds: {selected_info['count']:,}")
                             print(f"   🏷️  Type: {selected_info['type']}")
                             return selected_table
                         else:
@@ -2433,6 +2521,7 @@ class ChemSpace:
         except Exception as e:
             print(f"❌ Error selecting table for filtering: {e}")
             return None
+
 
     def _select_workflow_for_filtering(self) -> Optional[str]:
         """
