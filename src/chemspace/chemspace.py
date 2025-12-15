@@ -187,6 +187,153 @@ def _filter_chunk_worker_by_instances(chunk_data: List[Tuple], filters_list: Lis
     
     return results
 
+def _process_bimolecular_chunk_worker(chunk_data: List[Tuple], reaction_smarts: str, 
+                                    reaction_name: str, workflow_name: str) -> List[Dict[str, Any]]:
+    """
+    Worker function to process a chunk of bimolecular reaction combinations.
+    This function must be at module level to be pickleable for multiprocessing.
+    
+    Args:
+        chunk_data (List[Tuple]): List of (primary_compound, secondary_compound) tuples
+        reaction_smarts (str): SMARTS pattern for the reaction
+        reaction_name (str): Name of the reaction
+        workflow_name (str): Name of the workflow
+        
+    Returns:
+        List[Dict]: List of reaction products
+    """
+    try:
+        from rdkit import Chem
+        from rdkit.Chem import AllChem
+        from rdkit import RDLogger
+        RDLogger.DisableLog('rdApp.*')
+        
+        products = []
+        
+        # Parse reaction
+        rxn = AllChem.ReactionFromSmarts(reaction_smarts)
+        if rxn is None:
+            return []
+        
+        for primary_compound, secondary_compound in chunk_data:
+            try:
+                # Parse molecules
+                primary_mol = Chem.MolFromSmiles(primary_compound['smiles'])
+                secondary_mol = Chem.MolFromSmiles(secondary_compound['smiles'])
+                
+                if primary_mol is None or secondary_mol is None:
+                    continue
+                
+                # Run reaction
+                reaction_results = rxn.RunReactants((primary_mol, secondary_mol))
+                
+                # Process products
+                for product_set_idx, product_set in enumerate(reaction_results):
+                    for product_idx, product_mol in enumerate(product_set):
+                        try:
+                            Chem.SanitizeMol(product_mol)
+                            product_smiles = Chem.MolToSmiles(product_mol)
+                            
+                            # Generate product name
+                            primary_name = primary_compound.get('name', f"cpd_{primary_compound.get('id', 'unk')}")
+                            secondary_name = secondary_compound.get('name', f"cpd_{secondary_compound.get('id', 'unk')}")
+                            product_name = f"{primary_name}+{secondary_name}_{reaction_name}_{product_set_idx}_{product_idx}"
+                            
+                            products.append({
+                                'smiles': product_smiles,
+                                'name': product_name,
+                                'flag': 'parallel_bimolecular_product',
+                                'reactant1_name': primary_name,
+                                'reactant1_smiles': primary_compound['smiles'],
+                                'reactant2_name': secondary_name,
+                                'reactant2_smiles': secondary_compound['smiles'],
+                                'reaction_name': reaction_name,
+                                'workflow': workflow_name
+                            })
+                            
+                        except Exception:
+                            continue
+            
+            except Exception:
+                continue
+        
+        return products
+        
+    except Exception:
+        return []
+
+def _process_unimolecular_chunk_worker(chunk_data: List[Dict], reaction_smarts: str, 
+                                     reaction_name: str, workflow_name: str, 
+                                     name_prefix: str) -> List[Dict[str, Any]]:
+    """
+    Worker function to process a chunk of unimolecular reactions.
+    This function must be at module level to be pickleable for multiprocessing.
+    
+    Args:
+        chunk_data (List[Dict]): List of compound dictionaries
+        reaction_smarts (str): SMARTS pattern for the reaction
+        reaction_name (str): Name of the reaction
+        workflow_name (str): Name of the workflow
+        name_prefix (str): Prefix for product names
+        
+    Returns:
+        List[Dict]: List of reaction products
+    """
+    try:
+        from rdkit import Chem
+        from rdkit.Chem import AllChem
+        from rdkit import RDLogger
+        RDLogger.DisableLog('rdApp.*')
+        
+        products = []
+        
+        # Parse reaction
+        rxn = AllChem.ReactionFromSmarts(reaction_smarts)
+        if rxn is None:
+            return []
+        
+        for compound in chunk_data:
+            try:
+                # Parse molecule
+                reactant_mol = Chem.MolFromSmiles(compound['smiles'])
+                if reactant_mol is None:
+                    continue
+                
+                # Run reaction
+                reaction_results = rxn.RunReactants((reactant_mol,))
+                
+                # Process products
+                for product_set_idx, product_set in enumerate(reaction_results):
+                    for product_idx, product_mol in enumerate(product_set):
+                        try:
+                            Chem.SanitizeMol(product_mol)
+                            product_smiles = Chem.MolToSmiles(product_mol)
+                            
+                            # Generate product name
+                            original_name = compound.get('name', f"cpd_{compound.get('id', 'unk')}")
+                            product_name = f"{name_prefix}{original_name}_{reaction_name}_{product_set_idx}_{product_idx}"
+                            
+                            products.append({
+                                'smiles': product_smiles,
+                                'name': product_name,
+                                'flag': 'parallel_unimolecular_product',
+                                'reactant_name': original_name,
+                                'reactant_smiles': compound['smiles'],
+                                'reaction_name': reaction_name,
+                                'workflow': workflow_name
+                            })
+                            
+                        except Exception:
+                            continue
+                            
+            except Exception:
+                continue
+        
+        return products
+        
+    except Exception:
+        return []
+
 class ChemSpace:
     """
     ChemSpace class for managing chemical compound data within a project.
@@ -6822,31 +6969,40 @@ class ChemSpace:
             print(f"   ❌ Error in unimolecular reaction {reaction_info['name']}: {e}")
             return []
 
-    def apply_reaction_workflow(self, workflow_id: Optional[int] = None):
+    def apply_reaction_workflow(self, workflow_id: Optional[int] = None, 
+                                    max_workers: Optional[int] = None,
+                                    chunk_size: Optional[int] = None,
+                                    parallel_threshold: int = 1000) -> bool:
         """
-        Apply a saved reaction workflow to compounds with support for sequential multi-step reactions.
-        Each reaction step is analyzed separately for unimolecular/bimolecular nature, and users can choose to use products from previous steps as inputs for subsequent reactions.
+        Apply a saved reaction workflow to compounds with parallel processing support.
+        Uses existing helper methods for consistency while adding parallel execution for large datasets.
         
         Args:
             workflow_id (Optional[int]): ID of the reaction workflow to apply. If None, prompts user for selection.
+            max_workers (Optional[int]): Maximum number of parallel workers. If None, uses cpu_count()
+            chunk_size (Optional[int]): Size of chunks for parallel processing. If None, automatically calculated
+            parallel_threshold (int): Minimum number of compounds to trigger parallel processing
+            
+        Returns:
+            bool: True if workflow was applied successfully
         """
         try:
-            print(f"🔬 Starting sequential reaction workflow application...")
+            print(f"🚀 Starting parallel reaction workflow application...")
             
-            # Interactive workflow selection if not provided
+            # Reuse existing workflow selection logic
             if workflow_id is None:
                 workflow_id = self._select_reaction_workflow_for_application()
                 if workflow_id is None:
                     print("❌ No workflow selected for application")
-                    return
+                    return False
             
             print(f"   🆔 Workflow ID: {workflow_id}")
             
-            # Load the reaction workflow by ID
+            # Reuse existing workflow loading logic
             workflow_data = self._load_reaction_workflow_by_id(workflow_id)
             if not workflow_data:
                 print(f"❌ No reaction workflow found with ID {workflow_id}")
-                return
+                return False
             
             workflow_name = workflow_data['workflow_name']
             reactions_dict = workflow_data['reactions_dict']
@@ -6854,18 +7010,25 @@ class ChemSpace:
             print(f"   📋 Workflow: '{workflow_name}'")
             print(f"   🧪 Total reactions: {len(reactions_dict)}")
             
+            # Set up parallel processing parameters
+            if max_workers is None:
+                max_workers = min(cpu_count() or 4, 8)
+            
+            print(f"   👥 Max workers: {max_workers}")
+            print(f"   📦 Parallel threshold: {parallel_threshold:,} compounds")
+            
             # Sort reactions by order for sequential processing
             sorted_reactions = sorted(reactions_dict.items(), key=lambda x: x[1]['order'])
             
-            print(f"\n🔄 SEQUENTIAL REACTION ANALYSIS")
+            print(f"\n🔄 PARALLEL REACTION WORKFLOW ANALYSIS")
             print("=" * 60)
             for i, (reaction_id, reaction_info) in enumerate(sorted_reactions, 1):
                 reaction_type = self._analyze_single_reaction_type(reaction_info['smarts'])
                 print(f"   Step {i}: {reaction_info['name']} ({reaction_type})")
             print("=" * 60)
             
-            # Give a pause in the printing for the user to read the workflow analysis
-            input("Press Enter to continue with workflow execution...")
+            # Confirm execution
+            input("Press Enter to continue with parallel workflow execution...")
             
             # Import RDKit for reaction processing
             try:
@@ -6878,33 +7041,39 @@ class ChemSpace:
                 print("   conda install -c conda-forge rdkit")
                 print("   or")
                 print("   pip install rdkit")
-                return
+                return False
             
-            # Initialize workflow state
+            # Initialize parallel workflow state
             workflow_state = {
                 'step_results': {},
                 'available_tables': self.get_all_tables(),
-                'step_products': {}
+                'step_products': {},
+                'parallel_stats': {
+                    'total_workers_used': 0,
+                    'total_chunks_processed': 0,
+                    'total_processing_time': 0.0
+                }
             }
             
             if not workflow_state['available_tables']:
                 print("❌ No tables available in chemspace database")
-                return
+                return False
             
-            # Process each reaction step sequentially
+            # Process each reaction step with parallel support
             for step_num, (reaction_id, reaction_info) in enumerate(sorted_reactions, 1):
                 print(f"\n{'='*80}")
-                print(f"🔬 REACTION STEP {step_num}/{len(sorted_reactions)}: {reaction_info['name']}")
+                print(f"🚀 PARALLEL REACTION STEP {step_num}/{len(sorted_reactions)}: {reaction_info['name']}")
                 print(f"{'='*80}")
                 
-                step_result = self._process_sequential_reaction_step(
-                    step_num, reaction_id, reaction_info, workflow_name, workflow_state
+                step_result = self._process_parallel_reaction_step(
+                    step_num, reaction_id, reaction_info, workflow_name, workflow_state,
+                    max_workers, chunk_size, parallel_threshold
                 )
                 
                 workflow_state['step_results'][step_num] = step_result
                 
                 if not step_result['success']:
-                    print(f"❌ Step {step_num} failed. Stopping workflow execution.")
+                    print(f"❌ Step {step_num} failed. Stopping parallel workflow execution.")
                     break
                 
                 # Store step products for potential use in next steps
@@ -6915,14 +7084,635 @@ class ChemSpace:
                         'reaction_name': reaction_info['name']
                     }
             
-            # Invoke helper to offer deletion of intermediate step tables
+            # Reuse existing cleanup and summary methods
             self._query_and_delete_prev_step_tables(workflow_state)
+            self._display_parallel_workflow_summary(workflow_state, workflow_name)
             
-            # Display final workflow summary
-            self._display_reaction_workflow_summary(workflow_state, workflow_name)
+            return True
             
         except Exception as e:
-            print(f"❌ Error applying sequential reaction workflow: {e}")
+            print(f"❌ Error applying parallel reaction workflow: {e}")
+            return False
+
+    def _process_parallel_reaction_step(self, step_num: int, reaction_id: int, 
+                                    reaction_info: Dict[str, Any], workflow_name: str,
+                                    workflow_state: Dict[str, Any], max_workers: int,
+                                    chunk_size: Optional[int], parallel_threshold: int) -> Dict[str, Any]:
+        """
+        Process a single reaction step with parallel processing support.
+        Reuses existing helper methods where possible.
+        
+        Args:
+            step_num (int): Current step number
+            reaction_id (int): ID of the reaction
+            reaction_info (Dict): Reaction information
+            workflow_name (str): Name of the workflow
+            workflow_state (Dict): Current workflow state
+            max_workers (int): Maximum number of parallel workers
+            chunk_size (Optional[int]): Size of chunks for parallel processing
+            parallel_threshold (int): Minimum compounds to trigger parallel processing
+            
+        Returns:
+            Dict[str, Any]: Step execution results
+        """
+        try:
+            reaction_name = reaction_info['name']
+            reaction_smarts = reaction_info['smarts']
+            
+            # Reuse existing reaction analysis
+            reaction_type = self._analyze_single_reaction_type(reaction_smarts)
+            
+            print(f"🔍 Parallel Reaction Analysis:")
+            print(f"   📋 Name: {reaction_name}")
+            print(f"   🧪 Type: {reaction_type}")
+            print(f"   ⚗️  SMARTS: {reaction_smarts}")
+            
+            # Reuse existing input source detection
+            input_sources = self._get_available_input_sources(step_num, workflow_state)
+            
+            if not input_sources:
+                return {
+                    'success': False,
+                    'message': 'No input sources available',
+                    'products_generated': 0,
+                    'parallel_used': False
+                }
+            
+            # Reuse existing table selection logic
+            if reaction_type == 'bimolecular':
+                table_config = self._select_tables_for_step_bimolecular(
+                    input_sources, step_num, reaction_name
+                )
+            else:  # unimolecular
+                table_config = self._select_tables_for_step_unimolecular(
+                    input_sources, step_num, reaction_name
+                )
+            
+            if not table_config:
+                return {
+                    'success': False,
+                    'message': 'No tables selected for reaction step',
+                    'products_generated': 0,
+                    'parallel_used': False
+                }
+            
+            # Apply the reaction with parallel support
+            if reaction_type == 'bimolecular':
+                step_result = self._apply_parallel_step_bimolecular_reaction(
+                    table_config, reaction_info, workflow_name, step_num,
+                    max_workers, chunk_size, parallel_threshold
+                )
+            else:  # unimolecular
+                step_result = self._apply_parallel_step_unimolecular_reaction(
+                    table_config, reaction_info, workflow_name, step_num,
+                    max_workers, chunk_size, parallel_threshold
+                )
+            
+            # Update parallel statistics
+            if step_result.get('parallel_used', False):
+                stats = workflow_state['parallel_stats']
+                stats['total_workers_used'] += step_result.get('workers_used', 0)
+                stats['total_chunks_processed'] += step_result.get('chunks_processed', 0)
+                stats['total_processing_time'] += step_result.get('processing_time', 0.0)
+            
+            return step_result
+            
+        except Exception as e:
+            print(f"❌ Error processing parallel reaction step {step_num}: {e}")
+            return {
+                'success': False,
+                'message': f'Error in parallel step {step_num}: {e}',
+                'products_generated': 0,
+                'parallel_used': False
+            }
+
+    def _apply_parallel_step_bimolecular_reaction(self, table_config: Dict[str, Any], 
+                                                reaction_info: Dict[str, Any], 
+                                                workflow_name: str, step_num: int,
+                                                max_workers: int, chunk_size: Optional[int],
+                                                parallel_threshold: int) -> Dict[str, Any]:
+        """
+        Apply a bimolecular reaction with parallel processing support.
+        
+        Args:
+            table_config (Dict): Table configuration
+            reaction_info (Dict): Reaction information
+            workflow_name (str): Workflow name
+            step_num (int): Current step number
+            max_workers (int): Maximum parallel workers
+            chunk_size (Optional[int]): Chunk size for parallel processing
+            parallel_threshold (int): Threshold to trigger parallel processing
+            
+        Returns:
+            Dict[str, Any]: Step execution results
+        """
+        try:
+            from rdkit import Chem
+            from rdkit.Chem import AllChem
+            import time
+            
+            print(f"\n🚀 Executing Parallel Bimolecular Reaction - Step {step_num}")
+            print("-" * 60)
+            
+            # Get compound data
+            primary_df = self._get_table_as_dataframe(table_config['primary_table'])
+            secondary_df = self._get_table_as_dataframe(table_config['secondary_table'])
+            
+            primary_count = len(primary_df)
+            secondary_count = len(secondary_df)
+            total_combinations = primary_count * secondary_count
+            
+            print(f"📊 Primary reactants: {primary_count:,} compounds")
+            print(f"📊 Secondary reactants: {secondary_count:,} compounds")
+            print(f"🔢 Total combinations: {total_combinations:,}")
+            
+            # Determine if parallel processing should be used
+            use_parallel = total_combinations >= parallel_threshold
+            
+            if use_parallel:
+                print(f"🚀 Using parallel processing (threshold: {parallel_threshold:,})")
+                
+                # Set default chunk size if not provided
+                if chunk_size is None:
+                    chunk_size = max(100, total_combinations // (max_workers * 4))
+                
+                print(f"   👥 Workers: {max_workers}")
+                print(f"   📦 Chunk size: {chunk_size:,}")
+                
+                # Apply parallel bimolecular reaction
+                start_time = time.time()
+                products = self._apply_bimolecular_reaction_parallel(
+                    primary_df, secondary_df, reaction_info, workflow_name,
+                    max_workers, chunk_size
+                )
+                processing_time = time.time() - start_time
+                
+                chunks_processed = (total_combinations + chunk_size - 1) // chunk_size
+                
+                result = {
+                    'success': True,
+                    'products_generated': len(products),
+                    'reaction_type': 'bimolecular',
+                    'step_num': step_num,
+                    'parallel_used': True,
+                    'workers_used': max_workers,
+                    'chunks_processed': chunks_processed,
+                    'processing_time': processing_time,
+                    'combinations_processed': total_combinations
+                }
+            else:
+                print(f"🔄 Using sequential processing (below threshold)")
+                
+                # Use existing sequential method
+                products = self._apply_bimolecular_reaction(
+                    primary_df, secondary_df, reaction_info, workflow_name
+                )
+                
+                result = {
+                    'success': True,
+                    'products_generated': len(products),
+                    'reaction_type': 'bimolecular',
+                    'step_num': step_num,
+                    'parallel_used': False,
+                    'combinations_processed': total_combinations
+                }
+            
+            # Save products using existing logic
+            output_table_name = None
+            if products:
+                print(f"\n💾 Generated {len(products)} products from bimolecular reaction")
+                
+                save_choice = input("Save products to a new table? (y/n): ").strip().lower()
+                if save_choice in ['y', 'yes']:
+                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    default_name = f"parallel_step{step_num}_{reaction_info['name']}_{timestamp}"
+                    user_table_name = input(f"Enter table name (default: {default_name}): ").strip()
+                    chosen_name = user_table_name if user_table_name else default_name
+                    output_table_name = self._sanitize_table_name(chosen_name)
+                    
+                    # Reuse existing save method
+                    success = self._save_step_products(
+                        products, output_table_name, workflow_name, step_num
+                    )
+                    
+                    if not success:
+                        output_table_name = None
+            
+            result['output_table'] = output_table_name
+            return result
+            
+        except Exception as e:
+            print(f"❌ Error applying parallel bimolecular reaction: {e}")
+            return {
+                'success': False,
+                'products_generated': 0,
+                'error': str(e),
+                'parallel_used': False
+            }
+
+    def _apply_parallel_step_unimolecular_reaction(self, table_config: Dict[str, Any], 
+                                                reaction_info: Dict[str, Any], 
+                                                workflow_name: str, step_num: int,
+                                                max_workers: int, chunk_size: Optional[int],
+                                                parallel_threshold: int) -> Dict[str, Any]:
+        """
+        Apply a unimolecular reaction with parallel processing support.
+        
+        Args:
+            table_config (Dict): Table configuration
+            reaction_info (Dict): Reaction information
+            workflow_name (str): Workflow name
+            step_num (int): Current step number
+            max_workers (int): Maximum parallel workers
+            chunk_size (Optional[int]): Chunk size for parallel processing
+            parallel_threshold (int): Threshold to trigger parallel processing
+            
+        Returns:
+            Dict[str, Any]: Step execution results
+        """
+        try:
+            import time
+            
+            print(f"\n🚀 Executing Parallel Unimolecular Reaction - Step {step_num}")
+            print("-" * 60)
+            
+            all_products = []
+            total_compounds = 0
+            parallel_used = False
+            total_processing_time = 0.0
+            total_chunks_processed = 0
+            
+            # Process each selected source
+            for source in table_config['sources']:
+                print(f"\n🔬 Processing source: '{source['name']}'")
+                compounds_df = self._get_table_as_dataframe(source['name'])
+                
+                if compounds_df.empty:
+                    print(f"   ⚠️  No compounds found, skipping...")
+                    continue
+                
+                compound_count = len(compounds_df)
+                total_compounds += compound_count
+                print(f"   📊 Processing {compound_count:,} compounds...")
+                
+                # Determine if parallel processing should be used for this source
+                use_parallel_for_source = compound_count >= parallel_threshold
+                
+                if use_parallel_for_source:
+                    print(f"   🚀 Using parallel processing for this source")
+                    parallel_used = True
+                    
+                    # Set default chunk size if not provided
+                    if chunk_size is None:
+                        source_chunk_size = max(100, compound_count // (max_workers * 4))
+                    else:
+                        source_chunk_size = chunk_size
+                    
+                    print(f"      👥 Workers: {max_workers}")
+                    print(f"      📦 Chunk size: {source_chunk_size:,}")
+                    
+                    # Apply parallel unimolecular reaction
+                    start_time = time.time()
+                    source_prefix = f"parallel_step{step_num}_{source['name']}_"
+                    products = self._apply_unimolecular_reaction_parallel(
+                        compounds_df, reaction_info, workflow_name, source_prefix,
+                        max_workers, source_chunk_size
+                    )
+                    processing_time = time.time() - start_time
+                    total_processing_time += processing_time
+                    
+                    chunks_for_source = (compound_count + source_chunk_size - 1) // source_chunk_size
+                    total_chunks_processed += chunks_for_source
+                    
+                    print(f"   ⚡ Parallel processing completed in {processing_time:.2f}s")
+                    print(f"   📦 Chunks processed: {chunks_for_source}")
+                else:
+                    print(f"   🔄 Using sequential processing (below threshold)")
+                    
+                    # Use existing sequential method
+                    source_prefix = f"step{step_num}_{source['name']}_"
+                    products = self._apply_unimolecular_reaction(
+                        compounds_df, reaction_info, workflow_name, source_prefix
+                    )
+                
+                all_products.extend(products)
+                print(f"   ✅ Generated {len(products)} products")
+            
+            # Save products using existing logic
+            output_table_name = None
+            if all_products:
+                print(f"\n💾 Total products generated: {len(all_products)}")
+                
+                save_choice = input("Save products to a new table? (y/n): ").strip().lower()
+                if save_choice in ['y', 'yes']:
+                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    default_name = f"parallel_step{step_num}_{reaction_info['name']}_{timestamp}"
+                    user_table_name = input(f"Enter table name (default: {default_name}): ").strip()
+                    chosen_name = user_table_name if user_table_name else default_name
+                    output_table_name = self._sanitize_table_name(chosen_name)
+                    
+                    # Reuse existing save method
+                    success = self._save_step_products(
+                        all_products, output_table_name, workflow_name, step_num
+                    )
+                    
+                    if not success:
+                        output_table_name = None
+            
+            return {
+                'success': True,
+                'products_generated': len(all_products),
+                'output_table': output_table_name,
+                'reaction_type': 'unimolecular',
+                'step_num': step_num,
+                'parallel_used': parallel_used,
+                'workers_used': max_workers if parallel_used else 0,
+                'chunks_processed': total_chunks_processed,
+                'processing_time': total_processing_time,
+                'compounds_processed': total_compounds
+            }
+            
+        except Exception as e:
+            print(f"❌ Error applying parallel unimolecular reaction: {e}")
+            return {
+                'success': False,
+                'products_generated': 0,
+                'error': str(e),
+                'parallel_used': False
+            }
+
+    def _apply_bimolecular_reaction_parallel(self, primary_df: pd.DataFrame, secondary_df: pd.DataFrame,
+                                        reaction_info: Dict[str, Any], workflow_name: str,
+                                        max_workers: int, chunk_size: int) -> List[Dict[str, Any]]:
+        """
+        Apply a bimolecular reaction using parallel processing.
+        
+        Args:
+            primary_df (pd.DataFrame): Primary reactants dataframe
+            secondary_df (pd.DataFrame): Secondary reactants dataframe
+            reaction_info (Dict): Reaction information
+            workflow_name (str): Name of the workflow
+            max_workers (int): Maximum number of parallel workers
+            chunk_size (int): Size of each chunk for parallel processing
+            
+        Returns:
+            List[Dict]: List of reaction products
+        """
+        try:
+            from concurrent.futures import ProcessPoolExecutor, as_completed
+            
+            reaction_smarts = reaction_info['smarts']
+            reaction_name = reaction_info['name']
+            
+            print(f"   🔗 Reaction: {reaction_name}")
+            print(f"   ⚗️  SMARTS: {reaction_smarts}")
+            
+            # Prepare data chunks for parallel processing
+            total_combinations = len(primary_df) * len(secondary_df)
+            chunks = self._create_bimolecular_chunks(primary_df, secondary_df, chunk_size)
+            
+            print(f"   📦 Created {len(chunks)} chunks for parallel processing")
+            
+            all_products = []
+            processed_chunks = 0
+            successful_reactions = 0
+            
+            # Initialize progress tracking
+            if TQDM_AVAILABLE:
+                progress_bar = tqdm(
+                    total=len(chunks),
+                    desc=f"Parallel {reaction_name}",
+                    unit="chunks"
+                )
+            else:
+                progress_bar = None
+            
+            # Process chunks in parallel
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                # Submit all chunks
+                future_to_chunk = {
+                    executor.submit(
+                        _process_bimolecular_chunk_worker,
+                        chunk, reaction_smarts, reaction_name, workflow_name
+                    ): i for i, chunk in enumerate(chunks)
+                }
+                
+                # Collect results
+                for future in as_completed(future_to_chunk):
+                    chunk_idx = future_to_chunk[future]
+                    
+                    try:
+                        chunk_products = future.result()
+                        all_products.extend(chunk_products)
+                        successful_reactions += len(chunk_products)
+                        processed_chunks += 1
+                        
+                        if progress_bar:
+                            progress_bar.update(1)
+                            progress_bar.set_postfix({
+                                'products': len(all_products),
+                                'chunks': f"{processed_chunks}/{len(chunks)}"
+                            })
+                        else:
+                            if processed_chunks % max(1, len(chunks) // 10) == 0:
+                                progress = (processed_chunks / len(chunks)) * 100
+                                print(f"      📊 Progress: {progress:.1f}% ({len(all_products)} products)")
+                    
+                    except Exception as e:
+                        print(f"   ❌ Error processing chunk {chunk_idx}: {e}")
+                        processed_chunks += 1
+                        if progress_bar:
+                            progress_bar.update(1)
+            
+            if progress_bar:
+                progress_bar.close()
+            
+            print(f"   ✅ Parallel processing completed: {len(all_products)} products from {successful_reactions} reactions")
+            return all_products
+            
+        except Exception as e:
+            print(f"   ❌ Error in parallel bimolecular reaction: {e}")
+            return []
+
+    def _apply_unimolecular_reaction_parallel(self, compounds_df: pd.DataFrame, 
+                                            reaction_info: Dict[str, Any], workflow_name: str,
+                                            name_prefix: str, max_workers: int, 
+                                            chunk_size: int) -> List[Dict[str, Any]]:
+        """
+        Apply a unimolecular reaction using parallel processing.
+        
+        Args:
+            compounds_df (pd.DataFrame): Compounds dataframe
+            reaction_info (Dict): Reaction information
+            workflow_name (str): Name of the workflow
+            name_prefix (str): Prefix for product names
+            max_workers (int): Maximum number of parallel workers
+            chunk_size (int): Size of each chunk for parallel processing
+            
+        Returns:
+            List[Dict]: List of reaction products
+        """
+        try:
+            from concurrent.futures import ProcessPoolExecutor, as_completed
+            
+            reaction_smarts = reaction_info['smarts']
+            reaction_name = reaction_info['name']
+            
+            # Create data chunks for parallel processing
+            chunks = self._create_unimolecular_chunks(compounds_df, chunk_size)
+            
+            print(f"      📦 Created {len(chunks)} chunks for parallel processing")
+            
+            all_products = []
+            processed_chunks = 0
+            successful_reactions = 0
+            
+            # Initialize progress tracking
+            if TQDM_AVAILABLE:
+                progress_bar = tqdm(
+                    total=len(chunks),
+                    desc=f"Parallel {reaction_name}",
+                    unit="chunks"
+                )
+            else:
+                progress_bar = None
+            
+            # Process chunks in parallel
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                # Submit all chunks
+                future_to_chunk = {
+                    executor.submit(
+                        _process_unimolecular_chunk_worker,
+                        chunk, reaction_smarts, reaction_name, workflow_name, name_prefix
+                    ): i for i, chunk in enumerate(chunks)
+                }
+                
+                # Collect results
+                for future in as_completed(future_to_chunk):
+                    chunk_idx = future_to_chunk[future]
+                    
+                    try:
+                        chunk_products = future.result()
+                        all_products.extend(chunk_products)
+                        successful_reactions += len(chunk_products)
+                        processed_chunks += 1
+                        
+                        if progress_bar:
+                            progress_bar.update(1)
+                            progress_bar.set_postfix({
+                                'products': len(all_products)
+                            })
+                        
+                    except Exception as e:
+                        print(f"      ❌ Error processing chunk {chunk_idx}: {e}")
+                        processed_chunks += 1
+                        if progress_bar:
+                            progress_bar.update(1)
+            
+            if progress_bar:
+                progress_bar.close()
+            
+            print(f"      ✅ Parallel processing completed: {len(all_products)} products")
+            return all_products
+            
+        except Exception as e:
+            print(f"      ❌ Error in parallel unimolecular reaction: {e}")
+            return []
+
+    def _create_bimolecular_chunks(self, primary_df: pd.DataFrame, secondary_df: pd.DataFrame, 
+                                chunk_size: int) -> List[List[Tuple]]:
+        """
+        Create chunks for parallel bimolecular reaction processing.
+        
+        Args:
+            primary_df (pd.DataFrame): Primary reactants
+            secondary_df (pd.DataFrame): Secondary reactants
+            chunk_size (int): Size of each chunk
+            
+        Returns:
+            List[List[Tuple]]: List of chunks, each containing compound pairs
+        """
+        chunks = []
+        current_chunk = []
+        
+        for _, primary_compound in primary_df.iterrows():
+            for _, secondary_compound in secondary_df.iterrows():
+                current_chunk.append((
+                    primary_compound.to_dict(),
+                    secondary_compound.to_dict()
+                ))
+                
+                if len(current_chunk) >= chunk_size:
+                    chunks.append(current_chunk)
+                    current_chunk = []
+        
+        # Add remaining compounds
+        if current_chunk:
+            chunks.append(current_chunk)
+        
+        return chunks
+
+    def _create_unimolecular_chunks(self, compounds_df: pd.DataFrame, 
+                                chunk_size: int) -> List[List[Dict]]:
+        """
+        Create chunks for parallel unimolecular reaction processing.
+        
+        Args:
+            compounds_df (pd.DataFrame): Compounds dataframe
+            chunk_size (int): Size of each chunk
+            
+        Returns:
+            List[List[Dict]]: List of chunks, each containing compound dictionaries
+        """
+        chunks = []
+        current_chunk = []
+        
+        for _, compound in compounds_df.iterrows():
+            current_chunk.append(compound.to_dict())
+            
+            if len(current_chunk) >= chunk_size:
+                chunks.append(current_chunk)
+                current_chunk = []
+        
+        # Add remaining compounds
+        if current_chunk:
+            chunks.append(current_chunk)
+        
+        return chunks
+
+    def _display_parallel_workflow_summary(self, workflow_state: Dict[str, Any], workflow_name: str) -> None:
+        """
+        Display a comprehensive summary of the parallel workflow execution.
+        Extends the existing summary with parallel processing statistics.
+        
+        Args:
+            workflow_state (Dict): Final workflow state
+            workflow_name (str): Name of the workflow
+        """
+        try:
+            # Reuse existing summary display
+            self._display_reaction_workflow_summary(workflow_state, workflow_name)
+            
+            # Add parallel processing statistics
+            parallel_stats = workflow_state.get('parallel_stats', {})
+            
+            if parallel_stats.get('total_processing_time', 0) > 0:
+                print(f"\n🚀 PARALLEL PROCESSING STATISTICS:")
+                print(f"   👥 Total workers used: {parallel_stats.get('total_workers_used', 0)}")
+                print(f"   📦 Total chunks processed: {parallel_stats.get('total_chunks_processed', 0)}")
+                print(f"   ⏱️  Total processing time: {parallel_stats.get('total_processing_time', 0):.2f}s")
+                
+                # Calculate processing efficiency
+                total_time = parallel_stats.get('total_processing_time', 0)
+                total_workers = parallel_stats.get('total_workers_used', 1)
+                if total_time > 0 and total_workers > 0:
+                    efficiency = (total_time / total_workers)
+                    print(f"   ⚡ Average time per worker: {efficiency:.2f}s")
+                
+                print(f"{'='*80}")
+            
+        except Exception as e:
+            print(f"❌ Error displaying parallel workflow summary: {e}")
 
     def _select_reaction_workflow_for_application(self) -> Optional[int]:
         """
