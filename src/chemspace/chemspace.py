@@ -2197,9 +2197,6 @@ class ChemSpace:
             print(f"❌ Error in filter_using_workflow: {e}")
             return pd.DataFrame()
 
-### Fin Generado con IA
-
-
     def _select_table_for_filtering(self) -> Optional[str]:
         """
         Interactive selection of table for filtering.
@@ -2285,7 +2282,6 @@ class ChemSpace:
         except Exception as e:
             print(f"❌ Error selecting table for filtering: {e}")
             return None
-
 
     def _select_workflow_for_filtering(self) -> Optional[str]:
         """
@@ -2950,18 +2946,14 @@ class ChemSpace:
         except Exception as e:
             print(f"❌ Error saving workflow filtered compounds to table '{new_table_name}': {e}")
             return False
-  
-
-
-### Finished usando IA
 
 
 
-    def depict_table(self, table_name: str, 
+    def depict_table(self, table_name: Optional[str] = None, 
                     output_dir: Optional[str] = None,
                     image_size: Tuple[int, int] = (300, 300),
                     molecules_per_image: int = 25,
-                    max_molecules: Optional[int] = 25,
+                    max_molecules: Optional[int] = None,
                     depict_random: bool = False,
                     highlight_substructures: bool = False,
                     smarts_pattern: Optional[str] = None) -> bool:
@@ -2969,11 +2961,11 @@ class ChemSpace:
         Generate chemical structure depictions from SMILES strings in a table and save as PNG images.
         
         Args:
-            table_name (str): Name of the table containing compounds with SMILES
+            table_name (Optional[str]): Name of the table containing compounds with SMILES. If None, prompts user.
             output_dir (Optional[str]): Directory to save images. If None, creates directory named after table
             image_size (Tuple[int, int]): Size of each molecule image (width, height)
             molecules_per_image (int): Number of molecules per image (1 for individual, >1 for grids)
-            max_molecules (Optional[int]): Maximum number of molecules to depict. If None, depicts all
+            max_molecules (Optional[int]): Maximum number of molecules to depict. If None, prompts user.
             depict_random (bool): If True and max_molecules is set, randomly select molecules instead of taking first N
             highlight_substructures (bool): Whether to highlight substructures matching a SMARTS pattern
             smarts_pattern (Optional[str]): SMARTS pattern for substructure highlighting
@@ -2996,6 +2988,13 @@ class ChemSpace:
                 print("   pip install rdkit pillow")
                 return False
             
+            # Interactive table selection if not provided
+            if table_name is None:
+                table_name = self._select_table_for_depiction()
+                if not table_name:
+                    print("❌ No table selected for depiction")
+                    return False
+            
             # Check if table exists
             tables = self.get_all_tables()
             if table_name not in tables:
@@ -3013,21 +3012,34 @@ class ChemSpace:
                 print("❌ No 'smiles' column found in the table")
                 return False
             
-            # Limit molecules if specified
-            if max_molecules and max_molecules > 0:
+            total_available = len(compounds_df)
+            print(f"📊 Found {total_available:,} molecules in table '{table_name}'")
+            
+            # Interactive molecule count selection if not provided
+            if max_molecules is None:
+                max_molecules = self._prompt_for_molecule_count(total_available)
+                if max_molecules is None:
+                    print("❌ Depiction cancelled by user")
+                    return False
+            
+            # Handle special case: -1 means all molecules
+            if max_molecules == -1:
+                max_molecules = total_available
+                print(f"🎨 Depicting all {total_available:,} molecules in the table")
+            elif max_molecules > 0:
                 if depict_random:
-                    compounds_df = compounds_df.sample(n=max_molecules)
-                    print(f"🔍 Randomly selected {max_molecules} molecules for depiction")
+                    compounds_df = compounds_df.sample(n=min(max_molecules, total_available))
+                    print(f"🔍 Randomly selected {min(max_molecules, total_available)} molecules for depiction")
                 else:
                     compounds_df = compounds_df.head(max_molecules)
-                    print(f"🔍 Limited to first {max_molecules} molecules")
+                    print(f"🔍 Limited to first {min(max_molecules, total_available)} molecules")
             
             total_molecules = len(compounds_df)
-            print(f"🎨 Generating depictions for {total_molecules} molecules from table '{table_name}'")
+            print(f"🎨 Generating depictions for {total_molecules:,} molecules from table '{table_name}'")
             
             # Set up output directory
             if output_dir is None:
-                output_dir = os.path.join(self.path, 'chemspace', 'misc', table_name)
+                output_dir = os.path.join(self.path, 'chemspace', 'depictions', table_name)
             
             os.makedirs(output_dir, exist_ok=True)
             print(f"📁 Output directory: {output_dir}")
@@ -3079,7 +3091,196 @@ class ChemSpace:
         except Exception as e:
             print(f"❌ Error in depict_table: {e}")
             return False
-    
+
+    def _select_table_for_depiction(self) -> Optional[str]:
+        """
+        Interactive selection of table for molecular depiction.
+        
+        Returns:
+            Optional[str]: Selected table name or None if cancelled
+        """
+        try:
+            available_tables = self.get_all_tables()
+            
+            if not available_tables:
+                print("❌ No tables available for depiction")
+                return None
+            
+            print(f"\n🎨 SELECT TABLE FOR MOLECULAR DEPICTION")
+            print("=" * 70)
+            print(f"Available tables ({len(available_tables)} total):")
+            print("-" * 70)
+            
+            # Display tables with compound counts and types
+            table_info = []
+            for i, table_name in enumerate(available_tables, 1):
+                try:
+                    compound_count = self.get_compound_count(table_name=table_name)
+                    table_type = self._classify_table_type(table_name)
+                    type_icon = self._get_table_type_icon(table_type)
+                    
+                    print(f"{i:3d}. {type_icon} {table_name:<30} ({compound_count:>6,} compounds) [{table_type}]")
+                    table_info.append({
+                        'name': table_name,
+                        'type': table_type,
+                        'count': compound_count
+                    })
+                    
+                except Exception as e:
+                    print(f"{i:3d}. ❓ {table_name:<30} (Error: {e}) [Unknown]")
+                    table_info.append({
+                        'name': table_name,
+                        'type': 'unknown',
+                        'count': 0
+                    })
+            
+            print("-" * 70)
+            print("Commands: Enter table number, table name, or 'cancel' to abort")
+            
+            while True:
+                try:
+                    selection = input(f"\n🔍 Select table for depiction: ").strip()
+                    
+                    if selection.lower() in ['cancel', 'quit', 'exit']:
+                        return None
+                    
+                    # Try as number first
+                    try:
+                        table_idx = int(selection) - 1
+                        if 0 <= table_idx < len(available_tables):
+                            selected_table = available_tables[table_idx]
+                            selected_info = table_info[table_idx]
+                            
+                            print(f"\n✅ Selected table: '{selected_table}'")
+                            print(f"   🏷️  Type: {selected_info['type']}")
+                            print(f"   📊 Compounds: {selected_info['count']:,}")
+                            return selected_table
+                        else:
+                            print(f"❌ Invalid selection. Please enter 1-{len(available_tables)}")
+                            continue
+                    except ValueError:
+                        # Try as table name
+                        matching_tables = [t for t in available_tables if t.lower() == selection.lower()]
+                        if matching_tables:
+                            selected_table = matching_tables[0]
+                            # Find table info
+                            selected_info = next((info for info in table_info if info['name'] == selected_table), 
+                                            {'type': 'unknown', 'count': 0})
+                            
+                            print(f"\n✅ Selected table: '{selected_table}'")
+                            print(f"   🏷️  Type: {selected_info['type']}")
+                            print(f"   📊 Compounds: {selected_info['count']:,}")
+                            return selected_table
+                        else:
+                            print(f"❌ Table '{selection}' not found")
+                            continue
+                            
+                except KeyboardInterrupt:
+                    print("\n❌ Table selection cancelled")
+                    return None
+                    
+        except Exception as e:
+            print(f"❌ Error selecting table for depiction: {e}")
+            return None
+
+    def _prompt_for_molecule_count(self, total_available: int) -> Optional[int]:
+        """
+        Interactive prompt for the number of molecules to depict.
+        
+        Args:
+            total_available (int): Total number of molecules available in the table
+            
+        Returns:
+            Optional[int]: Number of molecules to depict, or None if cancelled
+        """
+        try:
+            print(f"\n📊 MOLECULE COUNT SELECTION")
+            print("=" * 40)
+            print(f"📋 Total molecules available: {total_available:,}")
+            print("\nOptions:")
+            print(f"   • Enter a number (1-{total_available:,}) to limit molecules")
+            print("   • Enter -1 to depict ALL molecules")
+            print("   • Enter 0 or 'cancel' to abort")
+            
+            # Suggest reasonable defaults based on table size
+            if total_available <= 25:
+                suggested = total_available
+                print(f"\n💡 Suggestion: {suggested} (all molecules)")
+            elif total_available <= 100:
+                suggested = 50
+                print(f"\n💡 Suggestion: {suggested} (good sample size)")
+            elif total_available <= 1000:
+                suggested = 100
+                print(f"\n💡 Suggestion: {suggested} (manageable sample)")
+            else:
+                suggested = 250
+                print(f"\n💡 Suggestion: {suggested} (representative sample)")
+            
+            print("=" * 40)
+            
+            while True:
+                try:
+                    user_input = input(f"🔢 Number of molecules to depict (default: {suggested}): ").strip()
+                    
+                    # Handle empty input (use default)
+                    if not user_input:
+                        print(f"✅ Using default: {suggested} molecules")
+                        return suggested
+                    
+                    # Handle cancel
+                    if user_input.lower() in ['cancel', 'quit', 'exit', 'abort']:
+                        return None
+                    
+                    # Handle numeric input
+                    try:
+                        count = int(user_input)
+                        
+                        # Handle special cases
+                        if count == 0:
+                            print("❌ Depiction cancelled (count = 0)")
+                            return None
+                        elif count == -1:
+                            print(f"✅ Will depict ALL {total_available:,} molecules")
+                            return -1
+                        elif count < 0:
+                            print("❌ Invalid input. Use -1 for all molecules or positive numbers")
+                            continue
+                        elif count > total_available:
+                            print(f"⚠️  Requested {count:,} molecules, but only {total_available:,} available")
+                            use_all = input(f"   Use all {total_available:,} molecules instead? (y/n): ").strip().lower()
+                            if use_all in ['y', 'yes']:
+                                print(f"✅ Will depict all {total_available:,} molecules")
+                                return total_available
+                            else:
+                                continue
+                        else:
+                            print(f"✅ Will depict {count:,} molecules")
+                            
+                            # Ask about random sampling for large requests
+                            if count > 25 and count < total_available:
+                                random_choice = input(f"   Select molecules randomly? (y/n, default: n): ").strip().lower()
+                                if random_choice in ['y', 'yes']:
+                                    print("   🎲 Will use random sampling")
+                                else:
+                                    print("   📋 Will use first molecules in table")
+                            
+                            return count
+                            
+                    except ValueError:
+                        print("❌ Invalid input. Please enter a number, -1, or 'cancel'")
+                        continue
+                        
+                except KeyboardInterrupt:
+                    print("\n❌ Molecule count selection cancelled")
+                    return None
+                    
+        except Exception as e:
+            print(f"❌ Error prompting for molecule count: {e}")
+            return None
+
+### Fin de Optimizada con IA
+
+
     def _depict_individual_molecules(self, compounds_df: pd.DataFrame, output_dir: str, 
                                    image_size: Tuple[int, int], highlight_mol, 
                                    highlight_substructures: bool) -> Tuple[int, int, int]:
