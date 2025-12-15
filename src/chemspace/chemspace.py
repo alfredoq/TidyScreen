@@ -334,6 +334,174 @@ def _process_unimolecular_chunk_worker(chunk_data: List[Dict], reaction_smarts: 
     except Exception:
         return []
 
+def _process_bimolecular_chunk_to_file_worker(chunk_data: List[Tuple], reaction_smarts: str, 
+                                            reaction_name: str, workflow_name: str, 
+                                            output_file_path: str) -> int:
+    """
+    Worker function to process a bimolecular chunk and write results directly to a CSV file.
+    
+    Args:
+        chunk_data (List[Tuple]): List of (primary_compound, secondary_compound) tuples
+        reaction_smarts (str): SMARTS pattern for the reaction
+        reaction_name (str): Name of the reaction
+        workflow_name (str): Name of the workflow
+        output_file_path (str): Path to output CSV file
+        
+    Returns:
+        int: Number of products written to file
+    """
+    try:
+        import csv
+        from rdkit import Chem
+        from rdkit.Chem import AllChem
+        from rdkit import RDLogger
+        RDLogger.DisableLog('rdApp.*')
+        
+        products_count = 0
+        
+        # Parse reaction
+        rxn = AllChem.ReactionFromSmarts(reaction_smarts)
+        if rxn is None:
+            return 0
+        
+        # Open file for writing
+        with open(output_file_path, 'w', newline='', encoding='utf-8') as csvfile:
+            fieldnames = ['smiles', 'name', 'flag', 'reactant1_name', 'reactant1_smiles',
+                         'reactant2_name', 'reactant2_smiles', 'reaction_name', 'workflow']
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            
+            for primary_compound, secondary_compound in chunk_data:
+                try:
+                    # Parse molecules
+                    primary_mol = Chem.MolFromSmiles(primary_compound['smiles'])
+                    secondary_mol = Chem.MolFromSmiles(secondary_compound['smiles'])
+                    
+                    if primary_mol is None or secondary_mol is None:
+                        continue
+                    
+                    # Run reaction
+                    reaction_results = rxn.RunReactants((primary_mol, secondary_mol))
+                    
+                    # Process products and write immediately
+                    for product_set_idx, product_set in enumerate(reaction_results):
+                        for product_idx, product_mol in enumerate(product_set):
+                            try:
+                                Chem.SanitizeMol(product_mol)
+                                product_smiles = Chem.MolToSmiles(product_mol)
+                                
+                                # Generate product name
+                                primary_name = primary_compound.get('name', f"cpd_{primary_compound.get('id', 'unk')}")
+                                secondary_name = secondary_compound.get('name', f"cpd_{secondary_compound.get('id', 'unk')}")
+                                product_name = f"{primary_name}+{secondary_name}_{reaction_name}_{product_set_idx}_{product_idx}"
+                                
+                                # Write product directly to file
+                                writer.writerow({
+                                    'smiles': product_smiles,
+                                    'name': product_name,
+                                    'flag': 'stream_bimolecular_product',
+                                    'reactant1_name': primary_name,
+                                    'reactant1_smiles': primary_compound['smiles'],
+                                    'reactant2_name': secondary_name,
+                                    'reactant2_smiles': secondary_compound['smiles'],
+                                    'reaction_name': reaction_name,
+                                    'workflow': workflow_name
+                                })
+                                products_count += 1
+                                
+                            except Exception:
+                                continue
+                                
+                except Exception:
+                    continue
+        
+        return products_count
+        
+    except Exception:
+        return 0
+
+def _process_unimolecular_chunk_to_file_worker(chunk_data: List[Dict], reaction_smarts: str, 
+                                             reaction_name: str, workflow_name: str,
+                                             name_prefix: str, output_file_path: str) -> int:
+    """
+    Worker function to process a unimolecular chunk and write results directly to a CSV file.
+    
+    Args:
+        chunk_data (List[Dict]): List of compound dictionaries
+        reaction_smarts (str): SMARTS pattern for the reaction
+        reaction_name (str): Name of the reaction
+        workflow_name (str): Name of the workflow
+        name_prefix (str): Prefix for product names
+        output_file_path (str): Path to output CSV file
+        
+    Returns:
+        int: Number of products written to file
+    """
+    try:
+        import csv
+        from rdkit import Chem
+        from rdkit.Chem import AllChem
+        from rdkit import RDLogger
+        RDLogger.DisableLog('rdApp.*')
+        
+        products_count = 0
+        
+        # Parse reaction
+        rxn = AllChem.ReactionFromSmarts(reaction_smarts)
+        if rxn is None:
+            return 0
+        
+        # Open file for writing
+        with open(output_file_path, 'w', newline='', encoding='utf-8') as csvfile:
+            fieldnames = ['smiles', 'name', 'flag', 'reactant_name', 
+                         'reactant_smiles', 'reaction_name', 'workflow']
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            
+            for compound in chunk_data:
+                try:
+                    # Parse molecule
+                    reactant_mol = Chem.MolFromSmiles(compound['smiles'])
+                    if reactant_mol is None:
+                        continue
+                    
+                    # Run reaction
+                    reaction_results = rxn.RunReactants((reactant_mol,))
+                    
+                    # Process products and write immediately
+                    for product_set_idx, product_set in enumerate(reaction_results):
+                        for product_idx, product_mol in enumerate(product_set):
+                            try:
+                                Chem.SanitizeMol(product_mol)
+                                product_smiles = Chem.MolToSmiles(product_mol)
+                                
+                                # Generate product name
+                                original_name = compound.get('name', f"cpd_{compound.get('id', 'unk')}")
+                                product_name = f"{name_prefix}{original_name}_{reaction_name}_{product_set_idx}_{product_idx}"
+                                
+                                # Write product directly to file
+                                writer.writerow({
+                                    'smiles': product_smiles,
+                                    'name': product_name,
+                                    'flag': 'stream_unimolecular_product',
+                                    'reactant_name': original_name,
+                                    'reactant_smiles': compound['smiles'],
+                                    'reaction_name': reaction_name,
+                                    'workflow': workflow_name
+                                })
+                                products_count += 1
+                                
+                            except Exception:
+                                continue
+                                
+                except Exception:
+                    continue
+        
+        return products_count
+        
+    except Exception:
+        return 0
+
 class ChemSpace:
     """
     ChemSpace class for managing chemical compound data within a project.
@@ -6970,24 +7138,28 @@ class ChemSpace:
             return []
 
     def apply_reaction_workflow(self, workflow_id: Optional[int] = None, 
-                                    max_workers: Optional[int] = None,
-                                    chunk_size: Optional[int] = None,
-                                    parallel_threshold: int = 1000) -> bool:
+                                        max_workers: Optional[int] = None,
+                                        chunk_size: Optional[int] = None,
+                                        parallel_threshold: int = 1000,
+                                        memory_limit_mb: int = 500,
+                                        stream_threshold: int = 10000) -> bool:
         """
-        Apply a saved reaction workflow to compounds with parallel processing support.
-        Uses existing helper methods for consistency while adding parallel execution for large datasets.
+        Apply a saved reaction workflow to compounds with streaming to disk to avoid memory exhaustion.
+        Uses existing helper methods for consistency while adding disk streaming for large datasets.
         
         Args:
             workflow_id (Optional[int]): ID of the reaction workflow to apply. If None, prompts user for selection.
             max_workers (Optional[int]): Maximum number of parallel workers. If None, uses cpu_count()
             chunk_size (Optional[int]): Size of chunks for parallel processing. If None, automatically calculated
             parallel_threshold (int): Minimum number of compounds to trigger parallel processing
+            memory_limit_mb (int): Memory limit in MB to trigger streaming mode
+            stream_threshold (int): Minimum number of products to trigger streaming to disk
             
         Returns:
             bool: True if workflow was applied successfully
         """
         try:
-            print(f"🚀 Starting parallel reaction workflow application...")
+            print(f"🚀 Starting streaming reaction workflow application...")
             
             # Reuse existing workflow selection logic
             if workflow_id is None:
@@ -7009,6 +7181,8 @@ class ChemSpace:
             
             print(f"   📋 Workflow: '{workflow_name}'")
             print(f"   🧪 Total reactions: {len(reactions_dict)}")
+            print(f"   💾 Memory limit: {memory_limit_mb}MB")
+            print(f"   📦 Stream threshold: {stream_threshold:,} products")
             
             # Set up parallel processing parameters
             if max_workers is None:
@@ -7020,7 +7194,7 @@ class ChemSpace:
             # Sort reactions by order for sequential processing
             sorted_reactions = sorted(reactions_dict.items(), key=lambda x: x[1]['order'])
             
-            print(f"\n🔄 PARALLEL REACTION WORKFLOW ANALYSIS")
+            print(f"\n🔄 STREAMING REACTION WORKFLOW ANALYSIS")
             print("=" * 60)
             for i, (reaction_id, reaction_info) in enumerate(sorted_reactions, 1):
                 reaction_type = self._analyze_single_reaction_type(reaction_info['smarts'])
@@ -7028,9 +7202,9 @@ class ChemSpace:
             print("=" * 60)
             
             # Confirm execution
-            input("Press Enter to continue with parallel workflow execution...")
+            input("Press Enter to continue with streaming workflow execution...")
             
-            # Import RDKit for reaction processing
+            # Import required libraries
             try:
                 from rdkit import Chem
                 from rdkit.Chem import AllChem
@@ -7039,19 +7213,18 @@ class ChemSpace:
             except ImportError:
                 print("❌ RDKit not installed. Please install RDKit to use reaction workflows:")
                 print("   conda install -c conda-forge rdkit")
-                print("   or")
-                print("   pip install rdkit")
                 return False
             
-            # Initialize parallel workflow state
+            # Initialize streaming workflow state
             workflow_state = {
                 'step_results': {},
                 'available_tables': self.get_all_tables(),
                 'step_products': {},
-                'parallel_stats': {
-                    'total_workers_used': 0,
-                    'total_chunks_processed': 0,
-                    'total_processing_time': 0.0
+                'streaming_stats': {
+                    'total_chunks_streamed': 0,
+                    'total_temp_files': 0,
+                    'total_disk_writes': 0,
+                    'peak_memory_usage': 0
                 }
             }
             
@@ -7059,21 +7232,21 @@ class ChemSpace:
                 print("❌ No tables available in chemspace database")
                 return False
             
-            # Process each reaction step with parallel support
+            # Process each reaction step with streaming support
             for step_num, (reaction_id, reaction_info) in enumerate(sorted_reactions, 1):
                 print(f"\n{'='*80}")
-                print(f"🚀 PARALLEL REACTION STEP {step_num}/{len(sorted_reactions)}: {reaction_info['name']}")
+                print(f"🌊 STREAMING REACTION STEP {step_num}/{len(sorted_reactions)}: {reaction_info['name']}")
                 print(f"{'='*80}")
                 
-                step_result = self._process_parallel_reaction_step(
+                step_result = self._process_streaming_reaction_step(
                     step_num, reaction_id, reaction_info, workflow_name, workflow_state,
-                    max_workers, chunk_size, parallel_threshold
+                    max_workers, chunk_size, parallel_threshold, memory_limit_mb, stream_threshold
                 )
                 
                 workflow_state['step_results'][step_num] = step_result
                 
                 if not step_result['success']:
-                    print(f"❌ Step {step_num} failed. Stopping parallel workflow execution.")
+                    print(f"❌ Step {step_num} failed. Stopping streaming workflow execution.")
                     break
                 
                 # Store step products for potential use in next steps
@@ -7086,13 +7259,817 @@ class ChemSpace:
             
             # Reuse existing cleanup and summary methods
             self._query_and_delete_prev_step_tables(workflow_state)
-            self._display_parallel_workflow_summary(workflow_state, workflow_name)
+            self._display_streaming_workflow_summary(workflow_state, workflow_name)
             
             return True
             
         except Exception as e:
-            print(f"❌ Error applying parallel reaction workflow: {e}")
+            print(f"❌ Error applying streaming reaction workflow: {e}")
             return False
+
+    def _process_streaming_reaction_step(self, step_num: int, reaction_id: int, 
+                                    reaction_info: Dict[str, Any], workflow_name: str,
+                                    workflow_state: Dict[str, Any], max_workers: int,
+                                    chunk_size: Optional[int], parallel_threshold: int,
+                                    memory_limit_mb: int, stream_threshold: int) -> Dict[str, Any]:
+        """
+        Process a single reaction step with streaming to disk support.
+        Reuses existing helper methods where possible.
+        
+        Args:
+            step_num (int): Current step number
+            reaction_id (int): ID of the reaction
+            reaction_info (Dict): Reaction information
+            workflow_name (str): Name of the workflow
+            workflow_state (Dict): Current workflow state
+            max_workers (int): Maximum number of parallel workers
+            chunk_size (Optional[int]): Size of chunks for parallel processing
+            parallel_threshold (int): Minimum compounds to trigger parallel processing
+            memory_limit_mb (int): Memory limit in MB
+            stream_threshold (int): Threshold to trigger streaming
+            
+        Returns:
+            Dict[str, Any]: Step execution results
+        """
+        try:
+            reaction_name = reaction_info['name']
+            reaction_smarts = reaction_info['smarts']
+            
+            # Reuse existing reaction analysis
+            reaction_type = self._analyze_single_reaction_type(reaction_smarts)
+            
+            print(f"🔍 Streaming Reaction Analysis:")
+            print(f"   📋 Name: {reaction_name}")
+            print(f"   🧪 Type: {reaction_type}")
+            print(f"   ⚗️  SMARTS: {reaction_smarts}")
+            
+            # Reuse existing input source detection
+            input_sources = self._get_available_input_sources(step_num, workflow_state)
+            
+            if not input_sources:
+                return {
+                    'success': False,
+                    'message': 'No input sources available',
+                    'products_generated': 0,
+                    'streaming_used': False
+                }
+            
+            # Reuse existing table selection logic
+            if reaction_type == 'bimolecular':
+                table_config = self._select_tables_for_step_bimolecular(
+                    input_sources, step_num, reaction_name
+                )
+            else:  # unimolecular
+                table_config = self._select_tables_for_step_unimolecular(
+                    input_sources, step_num, reaction_name
+                )
+            
+            if not table_config:
+                return {
+                    'success': False,
+                    'message': 'No tables selected for reaction step',
+                    'products_generated': 0,
+                    'streaming_used': False
+                }
+            
+            # Apply the reaction with streaming support
+            if reaction_type == 'bimolecular':
+                step_result = self._apply_streaming_step_bimolecular_reaction(
+                    table_config, reaction_info, workflow_name, step_num,
+                    max_workers, chunk_size, parallel_threshold, memory_limit_mb, stream_threshold
+                )
+            else:  # unimolecular
+                step_result = self._apply_streaming_step_unimolecular_reaction(
+                    table_config, reaction_info, workflow_name, step_num,
+                    max_workers, chunk_size, parallel_threshold, memory_limit_mb, stream_threshold
+                )
+            
+            # Update streaming statistics
+            if step_result.get('streaming_used', False):
+                stats = workflow_state['streaming_stats']
+                stats['total_chunks_streamed'] += step_result.get('chunks_streamed', 0)
+                stats['total_temp_files'] += step_result.get('temp_files_used', 0)
+                stats['total_disk_writes'] += step_result.get('disk_writes', 0)
+                stats['peak_memory_usage'] = max(
+                    stats['peak_memory_usage'],
+                    step_result.get('peak_memory_mb', 0)
+                )
+            
+            return step_result
+            
+        except Exception as e:
+            print(f"❌ Error processing streaming reaction step {step_num}: {e}")
+            return {
+                'success': False,
+                'message': f'Error in streaming step {step_num}: {e}',
+                'products_generated': 0,
+                'streaming_used': False
+            }
+
+    def _apply_streaming_step_bimolecular_reaction(self, table_config: Dict[str, Any], 
+                                                reaction_info: Dict[str, Any], 
+                                                workflow_name: str, step_num: int,
+                                                max_workers: int, chunk_size: Optional[int],
+                                                parallel_threshold: int, memory_limit_mb: int,
+                                                stream_threshold: int) -> Dict[str, Any]:
+        """
+        Apply a bimolecular reaction with streaming to disk support.
+        
+        Args:
+            table_config (Dict): Table configuration
+            reaction_info (Dict): Reaction information
+            workflow_name (str): Workflow name
+            step_num (int): Current step number
+            max_workers (int): Maximum parallel workers
+            chunk_size (Optional[int]): Chunk size for parallel processing
+            parallel_threshold (int): Threshold to trigger parallel processing
+            memory_limit_mb (int): Memory limit in MB
+            stream_threshold (int): Threshold to trigger streaming
+            
+        Returns:
+            Dict[str, Any]: Step execution results
+        """
+        try:
+            import tempfile
+            import os
+            import time
+            
+            print(f"\n🌊 Executing Streaming Bimolecular Reaction - Step {step_num}")
+            print("-" * 60)
+            
+            # Get compound data
+            primary_df = self._get_table_as_dataframe(table_config['primary_table'])
+            secondary_df = self._get_table_as_dataframe(table_config['secondary_table'])
+            
+            primary_count = len(primary_df)
+            secondary_count = len(secondary_df)
+            total_combinations = primary_count * secondary_count
+            
+            print(f"📊 Primary reactants: {primary_count:,} compounds")
+            print(f"📊 Secondary reactants: {secondary_count:,} compounds")
+            print(f"🔢 Total combinations: {total_combinations:,}")
+            
+            # Estimate memory usage and determine if streaming is needed
+            estimated_products = total_combinations * 0.1  # Conservative estimate
+            use_streaming = estimated_products > stream_threshold
+            
+            if use_streaming:
+                
+                # Create temporary directory for streaming
+                temp_dir = tempfile.mkdtemp(prefix=f'chemspace_stream_step{step_num}_')
+                temp_files_created = []
+                
+                try:
+                    start_time = time.time()
+                    total_products = self._stream_bimolecular_reaction_to_disk(
+                        primary_df, secondary_df, reaction_info, workflow_name,
+                        temp_dir, max_workers, chunk_size, temp_files_created
+                    )
+                    processing_time = time.time() - start_time
+                    
+                    # Consolidate temporary files into final table
+                    output_table_name = None
+                    if total_products > 0:
+                        print(f"\n💾 Consolidating {total_products:,} products from {len(temp_files_created)} files...")
+                        
+                        save_choice = input("Save consolidated products to a new table? (y/n): ").strip().lower()
+                        if save_choice in ['y', 'yes']:
+                            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                            default_name = f"stream_step{step_num}_{reaction_info['name']}_{timestamp}"
+                            user_table_name = input(f"Enter table name (default: {default_name}): ").strip()
+                            chosen_name = user_table_name if user_table_name else default_name
+                            output_table_name = self._sanitize_table_name(chosen_name)
+                            
+                            success = self._consolidate_temp_files_to_table(
+                                temp_files_created, output_table_name, workflow_name, step_num
+                            )
+                            
+                            if not success:
+                                output_table_name = None
+                    
+                    result = {
+                        'success': True,
+                        'products_generated': total_products,
+                        'reaction_type': 'bimolecular',
+                        'step_num': step_num,
+                        'streaming_used': True,
+                        'temp_files_used': len(temp_files_created),
+                        'chunks_streamed': len(temp_files_created),
+                        'disk_writes': len(temp_files_created),
+                        'processing_time': processing_time,
+                        'output_table': output_table_name,
+                        'combinations_processed': total_combinations
+                    }
+                    
+                finally:
+                    # Clean up temporary files
+                    self._cleanup_temp_files(temp_files_created, temp_dir)
+            
+            else:
+                print(f"📊 Using in-memory processing (below streaming threshold)")
+                
+                # Use existing parallel/sequential method
+                use_parallel = total_combinations >= parallel_threshold
+                
+                if use_parallel:
+                    # Set default chunk size if not provided
+                    if chunk_size is None:
+                        chunk_size = max(100, total_combinations // (max_workers * 4))
+                    
+                    products = self._apply_bimolecular_reaction_parallel(
+                        primary_df, secondary_df, reaction_info, workflow_name,
+                        max_workers, chunk_size
+                    )
+                else:
+                    # Use existing sequential method
+                    products = self._apply_bimolecular_reaction(
+                        primary_df, secondary_df, reaction_info, workflow_name
+                    )
+                
+                # Save products using existing logic
+                output_table_name = None
+                if products:
+                    print(f"\n💾 Generated {len(products)} products from bimolecular reaction")
+                    
+                    save_choice = input("Save products to a new table? (y/n): ").strip().lower()
+                    if save_choice in ['y', 'yes']:
+                        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                        default_name = f"step{step_num}_{reaction_info['name']}_{timestamp}"
+                        user_table_name = input(f"Enter table name (default: {default_name}): ").strip()
+                        chosen_name = user_table_name if user_table_name else default_name
+                        output_table_name = self._sanitize_table_name(chosen_name)
+                        
+                        success = self._save_step_products(
+                            products, output_table_name, workflow_name, step_num
+                        )
+                        
+                        if not success:
+                            output_table_name = None
+                
+                result = {
+                    'success': True,
+                    'products_generated': len(products),
+                    'reaction_type': 'bimolecular',
+                    'step_num': step_num,
+                    'streaming_used': False,
+                    'combinations_processed': total_combinations,
+                    'output_table': output_table_name
+                }
+            
+            return result
+            
+        except Exception as e:
+            print(f"❌ Error applying streaming bimolecular reaction: {e}")
+            return {
+                'success': False,
+                'products_generated': 0,
+                'error': str(e),
+                'streaming_used': False
+            }
+
+    def _apply_streaming_step_unimolecular_reaction(self, table_config: Dict[str, Any], 
+                                                reaction_info: Dict[str, Any], 
+                                                workflow_name: str, step_num: int,
+                                                max_workers: int, chunk_size: Optional[int],
+                                                parallel_threshold: int, memory_limit_mb: int,
+                                                stream_threshold: int) -> Dict[str, Any]:
+        """
+        Apply a unimolecular reaction with streaming to disk support.
+        
+        Args:
+            table_config (Dict): Table configuration
+            reaction_info (Dict): Reaction information
+            workflow_name (str): Workflow name
+            step_num (int): Current step number
+            max_workers (int): Maximum parallel workers
+            chunk_size (Optional[int]): Chunk size for parallel processing
+            parallel_threshold (int): Threshold to trigger parallel processing
+            memory_limit_mb (int): Memory limit in MB
+            stream_threshold (int): Threshold to trigger streaming
+            
+        Returns:
+            Dict[str, Any]: Step execution results
+        """
+        try:
+            import tempfile
+            import os
+            import time
+            
+            print(f"\n🌊 Executing Streaming Unimolecular Reaction - Step {step_num}")
+            print("-" * 60)
+            
+            total_compounds = table_config.get('total_compounds', 0)
+            
+            # Estimate if streaming is needed
+            estimated_products = total_compounds * 2  # Conservative estimate for unimolecular
+            use_streaming = estimated_products > stream_threshold
+            
+            if use_streaming:
+                print(f"🌊 Using streaming mode (estimated products: {estimated_products:,.0f})")
+                
+                # Create temporary directory for streaming
+                temp_dir = tempfile.mkdtemp(prefix=f'chemspace_stream_step{step_num}_')
+                temp_files_created = []
+                
+                try:
+                    start_time = time.time()
+                    total_products = 0
+                    
+                    # Process each source with streaming
+                    for source in table_config['sources']:
+                        print(f"\n🔬 Streaming processing source: '{source['name']}'")
+                        compounds_df = self._get_table_as_dataframe(source['name'])
+                        
+                        if compounds_df.empty:
+                            print(f"   ⚠️  No compounds found, skipping...")
+                            continue
+                        
+                        source_prefix = f"stream_step{step_num}_{source['name']}_"
+                        source_products = self._stream_unimolecular_reaction_to_disk(
+                            compounds_df, reaction_info, workflow_name, source_prefix,
+                            temp_dir, max_workers, chunk_size, temp_files_created
+                        )
+                        
+                        total_products += source_products
+                        print(f"   ✅ Streamed {source_products} products to disk")
+                    
+                    processing_time = time.time() - start_time
+                    
+                    # Consolidate temporary files into final table
+                    output_table_name = None
+                    if total_products > 0:
+                        print(f"\n💾 Consolidating {total_products:,} products from {len(temp_files_created)} files...")
+                        
+                        save_choice = input("Save consolidated products to a new table? (y/n): ").strip().lower()
+                        if save_choice in ['y', 'yes']:
+                            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                            default_name = f"stream_step{step_num}_{reaction_info['name']}_{timestamp}"
+                            user_table_name = input(f"Enter table name (default: {default_name}): ").strip()
+                            chosen_name = user_table_name if user_table_name else default_name
+                            output_table_name = self._sanitize_table_name(chosen_name)
+                            
+                            success = self._consolidate_temp_files_to_table(
+                                temp_files_created, output_table_name, workflow_name, step_num
+                            )
+                            
+                            if not success:
+                                output_table_name = None
+                    
+                    result = {
+                        'success': True,
+                        'products_generated': total_products,
+                        'output_table': output_table_name,
+                        'reaction_type': 'unimolecular',
+                        'step_num': step_num,
+                        'streaming_used': True,
+                        'temp_files_used': len(temp_files_created),
+                        'chunks_streamed': len(temp_files_created),
+                        'disk_writes': len(temp_files_created),
+                        'processing_time': processing_time,
+                        'compounds_processed': total_compounds
+                    }
+                    
+                finally:
+                    # Clean up temporary files
+                    self._cleanup_temp_files(temp_files_created, temp_dir)
+            
+            else:
+                print(f"📊 Using in-memory processing (below streaming threshold)")
+                
+                # Use existing sequential/parallel method
+                all_products = []
+                
+                for source in table_config['sources']:
+                    print(f"\n🔬 Processing source: '{source['name']}'")
+                    compounds_df = self._get_table_as_dataframe(source['name'])
+                    
+                    if compounds_df.empty:
+                        print(f"   ⚠️  No compounds found, skipping...")
+                        continue
+                    
+                    compound_count = len(compounds_df)
+                    use_parallel = compound_count >= parallel_threshold
+                    
+                    if use_parallel:
+                        # Set default chunk size if not provided
+                        if chunk_size is None:
+                            source_chunk_size = max(100, compound_count // (max_workers * 4))
+                        else:
+                            source_chunk_size = chunk_size
+                        
+                        source_prefix = f"step{step_num}_{source['name']}_"
+                        products = self._apply_unimolecular_reaction_parallel(
+                            compounds_df, reaction_info, workflow_name, source_prefix,
+                            max_workers, source_chunk_size
+                        )
+                    else:
+                        # Use existing sequential method
+                        source_prefix = f"step{step_num}_{source['name']}_"
+                        products = self._apply_unimolecular_reaction(
+                            compounds_df, reaction_info, workflow_name, source_prefix
+                        )
+                    
+                    all_products.extend(products)
+                    print(f"   ✅ Generated {len(products)} products")
+                
+                # Save products using existing logic
+                output_table_name = None
+                if all_products:
+                    print(f"\n💾 Total products generated: {len(all_products)}")
+                    
+                    save_choice = input("Save products to a new table? (y/n): ").strip().lower()
+                    if save_choice in ['y', 'yes']:
+                        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                        default_name = f"step{step_num}_{reaction_info['name']}_{timestamp}"
+                        user_table_name = input(f"Enter table name (default: {default_name}): ").strip()
+                        chosen_name = user_table_name if user_table_name else default_name
+                        output_table_name = self._sanitize_table_name(chosen_name)
+                        
+                        success = self._save_step_products(
+                            all_products, output_table_name, workflow_name, step_num
+                        )
+                        
+                        if not success:
+                            output_table_name = None
+                
+                result = {
+                    'success': True,
+                    'products_generated': len(all_products),
+                    'output_table': output_table_name,
+                    'reaction_type': 'unimolecular',
+                    'step_num': step_num,
+                    'streaming_used': False,
+                    'compounds_processed': total_compounds
+                }
+            
+            return result
+            
+        except Exception as e:
+            print(f"❌ Error applying streaming unimolecular reaction: {e}")
+            return {
+                'success': False,
+                'products_generated': 0,
+                'error': str(e),
+                'streaming_used': False
+            }
+
+    def _stream_bimolecular_reaction_to_disk(self, primary_df: pd.DataFrame, secondary_df: pd.DataFrame,
+                                        reaction_info: Dict[str, Any], workflow_name: str,
+                                        temp_dir: str, max_workers: int, chunk_size: Optional[int],
+                                        temp_files_created: List[str]) -> int:
+        """
+        Stream bimolecular reaction results directly to disk files.
+        
+        Args:
+            primary_df (pd.DataFrame): Primary reactants
+            secondary_df (pd.DataFrame): Secondary reactants
+            reaction_info (Dict): Reaction information
+            workflow_name (str): Workflow name
+            temp_dir (str): Temporary directory for files
+            max_workers (int): Maximum workers
+            chunk_size (Optional[int]): Chunk size
+            temp_files_created (List[str]): List to track created files
+            
+        Returns:
+            int: Total number of products streamed
+        """
+        try:
+            from concurrent.futures import ProcessPoolExecutor, as_completed
+            import csv
+            import os
+            
+            reaction_smarts = reaction_info['smarts']
+            reaction_name = reaction_info['name']
+            
+            # Set default chunk size if not provided
+            total_combinations = len(primary_df) * len(secondary_df)
+            if chunk_size is None:
+                chunk_size = max(1000, total_combinations // (max_workers * 8))  # Smaller chunks for streaming
+            
+            # Create chunks for streaming processing
+            chunks = self._create_bimolecular_chunks(primary_df, secondary_df, chunk_size)
+            
+            print(f"   📦 Created {len(chunks)} chunks for streaming processing")
+            print(f"   🌊 Each chunk will be streamed directly to disk")
+            
+            total_products = 0
+            processed_chunks = 0
+            
+            # Initialize progress tracking
+            if TQDM_AVAILABLE:
+                progress_bar = tqdm(
+                    total=len(chunks),
+                    desc=f"Streaming {reaction_name}",
+                    unit="chunks"
+                )
+            else:
+                progress_bar = None
+            
+            # Process chunks and stream to disk
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                # Submit streaming jobs
+                future_to_chunk = {}
+                for i, chunk in enumerate(chunks):
+                    temp_file_path = os.path.join(temp_dir, f'bimolecular_chunk_{i:06d}.csv')
+                    temp_files_created.append(temp_file_path)
+                    
+                    future = executor.submit(
+                        _process_bimolecular_chunk_to_file_worker,
+                        chunk, reaction_smarts, reaction_name, workflow_name, temp_file_path
+                    )
+                    future_to_chunk[future] = i
+                
+                # Collect results
+                for future in as_completed(future_to_chunk):
+                    chunk_idx = future_to_chunk[future]
+                    
+                    try:
+                        chunk_products_count = future.result()
+                        total_products += chunk_products_count
+                        processed_chunks += 1
+                        
+                        if progress_bar:
+                            progress_bar.update(1)
+                            progress_bar.set_postfix({
+                                'products': total_products,
+                                'chunks': f"{processed_chunks}/{len(chunks)}"
+                            })
+                        else:
+                            if processed_chunks % max(1, len(chunks) // 10) == 0:
+                                progress = (processed_chunks / len(chunks)) * 100
+                                print(f"      📊 Progress: {progress:.1f}% ({total_products:,} products streamed)")
+                    
+                    except Exception as e:
+                        print(f"   ❌ Error processing chunk {chunk_idx}: {e}")
+                        processed_chunks += 1
+                        if progress_bar:
+                            progress_bar.update(1)
+            
+            if progress_bar:
+                progress_bar.close()
+            
+            print(f"   ✅ Streaming completed: {total_products:,} products in {len(temp_files_created)} files")
+            return total_products
+            
+        except Exception as e:
+            print(f"   ❌ Error in streaming bimolecular reaction: {e}")
+            return 0
+
+    def _stream_unimolecular_reaction_to_disk(self, compounds_df: pd.DataFrame, 
+                                            reaction_info: Dict[str, Any], workflow_name: str,
+                                            name_prefix: str, temp_dir: str, max_workers: int,
+                                            chunk_size: Optional[int], temp_files_created: List[str]) -> int:
+        """
+        Stream unimolecular reaction results directly to disk files.
+        
+        Args:
+            compounds_df (pd.DataFrame): Compounds dataframe
+            reaction_info (Dict): Reaction information
+            workflow_name (str): Workflow name
+            name_prefix (str): Prefix for product names
+            temp_dir (str): Temporary directory for files
+            max_workers (int): Maximum workers
+            chunk_size (Optional[int]): Chunk size
+            temp_files_created (List[str]): List to track created files
+            
+        Returns:
+            int: Total number of products streamed
+        """
+        try:
+            from concurrent.futures import ProcessPoolExecutor, as_completed
+            import os
+            
+            reaction_smarts = reaction_info['smarts']
+            reaction_name = reaction_info['name']
+            
+            # Set default chunk size if not provided
+            if chunk_size is None:
+                chunk_size = max(500, len(compounds_df) // (max_workers * 8))  # Smaller chunks for streaming
+            
+            # Create chunks for streaming processing
+            chunks = self._create_unimolecular_chunks(compounds_df, chunk_size)
+            
+            print(f"      📦 Created {len(chunks)} chunks for streaming processing")
+            
+            total_products = 0
+            processed_chunks = 0
+            
+            # Initialize progress tracking
+            if TQDM_AVAILABLE:
+                progress_bar = tqdm(
+                    total=len(chunks),
+                    desc=f"Streaming {reaction_name}",
+                    unit="chunks"
+                )
+            else:
+                progress_bar = None
+            
+            # Process chunks and stream to disk
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                # Submit streaming jobs
+                future_to_chunk = {}
+                for i, chunk in enumerate(chunks):
+                    temp_file_path = os.path.join(temp_dir, f'unimolecular_chunk_{i:06d}.csv')
+                    temp_files_created.append(temp_file_path)
+                    
+                    future = executor.submit(
+                        _process_unimolecular_chunk_to_file_worker,
+                        chunk, reaction_smarts, reaction_name, workflow_name, name_prefix, temp_file_path
+                    )
+                    future_to_chunk[future] = i
+                
+                # Collect results
+                for future in as_completed(future_to_chunk):
+                    chunk_idx = future_to_chunk[future]
+                    
+                    try:
+                        chunk_products_count = future.result()
+                        total_products += chunk_products_count
+                        processed_chunks += 1
+                        
+                        if progress_bar:
+                            progress_bar.update(1)
+                            progress_bar.set_postfix({
+                                'products': total_products
+                            })
+                    
+                    except Exception as e:
+                        print(f"      ❌ Error processing chunk {chunk_idx}: {e}")
+                        processed_chunks += 1
+                        if progress_bar:
+                            progress_bar.update(1)
+            
+            if progress_bar:
+                progress_bar.close()
+            
+            print(f"      ✅ Streaming completed: {total_products:,} products")
+            return total_products
+            
+        except Exception as e:
+            print(f"      ❌ Error in streaming unimolecular reaction: {e}")
+            return 0
+
+    def _consolidate_temp_files_to_table(self, temp_files: List[str], output_table_name: str,
+                                        workflow_name: str, step_num: int) -> bool:
+        """
+        Consolidate temporary CSV files into a database table with streaming to avoid memory issues.
+        
+        Args:
+            temp_files (List[str]): List of temporary file paths
+            output_table_name (str): Name for the output table
+            workflow_name (str): Workflow name
+            step_num (int): Step number
+            
+        Returns:
+            bool: True if consolidation was successful
+        """
+        try:
+            import csv
+            
+            if not temp_files:
+                return False
+            
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            
+            # Create products table
+            cursor.execute(f'''
+                CREATE TABLE IF NOT EXISTS {output_table_name} (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    smiles TEXT NOT NULL,
+                    name TEXT,
+                    flag TEXT,
+                    workflow_step INTEGER,
+                    workflow_name TEXT,
+                    creation_date TEXT,
+                    UNIQUE(smiles, name)
+                )
+            ''')
+            
+            # Create indexes
+            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{output_table_name}_smiles ON {output_table_name}(smiles)")
+            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{output_table_name}_step ON {output_table_name}(workflow_step)")
+            
+            # Insert products from temp files with streaming
+            insert_query = f'''
+                INSERT OR IGNORE INTO {output_table_name} 
+                (smiles, name, flag, workflow_step, workflow_name, creation_date)
+                VALUES (?, ?, ?, ?, ?, ?)
+            '''
+            
+            creation_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            total_inserted = 0
+            
+            # Process files in batches to avoid memory issues
+            batch_size = 1000
+            
+            if TQDM_AVAILABLE:
+                progress_bar = tqdm(
+                    temp_files,
+                    desc="Consolidating files",
+                    unit="files"
+                )
+            else:
+                progress_bar = temp_files
+            
+            for temp_file in progress_bar:
+                try:
+                    with open(temp_file, 'r', newline='', encoding='utf-8') as f:
+                        reader = csv.DictReader(f)
+                        batch = []
+                        
+                        for row in reader:
+                            batch.append((
+                                row.get('smiles', ''),
+                                row.get('name', ''),
+                                row.get('flag', 'stream_product'),
+                                step_num,
+                                workflow_name,
+                                creation_date
+                            ))
+                            
+                            if len(batch) >= batch_size:
+                                cursor.executemany(insert_query, batch)
+                                total_inserted += len(batch)
+                                batch = []
+                        
+                        # Insert remaining items in batch
+                        if batch:
+                            cursor.executemany(insert_query, batch)
+                            total_inserted += len(batch)
+                            
+                except Exception as e:
+                    print(f"   ⚠️  Error processing file {temp_file}: {e}")
+                    continue
+            
+            conn.commit()
+            conn.close()
+            
+            print(f"   💾 Consolidated {total_inserted:,} products to table '{output_table_name}'")
+            return True
+            
+        except Exception as e:
+            print(f"   ❌ Error consolidating temp files: {e}")
+            return False
+
+    def _cleanup_temp_files(self, temp_files: List[str], temp_dir: str) -> None:
+        """
+        Clean up temporary files and directory.
+        
+        Args:
+            temp_files (List[str]): List of temporary file paths
+            temp_dir (str): Temporary directory path
+        """
+        try:
+            import os
+            import shutil
+            
+            # Remove individual files
+            for temp_file in temp_files:
+                try:
+                    if os.path.exists(temp_file):
+                        os.unlink(temp_file)
+                except Exception:
+                    pass  # Continue cleanup even if individual file fails
+            
+            # Remove temporary directory
+            try:
+                if os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir)
+            except Exception:
+                pass  # Continue even if directory removal fails
+            
+            print(f"   🧹 Cleaned up {len(temp_files)} temporary files")
+            
+        except Exception as e:
+            print(f"   ⚠️  Warning: Error during cleanup: {e}")
+
+    def _display_streaming_workflow_summary(self, workflow_state: Dict[str, Any], workflow_name: str) -> None:
+        """
+        Display a comprehensive summary of the streaming workflow execution.
+        
+        Args:
+            workflow_state (Dict): Final workflow state
+            workflow_name (str): Name of the workflow
+        """
+        try:
+            # Reuse existing summary display
+            self._display_reaction_workflow_summary(workflow_state, workflow_name)
+            
+            # Add streaming statistics
+            streaming_stats = workflow_state.get('streaming_stats', {})
+            
+            if streaming_stats.get('total_chunks_streamed', 0) > 0:
+                print(f"\n🌊 STREAMING PROCESSING STATISTICS:")
+                print(f"   📦 Total chunks streamed: {streaming_stats.get('total_chunks_streamed', 0)}")
+                print(f"   📄 Total temp files created: {streaming_stats.get('total_temp_files', 0)}")
+                print(f"   💾 Total disk writes: {streaming_stats.get('total_disk_writes', 0)}")
+                print(f"   📊 Peak memory usage: {streaming_stats.get('peak_memory_usage', 0):.1f}MB")
+                
+                print(f"{'='*80}")
+            
+        except Exception as e:
+            print(f"❌ Error displaying streaming workflow summary: {e}")
 
     def _process_parallel_reaction_step(self, step_num: int, reaction_id: int, 
                                     reaction_info: Dict[str, Any], workflow_name: str,
