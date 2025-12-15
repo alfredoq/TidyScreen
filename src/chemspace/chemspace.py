@@ -6822,16 +6822,24 @@ class ChemSpace:
             print(f"   ❌ Error in unimolecular reaction {reaction_info['name']}: {e}")
             return []
 
-    def apply_reaction_workflow(self, workflow_id: int):
+    def apply_reaction_workflow(self, workflow_id: Optional[int] = None):
         """
         Apply a saved reaction workflow to compounds with support for sequential multi-step reactions.
         Each reaction step is analyzed separately for unimolecular/bimolecular nature, and users can choose to use products from previous steps as inputs for subsequent reactions.
         
         Args:
-            workflow_id (int): ID of the reaction workflow to apply
+            workflow_id (Optional[int]): ID of the reaction workflow to apply. If None, prompts user for selection.
         """
         try:
             print(f"🔬 Starting sequential reaction workflow application...")
+            
+            # Interactive workflow selection if not provided
+            if workflow_id is None:
+                workflow_id = self._select_reaction_workflow_for_application()
+                if workflow_id is None:
+                    print("❌ No workflow selected for application")
+                    return
+            
             print(f"   🆔 Workflow ID: {workflow_id}")
             
             # Load the reaction workflow by ID
@@ -6907,9 +6915,6 @@ class ChemSpace:
                         'reaction_name': reaction_info['name']
                     }
             
-            # Helper: ask user whether to delete intermediate product tables from previous steps
-            
-
             # Invoke helper to offer deletion of intermediate step tables
             self._query_and_delete_prev_step_tables(workflow_state)
             
@@ -6917,7 +6922,126 @@ class ChemSpace:
             self._display_reaction_workflow_summary(workflow_state, workflow_name)
             
         except Exception as e:
-            print(f"❌ Error applying sequential reaction workflow {workflow_id}: {e}")
+            print(f"❌ Error applying sequential reaction workflow: {e}")
+
+    def _select_reaction_workflow_for_application(self) -> Optional[int]:
+        """
+        Interactive selection of reaction workflow for application.
+        Reuses existing helper methods for consistency.
+        
+        Returns:
+            Optional[int]: Selected workflow ID or None if cancelled
+        """
+        try:
+            # Check if reaction_workflows table exists
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='reaction_workflows'")
+            if not cursor.fetchone():
+                print("❌ No reaction workflows table found")
+                print("   Create workflows first using create_reaction_workflow()")
+                conn.close()
+                return None
+            
+            # Get all available workflows (reuse existing query pattern)
+            cursor.execute("""
+                SELECT id, workflow_name, creation_date, description, reactions_dict
+                FROM reaction_workflows 
+                ORDER BY creation_date DESC
+            """)
+            workflows = cursor.fetchall()
+            conn.close()
+            
+            if not workflows:
+                print("❌ No reaction workflows found")
+                print("   Create workflows first using create_reaction_workflow()")
+                return None
+            
+            print(f"\n🔬 SELECT REACTION WORKFLOW FOR APPLICATION")
+            print("=" * 70)
+            print(f"Available workflows ({len(workflows)} total):")
+            print("-" * 70)
+            print(f"{'#':<3} {'Workflow Name':<25} {'Reactions':<10} {'Created':<12} {'Description':<20}")
+            print("-" * 70)
+            
+            workflow_info = []
+            for i, (wf_id, name, date, desc, reactions_dict_str) in enumerate(workflows, 1):
+                try:
+                    reactions_dict = json.loads(reactions_dict_str)
+                    reaction_count = len(reactions_dict)
+                except json.JSONDecodeError:
+                    reaction_count = 0
+                
+                date_short = date[:10] if date else "Unknown"
+                name_display = name[:24] if len(name) <= 24 else name[:21] + "..."
+                desc_display = (desc or "No description")[:19]
+                if len(desc_display) > 19:
+                    desc_display = desc_display[:16] + "..."
+                
+                print(f"{i:<3} {name_display:<25} {reaction_count:<10} {date_short:<12} {desc_display:<20}")
+                workflow_info.append({
+                    'id': wf_id,
+                    'name': name,
+                    'reaction_count': reaction_count,
+                    'description': desc or "No description",
+                    'date': date
+                })
+            
+            print("-" * 70)
+            print("Commands: Enter workflow number, workflow name, 'list' for details, or 'cancel' to abort")
+            
+            while True:
+                try:
+                    selection = input(f"\n🔍 Select workflow for application: ").strip()
+                    
+                    if selection.lower() in ['cancel', 'quit', 'exit']:
+                        return None
+                    elif selection.lower() == 'list':
+                        # Reuse existing detailed workflow display (adapted for application context)
+                        self._show_detailed_workflow_list(workflows)
+                        continue
+                    
+                    # Try as number first
+                    try:
+                        workflow_idx = int(selection) - 1
+                        if 0 <= workflow_idx < len(workflows):
+                            selected_workflow_id = workflows[workflow_idx][0]  # workflow ID
+                            selected_info = workflow_info[workflow_idx]
+                            
+                            print(f"\n✅ Selected workflow: '{selected_info['name']}' (ID: {selected_workflow_id})")
+                            print(f"   🧪 Reactions: {selected_info['reaction_count']}")
+                            print(f"   📄 Description: {selected_info['description']}")
+                            print(f"   📅 Created: {selected_info['date']}")
+                            return selected_workflow_id
+                        else:
+                            print(f"❌ Invalid selection. Please enter 1-{len(workflows)}")
+                            continue
+                    except ValueError:
+                        # Try as workflow name (reuse existing search logic)
+                        matching_workflows = [w for w in workflows if w[1].lower() == selection.lower()]
+                        if matching_workflows:
+                            selected_workflow = matching_workflows[0]
+                            selected_workflow_id = selected_workflow[0]
+                            # Find workflow info
+                            selected_info = next((info for info in workflow_info if info['id'] == selected_workflow_id), 
+                                            {'name': 'Unknown', 'reaction_count': 0, 'description': 'Unknown'})
+                            
+                            print(f"\n✅ Selected workflow: '{selected_info['name']}' (ID: {selected_workflow_id})")
+                            print(f"   🧪 Reactions: {selected_info['reaction_count']}")
+                            print(f"   📄 Description: {selected_info['description']}")
+                            return selected_workflow_id
+                        else:
+                            print(f"❌ Workflow '{selection}' not found")
+                            continue
+                            
+                except KeyboardInterrupt:
+                    print("\n❌ Workflow selection cancelled")
+                    return None
+                    
+        except Exception as e:
+            print(f"❌ Error selecting workflow for application: {e}")
+            return None
 
     def _process_sequential_reaction_step(self, step_num: int, reaction_id: int, 
                                         reaction_info: Dict[str, Any], workflow_name: str,
@@ -7065,6 +7189,7 @@ class ChemSpace:
             print("=" * 60)
             print(f"Reaction: {reaction_name}")
             print("This reaction requires two reactant sources.")
+            print("Note: The same table can be used for both primary and secondary reactants.")
             
             # Display available sources
             print(f"\n📋 Available Input Sources:")
@@ -7101,22 +7226,42 @@ class ChemSpace:
             
             primary_source = all_sources[primary_idx]
             
-            # Select secondary reactant source
+            # Select secondary reactant source (ALLOW same table as primary)
             print(f"\n📋 Select SECONDARY reactant source:")
-            remaining_sources = [source for i, source in enumerate(all_sources) if i != primary_idx]
-            secondary_idx = self._select_source_by_index(remaining_sources, "secondary reactant")
+            print(f"   💡 You can select the same table as primary for intra-molecular reactions")
+            secondary_idx = self._select_source_by_index(all_sources, "secondary reactant")
             if secondary_idx is None:
                 return {}
             
-            secondary_source = remaining_sources[secondary_idx]
+            secondary_source = all_sources[secondary_idx]
             
             print(f"\n✅ Bimolecular Reaction Configuration:")
             print(f"   🅰️  Primary: '{primary_source['name']}' ({primary_source['count']} compounds)")
             print(f"   🅱️  Secondary: '{secondary_source['name']}' ({secondary_source['count']} compounds)")
             
-            # Estimate computational load
-            combinations = primary_source['count'] * secondary_source['count']
-            print(f"   🔢 Potential combinations: {combinations:,}")
+            # Special handling when same table is used for both reactants
+            if primary_source['name'] == secondary_source['name']:
+                print(f"   🔄 Using same table for both reactants (intra-molecular reactions)")
+                # For same table, combinations = n * (n-1) for non-self reactions, or n * n for self reactions
+                same_table_combinations = primary_source['count'] * secondary_source['count']
+                print(f"   🔢 Potential combinations: {same_table_combinations:,} (including self-reactions)")
+                
+                # Ask if user wants to exclude self-reactions
+                exclude_self = input("   ❓ Exclude self-reactions (same compound with itself)? (y/n): ").strip().lower()
+                exclude_self_reactions = exclude_self in ['y', 'yes']
+                
+                if exclude_self_reactions:
+                    unique_combinations = primary_source['count'] * (primary_source['count'] - 1)
+                    print(f"   🔢 Unique combinations (excluding self): {unique_combinations:,}")
+                    combinations = unique_combinations
+                else:
+                    combinations = same_table_combinations
+            else:
+                # Estimate computational load for different tables
+                combinations = primary_source['count'] * secondary_source['count']
+                exclude_self_reactions = False  # Not applicable for different tables
+            
+            print(f"   🔢 Total combinations to process: {combinations:,}")
             
             if combinations > 1000000:
                 print(f"   ⚠️  WARNING: Large number of combinations may take significant time!")
@@ -7130,7 +7275,9 @@ class ChemSpace:
                 'secondary_table': secondary_source['name'],
                 'primary_source_type': primary_source['type'],
                 'secondary_source_type': secondary_source['type'],
-                'step_num': step_num
+                'step_num': step_num,
+                'same_table': primary_source['name'] == secondary_source['name'],
+                'exclude_self_reactions': exclude_self_reactions
             }
             
         except Exception as e:
