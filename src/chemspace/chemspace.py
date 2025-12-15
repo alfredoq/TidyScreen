@@ -3276,9 +3276,6 @@ class ChemSpace:
             print(f"❌ Error prompting for molecule count: {e}")
             return None
 
-### Fin de Optimizada con IA
-
-
     def _depict_individual_molecules(self, compounds_df: pd.DataFrame, output_dir: str, 
                                    image_size: Tuple[int, int], highlight_mol, 
                                    highlight_substructures: bool) -> Tuple[int, int, int]:
@@ -4513,7 +4510,6 @@ class ChemSpace:
             print(f"❌ Error creating filtering workflow: {e}")
             return {}
 
-
     def _get_filter_id_by_name(self, filter_name: str, projects_db_path: str = None) -> Optional[int]:
         """
         Get filter ID from the projects database by filter name.
@@ -5728,7 +5724,6 @@ class ChemSpace:
         except Exception as e:
             print(f"❌ Error generating duplicate report: {e}")
             return False
-        
         
     def delete_reaction_workflow(self, workflow_identifier: Optional[str] = None) -> bool:
         """
@@ -8086,6 +8081,99 @@ class ChemSpace:
         except Exception as e:
             print(f"❌ Error executing table deletions: {e}")
             return {table: False for table in selected_tables}
+
+    def drop_table(self, table_name: str, confirm: bool = True) -> bool:
+        """
+        Drop a single table from the chemspace database.
+        
+        Args:
+            table_name (str): Name of the table to drop
+            confirm (bool): Whether to ask for confirmation before deletion
+            
+        Returns:
+            bool: True if table was dropped successfully, False otherwise
+        """
+        try:
+            # Check if table exists
+            tables = self.get_all_tables()
+            if table_name not in tables:
+                print(f"❌ Table '{table_name}' does not exist in chemspace database")
+                return False
+            
+            # Get table information for confirmation
+            try:
+                compound_count = self.get_compound_count(table_name=table_name)
+                table_type = self._classify_table_type(table_name)
+                type_icon = self._get_table_type_icon(table_type)
+            except Exception:
+                compound_count = 0
+                table_type = 'unknown'
+                type_icon = '❓'
+            
+            # Show confirmation if requested
+            if confirm:
+                print(f"\n🗑️  TABLE DELETION CONFIRMATION")
+                print("-" * 40)
+                print(f"{type_icon} Table: '{table_name}'")
+                print(f"📊 Compounds: {compound_count:,}")
+                print(f"🏷️  Type: {table_type}")
+                print(f"⚠️  This action cannot be undone!")
+                print("-" * 40)
+                
+                # Get user confirmation
+                while True:
+                    user_confirm = input(f"❓ Delete table '{table_name}'? (y/n): ").strip().lower()
+                    if user_confirm in ['y', 'yes']:
+                        break
+                    elif user_confirm in ['n', 'no']:
+                        print(f"❌ Table deletion cancelled for '{table_name}'")
+                        return False
+                    else:
+                        print("❗ Please answer 'y'/'yes' or 'n'/'no'")
+            
+            # Connect to database and drop table
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            
+            # Drop associated indexes first (if any)
+            index_prefixes = [f"idx_{table_name}_", f"index_{table_name}_"]
+            for prefix in index_prefixes:
+                try:
+                    # Get all indexes for this table
+                    cursor.execute("SELECT name FROM sqlite_master WHERE type='index' AND name LIKE ?", (f"{prefix}%",))
+                    indexes = cursor.fetchall()
+                    
+                    for (index_name,) in indexes:
+                        try:
+                            cursor.execute(f"DROP INDEX IF EXISTS {index_name}")
+                        except Exception:
+                            pass  # Continue even if index drop fails
+                except Exception:
+                    pass  # Continue if index query fails
+            
+            # Drop the table
+            cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
+            
+            # Verify table was dropped
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name = ?", (table_name,))
+            table_still_exists = cursor.fetchone() is not None
+            
+            conn.commit()
+            conn.close()
+            
+            if not table_still_exists:
+                print(f"✅ Successfully dropped table '{table_name}' ({compound_count:,} compounds)")
+                return True
+            else:
+                print(f"❌ Failed to drop table '{table_name}' (table still exists)")
+                return False
+            
+        except sqlite3.Error as e:
+            print(f"❌ Database error dropping table '{table_name}': {e}")
+            return False
+        except Exception as e:
+            print(f"❌ Error dropping table '{table_name}': {e}")
+            return False
 
     def clear_all_tables(self, confirm_with_project_name: bool = True) -> bool:
         """
