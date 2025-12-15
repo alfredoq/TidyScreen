@@ -10613,3 +10613,608 @@ class ChemSpace:
         except Exception as e:
             print(f"❌ Error clearing all filtering workflows: {e}")
             return False
+
+    def apply_ersilia_model(self) -> Optional[List[str]]:
+        """
+        Apply an Ersilia model by selecting a table and returning SMILES strings.
+        Prompts user for table selection, model name, and returns SMILES as a list.
+        
+        Returns:
+            Optional[List[str]]: List of SMILES strings from selected table, or None if cancelled
+        """
+        try:
+            # Check if Ersilia is available
+            try:
+                from ersilia.api import Model
+            except ImportError:
+                print("❌ Ersilia not installed. Please install Ersilia:")
+                print("   pip install ersilia")
+                return None
+            
+            # Get available tables
+            available_tables = self.get_all_tables()
+            
+            if not available_tables:
+                print("❌ No tables found in chemspace database")
+                return None
+            
+            print(f"\n🧬 ERSILIA MODEL APPLICATION")
+            print("=" * 50)
+            print("Select a table to process with Ersilia models:")
+            print("=" * 50)
+            
+            # Display available tables
+            table_info = []
+            for i, table_name in enumerate(available_tables, 1):
+                try:
+                    compound_count = self.get_compound_count(table_name=table_name)
+                    table_type = self._classify_table_type(table_name)
+                    type_icon = self._get_table_type_icon(table_type)
+                    
+                    print(f"{i:3d}. {type_icon} {table_name:<35} ({compound_count:>6,} compounds) [{table_type}]")
+                    table_info.append({
+                        'name': table_name,
+                        'count': compound_count,
+                        'type': table_type
+                    })
+                    
+                except Exception as e:
+                    print(f"{i:3d}. ❓ {table_name:<35} (Error: {e}) [Unknown]")
+                    table_info.append({
+                        'name': table_name,
+                        'count': 0,
+                        'type': 'unknown'
+                    })
+            
+            print("=" * 50)
+            print("Commands: Enter table number, table name, or 'cancel' to abort")
+            
+            # Interactive table selection
+            while True:
+                try:
+                    selection = input(f"\n🔍 Select table for Ersilia processing: ").strip()
+                    
+                    if selection.lower() in ['cancel', 'quit', 'exit']:
+                        print("❌ Ersilia model application cancelled")
+                        return None
+                    
+                    # Try as number first
+                    try:
+                        table_idx = int(selection) - 1
+                        if 0 <= table_idx < len(available_tables):
+                            selected_table = available_tables[table_idx]
+                            selected_info = table_info[table_idx]
+                            break
+                        else:
+                            print(f"❌ Invalid selection. Please enter 1-{len(available_tables)}")
+                            continue
+                    except ValueError:
+                        # Try as table name
+                        matching_tables = [t for t in available_tables if t.lower() == selection.lower()]
+                        if matching_tables:
+                            selected_table = matching_tables[0]
+                            # Find table info
+                            selected_info = next((info for info in table_info if info['name'] == selected_table), 
+                                            {'count': 0, 'type': 'unknown'})
+                            break
+                        else:
+                            print(f"❌ Table '{selection}' not found")
+                            continue
+                            
+                except KeyboardInterrupt:
+                    print("\n❌ Table selection cancelled")
+                    return None
+            
+            print(f"\n✅ Selected table: '{selected_table}'")
+            print(f"   🏷️  Type: {selected_info['type']}")
+            print(f"   📊 Compounds: {selected_info['count']:,}")
+            
+            # Prompt for Ersilia model name
+            print(f"\n🤖 ERSILIA MODEL SELECTION")
+            print("-" * 30)
+            print("Enter the Ersilia model identifier to use for predictions.")
+            print("Examples:")
+            print("   • eos3b5e (Molecular weight)")
+            print("   • eos4e40 (Broad spectrum antibiotic activity)")
+            print("   • eos7a45 (Molecule price prediction)")
+            print("   • eos1amr (Blood-brain barrier penetration)")
+            print("-" * 30)
+            
+            while True:
+                try:
+                    model_name = input("🧬 Enter Ersilia model name (or 'cancel' to abort): ").strip()
+                    
+                    if model_name.lower() in ['cancel', 'quit', 'exit']:
+                        print("❌ Ersilia model application cancelled")
+                        return None
+                    
+                    if not model_name:
+                        print("❌ Model name cannot be empty. Please enter a valid model identifier.")
+                        continue
+                    
+                    # Validate model name format (Ersilia models typically start with 'eos')
+                    if not model_name.startswith('eos') and len(model_name) < 6:
+                        print("⚠️  Warning: Model name doesn't follow typical Ersilia format (e.g., 'eos3b5e')")
+                        proceed = input("   Continue anyway? (y/n): ").strip().lower()
+                        if proceed not in ['y', 'yes']:
+                            continue
+                    
+                    print(f"✅ Selected Ersilia model: '{model_name}'")
+                    break
+                    
+                except KeyboardInterrupt:
+                    print("\n❌ Model selection cancelled")
+                    return None
+            
+            # Get compounds from selected table
+            print(f"\n📊 Retrieving SMILES from table '{selected_table}'...")
+            compounds_df = self._get_table_as_dataframe(selected_table)
+            
+            if compounds_df.empty:
+                print(f"❌ No compounds found in table '{selected_table}'")
+                return None
+            
+            # Check if SMILES column exists
+            if 'smiles' not in compounds_df.columns:
+                print(f"❌ No 'smiles' column found in table '{selected_table}'")
+                print(f"   Available columns: {list(compounds_df.columns)}")
+                return None
+            
+            # Extract SMILES strings and filter out invalid ones
+            print(f"🧪 Extracting and validating SMILES strings...")
+            smiles_list = []
+            invalid_count = 0
+            
+            for _, row in compounds_df.iterrows():
+                smiles = row['smiles']
+                
+                # Skip invalid/empty SMILES
+                if pd.isna(smiles) or str(smiles).strip() == '' or str(smiles).lower() in ['nan', 'none']:
+                    invalid_count += 1
+                    continue
+                
+                smiles_clean = str(smiles).strip()
+                if smiles_clean:
+                    smiles_list.append(smiles_clean)
+                else:
+                    invalid_count += 1
+            
+            # Display extraction results
+            print(f"\n📊 SMILES EXTRACTION RESULTS:")
+            print(f"   ✅ Valid SMILES: {len(smiles_list):,}")
+            print(f"   ❌ Invalid/empty SMILES: {invalid_count:,}")
+            print(f"   📈 Success rate: {(len(smiles_list)/(len(smiles_list)+invalid_count))*100:.1f}%")
+            
+            if not smiles_list:
+                print("❌ No valid SMILES found in the selected table")
+                return None
+            
+            # Show sample of SMILES
+            print(f"\n🔬 Sample SMILES (first 5):")
+            for i, smiles in enumerate(smiles_list[:5], 1):
+                display_smiles = smiles[:50] + "..." if len(smiles) > 50 else smiles
+                print(f"   {i}. {display_smiles}")
+            
+            if len(smiles_list) > 5:
+                print(f"   ... and {len(smiles_list) - 5} more SMILES")
+            
+            
+            # Process with Ersilia and display results
+            results_df = self._process_smiles_for_ersilia(smiles_list, model_name)
+                
+            if not results_df.empty:
+                print(f"\n🎯 ERSILIA MODEL RESULTS:")
+                print(f"   📊 Results shape: {results_df.shape}")
+                print(f"   📋 Columns: {list(results_df.columns)}")
+                    
+                # Show sample results
+                print(f"\n📋 Sample results (first 5 rows):")
+                print(results_df.head())
+                    
+                # Ask if user wants to merge results back to original table
+                print(f"\n🔗 MERGE OPTIONS:")
+                print("1. Merge results to new table (recommended)")
+                print("2. Update original table with predictions")
+                print("3. Save results as separate CSV file")
+                print("4. Just display results (no saving)")
+                    
+                merge_choice = input("Select option (1-4): ").strip()
+                    
+                if merge_choice == '1':
+                    # Merge to new table
+                    merged_table = self._merge_ersilia_results_to_table(
+                        selected_table, results_df, model_name, save_to_new_table=True
+                    )
+                    if merged_table:
+                        print(f"🎉 Merged results saved to new table: '{merged_table}'")
+                    
+                elif merge_choice == '2':
+                    # Update original table
+                    confirm = input(f"⚠️  This will modify the original table '{selected_table}'. Continue? (y/n): ").strip().lower()
+                    if confirm in ['y', 'yes']:
+                        merged_table = self._merge_ersilia_results_to_table(
+                            selected_table, results_df, model_name, save_to_new_table=False
+                        )
+                        if merged_table:
+                            print(f"🎉 Original table '{selected_table}' updated with Ersilia predictions")
+                    
+                elif merge_choice == '3':
+                    # Save as CSV
+                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    csv_filename = f"ersilia_{model_name}_{selected_table}_{timestamp}.csv"
+                    csv_path = os.path.join(self.path, 'chemspace', 'ersilia_results', csv_filename)
+                    
+                    # Ensure directory exists
+                    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+                    
+                    results_df.to_csv(csv_path, index=False)
+                    print(f"📁 Results saved to CSV: {csv_path}")
+                
+                elif merge_choice == '4':
+                    print("📊 Results displayed only (not saved)")
+                
+                else:
+                    print("❌ Invalid option selected")
+                        
+        except Exception as e:
+            print(f"❌ Error in apply_ersilia_model: {e}")
+            return None    
+        
+        
+    def _process_smiles_for_ersilia(self, smiles_list: List[str], model_name: str) -> pd.DataFrame:
+        """
+        Process a SMILES list with a given Ersilia model.
+        
+        Args:
+            smiles_list (List[str]): List of SMILES strings to process
+            model_name (str): Name of the Ersilia model to use
+            
+        Returns:
+            pd.DataFrame: Results from the Ersilia model with SMILES column preserved
+        """
+        try:
+            # Import Ersilia Model here since it's needed in this method
+            from ersilia.api import Model
+            
+            print(f"\n🧬 Processing {len(smiles_list)} SMILES with Ersilia model '{model_name}'...")
+            
+            # Initialize and set up the model
+            print(f"   📥 Fetching model '{model_name}'...")
+            mdl = Model(model_name)
+            
+            print(f"   🔄 Loading model...")
+            mdl.fetch()
+            
+            print(f"   🚀 Starting model server...")
+            mdl.serve()
+            
+            print(f"   🧪 Running predictions...")
+            results_df = mdl.run(smiles_list)
+            
+            print(f"   🛑 Closing model server...")
+            mdl.close()
+            
+            print(f"   ✅ Model processing completed!")
+            print(f"   📊 Results shape: {results_df.shape}")
+            
+            # Add SMILES column to results if it's missing
+            if 'smiles' not in results_df.columns:
+                print(f"   🔗 Adding SMILES column to results...")
+                
+                # Ensure we have the same number of SMILES as results
+                if len(results_df) == len(smiles_list):
+                    results_df.insert(0, 'smiles', smiles_list)
+                    print(f"   ✅ SMILES column added successfully")
+                else:
+                    print(f"   ⚠️  Warning: Mismatch between input SMILES ({len(smiles_list)}) and results ({len(results_df)})")
+                    # Try to match by creating a truncated or padded SMILES list
+                    if len(results_df) < len(smiles_list):
+                        # Results are fewer than input - take first N SMILES
+                        matched_smiles = smiles_list[:len(results_df)]
+                        results_df.insert(0, 'smiles', matched_smiles)
+                        print(f"   🔗 Added SMILES for first {len(results_df)} results")
+                    else:
+                        # Results are more than input - this shouldn't happen, but handle it
+                        extended_smiles = smiles_list + ['unknown'] * (len(results_df) - len(smiles_list))
+                        results_df.insert(0, 'smiles', extended_smiles)
+                        print(f"   🔗 Extended SMILES list to match {len(results_df)} results")
+            else:
+                print(f"   ✅ SMILES column already present in results")
+            
+            # Verify final structure
+            print(f"   📋 Final columns: {list(results_df.columns)}")
+            
+            return results_df
+            
+        except ImportError:
+            print("❌ Ersilia not installed or not available")
+            return pd.DataFrame()
+        except Exception as e:
+            print(f"❌ Error processing SMILES with Ersilia model: {e}")
+            # Return empty DataFrame with at least the smiles column for error handling
+            return pd.DataFrame({'smiles': []})
+    
+
+### Created using AI
+
+    def _merge_ersilia_results_to_table(self, selected_table: str, results_df: pd.DataFrame, 
+                                    model_name: str, save_to_new_table: bool = True) -> Optional[str]:
+        """
+        Merge Ersilia model results back to the original table by matching SMILES.
+        
+        Args:
+            selected_table (str): Name of the original table
+            results_df (pd.DataFrame): Results from Ersilia model
+            model_name (str): Name of the Ersilia model used
+            save_to_new_table (bool): Whether to save to a new table or update existing
+            
+        Returns:
+            Optional[str]: Name of the table with merged results, or None if failed
+        """
+        try:
+            if results_df.empty:
+                print("❌ No Ersilia results to merge")
+                return None
+            
+            print(f"\n🔄 MERGING ERSILIA RESULTS TO ORIGINAL TABLE")
+            print("=" * 60)
+            
+            # Get the original table data
+            original_df = self._get_table_as_dataframe(selected_table)
+            
+            if original_df.empty:
+                print(f"❌ Original table '{selected_table}' is empty")
+                return None
+            
+            print(f"📊 Original table: {len(original_df)} compounds")
+            print(f"📊 Ersilia results: {len(results_df)} predictions")
+            
+            # Check if both have SMILES column
+            if 'smiles' not in original_df.columns:
+                print("❌ Original table missing 'smiles' column")
+                return None
+            
+            if 'smiles' not in results_df.columns:
+                print("❌ Ersilia results missing 'smiles' column")
+                return None
+            
+            # Get prediction columns (exclude specified columns and 'smiles')
+            excluded_columns = {'smiles', 'key', 'input', 'ersilia_model', 'prediction_date'}
+            prediction_columns = [col for col in results_df.columns if col not in excluded_columns]
+            
+            if not prediction_columns:
+                print("❌ No prediction columns found in Ersilia results after filtering")
+                print(f"   Available columns: {list(results_df.columns)}")
+                print(f"   Excluded columns: {excluded_columns}")
+                return None
+            
+            print(f"🧪 Prediction columns to add: {prediction_columns}")
+            
+            # Merge DataFrames on SMILES
+            print(f"🔗 Merging tables on SMILES column...")
+            
+            # Use left join to keep all original compounds
+            merged_df = original_df.merge(
+                results_df, 
+                on='smiles', 
+                how='left', 
+                suffixes=('', f'_{model_name}')
+            )
+            
+            # Count successful matches
+            successful_matches = 0
+            missing_predictions = 0
+            
+            for col in prediction_columns:
+                non_null_count = merged_df[col].notna().sum()
+                successful_matches = max(successful_matches, non_null_count)
+            
+            missing_predictions = len(merged_df) - successful_matches
+            
+            print(f"📊 MERGE RESULTS:")
+            print(f"   ✅ Successful matches: {successful_matches}")
+            print(f"   ❌ Missing predictions: {missing_predictions}")
+            print(f"   📈 Match rate: {(successful_matches/len(merged_df))*100:.1f}%")
+            
+            # Show sample of merged data
+            print(f"\n📋 Sample merged data (first 3 rows):")
+            print("=" * 80)
+            
+            # Display key columns
+            display_cols = ['smiles', 'name'] + prediction_columns[:3]  # Show first 3 prediction cols
+            available_display_cols = [col for col in display_cols if col in merged_df.columns]
+            
+            for i, (_, row) in enumerate(merged_df.head(3).iterrows(), 1):
+                print(f"Row {i}:")
+                for col in available_display_cols:
+                    value = row[col]
+                    if pd.isna(value):
+                        value_str = "NaN"
+                    else:
+                        value_str = str(value)[:30] + "..." if len(str(value)) > 30 else str(value)
+                    print(f"   {col}: {value_str}")
+                print()
+            
+            print("=" * 80)
+            
+            # Determine output table name
+            if save_to_new_table:
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                default_name = f"{selected_table}_{model_name}_{timestamp}"
+                
+                user_input = input(f"\n💾 Enter table name for merged results (default: {default_name}): ").strip()
+                output_table_name = user_input if user_input else default_name
+                output_table_name = self._sanitize_table_name(output_table_name)
+            else:
+                output_table_name = selected_table
+                print(f"\n💾 Updating existing table '{selected_table}' with Ersilia results...")
+            
+            # Save merged results to database
+            success = self._save_merged_ersilia_results(merged_df, output_table_name, model_name, prediction_columns)
+            
+            if success:
+                print(f"✅ Successfully saved merged results to table '{output_table_name}'")
+                print(f"   📊 Total compounds: {len(merged_df)}")
+                print(f"   🧪 Prediction columns: {len(prediction_columns)}")
+                print(f"   🎯 Model used: {model_name}")
+                return output_table_name
+            else:
+                print(f"❌ Failed to save merged results")
+                return None
+            
+        except Exception as e:
+            print(f"❌ Error merging Ersilia results: {e}")
+            return None
+
+
+    def _save_merged_ersilia_results(self, merged_df: pd.DataFrame, table_name: str, 
+                                    model_name: str, prediction_columns: List[str]) -> bool:
+        """
+        Save merged Ersilia results to database table.
+        
+        Args:
+            merged_df (pd.DataFrame): Merged DataFrame with original data and predictions
+            table_name (str): Name of the table to create/update
+            model_name (str): Name of the Ersilia model used
+            prediction_columns (List[str]): List of prediction column names
+            
+        Returns:
+            bool: True if saved successfully
+        """
+        try:
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            
+            # Create table with extended schema including prediction columns (no metadata columns)
+            base_schema = """
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                smiles TEXT NOT NULL,
+                name TEXT,
+                flag TEXT,
+                inchi_key TEXT
+            """
+            
+            # Add prediction columns to schema with model name prefix
+            prediction_schema_parts = []
+            prefixed_column_mapping = {}
+            
+            for col in prediction_columns:
+                # Create prefixed column name: modelname_property
+                prefixed_col_name = f"{model_name}_{col}"
+                
+                # Sanitize column name for SQL
+                safe_col_name = self._sanitize_column_name(prefixed_col_name)
+                prediction_schema_parts.append(f"{safe_col_name} REAL")
+                
+                # Keep mapping of original column to prefixed column for data insertion
+                prefixed_column_mapping[col] = safe_col_name
+            
+            # Add unique constraint (no metadata columns)
+            unique_constraint = "UNIQUE(smiles, name)"
+            
+            full_schema = base_schema
+            if prediction_schema_parts:
+                full_schema += ",\n            " + ",\n            ".join(prediction_schema_parts)
+            full_schema += ",\n            " + unique_constraint
+            
+            cursor.execute(f'''
+                CREATE TABLE IF NOT EXISTS {table_name} (
+                    {full_schema}
+                )
+            ''')
+            
+            # Create indexes for better performance (no model index)
+            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_smiles ON {table_name}(smiles)")
+            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_name ON {table_name}(name)")
+            
+            # Prepare insert query with prefixed column names (no metadata columns)
+            columns = ['smiles', 'name', 'flag', 'inchi_key'] + list(prefixed_column_mapping.values())
+            placeholders = ', '.join(['?'] * len(columns))
+            
+            insert_query = f'''
+                INSERT OR REPLACE INTO {table_name} 
+                ({', '.join(columns)})
+                VALUES ({placeholders})
+            '''
+            
+            # Insert data (no metadata)
+            inserted_count = 0
+            
+            for _, row in merged_df.iterrows():
+                try:
+                    # Prepare row data (no metadata columns)
+                    row_data = [
+                        row.get('smiles', ''),
+                        row.get('name', 'unknown'),
+                        row.get('flag', 'nd'),
+                        row.get('inchi_key', None)
+                    ]
+                    
+                    # Add prediction values only with original column names
+                    for original_col in prediction_columns:
+                        value = row.get(original_col)
+                        # Convert to float if possible, otherwise None
+                        if pd.isna(value):
+                            row_data.append(None)
+                        else:
+                            try:
+                                row_data.append(float(value))
+                            except (ValueError, TypeError):
+                                row_data.append(None)
+                    
+                    # No metadata added here
+                    cursor.execute(insert_query, row_data)
+                    inserted_count += 1
+                    
+                except Exception as e:
+                    print(f"⚠️  Error inserting row: {e}")
+                    continue
+            
+            conn.commit()
+            conn.close()
+            
+            # Show the prefixed column names that were created
+            print(f"   💾 Inserted {inserted_count} compounds with Ersilia predictions")
+            print(f"   🏷️  Created columns with model prefix:")
+            for original_col, prefixed_col in prefixed_column_mapping.items():
+                print(f"      • {original_col} → {prefixed_col}")
+            
+            return True
+            
+        except Exception as e:
+            print(f"❌ Error saving merged Ersilia results: {e}")
+            return False
+
+
+
+    def _sanitize_column_name(self, column_name: str) -> str:
+        """
+        Sanitize column name for SQLite compatibility.
+        
+        Args:
+            column_name (str): Original column name
+            
+        Returns:
+            str: Sanitized column name
+        """
+        import re
+        
+        # Replace special characters with underscores
+        sanitized = re.sub(r'[^a-zA-Z0-9_]', '_', str(column_name))
+        
+        # Ensure it starts with a letter or underscore
+        if sanitized and not sanitized[0].isalpha() and sanitized[0] != '_':
+            sanitized = 'col_' + sanitized
+        
+        # Ensure it's not empty
+        if not sanitized:
+            sanitized = 'prediction_col'
+        
+        # Limit length
+        if len(sanitized) > 50:
+            sanitized = sanitized[:50]
+        
+        return sanitized.lower()
+
+
+### End created using AI
