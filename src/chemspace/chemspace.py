@@ -29,6 +29,9 @@ sys.path.insert(0, parent_dir)
 from tidyscreen import tidyscreen
 ActivateProject = tidyscreen.ActivateProject
 
+
+## Module level helper functions for multiprocessing workers
+
 def _process_chunk_worker(chunk_df: pd.DataFrame, smiles_column: str, 
                          name_column: Optional[str], flag_column: Optional[str],
                          name_available: bool, flag_available: bool, 
@@ -10860,7 +10863,6 @@ class ChemSpace:
             print(f"❌ Error in apply_ersilia_model: {e}")
             return None    
         
-        
     def _process_smiles_for_ersilia(self, smiles_list: List[str], model_name: str) -> pd.DataFrame:
         """
         Process a SMILES list with a given Ersilia model.
@@ -10934,9 +10936,6 @@ class ChemSpace:
             # Return empty DataFrame with at least the smiles column for error handling
             return pd.DataFrame({'smiles': []})
     
-
-### Created using AI
-
     def _merge_ersilia_results_to_table(self, selected_table: str, results_df: pd.DataFrame, 
                                     model_name: str, save_to_new_table: bool = True) -> Optional[str]:
         """
@@ -11066,7 +11065,6 @@ class ChemSpace:
             print(f"❌ Error merging Ersilia results: {e}")
             return None
 
-
     def _save_merged_ersilia_results(self, merged_df: pd.DataFrame, table_name: str, 
                                     model_name: str, prediction_columns: List[str]) -> bool:
         """
@@ -11185,8 +11183,6 @@ class ChemSpace:
             print(f"❌ Error saving merged Ersilia results: {e}")
             return False
 
-
-
     def _sanitize_column_name(self, column_name: str) -> str:
         """
         Sanitize column name for SQLite compatibility.
@@ -11216,5 +11212,1118 @@ class ChemSpace:
         
         return sanitized.lower()
 
+### Created using AI
 
-### End created using AI
+    def enumerate_stereoisomers(self, table_name: Optional[str] = None,
+                            max_stereoisomers: int = 20,
+                            save_results: bool = True,
+                            result_table_name: Optional[str] = None,
+                            include_original: bool = False,
+                            filter_duplicates: bool = True) -> pd.DataFrame:
+        """
+        Enumerate stereoisomers for molecules in a table using RDKit.
+        Computes stereoisomeric configuration and total count for each compound.
+        
+        Args:
+            table_name (Optional[str]): Name of the table to process. If None, prompts user.
+            max_stereoisomers (int): Maximum number of stereoisomers to generate per molecule
+            save_results (bool): Whether to save results to a new table
+            result_table_name (Optional[str]): Name for the result table
+            include_original (bool): Whether to include the original molecule in results
+            filter_duplicates (bool): Whether to filter out duplicate stereoisomers
+            
+        Returns:
+            pd.DataFrame: DataFrame containing original molecules and their stereoisomers
+        """
+        try:
+            # Import required libraries
+            try:
+                from rdkit import Chem
+                from rdkit.Chem import EnumerateStereoisomers
+                from rdkit import RDLogger
+                RDLogger.DisableLog('rdApp.*')
+            except ImportError:
+                print("❌ RDKit not installed. Please install RDKit to enumerate stereoisomers:")
+                print("   conda install -c conda-forge rdkit")
+                return pd.DataFrame()
+            
+            # Reuse existing table selection method
+            if table_name is None:
+                table_name = self._select_table_interactive("SELECT TABLE FOR STEREOISOMER ENUMERATION")
+                if not table_name:
+                    print("❌ No table selected for stereoisomer enumeration")
+                    return pd.DataFrame()
+            
+            # Get compounds from table using existing method
+            compounds_df = self._get_table_as_dataframe(table_name)
+            if compounds_df.empty:
+                print(f"❌ No compounds found in table '{table_name}'")
+                return pd.DataFrame()
+            
+            # Check if SMILES column exists (reuse existing pattern)
+            if 'smiles' not in compounds_df.columns:
+                print("❌ No 'smiles' column found in the table")
+                return pd.DataFrame()
+            
+            # Analyze SMILES for existing stereochemistry
+            stereochemistry_analysis = self._analyze_existing_stereochemistry(compounds_df)
+            
+            # Show stereochemistry analysis and get user preferences
+            enumeration_strategy = self._get_stereochemistry_enumeration_strategy(stereochemistry_analysis)
+            
+            if enumeration_strategy is None:
+                print("❌ Stereoisomer enumeration cancelled by user")
+                return pd.DataFrame()
+            
+            print(f"🧬 Enumerating stereoisomers for table '{table_name}'")
+            print(f"   📊 Input molecules: {len(compounds_df):,}")
+            print(f"   🔄 Max stereoisomers per molecule: {max_stereoisomers}")
+            print(f"   📋 Include original molecules: {'Yes' if include_original else 'No'}")
+            print(f"   🔍 Filter duplicates: {'Yes' if filter_duplicates else 'No'}")
+            print(f"   ⚗️  Stereochemistry strategy: {enumeration_strategy['strategy_name']}")
+            
+            # Process molecules and enumerate stereoisomers
+            print("\n🔬 Processing molecules for stereoisomer enumeration...")
+            all_stereoisomers = []
+            processing_stats = {
+                'processed': 0,
+                'with_stereocenters': 0,
+                'total_stereoisomers': 0,
+                'invalid_smiles': 0,
+                'failed_enumeration': 0,
+                'inchi_computed': 0,
+                'inchi_failed': 0,
+                'predefined_kept': 0,
+                'predefined_enumerated': 0
+            }
+            
+            # Use progress bar if available (reuse existing pattern)
+            if TQDM_AVAILABLE:
+                progress_bar = tqdm(
+                    compounds_df.iterrows(),
+                    total=len(compounds_df),
+                    desc="Enumerating stereoisomers",
+                    unit="molecules"
+                )
+            else:
+                progress_bar = compounds_df.iterrows()
+                processed_count = 0
+            
+            for _, compound in progress_bar:
+                processing_stats['processed'] += 1
+                
+                try:
+                    original_smiles = compound['smiles']
+                    compound_name = compound.get('name', f"compound_{compound.get('id', processing_stats['processed'])}")
+                    
+                    # Parse original molecule
+                    mol = Chem.MolFromSmiles(original_smiles)
+                    if mol is None:
+                        processing_stats['invalid_smiles'] += 1
+                        continue
+                    
+                    # Check if this molecule has predefined stereochemistry
+                    has_predefined_stereo = self._has_stereochemistry_definition(original_smiles)
+                    
+                    # Decide whether to enumerate based on user strategy
+                    should_enumerate = self._should_enumerate_compound(
+                        has_predefined_stereo, enumeration_strategy
+                    )
+                    
+                    if has_predefined_stereo and not should_enumerate:
+                        # Keep the predefined stereochemistry as-is
+                        processing_stats['predefined_kept'] += 1
+                        
+                        # Analyze stereoisomeric properties for metadata
+                        stereo_info = self._analyze_compound_stereochemistry(mol, original_smiles)
+                        
+                        # Compute InChI key
+                        original_inchi_key = self._compute_single_inchi_key(original_smiles)
+                        if original_inchi_key and original_inchi_key not in ['INVALID_SMILES', 'ERROR']:
+                            processing_stats['inchi_computed'] += 1
+                        else:
+                            processing_stats['inchi_failed'] += 1
+                        
+                        # Add the predefined stereoisomer to results
+                        all_stereoisomers.append({
+                            'parent_name': compound_name,
+                            'parent_smiles': original_smiles,
+                            'stereoisomer_smiles': original_smiles,  # ← Keep original SMILES
+                            'stereoisomer_name': compound_name,  # ← Keep original name
+                            'stereoisomer_type': 'predefined',  # ← Correct type
+                            'stereoisomer_index': 0,  # ← Index 0 for predefined
+                            'flag': compound.get('flag', 'nd'),
+                            'inchi_key': original_inchi_key,  # ← Use the computed InChI key
+                            'total_stereoisomers': stereo_info['total_stereoisomers'],
+                            'stereochemical_config': stereo_info['original_config'],  # ← Use original config
+                            'num_stereocenters': stereo_info['num_stereocenters'],
+                            'stereocenter_atoms': ','.join(map(str, stereo_info['stereocenter_atoms']))
+                        })
+                        
+                        
+                        processing_stats['total_stereoisomers'] += 1
+                        continue
+                    
+                    # If we reach here, we should enumerate stereoisomers
+                    if has_predefined_stereo:
+                        processing_stats['predefined_enumerated'] += 1
+                    
+                    # Analyze stereoisomeric properties using helper method
+                    stereo_info = self._analyze_compound_stereochemistry(mol, original_smiles)
+                    
+                    # Include original molecule if requested
+                    if include_original:
+                        # Compute InChI key for original molecule
+                        original_inchi_key = self._compute_single_inchi_key(original_smiles)
+                        if original_inchi_key and original_inchi_key not in ['INVALID_SMILES', 'ERROR']:
+                            processing_stats['inchi_computed'] += 1
+                        else:
+                            processing_stats['inchi_failed'] += 1
+                        
+                        all_stereoisomers.append({
+                            'parent_name': compound_name,
+                            'parent_smiles': original_smiles,
+                            'stereoisomer_smiles': original_smiles,
+                            'stereoisomer_name': f"{compound_name}_original",
+                            'stereoisomer_type': 'original',
+                            'stereoisomer_index': 0,
+                            'flag': compound.get('flag', 'nd'),
+                            'inchi_key': original_inchi_key,
+                            'total_stereoisomers': stereo_info['total_stereoisomers'],
+                            'stereochemical_config': stereo_info['original_config'],
+                            'num_stereocenters': stereo_info['num_stereocenters'],
+                            'stereocenter_atoms': ','.join(map(str, stereo_info['stereocenter_atoms']))
+                        })
+                        processing_stats['total_stereoisomers'] += 1
+                    
+                    # Check for stereocenters and enumerate
+                    if stereo_info['total_stereoisomers'] > 1:
+                        processing_stats['with_stereocenters'] += 1
+                        
+                        # Enumerate stereoisomers
+                        stereoisomer_options = EnumerateStereoisomers.EnumerateStereoisomers(mol)
+                        generated_smiles = set()
+                        stereoisomer_count = 0
+                        
+                        for i, stereoisomer in enumerate(stereoisomer_options):
+                            if stereoisomer_count >= max_stereoisomers:
+                                break
+                            
+                            try:
+                                # Generate SMILES for stereoisomer
+                                stereo_smiles = Chem.MolToSmiles(stereoisomer, isomericSmiles=True)
+                                
+                                # Skip if duplicate and filtering is enabled
+                                if filter_duplicates:
+                                    if stereo_smiles in generated_smiles:
+                                        continue
+                                    generated_smiles.add(stereo_smiles)
+                                
+                                # Skip original molecule if we already included it
+                                if include_original and stereo_smiles == original_smiles:
+                                    continue
+                                
+                                # Compute InChI key for stereoisomer using existing helper
+                                stereo_inchi_key = self._compute_single_inchi_key(stereo_smiles)
+                                if stereo_inchi_key and stereo_inchi_key not in ['INVALID_SMILES', 'ERROR']:
+                                    processing_stats['inchi_computed'] += 1
+                                else:
+                                    processing_stats['inchi_failed'] += 1
+                                
+                                # Analyze stereochemical configuration for this stereoisomer
+                                stereo_config = self._determine_stereoisomer_configuration(stereoisomer)
+                                
+                                # Add stereoisomer to results
+                                stereoisomer_name = f"{compound_name}_stereo_{stereoisomer_count + 1}"
+                                
+                                all_stereoisomers.append({
+                                    'parent_name': compound_name,
+                                    'parent_smiles': original_smiles,
+                                    'stereoisomer_smiles': stereo_smiles,
+                                    'stereoisomer_name': stereoisomer_name,
+                                    'stereoisomer_type': 'stereoisomer',
+                                    'stereoisomer_index': stereoisomer_count + 1,
+                                    'flag': compound.get('flag', 'nd'),  # ← Preserve original flag
+                                    'inchi_key': stereo_inchi_key,
+                                    'total_stereoisomers': stereo_info['total_stereoisomers'],
+                                    'stereochemical_config': stereo_config,
+                                    'num_stereocenters': stereo_info['num_stereocenters'],
+                                    'stereocenter_atoms': ','.join(map(str, stereo_info['stereocenter_atoms']))
+                                })
+                                
+                                stereoisomer_count += 1
+                                processing_stats['total_stereoisomers'] += 1
+                                
+                            except Exception as e:
+                                processing_stats['failed_enumeration'] += 1
+                                continue
+                
+                except Exception as e:
+                    processing_stats['failed_enumeration'] += 1
+                    continue
+                
+                # Progress update for non-tqdm case (reuse existing pattern)
+                if not TQDM_AVAILABLE:
+                    processed_count += 1
+                    if processed_count % max(1, len(compounds_df) // 10) == 0:
+                        print(f"   📊 Processed {processed_count}/{len(compounds_df)} molecules...")
+            
+            if TQDM_AVAILABLE and hasattr(progress_bar, 'close'):
+                progress_bar.close()
+            
+            # Create results DataFrame
+            results_df = pd.DataFrame(all_stereoisomers)
+            
+            # Display processing statistics (enhanced with stereochemistry info)
+            print(f"\n✅ Stereoisomer enumeration completed!")
+            print(f"   📊 Molecules processed: {processing_stats['processed']:,}")
+            print(f"   🎯 Molecules with stereocenters: {processing_stats['with_stereocenters']:,}")
+            print(f"   🧪 Total stereoisomers generated: {processing_stats['total_stereoisomers']:,}")
+            print(f"   ❌ Invalid SMILES: {processing_stats['invalid_smiles']:,}")
+            print(f"   ⚠️  Failed enumerations: {processing_stats['failed_enumeration']:,}")
+            print(f"   🔬 InChI keys computed: {processing_stats['inchi_computed']:,}")
+            print(f"   ❌ InChI computation failures: {processing_stats['inchi_failed']:,}")
+            
+            # Show stereochemistry handling statistics
+            if processing_stats['predefined_kept'] > 0 or processing_stats['predefined_enumerated'] > 0:
+                print(f"\n⚗️  Stereochemistry Handling:")
+                print(f"   ✅ Predefined stereochemistry kept: {processing_stats['predefined_kept']:,}")
+                print(f"   🔄 Predefined stereochemistry enumerated: {processing_stats['predefined_enumerated']:,}")
+            
+            if not results_df.empty:
+                expansion_factor = len(results_df) / len(compounds_df)
+                inchi_success_rate = (processing_stats['inchi_computed'] / processing_stats['total_stereoisomers']) * 100 if processing_stats['total_stereoisomers'] > 0 else 0
+                
+                print(f"   📈 Expansion factor: {expansion_factor:.2f}x")
+                print(f"   🔑 InChI success rate: {inchi_success_rate:.1f}%")
+                
+                # Show sample results with stereochemical information
+                print(f"\n📋 Sample stereoisomers with stereochemical information (first 5):")
+                for i, (_, row) in enumerate(results_df.head(5).iterrows(), 1):
+                    if row['stereoisomer_type'] == 'original':
+                        stereo_type = "Original"
+                    elif row['stereoisomer_type'] == 'predefined':
+                        stereo_type = "Predefined"
+                    else:
+                        stereo_type = f"Stereo {row['stereoisomer_index']}"
+                    
+                    inchi_status = "✅" if row.get('inchi_key') and row['inchi_key'] not in ['INVALID_SMILES', 'ERROR'] else "❌"
+                    
+                    # Clean the configuration for display
+                    clean_config = self._clean_stereochemical_config(row['stereochemical_config'])
+                    
+                    print(f"   {i}. {row['parent_name']} → {stereo_type} {inchi_status}")
+                    print(f"      SMILES: {row['stereoisomer_smiles'][:40]}{'...' if len(row['stereoisomer_smiles']) > 40 else ''}")
+                    print(f"      Total stereoisomers: {row['total_stereoisomers']}")
+                    print(f"      Stereocenters: {row['num_stereocenters']}")
+                    print(f"      Configuration: {clean_config}")
+                    if row.get('inchi_key') and row['inchi_key'] not in ['INVALID_SMILES', 'ERROR']:
+                        print(f"      InChI Key: {row['inchi_key'][:27]}...")
+            
+            # Save results if requested (reuse existing pattern)
+            if save_results and not results_df.empty:
+                if result_table_name is None:
+                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    default_name = f"{table_name}_stereoisomers_{timestamp}"
+                    user_table_name = input(f"\n💾 Enter table name for results (default: {default_name}): ").strip()
+                    result_table_name = user_table_name if user_table_name else default_name
+                
+                result_table_name = self._sanitize_table_name(result_table_name)
+                
+                print(f"   💾 Saving stereoisomers to table '{result_table_name}'...")
+                success = self._save_stereoisomer_results(results_df, result_table_name, table_name, processing_stats)
+                
+                if success:
+                    print(f"   ✅ Results saved to table: '{result_table_name}'")
+                else:
+                    print(f"   ❌ Failed to save results to database")
+            
+            return results_df
+            
+        except Exception as e:
+            print(f"❌ Error enumerating stereoisomers: {e}")
+            return pd.DataFrame()
+
+    def _analyze_existing_stereochemistry(self, compounds_df: pd.DataFrame) -> Dict[str, Any]:
+        """
+        Analyze the compounds to detect existing stereochemistry definitions.
+        
+        Args:
+            compounds_df (pd.DataFrame): DataFrame containing compounds
+            
+        Returns:
+            Dict[str, Any]: Analysis results about existing stereochemistry
+        """
+        try:
+            total_compounds = len(compounds_df)
+            compounds_with_stereo = 0
+            compounds_without_stereo = 0
+            sample_with_stereo = []
+            sample_without_stereo = []
+            
+            for _, row in compounds_df.iterrows():
+                smiles = row.get('smiles', '')
+                name = row.get('name', 'unknown')
+                
+                has_stereo = self._has_stereochemistry_definition(smiles)
+                
+                if has_stereo:
+                    compounds_with_stereo += 1
+                    if len(sample_with_stereo) < 5:
+                        sample_with_stereo.append({
+                            'name': name,
+                            'smiles': smiles[:50] + ('...' if len(smiles) > 50 else '')
+                        })
+                else:
+                    compounds_without_stereo += 1
+                    if len(sample_without_stereo) < 5:
+                        sample_without_stereo.append({
+                            'name': name,
+                            'smiles': smiles[:50] + ('...' if len(smiles) > 50 else '')
+                        })
+            
+            return {
+                'total_compounds': total_compounds,
+                'with_stereochemistry': compounds_with_stereo,
+                'without_stereochemistry': compounds_without_stereo,
+                'sample_with_stereo': sample_with_stereo,
+                'sample_without_stereo': sample_without_stereo,
+                'percentage_with_stereo': (compounds_with_stereo / total_compounds * 100) if total_compounds > 0 else 0
+            }
+            
+        except Exception as e:
+            print(f"❌ Error analyzing existing stereochemistry: {e}")
+            return {
+                'total_compounds': 0,
+                'with_stereochemistry': 0,
+                'without_stereochemistry': 0,
+                'sample_with_stereo': [],
+                'sample_without_stereo': [],
+                'percentage_with_stereo': 0
+            }
+
+    def _has_stereochemistry_definition(self, smiles: str) -> bool:
+        """
+        Check if a SMILES string contains stereochemistry definitions.
+        
+        Args:
+            smiles (str): SMILES string to check
+            
+        Returns:
+            bool: True if stereochemistry is defined, False otherwise
+        """
+        try:
+            if not smiles or pd.isna(smiles):
+                return False
+            
+            smiles_str = str(smiles)
+            
+            # Check for common stereochemistry markers
+            stereo_markers = ['@', '/', '\\']
+            
+            return any(marker in smiles_str for marker in stereo_markers)
+            
+        except Exception:
+            return False
+
+    def _get_stereochemistry_enumeration_strategy(self, analysis: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Get user preferences for handling existing stereochemistry during enumeration.
+        
+        Args:
+            analysis (Dict): Results from stereochemistry analysis
+            
+        Returns:
+            Optional[Dict]: Strategy configuration or None if cancelled
+        """
+        try:
+            print(f"\n⚗️  EXISTING STEREOCHEMISTRY ANALYSIS")
+            print("=" * 60)
+            print(f"📊 Total compounds: {analysis['total_compounds']:,}")
+            print(f"🧬 With stereochemistry: {analysis['with_stereochemistry']:,} ({analysis['percentage_with_stereo']:.1f}%)")
+            print(f"🔄 Without stereochemistry: {analysis['without_stereochemistry']:,}")
+            
+            if analysis['with_stereochemistry'] > 0:
+                print(f"\n📋 Sample compounds with stereochemistry (first 5):")
+                for i, sample in enumerate(analysis['sample_with_stereo'], 1):
+                    print(f"   {i}. {sample['name']}: {sample['smiles']}")
+            
+            if analysis['without_stereochemistry'] > 0:
+                print(f"\n📋 Sample compounds without stereochemistry (first 5):")
+                for i, sample in enumerate(analysis['sample_without_stereo'], 1):
+                    print(f"   {i}. {sample['name']}: {sample['smiles']}")
+            
+            print("=" * 60)
+            
+            if analysis['with_stereochemistry'] == 0:
+                # No stereochemistry found, proceed normally
+                return {
+                    'strategy': 'enumerate_all',
+                    'strategy_name': 'Enumerate all (no predefined stereochemistry found)'
+                }
+            
+            # Ask user what to do with predefined stereochemistry
+            print(f"\n❓ STEREOCHEMISTRY HANDLING OPTIONS")
+            print("-" * 40)
+            print("How should compounds with predefined stereochemistry be handled?")
+            print()
+            print("1. Keep predefined stereochemistry as-is (recommended)")
+            print("   → Compounds with @ / \\ symbols will be preserved")
+            print("   → Only compounds without stereochemistry will be enumerated")
+            print()
+            print("2. Enumerate all compounds (ignore predefined stereochemistry)")
+            print("   → All compounds will be enumerated regardless of existing stereochemistry")
+            print("   → May generate duplicates of already defined stereoisomers")
+            print()
+            print("3. Only enumerate compounds without stereochemistry")
+            print("   → Compounds with predefined stereochemistry will be kept as-is")
+            print("   → Compounds without stereochemistry will be enumerated")
+            print()
+            print("4. Cancel enumeration")
+            print("-" * 40)
+            
+            while True:
+                try:
+                    choice = input("Select option (1-4): ").strip()
+                    
+                    if choice == '1':
+                        return {
+                            'strategy': 'keep_predefined',
+                            'strategy_name': 'Keep predefined stereochemistry, enumerate undefined',
+                            'enumerate_predefined': False,
+                            'enumerate_undefined': True
+                        }
+                    elif choice == '2':
+                        print("⚠️  Warning: This will enumerate all compounds, potentially creating duplicates")
+                        print("   of stereoisomers that are already defined in the SMILES.")
+                        confirm = input("Continue anyway? (y/n): ").strip().lower()
+                        if confirm in ['y', 'yes']:
+                            return {
+                                'strategy': 'enumerate_all',
+                                'strategy_name': 'Enumerate all compounds (ignore predefined stereochemistry)',
+                                'enumerate_predefined': True,
+                                'enumerate_undefined': True
+                            }
+                        else:
+                            continue
+                    elif choice == '3':
+                        return {
+                            'strategy': 'enumerate_undefined_only',
+                            'strategy_name': 'Keep predefined, enumerate only undefined stereochemistry',
+                            'enumerate_predefined': False,
+                            'enumerate_undefined': True
+                        }
+                    elif choice == '4':
+                        return None
+                    else:
+                        print("❌ Invalid choice. Please enter 1, 2, 3, or 4.")
+                        continue
+                        
+                except KeyboardInterrupt:
+                    print("\n❌ Enumeration cancelled by user")
+                    return None
+        
+        except Exception as e:
+            print(f"❌ Error getting stereochemistry strategy: {e}")
+            return None
+
+    def _should_enumerate_compound(self, has_predefined_stereo: bool, strategy: Dict[str, Any]) -> bool:
+        """
+        Determine whether a compound should be enumerated based on its stereochemistry status and user strategy.
+        
+        Args:
+            has_predefined_stereo (bool): Whether the compound has predefined stereochemistry
+            strategy (Dict): User's enumeration strategy
+            
+        Returns:
+            bool: True if the compound should be enumerated, False if it should be kept as-is
+        """
+        try:
+            strategy_type = strategy.get('strategy', 'enumerate_all')
+            
+            if strategy_type == 'enumerate_all':
+                return True
+            elif strategy_type == 'keep_predefined':
+                # Enumerate compounds without predefined stereochemistry
+                return not has_predefined_stereo
+            elif strategy_type == 'enumerate_undefined_only':
+                # Only enumerate compounds without predefined stereochemistry
+                return not has_predefined_stereo
+            else:
+                # Default: enumerate everything
+                return True
+                
+        except Exception:
+            return True
+
+    def _analyze_compound_stereochemistry(self, mol, smiles: str) -> Dict[str, Any]:
+        """
+        Analyze stereochemical properties of a compound.
+        
+        Args:
+            mol: RDKit molecule object
+            smiles (str): SMILES string
+            
+        Returns:
+            Dict[str, Any]: Dictionary containing stereochemical analysis
+        """
+        try:
+            from rdkit import Chem
+            from rdkit.Chem import EnumerateStereoisomers
+            
+            # Find stereocenters
+            stereo_info = Chem.FindMolChiralCenters(mol, includeUnassigned=True)
+            num_stereocenters = len(stereo_info)
+            stereocenter_atoms = [info[0] for info in stereo_info]
+            
+            # Count total possible stereoisomers
+            stereoisomer_options = list(EnumerateStereoisomers.EnumerateStereoisomers(mol))
+            total_stereoisomers = len(stereoisomer_options)
+            
+            # Determine original configuration
+            original_config = self._determine_stereoisomer_configuration(mol)
+            
+            return {
+                'num_stereocenters': num_stereocenters,
+                'stereocenter_atoms': stereocenter_atoms,
+                'total_stereoisomers': total_stereoisomers,
+                'original_config': original_config
+            }
+            
+        except Exception as e:
+            return {
+                'num_stereocenters': 0,
+                'stereocenter_atoms': [],
+                'total_stereoisomers': 1,
+                'original_config': 'unknown'
+            }
+
+    def _determine_stereoisomer_configuration(self, mol) -> str:
+        """
+        Determine the stereochemical configuration of a molecule in simplified R/S format.
+        
+        Args:
+            mol: RDKit molecule object
+            
+        Returns:
+            str: String describing the stereochemical configuration (e.g., 'R,S', 'S,S')
+        """
+        try:
+            from rdkit import Chem
+            
+            # Find chiral centers with their configurations
+            chiral_centers = Chem.FindMolChiralCenters(mol, includeUnassigned=True)
+            
+            if not chiral_centers:
+                return 'achiral'
+            
+            # Extract just the R/S designations
+            rs_designations = []
+            for atom_idx, chirality in chiral_centers:
+                if chirality in ['R', 'S']:
+                    rs_designations.append(chirality)
+                else:
+                    rs_designations.append('?')
+            
+            if not rs_designations:
+                return 'unassigned'
+            
+            # Sort for consistent ordering (optional - you can remove this if you want to maintain atom order)
+            rs_designations.sort()
+            return ','.join(rs_designations)
+            
+        except Exception:
+            return 'unknown'
+
+    def _save_stereoisomer_results(self, results_df: pd.DataFrame, table_name: str, 
+                                source_table: str, processing_stats: Dict[str, int]) -> bool:
+        """
+        Save stereoisomer enumeration results to database table with stereochemical information.
+        Reuses existing table creation patterns for consistency.
+        
+        Args:
+            results_df (pd.DataFrame): DataFrame containing stereoisomer results
+            table_name (str): Name of the table to create
+            source_table (str): Name of the source table
+            processing_stats (Dict): Processing statistics
+            
+        Returns:
+            bool: True if saved successfully
+        """
+        try:
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            
+            # Create stereoisomers table with extended schema (excluding stereocenter_atoms column)
+            cursor.execute(f'''
+                CREATE TABLE IF NOT EXISTS {table_name} (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    smiles TEXT NOT NULL,
+                    name TEXT,
+                    flag TEXT,
+                    inchi_key TEXT,
+                    total_stereoisomers INTEGER,
+                    stereochemical_config TEXT,
+                    num_stereocenters INTEGER,
+                    UNIQUE(smiles, name)
+                )
+            ''')
+            
+            # Create indexes for better performance (excluding stereocenter_atoms)
+            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_smiles ON {table_name}(smiles)")
+            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_name ON {table_name}(name)")
+            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_flag ON {table_name}(flag)")
+            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_inchi_key ON {table_name}(inchi_key)")
+            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_stereocenters ON {table_name}(num_stereocenters)")
+            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_total_stereo ON {table_name}(total_stereoisomers)")
+            
+            # Prepare insert query with stereochemical columns (excluding stereocenter_atoms)
+            insert_query = f'''
+                INSERT OR IGNORE INTO {table_name} 
+                (smiles, name, flag, inchi_key, total_stereoisomers, stereochemical_config, 
+                num_stereocenters)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            '''
+            
+            # Insert stereoisomer data including stereochemical information
+            inserted_count = 0
+            
+            for _, row in results_df.iterrows():
+                try:
+                    # Clean up the stereochemical configuration format
+                    config = row.get('stereochemical_config', 'unknown')
+                    clean_config = self._clean_stereochemical_config(config)
+                    
+                    cursor.execute(insert_query, (
+                        row['stereoisomer_smiles'],
+                        row['stereoisomer_name'],
+                        row.get('flag', 'nd'),  # ← Use original flag or default to 'nd'
+                        row.get('inchi_key'),
+                        row.get('total_stereoisomers', 1),
+                        clean_config,
+                        row.get('num_stereocenters', 0)
+                    ))
+                    inserted_count += 1
+                except sqlite3.IntegrityError:
+                    continue  # Skip duplicates
+            
+            conn.commit()
+            conn.close()
+            
+            # Display summary (reuse existing pattern)
+            print(f"   💾 Inserted {inserted_count} stereoisomers into table '{table_name}'")
+            print(f"   📊 Processing summary:")
+            print(f"      • Molecules processed: {processing_stats['processed']}")
+            print(f"      • With stereocenters: {processing_stats['with_stereocenters']}")
+            print(f"      • Total stereoisomers: {processing_stats['total_stereoisomers']}")
+            print(f"   🧬 Table columns:")
+            print(f"      • total_stereoisomers: Total possible stereoisomers for parent")
+            print(f"      • stereochemical_config: R/S configuration (e.g., 'R,S', 'S,S')")
+            print(f"      • num_stereocenters: Number of stereogenic centers")
+            
+            return True
+            
+        except Exception as e:
+            print(f"❌ Error saving stereoisomer results: {e}")
+            return False
+
+    def _clean_stereochemical_config(self, config: str) -> str:
+        """
+        Clean stereochemical configuration to simple R/S format.
+        
+        Args:
+            config (str): Original configuration string (e.g., "5R,10S" or "achiral")
+            
+        Returns:
+            str: Cleaned configuration (e.g., "R,S" or "achiral")
+        """
+        try:
+            if not config or config in ['unknown', 'achiral', 'unassigned']:
+                return config
+            
+            # Extract R/S designations from atom-specific format
+            import re
+            rs_matches = re.findall(r'[RS]', config)
+            
+            if rs_matches:
+                # Sort to ensure consistent ordering (optional)
+                rs_matches.sort()
+                return ','.join(rs_matches)
+            else:
+                return config
+                
+        except Exception:
+            return 'unknown'
+    
+    def _compute_single_inchi_key(self, smiles: str) -> Optional[str]:
+        """
+        Compute InChI key for a single SMILES string.
+        Reuses existing RDKit patterns from the codebase.
+        
+        Args:
+            smiles (str): SMILES string to process
+            
+        Returns:
+            Optional[str]: InChI key or error indicator
+        """
+        try:
+            from rdkit import Chem
+            
+            # Skip empty or None SMILES (reuse existing validation pattern)
+            if not smiles or smiles.strip() == '':
+                return 'INVALID_SMILES'
+            
+            # Parse SMILES with RDKit (reuse existing pattern)
+            mol = Chem.MolFromSmiles(str(smiles).strip())
+            
+            if mol is not None:
+                # Compute InChI key (reuse existing pattern)
+                inchi_key = Chem.MolToInchiKey(mol)
+                if inchi_key:  # Ensure InChI key is not empty
+                    return inchi_key
+                else:
+                    return 'ERROR'
+            else:
+                # Invalid SMILES (reuse existing pattern)
+                return 'INVALID_SMILES'
+                
+        except Exception:
+            # Error computing InChI key (reuse existing pattern)
+            return 'ERROR' 
+
+    def enumerate_stereoisomers_for_specific_molecules(self, table_name: str, 
+                                                    molecule_names: List[str],
+                                                    max_stereoisomers: int = 20) -> pd.DataFrame:
+        """
+        Enumerate stereoisomers for specific molecules by name.
+        Reuses the main enumeration method for consistency.
+        
+        Args:
+            table_name (str): Name of the table containing molecules
+            molecule_names (List[str]): List of molecule names to process
+            max_stereoisomers (int): Maximum stereoisomers per molecule
+            
+        Returns:
+            pd.DataFrame: DataFrame containing stereoisomers for specified molecules
+        """
+        try:
+            print(f"🎯 Enumerating stereoisomers for specific molecules in table '{table_name}'")
+            
+            # Get the full table using existing method
+            compounds_df = self._get_table_as_dataframe(table_name)
+            if compounds_df.empty:
+                print(f"❌ No compounds found in table '{table_name}'")
+                return pd.DataFrame()
+            
+            # Filter for specific molecules (reuse existing validation pattern)
+            if 'name' not in compounds_df.columns:
+                print("❌ No 'name' column found in table for molecule selection")
+                return pd.DataFrame()
+            
+            filtered_df = compounds_df[compounds_df['name'].isin(molecule_names)]
+            
+            if filtered_df.empty:
+                print(f"❌ None of the specified molecules found in table '{table_name}'")
+                print(f"   Requested: {molecule_names}")
+                return pd.DataFrame()
+            
+            found_molecules = filtered_df['name'].tolist()
+            missing_molecules = [name for name in molecule_names if name not in found_molecules]
+            
+            print(f"   ✅ Found {len(found_molecules)} molecules")
+            if missing_molecules:
+                print(f"   ⚠️  Missing {len(missing_molecules)} molecules: {missing_molecules}")
+            
+            # Use the main enumeration method on the filtered data
+            # Temporarily replace the original dataframe data for processing
+            original_method = self._get_table_as_dataframe
+            
+            def mock_get_table(table):
+                if table == table_name:
+                    return filtered_df
+                return original_method(table)
+            
+            # Temporarily replace the method
+            self._get_table_as_dataframe = mock_get_table
+            
+            try:
+                results_df = self.enumerate_stereoisomers(
+                    table_name=table_name,
+                    max_stereoisomers=max_stereoisomers,
+                    save_results=False,
+                    include_original=True,
+                    filter_duplicates=True
+                )
+            finally:
+                # Restore original method
+                self._get_table_as_dataframe = original_method
+            
+            return results_df
+            
+        except Exception as e:
+            print(f"❌ Error enumerating stereoisomers for specific molecules: {e}")
+            return pd.DataFrame()
+
+    def get_stereocenter_info(self, table_name: str) -> pd.DataFrame:
+        """
+        Analyze molecules in a table to identify stereocenters and stereoisomer potential.
+        Reuses existing table access patterns for consistency.
+        
+        Args:
+            table_name (str): Name of the table to analyze
+            
+        Returns:
+            pd.DataFrame: DataFrame with stereocenter analysis for each molecule
+        """
+        try:
+            from rdkit import Chem
+            from rdkit.Chem import rdMolDescriptors, EnumerateStereoisomers
+            
+            print(f"🔬 Analyzing stereocenters in table '{table_name}'")
+            
+            # Use existing method to get table data
+            compounds_df = self._get_table_as_dataframe(table_name)
+            if compounds_df.empty:
+                print(f"❌ No compounds found in table '{table_name}'")
+                return pd.DataFrame()
+            
+            stereocenter_analysis = []
+            
+            # Use existing progress bar pattern
+            if TQDM_AVAILABLE:
+                progress_bar = tqdm(
+                    compounds_df.iterrows(),
+                    total=len(compounds_df),
+                    desc="Analyzing stereocenters",
+                    unit="molecules"
+                )
+            else:
+                progress_bar = compounds_df.iterrows()
+            
+            for _, compound in progress_bar:
+                try:
+                    smiles = compound['smiles']
+                    name = compound.get('name', 'unknown')
+                    
+                    mol = Chem.MolFromSmiles(smiles)
+                    if mol is None:
+                        # Use consistent error handling pattern
+                        stereocenter_analysis.append({
+                            'name': name,
+                            'smiles': smiles,
+                            'valid_smiles': False,
+                            'num_stereocenters': 0,
+                            'num_undefined_stereocenters': 0,
+                            'potential_stereoisomers': 0,
+                            'has_stereochemistry': False,
+                            'stereocenter_atoms': []
+                        })
+                        continue
+                    
+                    # Find stereocenters
+                    stereo_info = Chem.FindMolChiralCenters(mol, includeUnassigned=True)
+                    num_stereocenters = len(stereo_info)
+                    
+                    # Count undefined stereocenters
+                    undefined_stereocenters = len([info for info in stereo_info if info[1] == '?'])
+                    
+                    # Estimate potential stereoisomers
+                    stereoisomer_options = list(EnumerateStereoisomers.EnumerateStereoisomers(mol))
+                    potential_stereoisomers = len(stereoisomer_options)
+                    
+                    # Check if molecule already has defined stereochemistry
+                    has_stereochemistry = '@' in smiles
+                    
+                    # Get stereocenter atom indices
+                    stereocenter_atoms = [info[0] for info in stereo_info]
+                    
+                    stereocenter_analysis.append({
+                        'name': name,
+                        'smiles': smiles,
+                        'valid_smiles': True,
+                        'num_stereocenters': num_stereocenters,
+                        'num_undefined_stereocenters': undefined_stereocenters,
+                        'potential_stereoisomers': potential_stereoisomers,
+                        'has_stereochemistry': has_stereochemistry,
+                        'stereocenter_atoms': stereocenter_atoms
+                    })
+                    
+                except Exception:
+                    # Use consistent error handling
+                    stereocenter_analysis.append({
+                        'name': name,
+                        'smiles': smiles,
+                        'valid_smiles': False,
+                        'num_stereocenters': 0,
+                        'num_undefined_stereocenters': 0,
+                        'potential_stereoisomers': 0,
+                        'has_stereochemistry': False,
+                        'stereocenter_atoms': []
+                    })
+            
+            if TQDM_AVAILABLE and hasattr(progress_bar, 'close'):
+                progress_bar.close()
+            
+            analysis_df = pd.DataFrame(stereocenter_analysis)
+            
+            # Display summary statistics (reuse existing display patterns)
+            if not analysis_df.empty:
+                valid_molecules = analysis_df[analysis_df['valid_smiles']].shape[0]
+                with_stereocenters = analysis_df[analysis_df['num_stereocenters'] > 0].shape[0]
+                with_stereochemistry = analysis_df[analysis_df['has_stereochemistry']].shape[0]
+                
+                print(f"\n📊 Stereocenter Analysis Summary:")
+                print(f"   📋 Total molecules: {len(analysis_df):,}")
+                print(f"   ✅ Valid SMILES: {valid_molecules:,}")
+                print(f"   🎯 With stereocenters: {with_stereocenters:,} ({(with_stereocenters/valid_molecules)*100:.1f}%)")
+                print(f"   🧬 With defined stereochemistry: {with_stereochemistry:,} ({(with_stereochemistry/valid_molecules)*100:.1f}%)")
+                
+                if with_stereocenters > 0:
+                    max_stereocenters = analysis_df['num_stereocenters'].max()
+                    avg_stereocenters = analysis_df[analysis_df['num_stereocenters'] > 0]['num_stereocenters'].mean()
+                    total_potential = analysis_df['potential_stereoisomers'].sum()
+                    
+                    print(f"   📈 Max stereocenters in one molecule: {max_stereocenters}")
+                    print(f"   📊 Average stereocenters (for molecules with stereocenters): {avg_stereocenters:.1f}")
+                    print(f"   🚀 Total potential stereoisomers: {total_potential:,}")
+            
+            return analysis_df
+            
+        except Exception as e:
+            print(f"❌ Error analyzing stereocenters: {e}")
+            return pd.DataFrame()
+
+    def _select_table_interactive(self, prompt_title: str = "SELECT TABLE", 
+                                filter_type: Optional[str] = None,
+                                show_compound_count: bool = True) -> Optional[str]:
+        """
+        Unified interactive table selection method.
+        
+        Args:
+            prompt_title (str): Title for the selection prompt
+            filter_type (Optional[str]): Optional filter for table types
+            show_compound_count (bool): Whether to show compound counts
+            
+        Returns:
+            Optional[str]: Selected table name or None if cancelled
+        """
+        try:
+            available_tables = self.get_all_tables()
+            
+            if not available_tables:
+                print("❌ No tables available for selection")
+                return None
+            
+            # Filter tables if type specified
+            if filter_type:
+                filtered_tables = []
+                for table in available_tables:
+                    table_type = self._classify_table_type(table)
+                    if filter_type.lower() in table_type.lower():
+                        filtered_tables.append(table)
+                available_tables = filtered_tables
+                
+                if not available_tables:
+                    print(f"❌ No tables found matching filter: {filter_type}")
+                    return None
+            
+            print(f"\n🔍 {prompt_title}")
+            print("=" * 70)
+            print(f"Available tables ({len(available_tables)} total):")
+            print("-" * 70)
+            
+            # Display tables with optional compound counts
+            table_info = []
+            for i, table_name in enumerate(available_tables, 1):
+                try:
+                    if show_compound_count:
+                        compound_count = self.get_compound_count(table_name=table_name)
+                        table_type = self._classify_table_type(table_name)
+                        type_icon = self._get_table_type_icon(table_type)
+                        print(f"{i:3d}. {type_icon} {table_name:<30} ({compound_count:>6,} compounds) [{table_type}]")
+                        table_info.append({
+                            'name': table_name,
+                            'type': table_type,
+                            'count': compound_count
+                        })
+                    else:
+                        print(f"{i:3d}. 📊 {table_name}")
+                        table_info.append({
+                            'name': table_name,
+                            'type': 'unknown',
+                            'count': 0
+                        })
+                except Exception as e:
+                    print(f"{i:3d}. ❓ {table_name:<30} (Error: {e}) [Unknown]")
+                    table_info.append({
+                        'name': table_name,
+                        'type': 'unknown',
+                        'count': 0
+                    })
+            
+            print("-" * 70)
+            print("Commands: Enter table number, table name, or 'cancel' to abort")
+            
+            return self._get_user_table_selection(available_tables, table_info)
+            
+        except Exception as e:
+            print(f"❌ Error in table selection: {e}")
+            return None
+
+    def _get_user_table_selection(self, available_tables: List[str], 
+                                table_info: List[Dict]) -> Optional[str]:
+        """
+        Helper method for getting user table selection input.
+        
+        Args:
+            available_tables (List[str]): List of available table names
+            table_info (List[Dict]): List of table information dictionaries
+            
+        Returns:
+            Optional[str]: Selected table name or None if cancelled
+        """
+        while True:
+            try:
+                selection = input(f"\n🔍 Select table: ").strip()
+                
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    return None
+                
+                # Try as number first
+                try:
+                    table_idx = int(selection) - 1
+                    if 0 <= table_idx < len(available_tables):
+                        selected_table = available_tables[table_idx]
+                        selected_info = table_info[table_idx]
+                        
+                        print(f"\n✅ Selected table: '{selected_table}'")
+                        if selected_info.get('type') != 'unknown':
+                            print(f"   🏷️  Type: {selected_info['type']}")
+                            print(f"   📊 Compounds: {selected_info['count']:,}")
+                        
+                        return selected_table
+                    else:
+                        print(f"❌ Invalid selection. Please enter 1-{len(available_tables)}")
+                        continue
+                except ValueError:
+                    # Try as table name
+                    matching_tables = [t for t in available_tables if t.lower() == selection.lower()]
+                    if matching_tables:
+                        selected_table = matching_tables[0]
+                        # Find table info
+                        selected_info = next((info for info in table_info if info['name'] == selected_table), 
+                                        {'type': 'unknown', 'count': 0})
+                        
+                        print(f"\n✅ Selected table: '{selected_table}'")
+                        if selected_info.get('type') != 'unknown':
+                            print(f"   🏷️  Type: {selected_info['type']}")
+                            print(f"   📊 Compounds: {selected_info['count']:,}")
+                        
+                        return selected_table
+                    else:
+                        print(f"❌ Table '{selection}' not found")
+                        continue
+                        
+            except KeyboardInterrupt:
+                print("\n❌ Table selection cancelled")
+                return None
