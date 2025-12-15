@@ -2947,8 +2947,6 @@ class ChemSpace:
             print(f"❌ Error saving workflow filtered compounds to table '{new_table_name}': {e}")
             return False
 
-
-
     def depict_table(self, table_name: Optional[str] = None, 
                     output_dir: Optional[str] = None,
                     image_size: Tuple[int, int] = (300, 300),
@@ -8165,4 +8163,451 @@ class ChemSpace:
             
         except Exception as e:
             print(f"❌ Error clearing all tables: {e}")
+            return False
+
+    def delete_filtering_workflow(self, workflow_identifier: Optional[str] = None) -> bool:
+        """
+        Delete a filtering workflow from the chemspace database.
+        Can delete by workflow name or ID, or show interactive selection.
+        
+        Args:
+            workflow_identifier (Optional[str]): Workflow name or ID to delete. If None, shows interactive selection.
+            
+        Returns:
+            bool: True if workflow was deleted successfully, False otherwise
+        """
+        try:
+            # Check if filtering_workflows table exists
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='filtering_workflows'")
+            if not cursor.fetchone():
+                print("📝 No filtering workflows table found - no workflows to delete")
+                conn.close()
+                return False
+            
+            # Get all available workflows
+            cursor.execute("""
+                SELECT id, workflow_name, creation_date, description, filters_dict, filter_count, total_instances
+                FROM filtering_workflows 
+                ORDER BY creation_date DESC
+            """)
+            workflows = cursor.fetchall()
+            
+            if not workflows:
+                print("📝 No filtering workflows found to delete")
+                conn.close()
+                return False
+            
+            # If no identifier provided, show interactive selection
+            if workflow_identifier is None:
+                workflow_to_delete = self._select_filtering_workflow_for_deletion(workflows)
+                if workflow_to_delete is None:
+                    conn.close()
+                    return False
+            else:
+                # Find workflow by name or ID using existing method (adapted for filtering workflows)
+                workflow_to_delete = self._find_filtering_workflow_by_identifier(workflows, workflow_identifier)
+                if workflow_to_delete is None:
+                    print(f"❌ No filtering workflow found with identifier '{workflow_identifier}'")
+                    self._show_available_filtering_workflows()
+                    conn.close()
+                    return False
+            
+            # Extract workflow information
+            workflow_id, workflow_name, creation_date, description, filters_dict_str, filter_count, total_instances = workflow_to_delete
+            
+            # Parse filters for display
+            try:
+                filters_dict = json.loads(filters_dict_str)
+                actual_filter_count = len(filters_dict)
+            except json.JSONDecodeError:
+                filters_dict = {}
+                actual_filter_count = filter_count or 0
+            
+            # Show workflow details and confirm deletion
+            print(f"\n⚠️  FILTERING WORKFLOW DELETION CONFIRMATION")
+            print("=" * 70)
+            print(f"🆔 ID: {workflow_id}")
+            print(f"📋 Name: '{workflow_name}'")
+            print(f"📅 Created: {creation_date}")
+            print(f"🔍 Filters: {actual_filter_count}")
+            print(f"🔢 Total instances: {total_instances or 0}")
+            print(f"📄 Description: {description or 'No description'}")
+            
+            if filters_dict:
+                print(f"\n🔍 Filters in this workflow:")
+                for i, (filter_name, instances) in enumerate(list(filters_dict.items())[:5], 1):  # Show first 5
+                    print(f"   {i}. {filter_name} (instances: {instances})")
+                if len(filters_dict) > 5:
+                    print(f"   ... and {len(filters_dict) - 5} more filters")
+            
+            print("=" * 70)
+            
+            # Double confirmation for safety
+            confirm1 = input(f"❓ Are you sure you want to delete filtering workflow '{workflow_name}'? (yes/no): ").strip().lower()
+            if confirm1 not in ['yes', 'y']:
+                print("❌ Filtering workflow deletion cancelled")
+                conn.close()
+                return False
+            
+            confirm2 = input(f"❓ Type the workflow name '{workflow_name}' to confirm deletion: ").strip()
+            if confirm2 != workflow_name:
+                print("❌ Workflow name doesn't match. Deletion cancelled for safety.")
+                conn.close()
+                return False
+            
+            # Perform deletion
+            print(f"🗑️  Deleting filtering workflow '{workflow_name}'...")
+            
+            cursor.execute("DELETE FROM filtering_workflows WHERE id = ?", (workflow_id,))
+            deleted_rows = cursor.rowcount
+            
+            conn.commit()
+            conn.close()
+            
+            if deleted_rows > 0:
+                print(f"✅ Successfully deleted filtering workflow!")
+                print(f"   📋 Workflow: '{workflow_name}' (ID: {workflow_id})")
+                print(f"   🔍 Filters removed: {actual_filter_count}")
+                print(f"   🔢 Total instances removed: {total_instances or 0}")
+                print(f"   📅 Original creation date: {creation_date}")
+                
+                # Show remaining workflows using existing method
+                remaining_count = self._count_remaining_filtering_workflows()
+                if remaining_count > 0:
+                    print(f"   📊 Remaining workflows: {remaining_count}")
+                else:
+                    print("   📝 No filtering workflows remaining in database")
+                
+                return True
+            else:
+                print(f"❌ Failed to delete workflow (no rows affected)")
+                return False
+            
+        except Exception as e:
+            print(f"❌ Error deleting filtering workflow: {e}")
+            return False
+
+    def _select_filtering_workflow_for_deletion(self, workflows: List[Tuple]) -> Optional[Tuple]:
+        """
+        Interactive filtering workflow selection for deletion.
+        Uses similar pattern to existing _select_workflow_for_deletion but adapted for filtering workflows.
+        
+        Args:
+            workflows (List[Tuple]): List of workflow tuples from database
+            
+        Returns:
+            Optional[Tuple]: Selected workflow tuple or None if cancelled
+        """
+        try:
+            print(f"\n🗑️  SELECT FILTERING WORKFLOW FOR DELETION")
+            print("=" * 70)
+            print(f"📋 Available Filtering Workflows ({len(workflows)} total):")
+            print("-" * 70)
+            print(f"{'#':<3} {'Name':<25} {'Created':<12} {'Filters':<8} {'Instances':<10}")
+            print("-" * 70)
+            
+            workflow_map = {}
+            for i, (wf_id, name, date, desc, filters_dict_str, filter_count, total_instances) in enumerate(workflows, 1):
+                date_short = date[:10] if date else "Unknown"
+                name_display = name[:24] if len(name) <= 24 else name[:21] + "..."
+                
+                # Try to get actual filter count from JSON
+                try:
+                    filters_dict = json.loads(filters_dict_str)
+                    actual_filter_count = len(filters_dict)
+                except:
+                    actual_filter_count = filter_count or 0
+                
+                print(f"{i:<3} {name_display:<25} {date_short:<12} {actual_filter_count:<8} {total_instances or 0:<10}")
+                workflow_map[str(i)] = workflows[i-1]
+            
+            print("-" * 70)
+            print("Commands: Enter workflow number, 'cancel' to abort, 'list' for details")
+            
+            while True:
+                selection = input("\n🔍 Select filtering workflow to delete: ").strip().lower()
+                
+                if selection in ['cancel', 'abort', 'exit', 'quit']:
+                    print("❌ Filtering workflow deletion cancelled by user")
+                    return None
+                elif selection == 'list':
+                    # Reuse existing detailed workflow display method
+                    self._show_detailed_filtering_workflow_list(workflows)
+                    continue
+                elif selection in workflow_map:
+                    return workflow_map[selection]
+                else:
+                    try:
+                        selection_int = int(selection)
+                        if 1 <= selection_int <= len(workflows):
+                            return workflows[selection_int - 1]
+                        else:
+                            print(f"❌ Invalid selection. Please enter 1-{len(workflows)}")
+                    except ValueError:
+                        print("❌ Invalid input. Please enter a number, 'list', or 'cancel'")
+            
+        except KeyboardInterrupt:
+            print("\n❌ Selection cancelled by user")
+            return None
+        except Exception as e:
+            print(f"❌ Error in filtering workflow selection: {e}")
+            return None
+
+    def _find_filtering_workflow_by_identifier(self, workflows: List[Tuple], identifier: str) -> Optional[Tuple]:
+        """
+        Find filtering workflow by name or ID. 
+        Reuses the same logic as existing _find_workflow_by_identifier but adapted for filtering workflows.
+        
+        Args:
+            workflows (List[Tuple]): List of workflow tuples
+            identifier (str): Workflow name or ID to search for
+            
+        Returns:
+            Optional[Tuple]: Matching workflow tuple or None if not found
+        """
+        try:
+            # Try to find by ID first
+            try:
+                search_id = int(identifier)
+                for workflow in workflows:
+                    if workflow[0] == search_id:  # workflow[0] is the ID
+                        return workflow
+            except ValueError:
+                pass  # Not a number, continue to name search
+            
+            # Search by name (case-insensitive)
+            identifier_lower = identifier.lower()
+            for workflow in workflows:
+                workflow_name = workflow[1].lower()  # workflow[1] is the name
+                if workflow_name == identifier_lower:
+                    return workflow
+            
+            # Partial name match if exact match not found
+            for workflow in workflows:
+                workflow_name = workflow[1].lower()
+                if identifier_lower in workflow_name:
+                    return workflow
+            
+            return None
+            
+        except Exception as e:
+            print(f"❌ Error searching for filtering workflow: {e}")
+            return None
+
+    def _show_detailed_filtering_workflow_list(self, workflows: List[Tuple]) -> None:
+        """
+        Show detailed information about available filtering workflows.
+        Adapted from existing _show_detailed_workflow_list method.
+        
+        Args:
+            workflows (List[Tuple]): List of workflow tuples
+        """
+        try:
+            print(f"\n📋 DETAILED FILTERING WORKFLOW INFORMATION")
+            print("=" * 90)
+            
+            for i, (wf_id, name, date, desc, filters_dict_str, filter_count, total_instances) in enumerate(workflows, 1):
+                try:
+                    filters_dict = json.loads(filters_dict_str)
+                    actual_filter_count = len(filters_dict)
+                    
+                    # Get filter names for preview
+                    filter_names = list(filters_dict.keys())
+                    filters_preview = ', '.join(filter_names[:3])
+                    if len(filter_names) > 3:
+                        filters_preview += f" and {len(filter_names) - 3} more..."
+                except json.JSONDecodeError:
+                    actual_filter_count = filter_count or 0
+                    filters_preview = "Error parsing filters"
+                
+                print(f"\n{i}. {name} (ID: {wf_id})")
+                print(f"   📅 Created: {date}")
+                print(f"   🔍 Filters: {actual_filter_count}")
+                print(f"   🔢 Total instances: {total_instances or 0}")
+                print(f"   📄 Description: {desc or 'No description'}")
+                print(f"   🔍 Filter names: {filters_preview}")
+            
+            print("=" * 90)
+            
+        except Exception as e:
+            print(f"❌ Error showing detailed filtering workflow list: {e}")
+
+    def _show_available_filtering_workflows(self) -> None:
+        """
+        Display available filtering workflows with their IDs.
+        Reuses the pattern from existing _show_available_reaction_workflows.
+        """
+        try:
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+            SELECT id, workflow_name, creation_date, description, filter_count, total_instances
+            FROM filtering_workflows 
+            ORDER BY creation_date DESC
+            """)
+            
+            workflows = cursor.fetchall()
+            conn.close()
+            
+            if workflows:
+                print("\n📋 Available Filtering Workflows:")
+                print("-" * 80)
+                print(f"{'ID':<4} {'Name':<25} {'Created':<12} {'Filters':<8} {'Instances':<10} {'Description':<25}")
+                print("-" * 80)
+                
+                for wf_id, name, date, desc, filter_count, total_instances in workflows:
+                    date_short = date[:10] if date else "Unknown"
+                    desc_short = (desc or "No description")[:22] + "..." if len(str(desc or "")) > 25 else (desc or "No description")
+                    print(f"{wf_id:<4} {name[:24]:<25} {date_short:<12} {filter_count or 0:<8} {total_instances or 0:<10} {desc_short:<25}")
+                
+                print("-" * 80)
+            else:
+                print("📝 No filtering workflows found.")
+                
+        except Exception as e:
+            print(f"❌ Error showing available filtering workflows: {e}")
+
+    def _count_remaining_filtering_workflows(self) -> int:
+        """
+        Count remaining filtering workflows after deletion.
+        Reuses the pattern from existing _count_remaining_workflows.
+        
+        Returns:
+            int: Number of remaining workflows
+        """
+        try:
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT COUNT(*) FROM filtering_workflows")
+            count = cursor.fetchone()[0]
+            
+            conn.close()
+            return count
+            
+        except Exception:
+            return 0
+
+    def delete_multiple_filtering_workflows(self, workflow_identifiers: List[str]) -> Dict[str, bool]:
+        """
+        Delete multiple filtering workflows in batch.
+        Reuses the exact pattern from existing delete_multiple_reaction_workflows.
+        
+        Args:
+            workflow_identifiers (List[str]): List of workflow names or IDs to delete
+            
+        Returns:
+            Dict[str, bool]: Dictionary mapping workflow identifiers to deletion success status
+        """
+        try:
+            print(f"🗑️  BATCH FILTERING WORKFLOW DELETION")
+            print("=" * 60)
+            print(f"📋 Workflows to delete: {len(workflow_identifiers)}")
+            
+            results = {}
+            successful_deletions = 0
+            failed_deletions = 0
+            
+            for identifier in workflow_identifiers:
+                print(f"\n🔍 Processing filtering workflow: '{identifier}'")
+                success = self.delete_filtering_workflow(identifier)
+                results[identifier] = success
+                
+                if success:
+                    successful_deletions += 1
+                else:
+                    failed_deletions += 1
+            
+            # Summary
+            print(f"\n📊 BATCH DELETION SUMMARY")
+            print("=" * 40)
+            print(f"✅ Successful deletions: {successful_deletions}")
+            print(f"❌ Failed deletions: {failed_deletions}")
+            print(f"📋 Total processed: {len(workflow_identifiers)}")
+            
+            return results
+            
+        except Exception as e:
+            print(f"❌ Error in batch filtering workflow deletion: {e}")
+            return {identifier: False for identifier in workflow_identifiers}
+
+    def clear_all_filtering_workflows(self, confirm_with_count: bool = True) -> bool:
+        """
+        Delete all filtering workflows from the database.
+        Reuses the exact pattern from existing clear_all_reaction_workflows.
+        
+        Args:
+            confirm_with_count (bool): Require user to enter the exact count for confirmation
+            
+        Returns:
+            bool: True if all workflows were cleared successfully
+        """
+        try:
+            # Check if table exists and get workflow count
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='filtering_workflows'")
+            if not cursor.fetchone():
+                print("📝 No filtering workflows table found")
+                conn.close()
+                return True
+            
+            cursor.execute("SELECT COUNT(*) FROM filtering_workflows")
+            workflow_count = cursor.fetchone()[0]
+            
+            if workflow_count == 0:
+                print("📝 No filtering workflows found to clear")
+                conn.close()
+                return True
+            
+            # Show warning and get confirmation
+            print(f"⚠️  CLEAR ALL FILTERING WORKFLOWS")
+            print("=" * 60)
+            print(f"🚨 WARNING: This will permanently delete ALL {workflow_count} filtering workflows!")
+            print(f"🚨 This action cannot be undone!")
+            print("=" * 60)
+            
+            # First confirmation
+            confirm1 = input(f"❓ Are you sure you want to delete all {workflow_count} filtering workflows? (yes/no): ").strip().lower()
+            if confirm1 not in ['yes', 'y']:
+                print("❌ Operation cancelled")
+                conn.close()
+                return False
+            
+            # Second confirmation with count
+            if confirm_with_count:
+                confirm2 = input(f"❓ Type the number {workflow_count} to confirm deletion of all filtering workflows: ").strip()
+                if confirm2 != str(workflow_count):
+                    print("❌ Count doesn't match. Operation cancelled for safety.")
+                    conn.close()
+                    return False
+            
+            # Third confirmation
+            confirm3 = input("❓ Type 'DELETE ALL FILTERING WORKFLOWS' in capitals to proceed: ").strip()
+            if confirm3 != 'DELETE ALL FILTERING WORKFLOWS':
+                print("❌ Confirmation phrase doesn't match. Operation cancelled.")
+                conn.close()
+                return False
+            
+            # Perform deletion
+            print(f"🗑️  Clearing all filtering workflows...")
+            cursor.execute("DELETE FROM filtering_workflows")
+            deleted_count = cursor.rowcount
+            
+            conn.commit()
+            conn.close()
+            
+            print(f"✅ Successfully cleared all filtering workflows!")
+            print(f"   🗑️  Workflows deleted: {deleted_count}")
+            print(f"   📊 Database is now empty of filtering workflows")
+            
+            return True
+            
+        except Exception as e:
+            print(f"❌ Error clearing all filtering workflows: {e}")
             return False
