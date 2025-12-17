@@ -29,7 +29,6 @@ sys.path.insert(0, parent_dir)
 from tidyscreen import tidyscreen
 ActivateProject = tidyscreen.ActivateProject
 
-
 ## Module level helper functions for multiprocessing workers
 
 def _process_chunk_worker(chunk_df: pd.DataFrame, smiles_column: str, 
@@ -11212,8 +11211,6 @@ class ChemSpace:
         
         return sanitized.lower()
 
-### Created using AI
-
     def enumerate_stereoisomers(self, table_name: Optional[str] = None,
                             max_stereoisomers: int = 20,
                             save_results: bool = True,
@@ -12327,3 +12324,989 @@ class ChemSpace:
             except KeyboardInterrupt:
                 print("\n❌ Table selection cancelled")
                 return None
+
+    def generate_mols_in_table(self, max_molecules: Optional[int] = None,
+                            generate_conformers: bool = True,
+                            conformer_count: int = 10,
+                            conf_percentile: float = 0.25) -> Optional[List[Dict[str, Any]]]:
+        """
+        Generate RDKit molecule objects from SMILES in a selected table.
+        Uses existing helper methods for table selection and follows established patterns.
+        
+        Args:
+            max_molecules (Optional[int]): Maximum number of molecules to process. If None, prompts user.
+            generate_conformers (bool): Whether to generate 3D conformers for molecules
+            conformer_count (int): Number of conformers to generate per molecule
+            
+        Returns:
+            Optional[List[Dict]]: List of molecule dictionaries with RDKit objects and metadata
+        """
+        try:
+            print(f"🧬 GENERATE MOLECULE OBJECTS FROM TABLE")
+            print("=" * 60)
+            
+            # Use existing interactive table selection method
+            selected_table = self._select_table_interactive(
+                prompt_title="SELECT TABLE FOR MOLECULE GENERATION",
+                show_compound_count=True
+            )
+            
+            if not selected_table:
+                print("❌ No table selected for molecule generation")
+                return None
+            
+            # Get table data using existing method
+            compounds_df = self._get_table_as_dataframe(selected_table)
+            if compounds_df.empty:
+                print(f"❌ No compounds found in table '{selected_table}'")
+                return None
+            
+            # Validate SMILES column exists (reuse existing validation pattern)
+            if 'smiles' not in compounds_df.columns:
+                print("❌ No 'smiles' column found in the selected table")
+                print(f"   Available columns: {list(compounds_df.columns)}")
+                return None
+            
+            total_available = len(compounds_df)
+            print(f"\n📊 Table Analysis:")
+            print(f"   📋 Selected table: '{selected_table}'")
+            print(f"   🧪 Available compounds: {total_available:,}")
+            
+            # Interactive molecule count selection if not provided
+            if max_molecules is None:
+                max_molecules = self._prompt_for_processing_count(total_available, "molecules to process")
+                if max_molecules is None:
+                    print("❌ Molecule generation cancelled by user")
+                    return None
+            
+            # Handle special case: -1 means all molecules
+            if max_molecules == -1:
+                max_molecules = total_available
+                print(f"🧪 Processing all {total_available:,} molecules in the table")
+            elif max_molecules > 0:
+                compounds_df = compounds_df.head(max_molecules)
+                print(f"🔍 Limited to first {min(max_molecules, total_available):,} molecules")
+            
+            processing_count = len(compounds_df)
+            print(f"🧬 Generating molecule objects for {processing_count:,} compounds...")
+            
+            # Show processing configuration
+            print(f"\n⚙️  Processing Configuration:")
+            print(f"   🧪 Generate conformers: {'Yes' if generate_conformers else 'No'}")
+            if generate_conformers:
+                print(f"   🔄 Conformers per molecule: {conformer_count}")
+            
+            # Check RDKit availability (reuse existing pattern)
+            try:
+                from rdkit import Chem
+                from rdkit.Chem import AllChem, Descriptors, rdMolDescriptors
+                from rdkit import RDLogger
+                RDLogger.DisableLog('rdApp.*')  # Suppress RDKit warnings
+            except ImportError:
+                print("❌ RDKit not installed. Please install RDKit:")
+                print("   conda install -c conda-forge rdkit")
+                return None
+            
+            # Process molecules with progress tracking
+            print(f"\n🔬 Processing molecules...")
+            generated_molecules = []
+            processing_stats = {
+                'processed': 0,
+                'successful': 0,
+                'invalid_smiles': 0,
+                'conformer_failures': 0,
+                'property_calculations': 0
+            }
+            
+            # Use existing progress bar pattern
+            if TQDM_AVAILABLE:
+                progress_bar = tqdm(
+                    compounds_df.iterrows(),
+                    total=len(compounds_df),
+                    desc="Generating molecules",
+                    unit="compounds"
+                )
+            else:
+                progress_bar = compounds_df.iterrows()
+                processed_count = 0
+            
+            self._check_sdf_blob_column(selected_table)
+            
+            for _, compound in progress_bar:
+                processing_stats['processed'] += 1
+                
+                try:
+                    smiles = compound['smiles']
+                    compound_name = compound.get('name', f'compound_{compound.get("id", processing_stats["processed"])}')
+                    compound_id = compound.get('id', processing_stats['processed'])
+                    
+                    # Generate RDKit molecule object
+                    mol = Chem.MolFromSmiles(smiles)
+                    if mol is None:
+                        processing_stats['invalid_smiles'] += 1
+                        continue
+                    
+                    # Add hydrogens for 3D conformer generation
+                    mol_hs = Chem.AddHs(mol) if generate_conformers else mol
+                    
+                    # Calculate molecular properties (reuse existing patterns)
+                    mol_properties = self._calculate_molecular_properties(mol, smiles)
+                    processing_stats['property_calculations'] += 1
+                    
+                    # Generate conformers if requested
+                    conformers_data = []
+                    conformer_success = True
+                    
+                    # Create molecule data dictionary
+                    molecule_data = {
+                        'compound_id': compound_id,
+                        'compound_name': compound_name,
+                        'smiles': smiles,
+                        'rdkit_mol':mol,
+                        'source_table': selected_table,
+                        'original_flag': compound.get('flag', 'nd'),
+                        'inchi_key': compound.get('inchi_key', None)
+                    }
+                    
+                    if generate_conformers:
+                        try:
+
+                            mol, molecule_datamol = self._generate_molecule_conformer(
+                                mol_hs, conformer_count, compound_name, conf_percentile
+                            )
+                        
+                            self._store_mol(mol, molecule_data)
+                        
+                        except Exception as e:
+                            conformer_success = False
+                            processing_stats['conformer_failures'] += 1
+                    
+                    generated_molecules.append(molecule_data)
+                    processing_stats['successful'] += 1
+                    
+                except Exception as e:
+                    # Log error but continue processing
+                    continue
+                
+                # Progress update for non-tqdm case (reuse existing pattern)
+                if not TQDM_AVAILABLE:
+                    processed_count += 1
+                    if processed_count % max(1, len(compounds_df) // 10) == 0:
+                        print(f"   📊 Processed {processed_count}/{len(compounds_df)} compounds...")
+            
+            if TQDM_AVAILABLE and hasattr(progress_bar, 'close'):
+                progress_bar.close()
+            
+            # Display processing results
+            print(f"\n✅ Molecule generation completed!")
+            print(f"   📊 Processing Statistics:")
+            print(f"      • Total processed: {processing_stats['processed']:,}")
+            print(f"      • Successful generations: {processing_stats['successful']:,}")
+            print(f"      • Invalid SMILES: {processing_stats['invalid_smiles']:,}")
+            print(f"      • Property calculations: {processing_stats['property_calculations']:,}")
+            
+            if generate_conformers:
+                print(f"      • Conformer failures: {processing_stats['conformer_failures']:,}")
+                successful_conformers = processing_stats['successful'] - processing_stats['conformer_failures']
+                print(f"      • Successful conformer generations: {successful_conformers:,}")
+            
+            if processing_stats['successful'] > 0:
+                success_rate = (processing_stats['successful'] / processing_stats['processed']) * 100
+                print(f"   📈 Success rate: {success_rate:.1f}%")
+            
+            return generated_molecules if generated_molecules else None
+            
+        except Exception as e:
+            print(f"❌ Error in generate_mols_in_table: {e}")
+            return None
+
+    def _prompt_for_processing_count(self, total_available: int, item_type: str = "items") -> Optional[int]:
+        """
+        Interactive prompt for the number of items to process.
+        Reuses existing prompt patterns for consistency.
+        
+        Args:
+            total_available (int): Total number of items available
+            item_type (str): Description of items being processed
+            
+        Returns:
+            Optional[int]: Number of items to process, or None if cancelled
+        """
+        try:
+            print(f"\n📊 {item_type.upper()} COUNT SELECTION")
+            print("=" * 50)
+            print(f"📋 Total {item_type} available: {total_available:,}")
+            print("\nOptions:")
+            print(f"   • Enter a number (1-{total_available:,}) to limit {item_type}")
+            print(f"   • Enter -1 to process ALL {item_type}")
+            print(f"   • Enter 0 or 'cancel' to abort")
+            
+            # Suggest reasonable defaults based on size (reuse existing logic)
+            if total_available <= 50:
+                suggested = total_available
+                print(f"\n💡 Suggestion: {suggested} (all {item_type})")
+            elif total_available <= 200:
+                suggested = 100
+                print(f"\n💡 Suggestion: {suggested} (good sample size)")
+            elif total_available <= 1000:
+                suggested = 250
+                print(f"\n💡 Suggestion: {suggested} (manageable sample)")
+            else:
+                suggested = 500
+                print(f"\n💡 Suggestion: {suggested} (representative sample)")
+            
+            print("=" * 50)
+            
+            while True:
+                try:
+                    user_input = input(f"🔢 Number of {item_type} to process (default: {suggested}): ").strip()
+                    
+                    # Handle empty input (use default)
+                    if not user_input:
+                        print(f"✅ Using default: {suggested} {item_type}")
+                        return suggested
+                    
+                    # Handle cancel (reuse existing pattern)
+                    if user_input.lower() in ['cancel', 'quit', 'exit', 'abort']:
+                        print(f"❌ {item_type} processing cancelled")
+                        return None
+                    
+                    # Handle numeric input (reuse existing logic)
+                    try:
+                        count = int(user_input)
+                        
+                        if count == 0:
+                            print(f"❌ Processing cancelled (0 {item_type} selected)")
+                            return None
+                        elif count == -1:
+                            print(f"✅ Processing ALL {total_available:,} {item_type}")
+                            return -1
+                        elif 1 <= count <= total_available:
+                            print(f"✅ Processing {count:,} {item_type}")
+                            return count
+                        else:
+                            print(f"❌ Invalid count. Please enter 1-{total_available:,}, -1 for all, or 0 to cancel")
+                            continue
+                            
+                    except ValueError:
+                        print("❌ Please enter a valid number")
+                        continue
+                        
+                except KeyboardInterrupt:
+                    print(f"\n❌ {item_type} count selection cancelled")
+                    return None
+                    
+        except Exception as e:
+            print(f"❌ Error prompting for {item_type} count: {e}")
+            return None
+
+    def _calculate_molecular_properties(self, mol, smiles: str) -> Dict[str, float]:
+        """
+        Calculate molecular properties using RDKit.
+        Reuses existing property calculation patterns.
+        
+        Args:
+            mol: RDKit molecule object
+            smiles (str): SMILES string
+            
+        Returns:
+            Dict[str, float]: Dictionary of calculated molecular properties
+        """
+        try:
+            from rdkit.Chem import Descriptors, rdMolDescriptors
+            
+            properties = {
+                'molecular_weight': Descriptors.MolWt(mol),
+                'logp': Descriptors.MolLogP(mol),
+                'tpsa': Descriptors.TPSA(mol),
+                'num_rotatable_bonds': Descriptors.NumRotatableBonds(mol),
+                'num_hbd': Descriptors.NumHDonors(mol),
+                'num_hba': Descriptors.NumHAcceptors(mol),
+                'num_rings': Descriptors.RingCount(mol),
+                'num_aromatic_rings': Descriptors.NumAromaticRings(mol),
+                'num_heavy_atoms': Descriptors.HeavyAtomCount(mol),
+                'formal_charge': Descriptors.FormalCharge(mol)
+            }
+            
+            # Calculate additional descriptors
+            try:
+                properties['bertz_complexity'] = rdMolDescriptors.BertzCT(mol)
+            except:
+                properties['bertz_complexity'] = 0.0
+            
+            try:
+                properties['balaban_j'] = rdMolDescriptors.BalabanJ(mol)
+            except:
+                properties['balaban_j'] = 0.0
+            
+            return properties
+            
+        except Exception as e:
+            # Return basic properties if calculation fails
+            return {
+                'molecular_weight': 0.0,
+                'logp': 0.0,
+                'tpsa': 0.0,
+                'num_rotatable_bonds': 0,
+                'num_hbd': 0,
+                'num_hba': 0,
+                'num_rings': 0,
+                'num_aromatic_rings': 0,
+                'num_heavy_atoms': 0,
+                'formal_charge': 0,
+                'bertz_complexity': 0.0,
+                'balaban_j': 0.0
+            }
+
+    def _generate_molecule_conformer(self, mol_hs, conformer_count: int, 
+                                    compound_name: str, conf_percentile) -> List[Dict[str, Any]]:
+        """
+        Generate 3D conformers for a molecule.
+        Reuses existing conformer generation patterns from _generate_conformers.
+        
+        Args:
+            mol_with_hs: RDKit molecule object with hydrogens
+            conformer_count (int): Number of conformers to generate
+            compound_name (str): Name of the compound
+            
+        Returns:
+            List[Dict]: List of conformer data dictionaries
+        """
+        try:
+            from rdkit.Chem import AllChem
+            
+            # Use existing conformer generation method
+            mol_hs, confs, ps = self._generate_conformers(
+                mol_hs, nbr_confs=conformer_count, mmff='MMFF94s'
+            )
+
+            if not confs:
+                return []
+            
+            # Create conformer data
+            conformers_data = []
+            for i, conf_id in enumerate(confs):
+                try:
+                    # Get conformer energy if MMFF properties (ps) available
+                    energy = None
+                    if ps is not None:
+                        try:
+                            # Use the molecule with hydrogens returned by _generate_conformers (mol_hs)
+                            ff = AllChem.MMFFGetMoleculeForceField(mol_hs, ps, confId=int(conf_id))
+                            if ff is not None:
+                                energy = float(ff.CalcEnergy())
+                        except Exception:
+                            energy = None
+                    
+                    conformer_info = {
+                        'conformer_id': conf_id,
+                        'conformer_index': i,
+                        'energy': energy,
+                        'molecule_object': mol_hs,  # Reference to the molecule with this conformer
+                        'generation_successful': True
+                    }
+                    
+                    conformers_data.append(conformer_info)
+                    
+                except Exception as e:
+                    # Add failed conformer entry
+                    conformers_data.append({
+                        'conformer_id': conf_id,
+                        'conformer_index': i,
+                        'energy': None,
+                        'molecule_object': None,
+                        'generation_successful': False,
+                        'error': str(e)
+                    })
+            
+            # Determine lowest-energy conformer object (may be None or a mol object)
+            target_conformer = self._sort_conf_by_energy(conformers_data, mol_hs, ps, conf_percentile)
+            
+            target_conformer_renumbered = self._renumber_mol_object(target_conformer)
+
+            # Also return the associated data dict for the lowest-energy conformer.
+            # _sort_conf_by_energy marks the record with 'is_lowest_energy' when possible
+            molecule_data = None
+            if conformers_data:
+                molecule_data = next((r for r in conformers_data if r.get('is_lowest_energy')), conformers_data[0])
+            
+            return target_conformer_renumbered, molecule_data
+            
+        except Exception as e:
+            return []
+
+    def _generate_conformers(self, mol_hs, nbr_confs, mmff):
+        """
+        Generate 3D conformers for a SMILES string with robust handling and faster defaults.
+
+        Returns:
+            (mol_hs, conf_ids, ps)
+            - mol_hs: RDKit Mol with hydrogens (or None on failure)
+            - conf_ids: list of conformer ids (could be empty)
+            - ps: MMFF property object (or None)
+        """
+        
+        try:
+            from rdkit import Chem
+            from rdkit.Chem import AllChem
+            import multiprocessing
+
+            
+            # Prefer ETKDGv3 when available, fallback to ETKDG
+            try:
+                params = AllChem.ETKDGv3()
+            except Exception:
+                try:
+                    params = AllChem.ETKDG()
+                except Exception:
+                    params = None
+
+            # Configure embedding parameters if present
+            nbr_confs = 50
+            prune_rms = 0.25
+            max_attempts = 1000
+            threads = max(1, (multiprocessing.cpu_count() or 1) - 1)
+
+            if params is not None:
+                # defensive attribute setting (different RDKit versions expose different names)
+                if hasattr(params, "pruneRmsThresh"):
+                    params.pruneRmsThresh = float(prune_rms)
+                if hasattr(params, "useRandomCoords"):
+                    params.useRandomCoords = False  # deterministic & typically faster
+                if hasattr(params, "numThreads"):
+                    try:
+                        params.numThreads = int(threads)
+                    except Exception:
+                        pass
+                if hasattr(params, "maxAttempts"):
+                    try:
+                        params.maxAttempts = int(max_attempts)
+                    except Exception:
+                        pass
+                # encourage better small-ring geometry handling when available
+                if hasattr(params, "useSmallRingTorsions"):
+                    try:
+                        params.useSmallRingTorsions = True
+                    except Exception:
+                        pass
+
+            # Embed multiple conformers (defensive calling to support different RDKit signatures)
+            try:
+                if params is not None:
+                    conf_ids = list(AllChem.EmbedMultipleConfs(mol_hs, numConfs=nbr_confs, params=params))
+                else:
+                    conf_ids = list(AllChem.EmbedMultipleConfs(mol_hs, nbr_confs))
+            except TypeError:
+                # older signature
+                try:
+                    conf_ids = list(AllChem.EmbedMultipleConfs(mol_hs, nbr_confs, params))
+                except Exception:
+                    conf_ids = []
+            except Exception:
+                conf_ids = []
+
+            if not conf_ids:
+                return mol_hs, [], None
+
+            # Prepare MMFF properties
+            try:
+                ps = AllChem.MMFFGetMoleculeProperties(mol_hs, mmffVariant='MMFF94s')
+            except Exception:
+                try:
+                    ps = AllChem.MMFFGetMoleculeProperties(mol_hs)
+                except Exception:
+                    ps = None
+
+            # Try bulk optimization; fall back to per-conformer optimize if signature differs
+            try:
+                # modern RDKit: MMFFOptimizeMoleculeConfs returns list of (confId, status)
+                try:
+                    AllChem.MMFFOptimizeMoleculeConfs(mol_hs, confIds=conf_ids, maxIters=100, mmffVariant='MMFF94s')
+                except TypeError:
+                    # older signature without keyword args
+                    AllChem.MMFFOptimizeMoleculeConfs(mol_hs, conf_ids, 100)
+            except Exception:
+                # best-effort per-conformer optimization
+                for cid in conf_ids:
+                    try:
+                        ff = AllChem.MMFFGetMoleculeForceField(mol_hs, ps, confId=int(cid))
+                        if ff is not None:
+                            ff.Minimize(maxIts=100)
+                    except Exception:
+                        continue
+
+            return mol_hs, conf_ids, ps
+
+        except Exception as error:
+            
+            print(f"Exiting conformer generation with failure... Error: {error}")
+            
+            return None, [], None
+
+    def _sort_conf_by_energy(self, conformers_data, mol_hs, ps, conf_percentile):
+        """
+        Compute/collect energies for conformers_data, mark the lowest-energy conformer
+        with 'is_lowest_energy' = True and return that conformer dict.
+        The conformers_data list is sorted in-place by energy (lowest first, None last).
+        Returns:
+            dict or None: lowest energy conformer dict or None if none available
+        """
+        try:
+            # Defensive defaults
+            if not conformers_data:
+                return None
+
+            # Try to compute energies if missing, using RDKit MMFF if available
+            try:
+                rdkit_available = True
+            except Exception:
+                rdkit_available = False
+
+            for rec in conformers_data:
+                # Ensure conformer_id present
+                cid = rec.get('conformer_id')
+                # Normalize existing energy values to float or None
+                energy = rec.get('energy', None)
+                if energy is not None:
+                    try:
+                        rec['energy'] = float(energy)
+                    except Exception:
+                        rec['energy'] = None
+                    continue
+
+            # Collect records with valid energy
+            valid_records = [r for r in conformers_data if r.get('energy') is not None]
+
+            if valid_records:
+                # Find minimum energy
+                min_energy = min(r['energy'] for r in valid_records)
+                # Mark lowest; if multiple equal energies, first one kept as lowest
+                lowest = None
+                for r in conformers_data:
+                    is_low = (r.get('energy') is not None and abs(r['energy'] - min_energy) <= 1e-9)
+                    r['is_lowest_energy'] = bool(is_low)
+                    if is_low and lowest is None:
+                        lowest = r
+
+                # Sort conformers_data in-place: lowest energies first, None energies last
+                conformers_data.sort(key=lambda r: (r.get('energy') is None, r.get('energy') if r.get('energy') is not None else float('inf')))
+
+                # If all valid energies equal, fallback to lowest-energy behavior
+                if not valid_records:
+                    return None
+
+                min_energy = min(r['energy'] for r in valid_records)
+                max_energy = max(r['energy'] for r in valid_records)
+
+                # Determine target energy along the range [min_energy, max_energy]
+                if max_energy == min_energy:
+                    target_energy = min_energy
+                else:
+                    target_energy = min_energy + conf_percentile * (max_energy - min_energy)
+
+                # Find record whose energy is closest to the target_energy
+                selected = min(valid_records, key=lambda r: abs((r.get('energy') or 0.0) - target_energy))
+
+                # Mark selection flags for clarity
+                for r in conformers_data:
+                    r['is_selected_percentile'] = (r is selected)
+                    # keep existing is_lowest_energy marking
+                    if r.get('energy') is None:
+                        r['is_lowest_energy'] = False
+
+                # Return the molecule object for the selected conformer, fallback to lowest if neededprint(mol)
+                # fallback to lowest-energy conformer object if selected has no molecule_object
+                return lowest.get('molecule_object') if lowest else None
+
+            else:
+                # No energies available: annotate all as not lowest, pick first as fallback
+                for i, r in enumerate(conformers_data):
+                    r['energy'] = None
+                    r['is_lowest_energy'] = (i == 0)
+                return conformers_data[0] if conformers_data else None
+
+        except Exception:
+            # On any unexpected error, fail gracefully
+            try:
+                for i, r in enumerate(conformers_data or []):
+                    r.setdefault('energy', None)
+                    r['is_lowest_energy'] = (i == 0)
+                return (conformers_data[0] if conformers_data else None)
+            except Exception:
+                return None
+    
+    def _renumber_mol_object(self, mol):
+        """
+        Efficiently annotate atoms in an RDKit Mol with human-readable labels.
+
+        For each atom sets:
+          - _Name (string) -> e.g. "C1", "O2"
+          - atomLabel (string) -> same as _Name
+          - atom map number (integer) -> idx+1 (uses SetAtomMapNum when available)
+
+        Returns the same mol object (modified in place). Safe if mol is None.
+        """
+        
+        if mol is None:
+            return None
+
+        # Localize method lookups for small speed gain
+        get_atoms = mol.GetAtoms
+
+        for atom in get_atoms():
+            # Use GetIdx once, GetSymbol once
+            idx = atom.GetIdx()
+            symbol = atom.GetSymbol() or ""
+            label = f"{symbol}{idx + 1}"
+
+            # Prefer integer atom map for fast numeric access; ignore errors if not supported
+            try:
+                atom.SetAtomMapNum(idx + 1)
+            except Exception:
+                # Some RDKit contexts may not allow or need atom map numbers — ignore safely
+                pass
+
+            # Set textual properties; use try/except to avoid unexpected failures
+            try:
+                atom.SetProp("_Name", label)
+            except Exception:
+                pass
+
+            try:
+                atom.SetProp("atomLabel", label)
+            except Exception:
+                pass
+
+        return mol
+
+    def _check_sdf_blob_column(self, source_table) -> bool:
+        """
+        Checks for existing sdf_blob column and prompts user for deletion if needed.
+        
+        """
+
+        try:
+            if not source_table:
+                print("❌ Error: No 'source_table' specified in molecule_data")
+                return
+            
+            # Check if table exists
+            available_tables = self.get_all_tables()
+            if source_table not in available_tables:
+                print(f"❌ Error: Table '{source_table}' does not exist in chemspace database")
+                return
+            
+            # Check if sdf_blob column exists
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            
+            cursor.execute(f"PRAGMA table_info({source_table})")
+            columns = [row[1] for row in cursor.fetchall()]
+            
+            sdf_blob_exists = 'sdf_blob' in columns
+            conn.close()
+            
+            if sdf_blob_exists:
+                print(f"⚠️  Column 'sdf_blob' already exists in table '{source_table}'")
+                
+                # Count existing blobs
+                conn = sqlite3.connect(self.__chemspace_db)
+                cursor = conn.cursor()
+                cursor.execute(f"SELECT COUNT(*) FROM {source_table} WHERE sdf_blob IS NOT NULL")
+                existing_blobs = cursor.fetchone()[0]
+                conn.close()
+                
+                if existing_blobs > 0:
+                    print(f"   📊 Found {existing_blobs} existing SDF blob(s) in the table")
+                    
+                    while True:
+                        user_choice = input(f"❓ Do you want to delete the existing 'sdf_blob' column? (y/n): ").strip().lower()
+                        
+                        if user_choice in ['y', 'yes']:
+                            print(f"🗑️  Removing 'sdf_blob' column from table '{source_table}'...")
+                            success = self._remove_sdf_blob_column(source_table)
+                            if success:
+                                print(f"   ✅ Successfully removed 'sdf_blob' column")
+                                break
+                            else:
+                                print(f"   ❌ Failed to remove 'sdf_blob' column")
+                                return
+                        elif user_choice in ['n', 'no']:
+                            print(f"   ⚠️  Keeping existing 'sdf_blob' column - new blobs will be added/updated")
+                            break
+                        else:
+                            print("❗ Please answer 'y'/'yes' or 'n'/'no'")
+                else:
+                    print(f"   ℹ️  Column exists but contains no data - proceeding with molecule storage")
+                    
+        except Exception as e:
+            print(f"❌ Error checking sdf_blob column: {e}")
+
+    def _store_mol(self, mol, molecule_data):
+        """
+        Store an RDKit molecule as an SDF blob in the database.
+        
+        
+        Args:
+            mol: RDKit molecule object
+            molecule_data: Dictionary containing molecule metadata
+        """
+        try:
+            # Proceed with storing the molecule
+            destination_filename = self._create_sdf_file(mol, molecule_data)
+            self._save_mol_to_table(destination_filename, molecule_data)
+            
+        except Exception as e:
+            print(f"❌ Error in _store_mol: {e}")
+
+    def _remove_sdf_blob_column(self, table_name: str) -> bool:
+        """
+        Remove the sdf_blob column from a table by recreating the table without it.
+        SQLite doesn't support DROP COLUMN directly, so we use the standard approach.
+        
+        Args:
+            table_name (str): Name of the table to modify
+            
+        Returns:
+            bool: True if column was removed successfully
+        """
+        try:
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            
+            # Get current table schema
+            cursor.execute(f"PRAGMA table_info({table_name})")
+            columns_info = cursor.fetchall()
+            
+            # Filter out the sdf_blob column
+            filtered_columns = []
+            for col_info in columns_info:
+                col_name = col_info[1]
+                col_type = col_info[2]
+                col_notnull = col_info[3]
+                col_default = col_info[4]
+                col_pk = col_info[5]
+                
+                if col_name.lower() != 'sdf_blob':
+                    # Reconstruct column definition
+                    col_def = f"{col_name} {col_type}"
+                    
+                    if col_notnull:
+                        col_def += " NOT NULL"
+                    
+                    if col_default is not None:
+                        col_def += f" DEFAULT {col_default}"
+                    
+                    if col_pk:
+                        col_def += " PRIMARY KEY"
+                    
+                    filtered_columns.append(col_def)
+            
+            if not filtered_columns:
+                print(f"❌ Error: Cannot remove sdf_blob column - no other columns found")
+                conn.close()
+                return False
+            
+            # Create new table without sdf_blob column
+            temp_table_name = f"{table_name}_temp_no_sdf"
+            
+            # Add unique constraint if it was in original table
+            unique_constraint = ""
+            cursor.execute(f"SELECT sql FROM sqlite_master WHERE type='table' AND name='{table_name}'")
+            original_sql = cursor.fetchone()
+            if original_sql and 'UNIQUE' in original_sql[0]:
+                # Try to preserve UNIQUE constraints (simplified approach)
+                if 'UNIQUE(smiles, name)' in original_sql[0] or 'UNIQUE(name, smiles)' in original_sql[0]:
+                    unique_constraint = ", UNIQUE(smiles, name)"
+            
+            create_query = f"""
+            CREATE TABLE {temp_table_name} (
+                {', '.join(filtered_columns)}{unique_constraint}
+            )
+            """
+            
+            cursor.execute(create_query)
+            
+            # Copy data from original table (excluding sdf_blob column)
+            column_names = [col.split()[0] for col in filtered_columns]  # Extract just column names
+            columns_str = ', '.join(column_names)
+            
+            cursor.execute(f"""
+            INSERT INTO {temp_table_name} ({columns_str})
+            SELECT {columns_str} FROM {table_name}
+            """)
+            
+            # Drop original table
+            cursor.execute(f"DROP TABLE {table_name}")
+            
+            # Rename temp table to original name
+            cursor.execute(f"ALTER TABLE {temp_table_name} RENAME TO {table_name}")
+            
+            # Recreate indexes (basic ones)
+            try:
+                cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_smiles ON {table_name}(smiles)")
+                cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_name ON {table_name}(name)")
+                if 'flag' in [col.split()[0].lower() for col in filtered_columns]:
+                    cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_flag ON {table_name}(flag)")
+                if 'inchi_key' in [col.split()[0].lower() for col in filtered_columns]:
+                    cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_inchi_key ON {table_name}(inchi_key)")
+            except Exception as e:
+                # Continue even if index creation fails
+                print(f"   ⚠️  Warning: Some indexes could not be recreated: {e}")
+            
+            conn.commit()
+            conn.close()
+            
+            print(f"   🔄 Table '{table_name}' recreated without 'sdf_blob' column")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Error removing sdf_blob column from table '{table_name}': {e}")
+            try:
+                conn.close()
+            except:
+                pass
+            return False
+        
+    def _create_sdf_file(self, mol, molecule_data):
+        
+        """Write single RDKit molecule to SDF file with atom names preserved"""
+        from rdkit.Chem import SDWriter
+        
+        # Ensure atom names are stored as molecule properties before writing
+        atom_names = []
+        
+        for atom in mol.GetAtoms():
+            if atom.HasProp("_Name"):
+                atom_names.append(atom.GetProp("_Name"))
+            else:
+                atom_names.append(f"{atom.GetSymbol()}{atom.GetIdx() + 1}")
+        
+        # Store atom names as a property in the molecule
+        mol.SetProp("AtomNames", "|".join(atom_names))
+        
+        # Also store individual atom names as properties
+        for i, name in enumerate(atom_names):
+            mol.SetProp(f"Atom_{i}_Name", name)
+        
+        inchi_key = str(molecule_data.get('inchi_key') or '')
+        if not inchi_key:
+            inchi_key = 'unknown_inchi'
+        
+        destination_filename = f"/tmp/{inchi_key}.sdf"
+        
+        writer = SDWriter(destination_filename)
+        writer.write(mol)
+        writer.close()
+        
+        return destination_filename
+    
+    def _save_mol_to_table(self, filename: str, molecule_data: Dict[str, Any]) -> bool:
+        """
+        Will receive a filename and molecule_data dictionary, and will store the filename as a blob object 
+        to the table whose name is in molecule_data['source_table']. The row in which the file is stored 
+        is selected matching the molecule_data['inchi_key'] with the corresponding column in the table.
+        
+        Args:
+            filename (str): Path to the SDF file to store as blob
+            molecule_data (Dict[str, Any]): Dictionary containing molecule metadata including 'source_table' and 'inchi_key'
+            
+        Returns:
+            bool: True if the file was successfully stored, False otherwise
+        """
+        try:
+            # Extract required information from molecule_data
+            source_table = molecule_data.get('source_table')
+            inchi_key = molecule_data.get('inchi_key')
+            
+            if not source_table:
+                print("❌ Error: No 'source_table' specified in molecule_data")
+                return False
+                
+            if not inchi_key:
+                print("❌ Error: No 'inchi_key' specified in molecule_data")
+                return False
+            
+            # Check if the file exists
+            if not os.path.exists(filename):
+                print(f"❌ Error: SDF file not found: {filename}")
+                return False
+            
+            # Check if the table exists
+            available_tables = self.get_all_tables()
+            if source_table not in available_tables:
+                print(f"❌ Error: Table '{source_table}' does not exist in chemspace database")
+                return False
+            
+            #print(f"💾 Storing SDF file as blob in table '{source_table}' for InChI key: {inchi_key}")
+            
+            # Read the SDF file as binary data
+            try:
+                with open(filename, 'rb') as sdf_file:
+                    sdf_blob = sdf_file.read()
+            except Exception as e:
+                print(f"❌ Error reading SDF file '{filename}': {e}")
+                return False
+            
+            # Connect to database and update the table
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            
+            # First, check if the table has a 'sdf_blob' column, add it if it doesn't exist
+            cursor.execute(f"PRAGMA table_info({source_table})")
+            columns = [row[1] for row in cursor.fetchall()]
+            
+            if 'sdf_blob' not in columns:
+                print(f"   🔧 Adding 'sdf_blob' column to table '{source_table}'")
+                try:
+                    cursor.execute(f"ALTER TABLE {source_table} ADD COLUMN sdf_blob BLOB")
+                    conn.commit()
+                except Exception as e:
+                    print(f"❌ Error adding sdf_blob column: {e}")
+                    conn.close()
+                    return False
+            
+            # Check if a row with the matching inchi_key exists
+            cursor.execute(f"SELECT COUNT(*) FROM {source_table} WHERE inchi_key = ?", (inchi_key,))
+            row_count = cursor.fetchone()[0]
+            
+            if row_count == 0:
+                print(f"⚠️  Warning: No row found with inchi_key '{inchi_key}' in table '{source_table}'")
+                conn.close()
+                return False
+            
+            if row_count > 1:
+                print(f"⚠️  Warning: Multiple rows found with inchi_key '{inchi_key}' in table '{source_table}'. Updating the first match.")
+            
+            # Update the row with the SDF blob data
+            update_query = f"UPDATE {source_table} SET sdf_blob = ? WHERE inchi_key = ?"
+            cursor.execute(update_query, (sdf_blob, inchi_key))
+            
+            # Check if the update was successful
+            updated_rows = cursor.rowcount
+            
+            conn.commit()
+            conn.close()
+            
+            if updated_rows > 0:
+                #print(f"   ✅ Successfully stored SDF blob ({len(sdf_blob)} bytes) for InChI key: {inchi_key}")
+                
+                # Clean up temporary file after successful storage
+                try:
+                    os.unlink(filename)
+                    #print(f"   🧹 Cleaned up temporary SDF file: {filename}")
+                except Exception as e:
+                    print(f"   ⚠️  Warning: Could not delete temporary file '{filename}': {e}")
+                
+                return True
+            else:
+                print(f"❌ Error: No rows were updated in table '{source_table}'")
+                return False
+                
+        except sqlite3.Error as e:
+            print(f"❌ Database error storing SDF blob: {e}")
+            return False
+        except Exception as e:
+            print(f"❌ Error storing SDF file to table: {e}")
+            return False
+        
