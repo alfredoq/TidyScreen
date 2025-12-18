@@ -63,13 +63,439 @@ class MolDock:
         data_dir = os.path.dirname(self.__chemspace_db)
         os.makedirs(data_dir, exist_ok=True)
 
+    def create_docking_method(self):
+        """
+        Will prompt the user for the following method parameters:
+        - Docking engine: options: AutoDockGPU, Autodock, Vina
+
+        The method will create a docking_methods.db under project path in the docking/docking_registers folder
+        """
+        try:
+            print(f"🧬 CREATE DOCKING METHOD")
+            print("=" * 50)
+            
+            # Ensure docking directories exist
+            docking_registers_dir = os.path.dirname(self.__docking_registers_db)
+            os.makedirs(docking_registers_dir, exist_ok=True)
+            
+            # Define available docking engines with details
+            docking_engines = {
+                '1': {
+                    'name': 'AutoDockGPU',
+                    'description': 'GPU-accelerated AutoDock for high-throughput docking',
+                    'requirements': ['GPU with CUDA support', 'AutoDockGPU installation'],
+                    'pros': ['Very fast on GPU', 'Good for large libraries', 'Well-validated'],
+                    'cons': ['Requires CUDA GPU', 'Limited flexibility']
+                },
+                '2': {
+                    'name': 'AutoDock',
+                    'description': 'Classical AutoDock CPU-based docking',
+                    'requirements': ['AutoDock installation', 'AutoDockTools'],
+                    'pros': ['Well-established', 'Highly configurable', 'No GPU required'],
+                    'cons': ['Slower than GPU versions', 'More complex setup']
+                },
+                '3': {
+                    'name': 'Vina',
+                    'description': 'AutoDock Vina - fast and accurate docking',
+                    'requirements': ['AutoDock Vina installation'],
+                    'pros': ['Fast and reliable', 'Easy to use', 'Good accuracy'],
+                    'cons': ['Less configurable', 'CPU-only']
+                }
+            }
+            
+            # Display available docking engines
+            print(f"📋 Available Docking Engines:")
+            print("-" * 70)
+            
+            for key, engine in docking_engines.items():
+                print(f"{key}. {engine['name']}")
+                print(f"   📝 {engine['description']}")
+                print(f"   ✅ Pros: {', '.join(engine['pros'])}")
+                print(f"   ⚠️  Cons: {', '.join(engine['cons'])}")
+                print(f"   📋 Requirements: {', '.join(engine['requirements'])}")
+                print("-" * 70)
+            
+            # Get user selection
+            while True:
+                try:
+                    selection = input(f"\n🧬 Select docking engine (1-3) or 'cancel': ").strip()
+                    
+                    if selection.lower() in ['cancel', 'quit', 'exit']:
+                        print("❌ Docking method creation cancelled")
+                        return None
+                    
+                    if selection in docking_engines:
+                        selected_engine = docking_engines[selection]
+                        print(f"\n✅ Selected: {selected_engine['name']}")
+                        break
+                    else:
+                        print("❌ Invalid selection. Please enter 1, 2, or 3")
+                        continue
+                        
+                except KeyboardInterrupt:
+                    print("\n❌ Docking method creation cancelled")
+                    return None
+            
+            # Get method name
+            while True:
+                try:
+                    method_name = input(f"\n📝 Enter method name (or 'cancel'): ").strip()
+                    
+                    if method_name.lower() in ['cancel', 'quit', 'exit']:
+                        print("❌ Docking method creation cancelled")
+                        return None
+                    
+                    if not method_name:
+                        print("❌ Method name cannot be empty")
+                        continue
+                    
+                    # Validate method name (no special characters)
+                    if not method_name.replace('_', '').replace('-', '').replace(' ', '').isalnum():
+                        print("❌ Method name can only contain letters, numbers, spaces, hyphens, and underscores")
+                        continue
+                    
+                    break
+                    
+                except KeyboardInterrupt:
+                    print("\n❌ Docking method creation cancelled")
+                    return None
+            
+            # Get optional description
+            description = input(f"\n📄 Enter method description (optional): ").strip()
+            if not description:
+                description = f"Docking method using {selected_engine['name']}"
+            
+            # Get additional parameters based on engine
+            additional_params = self._get_engine_specific_parameters(selected_engine['name'])
+            
+            if additional_params is None:
+                print("❌ Parameter configuration cancelled")
+                return None
+            
+            # Create or connect to docking methods database
+            methods_db_path = os.path.join(docking_registers_dir, 'docking_methods.db')
+            
+            try:
+                import sqlite3
+                conn = sqlite3.connect(methods_db_path)
+                cursor = conn.cursor()
+                
+                # Create simplified docking_methods table
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS docking_methods (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        method_name TEXT UNIQUE NOT NULL,
+                        docking_engine TEXT NOT NULL,
+                        description TEXT,
+                        parameters TEXT,
+                        created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+                
+                # Check if method name already exists
+                cursor.execute("SELECT COUNT(*) FROM docking_methods WHERE method_name = ?", (method_name,))
+                if cursor.fetchone()[0] > 0:
+                    print(f"⚠️  Method name '{method_name}' already exists")
+                    
+                    while True:
+                        overwrite = input("Overwrite existing method? (y/n): ").strip().lower()
+                        if overwrite in ['y', 'yes']:
+                            # Update existing method
+                            cursor.execute('''
+                                UPDATE docking_methods 
+                                SET docking_engine = ?, description = ?, parameters = ?, 
+                                    created_date = CURRENT_TIMESTAMP
+                                WHERE method_name = ?
+                            ''', (
+                                selected_engine['name'],
+                                description,
+                                self._serialize_parameters(additional_params),
+                                method_name
+                            ))
+                            print(f"✅ Updated existing docking method '{method_name}'")
+                            break
+                        elif overwrite in ['n', 'no']:
+                            print("❌ Method creation cancelled - name already exists")
+                            conn.close()
+                            return None
+                        else:
+                            print("❌ Please answer 'y' or 'n'")
+                            continue
+                else:
+                    # Insert new method
+                    cursor.execute('''
+                        INSERT INTO docking_methods 
+                        (method_name, docking_engine, description, parameters)
+                        VALUES (?, ?, ?, ?)
+                    ''', (
+                        method_name,
+                        selected_engine['name'],
+                        description,
+                        self._serialize_parameters(additional_params)
+                    ))
+                    print(f"✅ Created new docking method '{method_name}'")
+                
+                method_id = cursor.lastrowid or cursor.execute("SELECT id FROM docking_methods WHERE method_name = ?", (method_name,)).fetchone()[0]
+                
+                conn.commit()
+                conn.close()
+                
+                # Display method summary
+                self._display_method_summary(method_id, method_name, selected_engine, description, additional_params, methods_db_path)
+                
+                return {
+                    'method_id': method_id,
+                    'method_name': method_name,
+                    'docking_engine': selected_engine['name'],
+                    'description': description,
+                    'parameters': additional_params,
+                    'database_path': methods_db_path
+                }
+                
+            except Exception as e:
+                print(f"❌ Error creating docking methods database: {e}")
+                return None
+                
+        except Exception as e:
+            print(f"❌ Error in create_docking_method: {e}")
+            return None
+
+    def _get_engine_specific_parameters(self, engine_name: str) -> Optional[Dict[str, Any]]:
+        """
+        Get engine-specific parameters from user input.
+        
+        Args:
+            engine_name (str): Name of the selected docking engine
+            
+        Returns:
+            Optional[Dict[str, Any]]: Engine parameters or None if cancelled
+        """
+        try:
+            print(f"\n⚙️  CONFIGURE {engine_name.upper()} PARAMETERS")
+            print("-" * 50)
+            
+            parameters = {}
+            
+            if engine_name == 'AutoDockGPU':
+                # AutoDockGPU specific parameters
+                parameters['search_algorithm'] = self._get_parameter_choice(
+                    "Search algorithm",
+                    ['Lamarckian GA', 'Solis-Wets', 'Simulated Annealing'],
+                    default='Lamarckian GA'
+                )
+                
+                parameters['num_runs'] = self._get_parameter_integer(
+                    "Number of docking runs per ligand",
+                    default=10, min_val=1, max_val=100
+                )
+                
+                parameters['population_size'] = self._get_parameter_integer(
+                    "GA population size",
+                    default=150, min_val=50, max_val=500
+                )
+                
+                parameters['max_generations'] = self._get_parameter_integer(
+                    "Maximum GA generations",
+                    default=42000, min_val=1000, max_val=100000
+                )
+                
+                parameters['gpu_device'] = self._get_parameter_integer(
+                    "GPU device ID (0 for first GPU)",
+                    default=0, min_val=0, max_val=7
+                )
+                
+            elif engine_name == 'AutoDock':
+                # AutoDock specific parameters
+                parameters['search_algorithm'] = self._get_parameter_choice(
+                    "Search algorithm",
+                    ['Lamarckian GA', 'Simulated Annealing', 'Genetic Algorithm'],
+                    default='Lamarckian GA'
+                )
+                
+                parameters['num_runs'] = self._get_parameter_integer(
+                    "Number of docking runs per ligand",
+                    default=10, min_val=1, max_val=100
+                )
+                
+                parameters['population_size'] = self._get_parameter_integer(
+                    "GA population size",
+                    default=150, min_val=50, max_val=500
+                )
+                
+                parameters['max_generations'] = self._get_parameter_integer(
+                    "Maximum GA generations",
+                    default=27000, min_val=1000, max_val=100000
+                )
+                
+                parameters['energy_evaluations'] = self._get_parameter_integer(
+                    "Maximum energy evaluations",
+                    default=2500000, min_val=100000, max_val=10000000
+                )
+                
+            elif engine_name == 'Vina':
+                # AutoDock Vina specific parameters
+                parameters['exhaustiveness'] = self._get_parameter_integer(
+                    "Search exhaustiveness",
+                    default=8, min_val=1, max_val=32
+                )
+                
+                parameters['num_modes'] = self._get_parameter_integer(
+                    "Number of binding modes to return",
+                    default=9, min_val=1, max_val=20
+                )
+                
+                parameters['energy_range'] = self._get_parameter_float(
+                    "Energy range (kcal/mol)",
+                    default=3.0, min_val=1.0, max_val=10.0
+                )
+                
+                parameters['cpu_cores'] = self._get_parameter_integer(
+                    "Number of CPU cores to use (0 = auto)",
+                    default=0, min_val=0, max_val=64
+                )
+            
+            # Common parameters for all engines
+            parameters['scoring_function'] = self._get_parameter_choice(
+                "Scoring function",
+                ['Default', 'Custom'],
+                default='Default'
+            )
+            
+            parameters['output_format'] = self._get_parameter_choice(
+                "Output format",
+                ['PDBQT', 'SDF', 'Both'],
+                default='PDBQT'
+            )
+            
+            return parameters if parameters else None
+            
+        except KeyboardInterrupt:
+            print("\n❌ Parameter configuration cancelled")
+            return None
+        except Exception as e:
+            print(f"❌ Error configuring parameters: {e}")
+            return None
+
+    def _get_parameter_choice(self, param_name: str, choices: List[str], default: str) -> str:
+        """Get parameter choice from user with validation."""
+        print(f"\n📋 {param_name}:")
+        for i, choice in enumerate(choices, 1):
+            marker = " (default)" if choice == default else ""
+            print(f"  {i}. {choice}{marker}")
+        
+        while True:
+            try:
+                selection = input(f"Select {param_name.lower()} (1-{len(choices)} or press Enter for default): ").strip()
+                
+                if not selection:
+                    return default
+                
+                try:
+                    idx = int(selection) - 1
+                    if 0 <= idx < len(choices):
+                        return choices[idx]
+                    else:
+                        print(f"❌ Please enter 1-{len(choices)}")
+                        continue
+                except ValueError:
+                    print("❌ Please enter a number")
+                    continue
+                    
+            except KeyboardInterrupt:
+                raise
+
+    def _get_parameter_integer(self, param_name: str, default: int, min_val: int, max_val: int) -> int:
+        """Get integer parameter from user with validation."""
+        while True:
+            try:
+                value_str = input(f"📊 {param_name} ({min_val}-{max_val}, default: {default}): ").strip()
+                
+                if not value_str:
+                    return default
+                
+                try:
+                    value = int(value_str)
+                    if min_val <= value <= max_val:
+                        return value
+                    else:
+                        print(f"❌ Value must be between {min_val} and {max_val}")
+                        continue
+                except ValueError:
+                    print("❌ Please enter a valid integer")
+                    continue
+                    
+            except KeyboardInterrupt:
+                raise
+
+    def _get_parameter_float(self, param_name: str, default: float, min_val: float, max_val: float) -> float:
+        """Get float parameter from user with validation."""
+        while True:
+            try:
+                value_str = input(f"📊 {param_name} ({min_val}-{max_val}, default: {default}): ").strip()
+                
+                if not value_str:
+                    return default
+                
+                try:
+                    value = float(value_str)
+                    if min_val <= value <= max_val:
+                        return value
+                    else:
+                        print(f"❌ Value must be between {min_val} and {max_val}")
+                        continue
+                except ValueError:
+                    print("❌ Please enter a valid number")
+                    continue
+                    
+            except KeyboardInterrupt:
+                raise
+
+    def _serialize_parameters(self, parameters: Dict[str, Any]) -> str:
+        """Serialize parameters dictionary to JSON string for database storage."""
+        try:
+            import json
+            return json.dumps(parameters, indent=2)
+        except Exception:
+            return str(parameters)
+
+    def _display_method_summary(self, method_id: int, method_name: str, engine_info: Dict,
+                            description: str, parameters: Dict[str, Any], db_path: str) -> None:
+        """Display summary of created docking method."""
+        try:
+            print(f"\n🎯 DOCKING METHOD CREATED SUCCESSFULLY")
+            print("=" * 60)
+            print(f"📋 Method ID: {method_id}")
+            print(f"🏷️  Method Name: {method_name}")
+            print(f"🧬 Docking Engine: {engine_info['name']}")
+            print(f"📝 Description: {description}")
+            print(f"🗂️  Database: {db_path}")
+            
+            print(f"\n⚙️  CONFIGURED PARAMETERS:")
+            for key, value in parameters.items():
+                print(f"   • {key.replace('_', ' ').title()}: {value}")
+            
+            print(f"\n📋 REQUIREMENTS:")
+            for req in engine_info['requirements']:
+                print(f"   • {req}")
+            
+            print(f"\n💡 NEXT STEPS:")
+            print("   1. Ensure all requirements are installed")
+            print("   2. Use this method for docking experiments")
+            print("   3. Configure receptor files for docking")
+            
+            print("=" * 60)
+            
+        except Exception as e:
+            print(f"⚠️  Error displaying method summary: {e}")
+   
     def dock_table(self, show_details: bool = True, 
                 filter_by_type: Optional[str] = None,
                 sort_by: str = 'name',
                 show_all_tables: bool = False) -> Optional[Any]:
         """
-        List tables available in the chemspace database and allow selection for docking preparation.
+        List tables available in the chemspace database, select a docking method, and allow selection for docking preparation.
         By default, only shows tables ready for docking (with SDF blobs).
+        Creates a docking assay registry upon successful completion.
         
         Args:
             show_details (bool): Whether to show detailed information including compound counts
@@ -78,19 +504,29 @@ class MolDock:
             show_all_tables (bool): If True, shows all tables regardless of docking readiness
             
         Returns:
-            Optional[Any]: Selected table name, list of SMILES, or None if cancelled
+            Optional[Any]: Dictionary with selected table name, docking method, assay registry info and SMILES data if requested, or None if cancelled
         """
         try:
-            print(f"🧬 MOLDOCK - Table Selection for Docking Preparation")
+            print(f"🧬 MOLDOCK - Table and Method Selection for Docking")
             print("=" * 70)
             
-            # Check if chemspace database exists
+            # Step 1: Select docking method first
+            selected_method = self._select_docking_method()
+            
+            if not selected_method:
+                print("❌ No docking method selected")
+                return None
+            
+            print(f"\n✅ Selected docking method: '{selected_method['method_name']}' ({selected_method['docking_engine']})")
+            print("-" * 70)
+            
+            # Step 2: Check if chemspace database exists
             if not os.path.exists(self.__chemspace_db):
                 print(f"❌ ChemSpace database not found: {self.__chemspace_db}")
                 print("   Please ensure ChemSpace has been initialized for this project.")
                 return None
             
-            # Connect to chemspace database and get available tables
+            # Step 3: Connect to chemspace database and get available tables
             try:
                 import sqlite3
                 conn = sqlite3.connect(self.__chemspace_db)
@@ -112,7 +548,7 @@ class MolDock:
             
             print(f"📊 Found {len(available_tables)} table(s) in ChemSpace database")
             
-            # Collect table information using existing patterns
+            # Step 4: Collect table information using existing patterns
             table_data = []
             ready_table_data = []
             not_ready_count = 0
@@ -142,7 +578,7 @@ class MolDock:
                     print(f"   ⚠️  Error analyzing table '{table_name}': {e}")
                     continue
             
-            # Show summary of table readiness
+            # Step 5: Show summary of table readiness
             total_analyzed = len(table_data)
             ready_count = len(ready_table_data)
             
@@ -151,7 +587,7 @@ class MolDock:
             print(f"   ✅ Ready for docking: {ready_count}")
             print(f"   ❌ Not ready for docking: {not_ready_count}")
             
-            # Determine which tables to display
+            # Step 6: Determine which tables to display
             if not show_all_tables:
                 # Default behavior: show only ready tables
                 tables_to_display = ready_table_data
@@ -203,10 +639,10 @@ class MolDock:
                     print("❌ No valid tables found for docking preparation")
                 return None
             
-            # Sort tables (reusing existing logic)
+            # Step 7: Sort tables (reusing existing logic)
             tables_to_display = self._sort_table_data_for_docking(tables_to_display, sort_by)
             
-            # Display table list for selection with readiness context
+            # Step 8: Display table list for selection with readiness context
             selected_table = self._display_and_select_docking_table(
                 tables_to_display, filter_by_type, show_all_tables, ready_count, not_ready_count
             )
@@ -214,23 +650,64 @@ class MolDock:
             if selected_table:
                 print(f"\n✅ Selected table for docking: '{selected_table}'")
                 
-                # Show preparation summary and get user choice
-                user_choice = self._show_docking_preparation_summary(selected_table, tables_to_display)
+                # Step 9: Show docking setup summary and get user choice
+                user_choice = self._show_docking_setup_summary(selected_table, selected_method, tables_to_display)
                 
-                if user_choice == 1:
-                    # Return table name only
-                    return selected_table
-                elif user_choice == 2:
-                    # Return SMILES list for immediate processing
-                    print(f"\n🧪 Loading SMILES from table '{selected_table}'...")
-                    smiles_data = self._get_smiles_from_table(selected_table)
+                if user_choice == 1 or user_choice == 2:
+                    # Step 10: Create docking assay registry before returning results
+                    print(f"\n📝 Creating docking assay registry...")
                     
-                    if smiles_data:
-                        print(f"✅ Loaded {len(smiles_data)} compounds with SMILES")
-                        return smiles_data
+                    # Get selected table info for registry
+                    selected_table_info = next((t for t in tables_to_display if t['name'] == selected_table), None)
+                    
+                    # Create assay registry
+                    assay_registry = self._create_docking_assay_registry(
+                        selected_table, 
+                        selected_method, 
+                        selected_table_info,
+                        user_choice
+                    )
+                    
+                    if not assay_registry:
+                        print("⚠️  Warning: Could not create docking assay registry, but continuing...")
                     else:
-                        print("❌ No valid SMILES found in selected table")
-                        return None
+                        print(f"✅ Docking assay registry created with ID: {assay_registry['assay_id']}")
+                    
+                    if user_choice == 1:
+                        # Return complete docking configuration
+                        return {
+                            'table_name': selected_table,
+                            'docking_method': selected_method,
+                            'assay_registry': assay_registry,
+                            'setup_type': 'configuration_only'
+                        }
+                    elif user_choice == 2:
+                        # Load SMILES and return complete setup
+                        print(f"\n🧪 Loading SMILES from table '{selected_table}'...")
+                        smiles_data = self._get_smiles_from_table(selected_table)
+                        
+                        if smiles_data:
+                            print(f"✅ Loaded {len(smiles_data)} compounds with SMILES")
+                            
+                            # Update registry with loaded compound count
+                            if assay_registry:
+                                self._update_assay_registry_compound_count(assay_registry['assay_id'], len(smiles_data))
+                            
+                            return {
+                                'table_name': selected_table,
+                                'docking_method': selected_method,
+                                'assay_registry': assay_registry,
+                                'smiles_data': smiles_data,
+                                'setup_type': 'ready_for_docking'
+                            }
+                        else:
+                            print("❌ No valid SMILES found in selected table")
+                            
+                            # Update registry status to indicate failure
+                            if assay_registry:
+                                self._update_assay_registry_status(assay_registry['assay_id'], 'failed', 'No valid SMILES found')
+                            
+                            return None
                 else:
                     return None
             else:
@@ -239,6 +716,760 @@ class MolDock:
             
         except Exception as e:
             print(f"❌ Error in dock_table method: {e}")
+            return None
+
+    def _create_docking_assay_registry(self, table_name: str, docking_method: Dict[str, Any], 
+                                    table_info: Optional[Dict[str, Any]], setup_type: int) -> Optional[Dict[str, Any]]:
+        """
+        Create a docking assay registry entry in the docking_assays database and create associated folder.
+        
+        Args:
+            table_name (str): Name of the selected table
+            docking_method (Dict): Selected docking method information
+            table_info (Optional[Dict]): Table information dictionary
+            setup_type (int): Setup type (1=configuration_only, 2=ready_for_docking)
+            
+        Returns:
+            Optional[Dict[str, Any]]: Assay registry information or None if failed
+        """
+        try:
+            # Ensure docking registers directory exists
+            docking_registers_dir = os.path.dirname(self.__docking_registers_db)
+            os.makedirs(docking_registers_dir, exist_ok=True)
+            
+            # Create assays directory for storing docking results
+            docking_assays_base_dir = os.path.join(self.path, 'docking', 'docking_assays')
+            os.makedirs(docking_assays_base_dir, exist_ok=True)
+            
+            # Create assay registry database path
+            assays_db_path = os.path.join(docking_registers_dir, 'docking_assays.db')
+            
+            import sqlite3
+            import json
+            from datetime import datetime
+            
+            conn = sqlite3.connect(assays_db_path)
+            cursor = conn.cursor()
+            
+            # Create docking_assays table with assay_folder_path column
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS docking_assays (
+                    assay_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    assay_name TEXT NOT NULL,
+                    project_name TEXT,
+                    table_name TEXT NOT NULL,
+                    docking_method_id INTEGER,
+                    docking_method_name TEXT NOT NULL,
+                    docking_engine TEXT NOT NULL,
+                    compound_count INTEGER DEFAULT 0,
+                    prepared_molecules INTEGER DEFAULT 0,
+                    setup_type TEXT,
+                    status TEXT DEFAULT 'created',
+                    created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_modified TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    table_readiness_score INTEGER,
+                    docking_status TEXT,
+                    notes TEXT,
+                    configuration TEXT,
+                    assay_folder_path TEXT
+                )
+            ''')
+            
+            # Generate assay name based on table and method
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            assay_name = f"{table_name}_{docking_method['method_name']}_{timestamp}"
+            
+            # Create unique assay folder
+            assay_folder_path = self._create_assay_folder(docking_assays_base_dir, assay_name)
+            
+            if not assay_folder_path:
+                print("⚠️  Warning: Could not create assay folder, but continuing...")
+                assay_folder_path = ""
+            
+            # Determine setup type string
+            setup_type_str = 'configuration_only' if setup_type == 1 else 'ready_for_docking'
+            
+            # Prepare configuration data
+            configuration_data = {
+                'docking_method': docking_method,
+                'table_info': {
+                    'name': table_name,
+                    'compound_count': table_info['compound_count'] if table_info else 0,
+                    'has_sdf_blob': table_info['has_sdf_blob'] if table_info else False,
+                    'sdf_blob_count': table_info['sdf_blob_count'] if table_info else 0,
+                    'readiness_score': table_info['readiness_score'] if table_info else 0,
+                    'docking_status': table_info['docking_status'] if table_info else 'unknown'
+                },
+                'setup_parameters': {
+                    'setup_type': setup_type_str,
+                    'created_via': 'dock_table_method'
+                },
+                'assay_folder': {
+                    'path': assay_folder_path,
+                    'created': assay_folder_path != ""
+                }
+            }
+            
+            # Insert assay registry
+            cursor.execute('''
+                INSERT INTO docking_assays (
+                    assay_name, project_name, table_name, docking_method_id, docking_method_name,
+                    docking_engine, compound_count, prepared_molecules, setup_type, status,
+                    table_readiness_score, docking_status, notes, configuration, assay_folder_path
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                assay_name,
+                self.name,  # project name
+                table_name,
+                docking_method.get('method_id'),
+                docking_method['method_name'],
+                docking_method['docking_engine'],
+                table_info['compound_count'] if table_info else 0,
+                table_info['sdf_blob_count'] if table_info else 0,
+                setup_type_str,
+                'created',
+                table_info['readiness_score'] if table_info else 0,
+                table_info['docking_status'] if table_info else 'unknown',
+                f"Assay created via dock_table method for {setup_type_str}",
+                json.dumps(configuration_data, indent=2),
+                assay_folder_path
+            ))
+            
+            assay_id = cursor.lastrowid
+            
+            conn.commit()
+            conn.close()
+            
+            print(f"📝 Assay Registry Created:")
+            print(f"   🆔 Assay ID: {assay_id}")
+            print(f"   📋 Assay Name: {assay_name}")
+            print(f"   📊 Table: {table_name}")
+            print(f"   🧬 Method: {docking_method['method_name']} ({docking_method['docking_engine']})")
+            print(f"   🔧 Setup Type: {setup_type_str}")
+            print(f"   📁 Assay Folder: {assay_folder_path}")
+            print(f"   💾 Database: {assays_db_path}")
+            
+            return {
+                'assay_id': assay_id,
+                'assay_name': assay_name,
+                'project_name': self.name,
+                'table_name': table_name,
+                'docking_method': docking_method,
+                'setup_type': setup_type_str,
+                'status': 'created',
+                'database_path': assays_db_path,
+                'assay_folder_path': assay_folder_path,
+                'created_date': datetime.now().isoformat()
+            }
+            
+        except Exception as e:
+            print(f"❌ Error creating docking assay registry: {e}")
+            return None
+
+    def _create_assay_folder(self, base_dir: str, assay_name: str) -> str:
+        """
+        Create a unique folder for the docking assay with proper structure.
+        
+        Args:
+            base_dir (str): Base directory for docking assays
+            assay_name (str): Name of the assay
+            
+        Returns:
+            str: Path to the created assay folder, empty string if failed
+        """
+        try:
+            # Clean assay name for folder creation (remove invalid characters)
+            clean_name = "".join(c for c in assay_name if c.isalnum() or c in ('_', '-', '.')).strip()
+            
+            # Create unique folder path
+            assay_folder_path = os.path.join(base_dir, clean_name)
+            
+            # Handle name conflicts by adding suffix
+            original_path = assay_folder_path
+            counter = 1
+            while os.path.exists(assay_folder_path):
+                assay_folder_path = f"{original_path}_{counter}"
+                counter += 1
+            
+            # Create the assay folder and subdirectories
+            os.makedirs(assay_folder_path, exist_ok=True)
+            
+            # Create standard subdirectories for docking workflow
+            subdirs = [
+                'ligands',          # For prepared ligand files (PDBQT, SDF)
+                'receptors',        # For receptor files (PDB, PDBQT)
+                'grid_files',       # For grid/map files (AutoDock grid files)
+                'results',          # For docking output files
+                'logs',             # For log files and error reports
+                'analysis',         # For analysis results and plots
+                'configurations'    # For configuration files (DPF, config files)
+            ]
+            
+            for subdir in subdirs:
+                subdir_path = os.path.join(assay_folder_path, subdir)
+                os.makedirs(subdir_path, exist_ok=True)
+            
+            # Create a README file with assay information
+            self._create_assay_readme(assay_folder_path, assay_name)
+            
+            print(f"   📁 Created assay folder: {assay_folder_path}")
+            print(f"   📋 Subdirectories: {', '.join(subdirs)}")
+            
+            return assay_folder_path
+            
+        except Exception as e:
+            print(f"⚠️  Error creating assay folder: {e}")
+            return ""
+
+    def _create_assay_readme(self, assay_folder_path: str, assay_name: str) -> None:
+        """
+        Create a README file in the assay folder with information about the structure.
+        
+        Args:
+            assay_folder_path (str): Path to the assay folder
+            assay_name (str): Name of the assay
+        """
+        try:
+            from datetime import datetime
+            
+            readme_content = f"""# Docking Assay: {assay_name}
+
+    Created: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+    Project: {self.name}
+
+    ## Folder Structure
+
+    - **ligands/**: Prepared ligand files (PDBQT, SDF formats)
+    - **receptors/**: Receptor structure files (PDB, PDBQT formats)  
+    - **grid_files/**: Grid and map files for docking
+    - **results/**: Docking output files and poses
+    - **logs/**: Log files and error reports
+    - **analysis/**: Analysis results, plots, and summaries
+    - **configurations/**: Docking configuration files (DPF, config files)
+
+    ## Usage Notes
+
+    This folder structure is designed to organize all files related to this docking assay.
+    Place input files in the appropriate directories and docking results will be saved
+    to the results/ directory.
+
+    ## File Naming Convention
+
+    - Use consistent naming with assay ID prefix
+    - Keep original compound identifiers where possible
+    - Use standard file extensions (.pdbqt, .sdf, .pdb, .dlg, etc.)
+
+    Generated by TidyScreen MolDock module.
+    """
+            
+            readme_path = os.path.join(assay_folder_path, 'README.md')
+            with open(readme_path, 'w') as f:
+                f.write(readme_content)
+                
+        except Exception as e:
+            print(f"⚠️  Could not create README file: {e}")
+
+    def _update_assay_registry_compound_count(self, assay_id: int, compound_count: int) -> bool:
+        """
+        Update the compound count in the assay registry after SMILES are loaded.
+        
+        Args:
+            assay_id (int): Assay registry ID
+            compound_count (int): Actual number of loaded compounds
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            assays_db_path = os.path.join(os.path.dirname(self.__docking_registers_db), 'docking_assays.db')
+            
+            import sqlite3
+            conn = sqlite3.connect(assays_db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                UPDATE docking_assays 
+                SET compound_count = ?, status = 'molecules_loaded', last_modified = CURRENT_TIMESTAMP
+                WHERE assay_id = ?
+            ''', (compound_count, assay_id))
+            
+            conn.commit()
+            conn.close()
+            
+            print(f"   📊 Updated assay registry: {compound_count:,} compounds loaded")
+            return True
+            
+        except Exception as e:
+            print(f"⚠️  Error updating assay registry compound count: {e}")
+            return False
+
+    def _update_assay_registry_status(self, assay_id: int, status: str, notes: str = "") -> bool:
+        """
+        Update the status of an assay registry entry.
+        
+        Args:
+            assay_id (int): Assay registry ID
+            status (str): New status ('created', 'molecules_loaded', 'failed', 'completed')
+            notes (str): Additional notes about the status change
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            assays_db_path = os.path.join(os.path.dirname(self.__docking_registers_db), 'docking_assays.db')
+            
+            import sqlite3
+            conn = sqlite3.connect(assays_db_path)
+            cursor = conn.cursor()
+            
+            # Get existing notes
+            cursor.execute("SELECT notes FROM docking_assays WHERE assay_id = ?", (assay_id,))
+            result = cursor.fetchone()
+            existing_notes = result[0] if result else ""
+            
+            # Append new notes
+            updated_notes = f"{existing_notes}\n{notes}" if existing_notes else notes
+            
+            cursor.execute('''
+                UPDATE docking_assays 
+                SET status = ?, notes = ?, last_modified = CURRENT_TIMESTAMP
+                WHERE assay_id = ?
+            ''', (status, updated_notes.strip(), assay_id))
+            
+            conn.commit()
+            conn.close()
+            
+            print(f"   📝 Updated assay registry status: {status}")
+            return True
+            
+        except Exception as e:
+            print(f"⚠️  Error updating assay registry status: {e}")
+            return False
+
+    def get_assay_folder_path(self, assay_id: int) -> Optional[str]:
+        """
+        Retrieve the folder path for a specific assay ID.
+        
+        Args:
+            assay_id (int): Assay registry ID
+            
+        Returns:
+            Optional[str]: Path to assay folder or None if not found
+        """
+        try:
+            assays_db_path = os.path.join(os.path.dirname(self.__docking_registers_db), 'docking_assays.db')
+            
+            if not os.path.exists(assays_db_path):
+                return None
+            
+            import sqlite3
+            conn = sqlite3.connect(assays_db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT assay_folder_path FROM docking_assays WHERE assay_id = ?", (assay_id,))
+            result = cursor.fetchone()
+            
+            conn.close()
+            
+            if result and result[0]:
+                folder_path = result[0]
+                # Verify folder still exists
+                if os.path.exists(folder_path):
+                    return folder_path
+                else:
+                    print(f"⚠️  Assay folder not found: {folder_path}")
+                    return None
+            
+            return None
+            
+        except Exception as e:
+            print(f"❌ Error retrieving assay folder path: {e}")
+            return None
+
+    def list_assay_folders(self) -> Optional[List[Dict[str, Any]]]:
+        """
+        List all docking assays and their folder paths for this project.
+        
+        Returns:
+            Optional[List[Dict]]: List of assay information with folder paths
+        """
+        try:
+            assays_db_path = os.path.join(os.path.dirname(self.__docking_registers_db), 'docking_assays.db')
+            
+            if not os.path.exists(assays_db_path):
+                print("📋 No docking assays found")
+                return None
+            
+            import sqlite3
+            conn = sqlite3.connect(assays_db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT assay_id, assay_name, table_name, docking_method_name, 
+                    docking_engine, status, created_date, assay_folder_path
+                FROM docking_assays 
+                WHERE project_name = ?
+                ORDER BY created_date DESC
+            ''', (self.name,))
+            
+            results = cursor.fetchall()
+            conn.close()
+            
+            if not results:
+                print("📋 No docking assays found for this project")
+                return None
+            
+            assay_list = []
+            print(f"\n📋 DOCKING ASSAYS FOR PROJECT: {self.name}")
+            print("=" * 80)
+            print(f"{'ID':<5} {'Assay Name':<25} {'Table':<15} {'Method':<15} {'Status':<12} {'Folder Exists':<13}")
+            print("=" * 80)
+            
+            for row in results:
+                assay_id, assay_name, table_name, method_name, engine, status, created_date, folder_path = row
+                
+                folder_exists = "✅ Yes" if folder_path and os.path.exists(folder_path) else "❌ No"
+                
+                print(f"{assay_id:<5} {assay_name[:24]:<25} {table_name[:14]:<15} "
+                    f"{method_name[:14]:<15} {status[:11]:<12} {folder_exists:<13}")
+                
+                assay_list.append({
+                    'assay_id': assay_id,
+                    'assay_name': assay_name,
+                    'table_name': table_name,
+                    'docking_method_name': method_name,
+                    'docking_engine': engine,
+                    'status': status,
+                    'created_date': created_date,
+                    'assay_folder_path': folder_path,
+                    'folder_exists': folder_path and os.path.exists(folder_path)
+                })
+            
+            print("=" * 80)
+            print(f"Total assays: {len(assay_list)}")
+            
+            return assay_list
+            
+        except Exception as e:
+            print(f"❌ Error listing assay folders: {e}")
+            return None
+
+    def _update_assay_registry_compound_count(self, assay_id: int, compound_count: int) -> bool:
+        """
+        Update the compound count in the assay registry after SMILES are loaded.
+        
+        Args:
+            assay_id (int): Assay registry ID
+            compound_count (int): Actual number of loaded compounds
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            assays_db_path = os.path.join(os.path.dirname(self.__docking_registers_db), 'docking_assays.db')
+            
+            import sqlite3
+            conn = sqlite3.connect(assays_db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                UPDATE docking_assays 
+                SET compound_count = ?, status = 'molecules_loaded', last_modified = CURRENT_TIMESTAMP
+                WHERE assay_id = ?
+            ''', (compound_count, assay_id))
+            
+            conn.commit()
+            conn.close()
+            
+            print(f"   📊 Updated assay registry: {compound_count:,} compounds loaded")
+            return True
+            
+        except Exception as e:
+            print(f"⚠️  Error updating assay registry compound count: {e}")
+            return False
+
+    def _select_docking_method(self) -> Optional[Dict[str, Any]]:
+        """
+        Select a docking method from available methods created by create_docking_method.
+        
+        Returns:
+            Optional[Dict[str, Any]]: Selected docking method information or None if cancelled
+        """
+        try:
+            print(f"🎯 SELECT DOCKING METHOD")
+            print("=" * 50)
+            
+            # Check if docking methods database exists
+            methods_db_path = os.path.join(os.path.dirname(self.__docking_registers_db), 'docking_methods.db')
+            
+            if not os.path.exists(methods_db_path):
+                print(f"❌ No docking methods found")
+                print(f"   Database not found: {methods_db_path}")
+                print(f"   💡 Create a docking method first using create_docking_method()")
+                return None
+            
+            # Connect to docking methods database
+            try:
+                import sqlite3
+                import json
+                conn = sqlite3.connect(methods_db_path)
+                cursor = conn.cursor()
+                
+                # Get available docking methods
+                cursor.execute('''
+                    SELECT id, method_name, docking_engine, description, parameters, created_date
+                    FROM docking_methods
+                    ORDER BY created_date DESC
+                ''')
+                
+                methods = cursor.fetchall()
+                conn.close()
+                
+            except Exception as e:
+                print(f"❌ Error accessing docking methods database: {e}")
+                return None
+            
+            if not methods:
+                print("❌ No docking methods available")
+                print("   💡 Create a docking method first using create_docking_method()")
+                return None
+            
+            print(f"📋 Available Docking Methods ({len(methods)} found):")
+            print("-" * 80)
+            print(f"{'#':<3} {'Method Name':<20} {'Engine':<15} {'Description':<30} {'Created':<12}")
+            print("-" * 80)
+            
+            # Display available methods
+            method_list = []
+            for i, method in enumerate(methods, 1):
+                method_id, method_name, docking_engine, description, parameters_json, created_date = method
+                
+                # Parse parameters for display
+                try:
+                    parameters = json.loads(parameters_json) if parameters_json else {}
+                except:
+                    parameters = {}
+                
+                # Format created date
+                try:
+                    from datetime import datetime
+                    created_dt = datetime.strptime(created_date, '%Y-%m-%d %H:%M:%S')
+                    created_str = created_dt.strftime('%Y-%m-%d')
+                except:
+                    created_str = created_date[:10] if created_date else 'Unknown'
+                
+                # Truncate description for display
+                desc_short = (description[:27] + '...') if len(description) > 30 else description
+                
+                print(f"{i:<3} {method_name[:19]:<20} {docking_engine[:14]:<15} {desc_short:<30} {created_str:<12}")
+                
+                method_list.append({
+                    'method_id': method_id,
+                    'method_name': method_name,
+                    'docking_engine': docking_engine,
+                    'description': description,
+                    'parameters': parameters,
+                    'created_date': created_date
+                })
+            
+            print("-" * 80)
+            print("Commands: Enter method number, method name, 'details <num>' for info, or 'cancel'")
+            
+            # Method selection loop
+            while True:
+                try:
+                    selection = input(f"\n🎯 Select docking method: ").strip()
+                    
+                    if selection.lower() in ['cancel', 'quit', 'exit']:
+                        return None
+                    
+                    # Handle details command
+                    if selection.lower().startswith('details '):
+                        try:
+                            detail_idx = int(selection.split()[1]) - 1
+                            if 0 <= detail_idx < len(method_list):
+                                self._show_docking_method_details(method_list[detail_idx])
+                                continue
+                            else:
+                                print(f"❌ Invalid method number. Please enter 1-{len(method_list)}")
+                                continue
+                        except (IndexError, ValueError):
+                            print("❌ Invalid details command. Use 'details <number>'")
+                            continue
+                    
+                    # Try as number first
+                    try:
+                        method_idx = int(selection) - 1
+                        if 0 <= method_idx < len(method_list):
+                            selected_method = method_list[method_idx]
+                            print(f"\n✅ Selected: '{selected_method['method_name']}' using {selected_method['docking_engine']}")
+                            return selected_method
+                        else:
+                            print(f"❌ Invalid selection. Please enter 1-{len(method_list)}")
+                            continue
+                            
+                    except ValueError:
+                        # Try as method name
+                        matching_methods = [m for m in method_list if m['method_name'].lower() == selection.lower()]
+                        if matching_methods:
+                            selected_method = matching_methods[0]
+                            print(f"\n✅ Selected: '{selected_method['method_name']}' using {selected_method['docking_engine']}")
+                            return selected_method
+                        else:
+                            print(f"❌ Method '{selection}' not found")
+                            continue
+                            
+                except KeyboardInterrupt:
+                    print("\n❌ Method selection cancelled")
+                    return None
+            
+        except Exception as e:
+            print(f"❌ Error in docking method selection: {e}")
+            return None
+
+    def _show_docking_method_details(self, method_info: Dict[str, Any]) -> None:
+        """
+        Show detailed information about a docking method.
+        
+        Args:
+            method_info (Dict): Docking method information dictionary
+        """
+        try:
+            print(f"\n🎯 DOCKING METHOD DETAILS: '{method_info['method_name']}'")
+            print("=" * 60)
+            print(f"🆔 Method ID: {method_info['method_id']}")
+            print(f"🏷️  Method Name: {method_info['method_name']}")
+            print(f"🧬 Docking Engine: {method_info['docking_engine']}")
+            print(f"📝 Description: {method_info['description']}")
+            print(f"📅 Created: {method_info['created_date']}")
+            
+            print(f"\n⚙️  CONFIGURED PARAMETERS:")
+            parameters = method_info.get('parameters', {})
+            if parameters:
+                for key, value in parameters.items():
+                    param_name = key.replace('_', ' ').title()
+                    print(f"   • {param_name}: {value}")
+            else:
+                print("   • No specific parameters configured")
+            
+            # Show engine-specific information
+            engine = method_info['docking_engine']
+            print(f"\n🔧 {engine.upper()} ENGINE INFO:")
+            
+            if engine == 'AutoDockGPU':
+                print("   • Optimized for GPU acceleration")
+                print("   • Best for high-throughput screening")
+                print("   • Requires CUDA-compatible GPU")
+            elif engine == 'AutoDock':
+                print("   • Classical CPU-based docking")
+                print("   • Highly configurable parameters")
+                print("   • Suitable for detailed studies")
+            elif engine == 'Vina':
+                print("   • Fast and accurate docking")
+                print("   • Easy to use and configure")
+                print("   • Good balance of speed and accuracy")
+            
+            print("=" * 60)
+            
+        except Exception as e:
+            print(f"❌ Error showing method details: {e}")
+
+    def _show_docking_setup_summary(self, selected_table: str, selected_method: Dict[str, Any], 
+                                table_data: List[Dict]) -> Optional[int]:
+        """
+        Show summary of selected table and docking method, and get user choice for next steps.
+        
+        Args:
+            selected_table (str): Name of selected table
+            selected_method (Dict): Selected docking method information
+            table_data (List[Dict]): Table data list
+            
+        Returns:
+            Optional[int]: User choice (1=configuration only, 2=load SMILES, None=cancel)
+        """
+        try:
+            # Find selected table info
+            table_info = next((t for t in table_data if t['name'] == selected_table), None)
+            
+            if not table_info:
+                return None
+            
+            print(f"\n🎯 DOCKING SETUP SUMMARY")
+            print("=" * 60)
+            print(f"📋 Selected Table: '{selected_table}'")
+            print(f"📊 Compounds: {table_info['compound_count']:,}")
+            print(f"🎯 Table Status: {table_info['docking_readiness']['status']}")
+            
+            if table_info['has_sdf_blob'] and table_info['sdf_blob_count'] > 0:
+                print(f"🚀 3D Molecules Ready: {table_info['sdf_blob_count']:,}")
+                prep_coverage = (table_info['sdf_blob_count'] / table_info['compound_count']) * 100
+                print(f"📈 Preparation Coverage: {prep_coverage:.1f}%")
+            
+            print(f"\n🔬 Selected Docking Method: '{selected_method['method_name']}'")
+            print(f"🧬 Docking Engine: {selected_method['docking_engine']}")
+            print(f"📝 Description: {selected_method['description']}")
+            
+            # Show key parameters
+            parameters = selected_method.get('parameters', {})
+            if parameters:
+                print(f"⚙️  Key Parameters:")
+                # Show most important parameters based on engine
+                engine = selected_method['docking_engine']
+                if engine == 'AutoDockGPU':
+                    key_params = ['num_runs', 'population_size', 'gpu_device']
+                elif engine == 'AutoDock':
+                    key_params = ['num_runs', 'population_size', 'energy_evaluations']
+                elif engine == 'Vina':
+                    key_params = ['exhaustiveness', 'num_modes', 'cpu_cores']
+                else:
+                    key_params = list(parameters.keys())[:3]  # First 3 parameters
+                
+                for param in key_params:
+                    if param in parameters:
+                        param_name = param.replace('_', ' ').title()
+                        print(f"   • {param_name}: {parameters[param]}")
+            
+            # Show readiness assessment
+            readiness = table_info['docking_readiness']
+            if readiness['score'] >= 70:
+                print(f"\n✅ Setup Status: Ready for docking")
+            else:
+                print(f"\n⚠️  Setup Status: {readiness['status']}")
+                if readiness['issues']:
+                    print("   Issues to consider:")
+                    for issue in readiness['issues'][:3]:  # Show first 3 issues
+                        print(f"   • {issue}")
+            
+            print(f"\n🔄 NEXT STEPS:")
+            print("   1. Save configuration (return table name and method info)")
+            print("   2. Load molecules and prepare for immediate docking")
+            print("   3. Cancel setup")
+            print("=" * 60)
+            
+            # Get user choice
+            while True:
+                try:
+                    choice = input("🎯 Select next step (1/2/3): ").strip()
+                    
+                    if choice == '1':
+                        print("✅ Configuration saved for later use")
+                        return 1
+                    elif choice == '2':
+                        print("🧪 Will load molecules for immediate docking preparation")
+                        return 2
+                    elif choice == '3' or choice.lower() in ['cancel', 'quit', 'exit']:
+                        print("❌ Docking setup cancelled")
+                        return None
+                    else:
+                        print("❌ Invalid choice. Please enter 1, 2, or 3")
+                        continue
+                        
+                except KeyboardInterrupt:
+                    print("\n❌ Docking setup cancelled")
+                    return None
+            
+        except Exception as e:
+            print(f"⚠️  Error showing docking setup summary: {e}")
             return None
 
     def _show_docking_preparation_summary(self, selected_table: str, table_data: List[Dict]) -> Optional[int]:
