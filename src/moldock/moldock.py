@@ -877,7 +877,6 @@ class MolDock:
             print(f"❌ Error creating docking assay registry: {e}")
             return None
 
-
     def _create_assay_folder(self, base_dir: str, assay_name: str) -> str:
         """
         Create a unique folder for the docking assay with proper structure.
@@ -2186,3 +2185,1376 @@ class MolDock:
             
         except Exception as e:
             print(f"❌ Error showing table details: {e}")
+            
+    def create_receptor_for_docking(self, pdb_file: Optional[str] = None, receptor_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """
+        Create a receptor entry for docking from a PDB file. The user is prompted for a pdb file and receptor name, 
+        after which a register for the receptor is created in a database called receptors.db located in the 
+        project_path/docking/receptors directory.
+        
+        Args:
+            pdb_file (Optional[str]): Path to PDB file. If None, user will be prompted.
+            receptor_name (Optional[str]): Name for the receptor. If None, user will be prompted.
+            
+        Returns:
+            Optional[Dict[str, Any]]: Receptor registry information or None if failed
+        """
+        try:
+            print(f"🧬 CREATE RECEPTOR FOR DOCKING")
+            print("=" * 50)
+            
+            # Step 1: Get PDB file path
+            if pdb_file is None:
+                while True:
+                    try:
+                        pdb_file = input("📁 Enter path to PDB file (or 'cancel'): ").strip()
+                        
+                        if pdb_file.lower() in ['cancel', 'quit', 'exit']:
+                            print("❌ Receptor creation cancelled")
+                            return None
+                        
+                        if not pdb_file:
+                            print("❌ PDB file path cannot be empty")
+                            continue
+                        
+                        # Expand user path and resolve relative paths
+                        pdb_file = os.path.expanduser(pdb_file)
+                        pdb_file = os.path.abspath(pdb_file)
+                        
+                        if not os.path.exists(pdb_file):
+                            print(f"❌ File not found: {pdb_file}")
+                            continue
+                        
+                        if not pdb_file.lower().endswith('.pdb'):
+                            print("❌ File must have .pdb extension")
+                            continue
+                        
+                        break
+                        
+                    except KeyboardInterrupt:
+                        print("\n❌ Receptor creation cancelled")
+                        return None
+            else:
+                # Validate provided PDB file
+                pdb_file = os.path.expanduser(pdb_file)
+                pdb_file = os.path.abspath(pdb_file)
+                
+                if not os.path.exists(pdb_file):
+                    print(f"❌ PDB file not found: {pdb_file}")
+                    return None
+                
+                if not pdb_file.lower().endswith('.pdb'):
+                    print(f"❌ File must have .pdb extension: {pdb_file}")
+                    return None
+            
+            print(f"✅ PDB file validated: {os.path.basename(pdb_file)}")
+            
+            # Step 2: Analyze PDB file
+            print("🔬 Analyzing PDB file...")
+            pdb_analysis = self._analyze_pdb_file(pdb_file)
+            
+            print(pdb_analysis)
+            
+            
+            if not pdb_analysis:
+                print("❌ Failed to analyze PDB file")
+                return None
+            
+            self._display_pdb_analysis(pdb_analysis)
+            
+            # Step 3: Get receptor name
+            if receptor_name is None:
+                while True:
+                    try:
+                        default_name = os.path.splitext(os.path.basename(pdb_file))[0]
+                        receptor_name = input(f"🏷️  Enter receptor name (default: {default_name}): ").strip()
+                        
+                        if not receptor_name:
+                            receptor_name = default_name
+                        
+                        if receptor_name.lower() in ['cancel', 'quit', 'exit']:
+                            print("❌ Receptor creation cancelled")
+                            return None
+                        
+                        # Validate receptor name
+                        if not receptor_name.replace('_', '').replace('-', '').replace(' ', '').isalnum():
+                            print("❌ Receptor name can only contain letters, numbers, spaces, hyphens, and underscores")
+                            continue
+                        
+                        break
+                        
+                    except KeyboardInterrupt:
+                        print("\n❌ Receptor creation cancelled")
+                        return None
+            
+            # Step 4: Check if receptor name already exists
+            existing_check = self._check_receptor_name_exists(receptor_name)
+            if existing_check:
+                while True:
+                    overwrite = input(f"⚠️  Receptor '{receptor_name}' already exists. Overwrite? (y/n): ").strip().lower()
+                    if overwrite in ['y', 'yes']:
+                        print("🔄 Will overwrite existing receptor")
+                        break
+                    elif overwrite in ['n', 'no']:
+                        print("❌ Receptor creation cancelled - name already exists")
+                        return None
+                    else:
+                        print("❌ Please answer 'y' or 'n'")
+            
+            # Step 5: Create receptors directory structure
+            receptors_base_dir = os.path.join(self.path, 'docking', 'receptors')
+            os.makedirs(receptors_base_dir, exist_ok=True)
+            
+            # Create receptor-specific directory
+            receptor_folder = self._create_receptor_folder(receptors_base_dir, receptor_name)
+            
+            if not receptor_folder:
+                print("❌ Failed to create receptor folder")
+                return None
+            
+            # Step 6: Copy and process PDB file
+            processed_pdb_path = self._process_pdb_file(pdb_file, receptor_folder, pdb_analysis)
+            
+            if not processed_pdb_path:
+                print("❌ Failed to process PDB file")
+                return None
+            
+            # Step 7: Create receptor registry entry
+            receptor_registry = self._create_receptor_registry_entry(
+                receptor_name, pdb_file, processed_pdb_path, receptor_folder, pdb_analysis
+            )
+            
+            if not receptor_registry:
+                print("❌ Failed to create receptor registry")
+                return None
+            
+            # Step 8: Display success summary
+            self._display_receptor_creation_summary(receptor_registry)
+            
+            return receptor_registry
+            
+        except Exception as e:
+            print(f"❌ Error creating receptor for docking: {e}")
+            return None
+
+    def _analyze_pdb_file(self, pdb_file: str) -> Optional[Dict[str, Any]]:
+        """
+        Analyze PDB file structure and content, including detection and processing of alternate locations (altlocs).
+        
+        Args:
+            pdb_file (str): Path to PDB file
+            
+        Returns:
+            Optional[Dict[str, Any]]: PDB analysis results or None if failed
+        """
+        try:
+            analysis = {
+                'file_path': pdb_file,
+                'file_size': os.path.getsize(pdb_file),
+                'chains': set(),
+                'residue_count': 0,
+                'atom_count': 0,
+                'hetero_count': 0,
+                'has_waters': False,
+                'has_ligands': False,
+                'ligand_residues': set(),
+                'resolution': None,
+                'header_info': {},
+                'altlocs': {},  # New: altlocs summary
+                'has_altlocs': False  # New: quick flag
+            }
+            altlocs_per_residue = {}
+            altloc_counts = {}
+            with open(pdb_file, 'r') as f:
+                for line_num, line in enumerate(f, 1):
+                    # Parse HEADER information
+                    if line.startswith('HEADER'):
+                        analysis['header_info']['title'] = line[10:50].strip()
+                        analysis['header_info']['deposition_date'] = line[50:59].strip()
+                        analysis['header_info']['pdb_id'] = line[62:66].strip()
+                    
+                    # Parse RESOLUTION
+                    elif line.startswith('REMARK   2 RESOLUTION'):
+                        try:
+                            resolution_text = line[23:].strip()
+                            if 'ANGSTROMS' in resolution_text:
+                                resolution_value = float(resolution_text.split()[0])
+                                analysis['resolution'] = resolution_value
+                        except (ValueError, IndexError):
+                            pass
+                    
+                    # Parse ATOM records
+                    elif line.startswith('ATOM'):
+                        analysis['atom_count'] += 1
+                        chain_id = line[21].strip()
+                        if chain_id:
+                            analysis['chains'].add(chain_id)
+                        # Count unique residues
+                        residue_id = f"{line[21]}{line[22:26].strip()}"
+                        analysis['residue_count'] += 1
+
+                        # --- ALTLOC detection ---
+                        altloc = line[16] if len(line) > 16 else " "
+                        if altloc and altloc not in (" ", ""):
+                            analysis['has_altlocs'] = True
+                            res_uid = (chain_id, line[17:20].strip(), line[22:26].strip())
+                            altlocs_per_residue.setdefault(res_uid, set()).add(altloc)
+                            altloc_counts[altloc] = altloc_counts.get(altloc, 0) + 1
+
+                    # Parse HETATM records
+                    elif line.startswith('HETATM'):
+                        analysis['hetero_count'] += 1
+                        residue_name = line[17:20].strip()
+                        if residue_name == 'HOH':
+                            analysis['has_waters'] = True
+                        else:
+                            analysis['has_ligands'] = True
+                            analysis['ligand_residues'].add(residue_name)
+                        chain_id = line[21].strip()
+                        if chain_id:
+                            analysis['chains'].add(chain_id)
+                        # --- ALTLOC detection for HETATM ---
+                        altloc = line[16] if len(line) > 16 else " "
+                        if altloc and altloc not in (" ", ""):
+                            analysis['has_altlocs'] = True
+                            res_uid = (chain_id, line[17:20].strip(), line[22:26].strip())
+                            altlocs_per_residue.setdefault(res_uid, set()).add(altloc)
+                            altloc_counts[altloc] = altloc_counts.get(altloc, 0) + 1
+
+            # Convert sets to lists for JSON serialization
+            analysis['chains'] = sorted(list(analysis['chains']))
+            analysis['ligand_residues'] = sorted(list(analysis['ligand_residues']))
+
+            # Add altlocs summary
+            if analysis['has_altlocs']:
+                analysis['altlocs'] = {
+                    'total_altlocs': sum(len(v) for v in altlocs_per_residue.values()),
+                    'unique_altloc_ids': sorted(list(altloc_counts.keys())),
+                    'altloc_counts': dict(sorted(altloc_counts.items())),
+                    'residues_with_altlocs': len(altlocs_per_residue),
+                }
+            else:
+                analysis['altlocs'] = {
+                    'total_altlocs': 0,
+                    'unique_altloc_ids': [],
+                    'altloc_counts': {},
+                    'residues_with_altlocs': 0,
+                }
+
+            return analysis
+
+        except Exception as e:
+            print(f"❌ Error analyzing PDB file: {e}")
+            return None
+
+    def _process_pdb_file(self, pdb_file: str, receptor_folder: str, analysis: Dict[str, Any]) -> str:
+        """
+        Process and copy PDB file to receptor folder with chain and ligand selection options.
+        Now also manages alternate locations (altlocs) if present.
+        
+        Args:
+            pdb_file (str): Original PDB file path
+            receptor_folder (str): Receptor folder path
+            analysis (Dict): PDB analysis results
+            
+        Returns:
+            str: Path to processed PDB file
+        """
+        try:
+            import shutil
+
+            # Copy original PDB to original folder
+            original_dir = os.path.join(receptor_folder, 'original')
+            original_pdb_path = os.path.join(original_dir, 'receptor_original.pdb')
+            os.makedirs(original_dir, exist_ok=True)
+            shutil.copy2(pdb_file, original_pdb_path)
+            print(f"   📋 Copied original PDB file to: {os.path.relpath(original_pdb_path)}")
+
+            # Create processed PDB path in processed folder
+            processed_dir = os.path.join(receptor_folder, 'processed')
+            os.makedirs(processed_dir, exist_ok=True)
+            processed_pdb_path = os.path.join(processed_dir, 'receptor.pdb')
+            shutil.copy2(original_pdb_path, processed_pdb_path)
+            print(f"   🔄 Created working copy for processing: {os.path.relpath(processed_pdb_path)}")
+
+            # --- ALTLOC MANAGEMENT ---
+            altloc_handling = None
+            altloc_map = {}
+            if analysis.get('has_altlocs', False):
+                altlocs = analysis.get('altlocs', {})
+                print(f"\n⚠️  Alternate locations (altlocs) detected in structure.")
+                print(f"   • Residues with altlocs: {altlocs.get('residues_with_altlocs', 0)}")
+                print(f"   • Unique altloc IDs: {', '.join(altlocs.get('unique_altloc_ids', [])) or 'None'}")
+                print(f"   • Total altloc atoms: {altlocs.get('total_altlocs', 0)}")
+                print("   ⚠️  You must select which altlocs to keep in the processed file.")
+
+                # Query user for altloc handling strategy
+                altloc_handling, altloc_map = self._query_altloc_handling(original_pdb_path, analysis)
+                if altloc_handling == "cancel":
+                    print("   ❌ Altloc selection cancelled. Aborting processing.")
+                    return ""
+
+                # Apply altloc filtering to processed file
+                self._filter_altlocs_in_pdb(processed_pdb_path, altloc_handling, altloc_map)
+                print(f"   ✅ Applied altloc filtering: {altloc_handling}")
+
+            # Process chains if multiple chains exist
+            selected_chains = None
+            if len(analysis['chains']) > 1:
+                print(f"   🔗 Multi-chain structure detected: {', '.join(analysis['chains'])}")
+                while True:
+                    try:
+                        choice = input(f"   🧬 Keep all chains or select specific chain? (all/select): ").strip().lower()
+                        if choice in ['all', 'a']:
+                            print("   ✅ Keeping all chains")
+                            selected_chains = analysis['chains']
+                            break
+                        elif choice in ['select', 's']:
+                            selected_chain = self._select_chain_interactive(analysis['chains'])
+                            if selected_chain:
+                                selected_chains = [selected_chain]
+                                print(f"   ✅ Selected chain: {selected_chain}")
+                                break
+                            else:
+                                print("   ⚠️  No chain selected, keeping all chains")
+                                selected_chains = analysis['chains']
+                                break
+                        else:
+                            print("   ❌ Please enter 'all' or 'select'")
+                            continue
+                    except KeyboardInterrupt:
+                        print("\n   ⚠️  Using all chains by default")
+                        selected_chains = analysis['chains']
+                        break
+            else:
+                selected_chains = analysis['chains']
+
+            # Process ligands if any exist
+            selected_ligands = None
+            if analysis['has_ligands'] and analysis['ligand_residues']:
+                print(f"\n   💊 Ligand residues detected: {', '.join(analysis['ligand_residues'])}")
+                ligand_details = self._analyze_ligands_in_pdb(original_pdb_path, analysis['ligand_residues'])
+                if ligand_details:
+                    self._display_ligand_analysis(ligand_details)
+                    while True:
+                        try:
+                            print("\n   🧪 LIGAND OPTIONS:")
+                            print("   1. Remove all ligands (clean receptor)")
+                            print("   2. Keep all ligands")
+                            print("   3. Select specific ligands to keep")
+                            print("   4. Keep only co-crystallized ligands (exclude waters)")
+                            ligand_choice = input("   💊 Select ligand handling (1-4): ").strip()
+                            if ligand_choice == '1':
+                                print("   🧹 Will remove all ligands from processed PDB")
+                                selected_ligands = []
+                                break
+                            elif ligand_choice == '2':
+                                print("   ✅ Will keep all ligands")
+                                selected_ligands = list(analysis['ligand_residues'])
+                                break
+                            elif ligand_choice == '3':
+                                selected_ligands = self._select_ligands_interactive(ligand_details)
+                                if selected_ligands is not None:
+                                    if selected_ligands:
+                                        print(f"   ✅ Selected ligands: {', '.join(selected_ligands)}")
+                                    else:
+                                        print("   🧹 No ligands selected - will create clean receptor")
+                                    break
+                                else:
+                                    print("   ⚠️  Ligand selection cancelled, keeping all ligands")
+                                    selected_ligands = list(analysis['ligand_residues'])
+                                    break
+                            elif ligand_choice == '4':
+                                non_water_ligands = [lig for lig in analysis['ligand_residues'] if lig != 'HOH']
+                                selected_ligands = non_water_ligands
+                                if non_water_ligands:
+                                    print(f"   ✅ Will keep co-crystallized ligands: {', '.join(non_water_ligands)}")
+                                else:
+                                    print("   🧹 No co-crystallized ligands found - will create clean receptor")
+                                break
+                            else:
+                                print("   ❌ Invalid choice. Please enter 1, 2, 3, or 4")
+                                continue
+                        except KeyboardInterrupt:
+                            print("\n   ⚠️  Keeping all ligands by default")
+                            selected_ligands = list(analysis['ligand_residues'])
+                            break
+                else:
+                    selected_ligands = list(analysis['ligand_residues'])
+            else:
+                selected_ligands = []
+
+            # Create processed PDB file with selected chains and ligands
+            if selected_chains != analysis['chains'] or selected_ligands != list(analysis['ligand_residues']):
+                print(f"   🔄 Applying filters to processed PDB...")
+                filtered_pdb_path = self._create_filtered_pdb(
+                    processed_pdb_path, selected_chains, selected_ligands, analysis
+                )
+                if not filtered_pdb_path:
+                    print("   ❌ Failed to create filtered PDB file")
+                    return ""
+                processed_pdb_path = filtered_pdb_path
+            else:
+                print(f"   ✅ No filtering needed - processed PDB ready")
+
+            # Create reference ligand file if ligands were kept
+            if selected_ligands:
+                self._extract_reference_ligands(processed_pdb_path, receptor_folder, selected_ligands)
+
+            # Create processing summary file
+            self._create_processing_summary(receptor_folder, original_pdb_path, processed_pdb_path, 
+                                            selected_chains, selected_ligands, analysis)
+
+            return processed_pdb_path
+
+        except Exception as e:
+            print(f"❌ Error processing PDB file: {e}")
+            return ""
+
+    def _query_altloc_handling(self, pdb_file: str, analysis: Dict[str, Any]) -> Tuple[str, dict]:
+        """
+        Query the user for how to handle altlocs: keep first, keep highest occupancy, or select manually.
+        Returns the chosen strategy and a mapping if manual selection.
+        """
+        altlocs = analysis.get('altlocs', {})
+        unique_altlocs = altlocs.get('unique_altloc_ids', [])
+        print("\n   ALTLOC HANDLING OPTIONS:")
+        print("   1. Keep only the first altloc (A/B/C...) for each residue")
+        print("   2. Keep altloc with highest occupancy (if available)")
+        print("   3. Select altloc manually for each residue with altlocs")
+        print("   4. Cancel processing")
+        while True:
+            choice = input("   Select altloc handling (1-4): ").strip()
+            if choice == '1':
+                return "first", {}
+            elif choice == '2':
+                return "highest_occupancy", {}
+            elif choice == '3':
+                # Manual selection per residue
+                altloc_map = self._manual_select_altlocs(pdb_file, analysis)
+                return "manual", altloc_map
+            elif choice == '4' or choice.lower() in ['cancel', 'quit', 'exit']:
+                return "cancel", {}
+            else:
+                print("   ❌ Invalid choice. Please enter 1, 2, 3, or 4.")
+
+    def _manual_select_altlocs(self, pdb_file: str, analysis: Dict[str, Any]) -> dict:
+        """
+        For each residue with altlocs, ask the user which altloc to keep.
+        Returns a mapping: {res_uid: altloc_id}
+        """
+        altlocs = {}
+        altlocs_per_residue = {}
+        with open(pdb_file, 'r') as f:
+            for line in f:
+                if line.startswith(('ATOM', 'HETATM')):
+                    chain_id = line[21].strip()
+                    resname = line[17:20].strip()
+                    resnum = line[22:26].strip()
+                    altloc = line[16] if len(line) > 16 else " "
+                    if altloc and altloc not in (" ", ""):
+                        res_uid = (chain_id, resname, resnum)
+                        altlocs_per_residue.setdefault(res_uid, set()).add(altloc)
+        for res_uid, altloc_set in altlocs_per_residue.items():
+            print(f"   Residue {res_uid} has altlocs: {', '.join(sorted(altloc_set))}")
+            while True:
+                sel = input(f"   Select altloc to keep for {res_uid} (or leave blank for first): ").strip().upper()
+                if not sel:
+                    altlocs[res_uid] = sorted(altloc_set)[0]
+                    break
+                elif sel in altloc_set:
+                    altlocs[res_uid] = sel
+                    break
+                else:
+                    print(f"   ❌ Invalid altloc. Choose from: {', '.join(sorted(altloc_set))}")
+        return altlocs
+
+    def _filter_altlocs_in_pdb(self, pdb_file: str, handling: str, altloc_map: dict) -> None:
+        """
+        Filter altlocs in the given pdb_file in-place according to the chosen strategy.
+        """
+        import tempfile
+        tmp_path = pdb_file + ".altloc.tmp"
+        with open(pdb_file, 'r') as infile, open(tmp_path, 'w') as outfile:
+            for line in infile:
+                if line.startswith(('ATOM', 'HETATM')):
+                    altloc = line[16] if len(line) > 16 else " "
+                    chain_id = line[21].strip()
+                    resname = line[17:20].strip()
+                    resnum = line[22:26].strip()
+                    res_uid = (chain_id, resname, resnum)
+                    if altloc and altloc not in (" ", ""):
+                        if handling == "first":
+                            # Keep only the first altloc for each residue
+                            # We assume lines are ordered, so keep only the first altloc encountered
+                            # (This is a simplification; for more robust handling, build a set first)
+                            if not hasattr(self, "_altloc_first_seen"):
+                                self._altloc_first_seen = {}
+                            if res_uid not in self._altloc_first_seen:
+                                self._altloc_first_seen[res_uid] = altloc
+                            if altloc == self._altloc_first_seen[res_uid]:
+                                outfile.write(line)
+                        elif handling == "highest_occupancy":
+                            # Parse occupancy and keep highest for each residue
+                            if not hasattr(self, "_altloc_occ"):
+                                self._altloc_occ = {}
+                            occ = float(line[54:60].strip() or 0)
+                            if res_uid not in self._altloc_occ or occ > self._altloc_occ[res_uid][0]:
+                                self._altloc_occ[res_uid] = (occ, line)
+                        elif handling == "manual":
+                            if res_uid in altloc_map and altloc == altloc_map[res_uid]:
+                                outfile.write(line)
+                        else:
+                            # Unknown handling, write all
+                            outfile.write(line)
+                    else:
+                        # No altloc, always keep
+                        outfile.write(line)
+                else:
+                    outfile.write(line)
+            # For highest_occupancy, after reading all lines, write the best for each residue
+            if handling == "highest_occupancy" and hasattr(self, "_altloc_occ"):
+                # Rewind and write only the highest occupancy lines
+                outfile.seek(0)
+                for occ, line in self._altloc_occ.values():
+                    outfile.write(line)
+                del self._altloc_occ
+            if hasattr(self, "_altloc_first_seen"):
+                del self._altloc_first_seen
+        # Replace original file
+        import shutil
+        shutil.move(tmp_path, pdb_file)
+
+    def _create_processing_summary(self, receptor_folder: str, original_pdb_path: str, 
+                                processed_pdb_path: str, selected_chains: List[str], 
+                                selected_ligands: List[str], analysis: Dict[str, Any]) -> None:
+        """
+        Create a summary file documenting the processing steps applied.
+        
+        Args:
+            receptor_folder (str): Receptor folder path
+            original_pdb_path (str): Path to original PDB file
+            processed_pdb_path (str): Path to processed PDB file
+            selected_chains (List[str]): Chains that were kept
+            selected_ligands (List[str]): Ligands that were kept
+            analysis (Dict): PDB analysis results
+        """
+        try:
+            from datetime import datetime
+            
+            summary_path = os.path.join(receptor_folder, 'processing_summary.txt')
+            
+            with open(summary_path, 'w') as f:
+                f.write(f"PDB PROCESSING SUMMARY\n")
+                f.write(f"=" * 50 + "\n")
+                f.write(f"Processing Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"Project: {self.name}\n\n")
+                
+                f.write(f"ORIGINAL FILE:\n")
+                f.write(f"  Path: {original_pdb_path}\n")
+                f.write(f"  Size: {analysis['file_size']:,} bytes\n")
+                f.write(f"  Chains: {', '.join(analysis['chains'])}\n")
+                f.write(f"  Atoms: {analysis['atom_count']:,}\n")
+                f.write(f"  Ligands: {', '.join(analysis['ligand_residues']) if analysis['ligand_residues'] else 'None'}\n")
+                if analysis.get('resolution'):
+                    f.write(f"  Resolution: {analysis['resolution']:.2f} Å\n")
+                f.write("\n")
+                
+                f.write(f"PROCESSING APPLIED:\n")
+                f.write(f"  Chains kept: {', '.join(selected_chains) if selected_chains else 'All'}\n")
+                f.write(f"  Ligands kept: {', '.join(selected_ligands) if selected_ligands else 'None (clean receptor)'}\n")
+                f.write("\n")
+                
+                f.write(f"PROCESSED FILE:\n")
+                f.write(f"  Path: {processed_pdb_path}\n")
+                
+                # Get processed file stats
+                if os.path.exists(processed_pdb_path):
+                    processed_size = os.path.getsize(processed_pdb_path)
+                    f.write(f"  Size: {processed_size:,} bytes\n")
+                    
+                    # Count atoms in processed file
+                    with open(processed_pdb_path, 'r') as pdb:
+                        processed_atoms = sum(1 for line in pdb if line.startswith('ATOM'))
+                    f.write(f"  Protein atoms: {processed_atoms:,}\n")
+                
+                f.write("\n")
+                f.write(f"FOLDER STRUCTURE:\n")
+                f.write(f"  original/     - Original PDB file\n")
+                f.write(f"  processed/    - Processed receptor file\n")
+                f.write(f"  analysis/     - Reference ligands and analysis\n")
+                f.write(f"  grid_files/   - Grid files (to be created)\n")
+                f.write(f"  logs/         - Processing and docking logs\n")
+            
+            print(f"   📄 Created processing summary: {os.path.relpath(summary_path)}")
+            
+        except Exception as e:
+            print(f"   ⚠️  Could not create processing summary: {e}")
+
+    def _extract_reference_ligands(self, pdb_file: str, receptor_folder: str, selected_ligands: List[str]) -> None:
+        """
+        Extract reference ligands to separate files for docking reference.
+        Adds a 'TER' card after the protein and after each ligand for clarity.
+        
+        Args:
+            pdb_file (str): Processed PDB file path
+            receptor_folder (str): Receptor folder path
+            selected_ligands (List[str]): List of ligand residue names that were kept
+        """
+        try:
+            if not selected_ligands or selected_ligands == ['HOH']:
+                return  # No ligands to extract or only waters
+            
+            reference_dir = os.path.join(receptor_folder, 'analysis')
+            os.makedirs(reference_dir, exist_ok=True)
+            
+            # Extract each ligand type to separate files
+            ligands_extracted = []
+            
+            for ligand_name in selected_ligands:
+                if ligand_name == 'HOH':
+                    continue  # Skip water molecules
+                
+                ligand_file = os.path.join(reference_dir, f"reference_ligand_{ligand_name}.pdb")
+                ligand_count = 0
+                last_residue = None
+                protein_section_done = False
+
+                with open(pdb_file, 'r') as infile, open(ligand_file, 'w') as ligand_out:
+                    # Write header
+                    ligand_out.write(f"HEADER    REFERENCE LIGAND {ligand_name}\n")
+                    ligand_out.write(f"REMARK    Extracted from processed receptor\n")
+                    ligand_out.write(f"REMARK    Source: {os.path.basename(pdb_file)}\n")
+                    ligand_out.write(f"REMARK    Project: {self.name}\n")
+                    
+                    for line in infile:
+                        # Add 'TER' after the last ATOM line and before the first HETATM for this ligand
+                        if not protein_section_done and line.startswith('HETATM'):
+                            ligand_out.write("TER\n")
+                            protein_section_done = True
+                        if line.startswith('HETATM'):
+                            residue_name = line[17:20].strip()
+                            chain_id = line[21].strip()
+                            residue_number = line[22:26].strip()
+                            res_uid = (chain_id, residue_name, residue_number)
+                            if residue_name == ligand_name:
+                                ligand_out.write(line)
+                                ligand_count += 1
+                                # If residue changes, write TER
+                                if last_residue and res_uid != last_residue:
+                                    ligand_out.write("TER\n")
+                                last_residue = res_uid
+                    if ligand_count > 0:
+                        ligand_out.write("TER\n")
+                        ligand_out.write("END\n")
+                
+                if ligand_count > 0:
+                    print(f"   📄 Extracted reference ligand: {ligand_name} ({ligand_count} atoms)")
+                    ligands_extracted.append(ligand_name)
+                else:
+                    # Remove empty file
+                    os.remove(ligand_file)
+            
+            if ligands_extracted:
+                print(f"   📁 Reference ligands saved to: {os.path.relpath(reference_dir)}")
+            
+        except Exception as e:
+            print(f"   ⚠️  Error extracting reference ligands: {e}")
+
+    def _create_filtered_pdb(self, pdb_file: str, selected_chains: List[str], 
+                        selected_ligands: List[str], analysis: Dict[str, Any]) -> str:
+        """
+        Create a filtered PDB file with only selected chains and ligands.
+        Adds a 'TER' card after each ligand for clarity.
+        
+        Args:
+            pdb_file (str): Input PDB file path
+            selected_chains (List[str]): Chains to keep
+            selected_ligands (List[str]): Ligand residue names to keep
+            analysis (Dict): PDB analysis results
+            
+        Returns:
+            str: Path to filtered PDB file (same as input, modified in place)
+        """
+        try:
+            # Create temporary filtered file
+            temp_filtered_path = f"{pdb_file}.tmp"
+            
+            atoms_kept = 0
+            ligand_atoms_kept = 0
+            water_atoms_kept = 0
+            last_ligand_res = None
+            
+            with open(pdb_file, 'r') as infile, open(temp_filtered_path, 'w') as outfile:
+                # Process each line
+                for line in infile:
+                    write_line = False
+                    
+                    if line.startswith(('HEADER', 'TITLE', 'COMPND', 'SOURCE', 'REMARK')):
+                        # Keep header information
+                        write_line = True
+                    elif line.startswith('ATOM'):
+                        # Process protein atoms
+                        chain_id = line[21].strip()
+                        if not selected_chains or chain_id in selected_chains:
+                            write_line = True
+                            atoms_kept += 1
+                    elif line.startswith('TER'):
+                        # Keep the TER card associated to the chain
+                        chain_id = line[21].strip()
+                        if not selected_chains or chain_id in selected_chains:
+                            write_line = True
+                            atoms_kept += 1
+                    elif line.startswith('HETATM'):
+                        # Process hetero atoms (ligands, waters, etc.)
+                        chain_id = line[21].strip()
+                        residue_name = line[17:20].strip()
+                        residue_number = line[22:26].strip()
+                        res_uid = (chain_id, residue_name, residue_number)
+                        # Check if we should keep this hetero atom
+                        if selected_ligands and residue_name in selected_ligands:
+                            # Check chain selection as well
+                            if not selected_chains or chain_id in selected_chains:
+                                write_line = True
+                                if residue_name == 'HOH':
+                                    water_atoms_kept += 1
+                                else:
+                                    ligand_atoms_kept += 1
+                                # Insert TER if ligand residue changes
+                                if last_ligand_res and res_uid != last_ligand_res:
+                                    outfile.write("TER\n")
+                                last_ligand_res = res_uid
+                    
+                    # elif line.startswith(('END', 'ENDMDL')):
+                    #     # Keep end markers
+                    #     write_line = True
+                    
+                    if write_line:
+                        outfile.write(line)
+                # Add TER at the end if any ligand was written
+                if last_ligand_res:
+                    outfile.write("TER\n")
+                
+                # Add an 'END' card at the end of the processed file
+                outfile.write("END\n")
+                outfile.truncate()
+            
+            
+            # Replace original file with filtered version
+            import shutil
+            shutil.move(temp_filtered_path, pdb_file)
+            
+            print(f"   ✅ Applied filtering to PDB file:")
+            print(f"      • Chains kept: {', '.join(selected_chains) if selected_chains else 'all'}")
+            print(f"      • Protein atoms: {atoms_kept:,}")
+            
+            if selected_ligands:
+                if ligand_atoms_kept > 0:
+                    ligand_names = [lig for lig in selected_ligands if lig != 'HOH']
+                    if ligand_names:
+                        print(f"      • Ligand atoms: {ligand_atoms_kept:,} ({', '.join(ligand_names)})")
+                if water_atoms_kept > 0:
+                    print(f"      • Water atoms: {water_atoms_kept:,}")
+            else:
+                print(f"      • All ligands removed (clean receptor)")
+            
+            return pdb_file
+            
+        except Exception as e:
+            print(f"   ❌ Error creating filtered PDB: {e}")
+            # Clean up temporary file if it exists
+            temp_filtered_path = f"{pdb_file}.tmp"
+            if os.path.exists(temp_filtered_path):
+                os.remove(temp_filtered_path)
+            return ""
+
+    def _analyze_ligands_in_pdb(self, pdb_file: str, ligand_residues: List[str]) -> Optional[Dict[str, Any]]:
+        """
+        Analyze ligands in PDB file to provide detailed information for selection.
+        
+        Args:
+            pdb_file (str): Path to PDB file
+            ligand_residues (List[str]): List of ligand residue names
+            
+        Returns:
+            Optional[Dict[str, Any]]: Detailed ligand analysis or None if failed
+        """
+        try:
+            ligand_details = {}
+            
+            with open(pdb_file, 'r') as f:
+                for line in f:
+                    if line.startswith('HETATM'):
+                        residue_name = line[17:20].strip()
+                        chain_id = line[21].strip()
+                        residue_number = line[22:26].strip()
+                        atom_name = line[12:16].strip()
+                        
+                        if residue_name in ligand_residues:
+                            # Create unique ligand identifier
+                            ligand_id = f"{residue_name}_{chain_id}_{residue_number}"
+                            
+                            if ligand_id not in ligand_details:
+                                ligand_details[ligand_id] = {
+                                    'residue_name': residue_name,
+                                    'chain_id': chain_id,
+                                    'residue_number': residue_number,
+                                    'atoms': [],
+                                    'atom_count': 0,
+                                    'is_water': residue_name == 'HOH',
+                                    'coordinates': []
+                                }
+                            
+                            # Extract coordinates
+                            try:
+                                x = float(line[30:38])
+                                y = float(line[38:46])
+                                z = float(line[46:54])
+                                ligand_details[ligand_id]['coordinates'].append((x, y, z))
+                            except ValueError:
+                                pass
+                            
+                            ligand_details[ligand_id]['atoms'].append(atom_name)
+                            ligand_details[ligand_id]['atom_count'] += 1
+            
+            # Calculate ligand properties
+            for ligand_id, details in ligand_details.items():
+                if details['coordinates']:
+                    # Calculate center of mass (approximate)
+                    coords = details['coordinates']
+                    center_x = sum(coord[0] for coord in coords) / len(coords)
+                    center_y = sum(coord[1] for coord in coords) / len(coords)
+                    center_z = sum(coord[2] for coord in coords) / len(coords)
+                    details['center'] = (center_x, center_y, center_z)
+                    
+                    # Calculate size (max distance from center)
+                    max_dist = max(
+                        ((coord[0] - center_x)**2 + (coord[1] - center_y)**2 + (coord[2] - center_z)**2)**0.5
+                        for coord in coords
+                    )
+                    details['size'] = max_dist
+                else:
+                    details['center'] = (0, 0, 0)
+                    details['size'] = 0
+            
+            return ligand_details if ligand_details else None
+            
+        except Exception as e:
+            print(f"   ⚠️  Error analyzing ligands: {e}")
+            return None
+
+    def _display_ligand_analysis(self, ligand_details: Dict[str, Any]) -> None:
+        """
+        Display detailed ligand analysis for user review.
+        
+        Args:
+            ligand_details (Dict): Detailed ligand information
+        """
+        try:
+            print(f"\n   📊 LIGAND ANALYSIS:")
+            print("   " + "-" * 70)
+            print(f"   {'Ligand ID':<15} {'Type':<8} {'Chain':<6} {'ResNum':<7} {'Atoms':<7} {'Size':<8} {'Center (Å)':<15}")
+            print("   " + "-" * 70)
+            
+            # Sort ligands by type (waters last) and then by size (largest first)
+            sorted_ligands = sorted(
+                ligand_details.items(),
+                key=lambda x: (x[1]['is_water'], -x[1]['size'], x[1]['residue_name'])
+            )
+            
+            for ligand_id, details in sorted_ligands:
+                ligand_type = "Water" if details['is_water'] else "Ligand"
+                center_str = f"({details['center'][0]:.1f}, {details['center'][1]:.1f}, {details['center'][2]:.1f})"
+                
+                print(f"   {ligand_id[:14]:<15} {ligand_type:<8} {details['chain_id']:<6} "
+                    f"{details['residue_number']:<7} {details['atom_count']:<7} "
+                    f"{details['size']:8.2f}Å {center_str:<15}")
+            
+            print("   " + "-" * 70)
+            
+            # Show summary
+            total_ligands = len([l for l in ligand_details.values() if not l['is_water']])
+            total_waters = len([l for l in ligand_details.values() if l['is_water']])
+            
+            print(f"   📊 Summary: {total_ligands} ligand(s), {total_waters} water molecule(s)")
+            
+            if total_ligands > 0:
+                largest_ligand = max(
+                    [l for l in ligand_details.values() if not l['is_water']],
+                    key=lambda x: x['size']
+                )
+                print(f"   🎯 Largest ligand: {largest_ligand['residue_name']} ({largest_ligand['atom_count']} atoms, {largest_ligand['size']:.2f}Å)")
+            
+        except Exception as e:
+            print(f"   ⚠️  Error displaying ligand analysis: {e}")
+
+    def _select_ligands_interactive(self, ligand_details: Dict[str, Any]) -> Optional[List[str]]:
+        """
+        Interactive ligand selection interface.
+        
+        Args:
+            ligand_details (Dict): Detailed ligand information
+            
+        Returns:
+            Optional[List[str]]: List of selected ligand residue names or None if cancelled
+        """
+        try:
+            # Separate waters from other ligands
+            waters = {k: v for k, v in ligand_details.items() if v['is_water']}
+            ligands = {k: v for k, v in ligand_details.items() if not v['is_water']}
+            
+            selected_residues = []
+            
+            # Handle non-water ligands first
+            if ligands:
+                print(f"\n   🧪 SELECT LIGANDS TO KEEP:")
+                print("   " + "-" * 50)
+                
+                ligand_list = list(ligands.items())
+                for i, (ligand_id, details) in enumerate(ligand_list, 1):
+                    print(f"   {i}. {ligand_id} ({details['atom_count']} atoms, {details['size']:.2f}Å)")
+                
+                print(f"\n   Commands:")
+                print(f"   • Enter numbers separated by commas (e.g., 1,3)")
+                print(f"   • 'all' to keep all ligands")
+                print(f"   • 'none' to remove all ligands")
+                print(f"   • 'largest' to keep only the largest ligand")
+                
+                while True:
+                    try:
+                        selection = input(f"\n   💊 Select ligands to keep: ").strip().lower()
+                        
+                        if selection in ['cancel', 'quit', 'exit']:
+                            return None
+                        elif selection == 'all':
+                            selected_residues.extend([details['residue_name'] for details in ligands.values()])
+                            print(f"   ✅ Selected all ligands: {', '.join(set(selected_residues))}")
+                            break
+                        elif selection == 'none':
+                            print("   🧹 No ligands selected")
+                            break
+                        elif selection == 'largest':
+                            largest = max(ligands.values(), key=lambda x: x['size'])
+                            selected_residues.append(largest['residue_name'])
+                            print(f"   ✅ Selected largest ligand: {largest['residue_name']}")
+                            break
+                        else:
+                            # Parse comma-separated numbers
+                            try:
+                                indices = [int(x.strip()) - 1 for x in selection.split(',')]
+                                valid_selections = []
+                                
+                                for idx in indices:
+                                    if 0 <= idx < len(ligand_list):
+                                        ligand_id, details = ligand_list[idx]
+                                        selected_residues.append(details['residue_name'])
+                                        valid_selections.append(ligand_id)
+                                    else:
+                                        print(f"   ⚠️  Invalid selection: {idx + 1}")
+                                
+                                if valid_selections:
+                                    print(f"   ✅ Selected: {', '.join(valid_selections)}")
+                                    break
+                                else:
+                                    print("   ❌ No valid selections made")
+                                    continue
+                                    
+                            except ValueError:
+                                print("   ❌ Invalid input. Use numbers, 'all', 'none', or 'largest'")
+                                continue
+                                
+                    except KeyboardInterrupt:
+                        return None
+            
+            # Handle waters separately
+            if waters:
+                print(f"\n   💧 WATER MOLECULES FOUND: {len(waters)}")
+                
+                while True:
+                    try:
+                        water_choice = input(f"   Keep water molecules? (y/n/ask): ").strip().lower()
+                        
+                        if water_choice in ['y', 'yes']:
+                            selected_residues.append('HOH')
+                            print(f"   💧 Will keep {len(waters)} water molecules")
+                            break
+                        elif water_choice in ['n', 'no']:
+                            print("   🧹 Will remove all water molecules")
+                            break
+                        elif water_choice == 'ask':
+                            # Show water details and let user decide
+                            print(f"   Water molecule details:")
+                            water_list = list(waters.items())
+                            for i, (water_id, details) in enumerate(water_list[:10], 1):  # Show first 10
+                                center = details['center']
+                                print(f"     {i}. {water_id} at ({center[0]:.1f}, {center[1]:.1f}, {center[2]:.1f})")
+                            
+                            if len(waters) > 10:
+                                print(f"     ... and {len(waters) - 10} more water molecules")
+                            
+                            keep_waters = input(f"   Keep these water molecules? (y/n): ").strip().lower()
+                            if keep_waters in ['y', 'yes']:
+                                selected_residues.append('HOH')
+                                print(f"   💧 Will keep {len(waters)} water molecules")
+                            else:
+                                print("   🧹 Will remove all water molecules")
+                            break
+                        else:
+                            print("   ❌ Please answer 'y', 'n', or 'ask'")
+                            continue
+                            
+                    except KeyboardInterrupt:
+                        return None
+            
+            # Remove duplicates and return
+            return list(set(selected_residues)) if selected_residues else []
+            
+        except Exception as e:
+            print(f"   ❌ Error in ligand selection: {e}")
+            return None
+
+    def _display_pdb_analysis(self, analysis: Dict[str, Any]) -> None:
+        """
+        Display PDB file analysis results.
+        
+        Args:
+            analysis (Dict): PDB analysis dictionary
+        """
+        try:
+            print(f"\n📊 PDB FILE ANALYSIS")
+            print("-" * 50)
+            print(f"📁 File: {os.path.basename(analysis['file_path'])}")
+            print(f"💾 Size: {analysis['file_size']:,} bytes")
+            
+            if analysis['header_info']:
+                header = analysis['header_info']
+                if header.get('title'):
+                    print(f"🏷️  Title: {header['title']}")
+                if header.get('pdb_id'):
+                    print(f"🆔 PDB ID: {header['pdb_id']}")
+                if header.get('deposition_date'):
+                    print(f"📅 Date: {header['deposition_date']}")
+            
+            if analysis['resolution']:
+                print(f"🔬 Resolution: {analysis['resolution']:.2f} Å")
+            
+            print(f"\n🧬 STRUCTURE CONTENT:")
+            print(f"   ⚛️  Protein atoms: {analysis['atom_count']:,}")
+            print(f"   🔗 Chains: {', '.join(analysis['chains'])} ({len(analysis['chains'])} total)")
+            print(f"   📊 Residues: ~{analysis['residue_count']:,}")
+            
+            if analysis['hetero_count'] > 0:
+                print(f"   🧪 Hetero atoms: {analysis['hetero_count']:,}")
+                
+                if analysis['has_waters']:
+                    print(f"   💧 Contains water molecules")
+                
+                if analysis['has_ligands']:
+                    print(f"   💊 Contains ligands: {', '.join(analysis['ligand_residues'])}")
+
+            # Inform about alternate locations (altlocs)
+            if analysis.get('has_altlocs', False):
+                altlocs = analysis.get('altlocs', {})
+                print(f"\n⚠️  Alternate locations (altlocs) detected:")
+                print(f"   • Residues with altlocs: {altlocs.get('residues_with_altlocs', 0)}")
+                print(f"   • Unique altloc IDs: {', '.join(altlocs.get('unique_altloc_ids', [])) or 'None'}")
+                print(f"   • Total altloc atoms: {altlocs.get('total_altlocs', 0)}")
+                print("   ⚠️  Consider handling altlocs (alternate conformations) during processing.")
+            else:
+                print(f"\n✅ No alternate location (altloc) atoms detected.")
+
+            # Assessment
+            print(f"\n✅ DOCKING SUITABILITY:")
+            issues = []
+            
+            if analysis['atom_count'] == 0:
+                issues.append("No protein atoms found")
+            elif analysis['atom_count'] < 100:
+                issues.append("Very small protein structure")
+            
+            if len(analysis['chains']) == 0:
+                issues.append("No chain identifiers found")
+            elif len(analysis['chains']) > 4:
+                issues.append(f"Many chains ({len(analysis['chains'])}) - may need selection")
+            
+            if analysis['resolution'] and analysis['resolution'] > 3.0:
+                issues.append(f"Low resolution ({analysis['resolution']:.1f} Å)")
+            
+            if issues:
+                print("   ⚠️  Potential issues:")
+                for issue in issues:
+                    print(f"      • {issue}")
+            else:
+                print("   ✅ Structure appears suitable for docking")
+            
+            print("-" * 50)
+            
+        except Exception as e:
+            print(f"⚠️  Error displaying PDB analysis: {e}")
+
+    def _check_receptor_name_exists(self, receptor_name: str) -> bool:
+        """
+        Check if receptor name already exists in the database.
+        
+        Args:
+            receptor_name (str): Receptor name to check
+            
+        Returns:
+            bool: True if name exists, False otherwise
+        """
+        try:
+            receptors_db_path = os.path.join(self.path, 'docking', 'receptors', 'receptors.db')
+            
+            if not os.path.exists(receptors_db_path):
+                return False
+            
+            import sqlite3
+            conn = sqlite3.connect(receptors_db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT COUNT(*) FROM receptors WHERE receptor_name = ?", (receptor_name,))
+            count = cursor.fetchone()[0]
+            
+            conn.close()
+            return count > 0
+            
+        except Exception:
+            return False
+
+    def _create_receptor_folder(self, base_dir: str, receptor_name: str) -> str:
+        """
+        Create folder structure for receptor files.
+        
+        Args:
+            base_dir (str): Base receptors directory
+            receptor_name (str): Name of the receptor
+            
+        Returns:
+            str: Path to created receptor folder
+        """
+        try:
+            # Clean receptor name for folder creation
+            clean_name = "".join(c for c in receptor_name if c.isalnum() or c in ('_', '-', '.')).strip()
+            receptor_folder = os.path.join(base_dir, clean_name)
+            
+            # Create receptor folder and subdirectories
+            os.makedirs(receptor_folder, exist_ok=True)
+            
+            subdirs = [
+                'original',      # Original PDB file
+                'processed',     # Processed receptor files (PDBQT, etc.)
+                'grid_files',    # Grid/map files
+                'analysis',      # Analysis results
+                'logs'           # Processing logs
+            ]
+            
+            for subdir in subdirs:
+                os.makedirs(os.path.join(receptor_folder, subdir), exist_ok=True)
+            
+            print(f"   📁 Created receptor folder: {receptor_folder}")
+            return receptor_folder
+            
+        except Exception as e:
+            print(f"❌ Error creating receptor folder: {e}")
+            return ""
+
+    def _select_chain_interactive(self, chains: List[str]) -> Optional[str]:
+        """
+        Interactive chain selection for multi-chain structures.
+        
+        Args:
+            chains (List[str]): Available chain identifiers
+            
+        Returns:
+            Optional[str]: Selected chain ID or None if cancelled
+        """
+        try:
+            print(f"   📋 Available chains: {', '.join(chains)}")
+            
+            while True:
+                try:
+                    selection = input(f"   🔗 Select chain ({'/'.join(chains)}): ").strip().upper()
+                    
+                    if selection in chains:
+                        return selection
+                    elif selection.lower() in ['cancel', 'quit', 'exit']:
+                        return None
+                    else:
+                        print(f"   ❌ Invalid chain. Please select from: {', '.join(chains)}")
+                        continue
+                        
+                except KeyboardInterrupt:
+                    return None
+                    
+        except Exception:
+            return None
+
+    def _extract_single_chain(self, pdb_file: str, chain_id: str) -> str:
+        """
+        Extract single chain from PDB file, including 'TER' cards associated with that chain.
+        
+        Args:
+            pdb_file (str): Input PDB file path
+            chain_id (str): Chain identifier to extract
+            
+        Returns:
+            str: Path to single-chain PDB file
+        """
+        try:
+            output_file = pdb_file.replace('.pdb', f'_chain_{chain_id}.pdb')
+            with open(pdb_file, 'r') as infile, open(output_file, 'w') as outfile:
+                for line in infile:
+                    
+                    if line.startswith(('ATOM', 'HETATM')):
+                        if line[21].strip() == chain_id:
+                            outfile.write(line)
+                    elif line.startswith('TER'):
+                        # For TER, the chain ID is at column 22 (index 21)
+                        print(line.strip())   
+                        if len(line) > 21 and line[21].strip() == chain_id:
+                            outfile.write(line)
+                    else:
+                        # Keep header and other non-atom lines
+                        outfile.write(line)
+            
+            return output_file
+            
+        except Exception as e:
+            print(f"   ❌ Error extracting chain: {e}")
+            return ""
+
+    def _create_receptor_registry_entry(self, receptor_name: str, original_pdb_path: str, 
+                                    processed_pdb_path: str, receptor_folder: str, 
+                                    analysis: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Create receptor registry entry in receptors.db
+        
+        Args:
+            receptor_name (str): Name of the receptor
+            original_pdb_path (str): Path to original PDB file
+            processed_pdb_path (str): Path to processed PDB file
+            receptor_folder (str): Path to receptor folder
+            analysis (Dict): PDB analysis results
+            
+        Returns:
+            Optional[Dict[str, Any]]: Registry entry information or None if failed
+        """
+        try:
+            # Create receptors database
+            receptors_db_path = os.path.join(self.path, 'docking', 'receptors', 'receptors.db')
+            
+            import sqlite3
+            import json
+            from datetime import datetime
+            
+            conn = sqlite3.connect(receptors_db_path)
+            cursor = conn.cursor()
+            
+            # Create receptors table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS receptors (
+                    receptor_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    receptor_name TEXT UNIQUE NOT NULL,
+                    project_name TEXT,
+                    original_pdb_path TEXT NOT NULL,
+                    processed_pdb_path TEXT NOT NULL,
+                    receptor_folder_path TEXT NOT NULL,
+                    pdb_analysis TEXT,
+                    chains TEXT,
+                    resolution REAL,
+                    atom_count INTEGER,
+                    has_ligands BOOLEAN,
+                    status TEXT DEFAULT 'created',
+                    created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_modified TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    notes TEXT
+                )
+            ''')
+            
+            # Prepare data for insertion
+            pdb_analysis_json = json.dumps(analysis, indent=2)
+            chains_str = ','.join(analysis['chains'])
+            
+            # Insert or update receptor entry
+            cursor.execute('''
+                INSERT OR REPLACE INTO receptors (
+                    receptor_name, project_name, original_pdb_path, processed_pdb_path,
+                    receptor_folder_path, pdb_analysis, chains, resolution, atom_count,
+                    has_ligands, status, notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                receptor_name,
+                self.name,
+                original_pdb_path,
+                processed_pdb_path,
+                receptor_folder,
+                pdb_analysis_json,
+                chains_str,
+                analysis.get('resolution'),
+                analysis['atom_count'],
+                analysis['has_ligands'],
+                'created',
+                f"Receptor created from PDB file: {os.path.basename(original_pdb_path)}"
+            ))
+            
+            receptor_id = cursor.lastrowid or cursor.execute(
+                "SELECT receptor_id FROM receptors WHERE receptor_name = ?", 
+                (receptor_name,)
+            ).fetchone()[0]
+            
+            conn.commit()
+            conn.close()
+            
+            return {
+                'receptor_id': receptor_id,
+                'receptor_name': receptor_name,
+                'project_name': self.name,
+                'original_pdb_path': original_pdb_path,
+                'processed_pdb_path': processed_pdb_path,
+                'receptor_folder_path': receptor_folder,
+                'database_path': receptors_db_path,
+                'pdb_analysis': analysis,
+                'created_date': datetime.now().isoformat()
+            }
+            
+        except Exception as e:
+            print(f"❌ Error creating receptor registry: {e}")
+            return None
+
+    def _display_receptor_creation_summary(self, receptor_info: Dict[str, Any]) -> None:
+        """
+        Display summary of created receptor.
+        
+        Args:
+            receptor_info (Dict): Receptor registry information
+        """
+        try:
+            print(f"\n✅ RECEPTOR CREATED SUCCESSFULLY")
+            print("=" * 60)
+            print(f"🆔 Receptor ID: {receptor_info['receptor_id']}")
+            print(f"🏷️  Receptor Name: {receptor_info['receptor_name']}")
+            print(f"📁 Original PDB: {os.path.basename(receptor_info['original_pdb_path'])}")
+            print(f"📋 Processed PDB: {os.path.relpath(receptor_info['processed_pdb_path'])}")
+            print(f"📂 Receptor Folder: {os.path.relpath(receptor_info['receptor_folder_path'])}")
+            print(f"💾 Database: {os.path.relpath(receptor_info['database_path'])}")
+            
+            analysis = receptor_info['pdb_analysis']
+            print(f"\n📊 STRUCTURE INFO:")
+            print(f"   ⚛️  Atoms: {analysis['atom_count']:,}")
+            print(f"   🔗 Chains: {', '.join(analysis['chains'])}")
+            if analysis.get('resolution'):
+                print(f"   🔬 Resolution: {analysis['resolution']:.2f} Å")
+            if analysis['has_ligands']:
+                print(f"   💊 Ligands: {', '.join(analysis['ligand_residues'])}")
+            
+            print(f"\n💡 NEXT STEPS:")
+            print("   1. Prepare receptor for docking (convert to PDBQT format)")
+            print("   2. Generate grid files for your docking software")
+            print("   3. Use this receptor in docking assays")
+            print("   4. Configure binding site and docking parameters")
+            
+            print("=" * 60)
+            
+        except Exception as e:
+            print(f"⚠️  Error displaying receptor summary: {e}")
+        
