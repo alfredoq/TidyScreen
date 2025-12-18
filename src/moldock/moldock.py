@@ -2729,7 +2729,7 @@ class MolDock:
                                 processed_pdb_path: str, selected_chains: List[str], 
                                 selected_ligands: List[str], analysis: Dict[str, Any]) -> None:
         """
-        Create a summary file documenting the processing steps applied.
+        Create a summary file documenting the processing steps applied, including altloc handling.
         
         Args:
             receptor_folder (str): Receptor folder path
@@ -2763,6 +2763,21 @@ class MolDock:
                 f.write(f"PROCESSING APPLIED:\n")
                 f.write(f"  Chains kept: {', '.join(selected_chains) if selected_chains else 'All'}\n")
                 f.write(f"  Ligands kept: {', '.join(selected_ligands) if selected_ligands else 'None (clean receptor)'}\n")
+                # Altloc summary
+                if analysis.get('has_altlocs', False):
+                    altlocs = analysis.get('altlocs', {})
+                    f.write(f"  Altlocs present: Yes\n")
+                    f.write(f"    • Residues with altlocs: {altlocs.get('residues_with_altlocs', 0)}\n")
+                    f.write(f"    • Unique altloc IDs: {', '.join(altlocs.get('unique_altloc_ids', [])) or 'None'}\n")
+                    f.write(f"    • Total altloc atoms: {altlocs.get('total_altlocs', 0)}\n")
+                    # If altloc handling info is available, add it
+                    altloc_handling_path = os.path.join(receptor_folder, 'processed', 'altloc_handling.txt')
+                    if os.path.exists(altloc_handling_path):
+                        f.write(f"    • Altloc handling: See processed/altloc_handling.txt\n")
+                    else:
+                        f.write(f"    • Altloc handling: Only one altloc per residue kept (see code for details)\n")
+                else:
+                    f.write(f"  Altlocs present: No\n")
                 f.write("\n")
                 
                 f.write(f"PROCESSED FILE:\n")
