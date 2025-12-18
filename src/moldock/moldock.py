@@ -775,19 +775,43 @@ class MolDock:
                 )
             ''')
             
-            # Generate assay name based on table and method
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            assay_name = f"{table_name}_{docking_method['method_name']}_{timestamp}"
+            # First, insert a temporary record to get the assay_id
+            cursor.execute('''
+                INSERT INTO docking_assays (
+                    assay_name, project_name, table_name, docking_method_id, docking_method_name,
+                    docking_engine, compound_count, prepared_molecules, setup_type, status,
+                    table_readiness_score, docking_status, notes, configuration, assay_folder_path
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                'temp_assay',  # Temporary name - will be updated
+                self.name,  # project name
+                table_name,
+                docking_method.get('method_id'),
+                docking_method['method_name'],
+                docking_method['docking_engine'],
+                table_info['compound_count'] if table_info else 0,
+                table_info['sdf_blob_count'] if table_info else 0,
+                'configuration_only' if setup_type == 1 else 'ready_for_docking',
+                'created',
+                table_info['readiness_score'] if table_info else 0,
+                table_info['docking_status'] if table_info else 'unknown',
+                f"Assay created via dock_table method",
+                '{}',  # Temporary empty configuration - will be updated
+                ''     # Temporary empty folder path - will be updated
+            ))
             
-            # Create unique assay folder
+            # Get the generated assay_id
+            assay_id = cursor.lastrowid
+            
+            # Generate assay name using the assay_id
+            assay_name = f"assay_{assay_id}"
+            
+            # Create unique assay folder using the new assay name
             assay_folder_path = self._create_assay_folder(docking_assays_base_dir, assay_name)
             
             if not assay_folder_path:
                 print("⚠️  Warning: Could not create assay folder, but continuing...")
                 assay_folder_path = ""
-            
-            # Determine setup type string
-            setup_type_str = 'configuration_only' if setup_type == 1 else 'ready_for_docking'
             
             # Prepare configuration data
             configuration_data = {
@@ -801,7 +825,7 @@ class MolDock:
                     'docking_status': table_info['docking_status'] if table_info else 'unknown'
                 },
                 'setup_parameters': {
-                    'setup_type': setup_type_str,
+                    'setup_type': 'configuration_only' if setup_type == 1 else 'ready_for_docking',
                     'created_via': 'dock_table_method'
                 },
                 'assay_folder': {
@@ -810,32 +834,19 @@ class MolDock:
                 }
             }
             
-            # Insert assay registry
+            # Update the record with the correct assay_name, configuration, and folder path
             cursor.execute('''
-                INSERT INTO docking_assays (
-                    assay_name, project_name, table_name, docking_method_id, docking_method_name,
-                    docking_engine, compound_count, prepared_molecules, setup_type, status,
-                    table_readiness_score, docking_status, notes, configuration, assay_folder_path
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                UPDATE docking_assays 
+                SET assay_name = ?, configuration = ?, assay_folder_path = ?, 
+                    notes = ?, last_modified = CURRENT_TIMESTAMP
+                WHERE assay_id = ?
             ''', (
                 assay_name,
-                self.name,  # project name
-                table_name,
-                docking_method.get('method_id'),
-                docking_method['method_name'],
-                docking_method['docking_engine'],
-                table_info['compound_count'] if table_info else 0,
-                table_info['sdf_blob_count'] if table_info else 0,
-                setup_type_str,
-                'created',
-                table_info['readiness_score'] if table_info else 0,
-                table_info['docking_status'] if table_info else 'unknown',
-                f"Assay created via dock_table method for {setup_type_str}",
                 json.dumps(configuration_data, indent=2),
-                assay_folder_path
+                assay_folder_path,
+                f"Assay created via dock_table method for {'configuration_only' if setup_type == 1 else 'ready_for_docking'}",
+                assay_id
             ))
-            
-            assay_id = cursor.lastrowid
             
             conn.commit()
             conn.close()
@@ -845,7 +856,7 @@ class MolDock:
             print(f"   📋 Assay Name: {assay_name}")
             print(f"   📊 Table: {table_name}")
             print(f"   🧬 Method: {docking_method['method_name']} ({docking_method['docking_engine']})")
-            print(f"   🔧 Setup Type: {setup_type_str}")
+            print(f"   🔧 Setup Type: {'configuration_only' if setup_type == 1 else 'ready_for_docking'}")
             print(f"   📁 Assay Folder: {assay_folder_path}")
             print(f"   💾 Database: {assays_db_path}")
             
@@ -855,7 +866,7 @@ class MolDock:
                 'project_name': self.name,
                 'table_name': table_name,
                 'docking_method': docking_method,
-                'setup_type': setup_type_str,
+                'setup_type': 'configuration_only' if setup_type == 1 else 'ready_for_docking',
                 'status': 'created',
                 'database_path': assays_db_path,
                 'assay_folder_path': assay_folder_path,
@@ -865,6 +876,7 @@ class MolDock:
         except Exception as e:
             print(f"❌ Error creating docking assay registry: {e}")
             return None
+
 
     def _create_assay_folder(self, base_dir: str, assay_name: str) -> str:
         """
@@ -2111,7 +2123,6 @@ class MolDock:
         except Exception as e:
             print(f"❌ Error in table selection: {e}")
             return None
-
 
     def _show_table_details_for_docking(self, table_info: Dict[str, Any]) -> None:
         """
