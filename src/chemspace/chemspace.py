@@ -12327,7 +12327,7 @@ class ChemSpace:
 
     def generate_mols_in_table(self, max_molecules: Optional[int] = None,
                             generate_conformers: bool = True,
-                            conformer_count: int = 10,
+                            nbr_confs: int = 10,
                             conf_percentile: float = 0.25) -> Optional[List[Dict[str, Any]]]:
         """
         Generate RDKit molecule objects from SMILES in a selected table.
@@ -12394,7 +12394,7 @@ class ChemSpace:
             print(f"\n⚙️  Processing Configuration:")
             print(f"   🧪 Generate conformers: {'Yes' if generate_conformers else 'No'}")
             if generate_conformers:
-                print(f"   🔄 Conformers per molecule: {conformer_count}")
+                print(f"   🔄 Conformers per molecule: {nbr_confs}")
             
             # Check RDKit availability (reuse existing pattern)
             try:
@@ -12449,9 +12449,9 @@ class ChemSpace:
                     # Add hydrogens for 3D conformer generation
                     mol_hs = Chem.AddHs(mol) if generate_conformers else mol
                     
-                    # Calculate molecular properties (reuse existing patterns)
-                    mol_properties = self._calculate_molecular_properties(mol, smiles)
-                    processing_stats['property_calculations'] += 1
+                    # # Calculate molecular properties (reuse existing patterns)
+                    # mol_properties = self._calculate_molecular_properties(mol, smiles)
+                    # processing_stats['property_calculations'] += 1
                     
                     # Generate conformers if requested
                     conformers_data = []
@@ -12472,7 +12472,7 @@ class ChemSpace:
                         try:
 
                             mol, molecule_datamol = self._generate_molecule_conformer(
-                                mol_hs, conformer_count, compound_name, conf_percentile
+                                mol_hs, nbr_confs, compound_name, conf_percentile
                             )
                         
                             self._store_mol(mol, molecule_data)
@@ -12600,65 +12600,7 @@ class ChemSpace:
             print(f"❌ Error prompting for {item_type} count: {e}")
             return None
 
-    def _calculate_molecular_properties(self, mol, smiles: str) -> Dict[str, float]:
-        """
-        Calculate molecular properties using RDKit.
-        Reuses existing property calculation patterns.
-        
-        Args:
-            mol: RDKit molecule object
-            smiles (str): SMILES string
-            
-        Returns:
-            Dict[str, float]: Dictionary of calculated molecular properties
-        """
-        try:
-            from rdkit.Chem import Descriptors, rdMolDescriptors
-            
-            properties = {
-                'molecular_weight': Descriptors.MolWt(mol),
-                'logp': Descriptors.MolLogP(mol),
-                'tpsa': Descriptors.TPSA(mol),
-                'num_rotatable_bonds': Descriptors.NumRotatableBonds(mol),
-                'num_hbd': Descriptors.NumHDonors(mol),
-                'num_hba': Descriptors.NumHAcceptors(mol),
-                'num_rings': Descriptors.RingCount(mol),
-                'num_aromatic_rings': Descriptors.NumAromaticRings(mol),
-                'num_heavy_atoms': Descriptors.HeavyAtomCount(mol),
-                'formal_charge': Descriptors.FormalCharge(mol)
-            }
-            
-            # Calculate additional descriptors
-            try:
-                properties['bertz_complexity'] = rdMolDescriptors.BertzCT(mol)
-            except:
-                properties['bertz_complexity'] = 0.0
-            
-            try:
-                properties['balaban_j'] = rdMolDescriptors.BalabanJ(mol)
-            except:
-                properties['balaban_j'] = 0.0
-            
-            return properties
-            
-        except Exception as e:
-            # Return basic properties if calculation fails
-            return {
-                'molecular_weight': 0.0,
-                'logp': 0.0,
-                'tpsa': 0.0,
-                'num_rotatable_bonds': 0,
-                'num_hbd': 0,
-                'num_hba': 0,
-                'num_rings': 0,
-                'num_aromatic_rings': 0,
-                'num_heavy_atoms': 0,
-                'formal_charge': 0,
-                'bertz_complexity': 0.0,
-                'balaban_j': 0.0
-            }
-
-    def _generate_molecule_conformer(self, mol_hs, conformer_count: int, 
+    def _generate_molecule_conformer(self, mol_hs, nbr_confs: int, 
                                     compound_name: str, conf_percentile) -> List[Dict[str, Any]]:
         """
         Generate 3D conformers for a molecule.
@@ -12677,7 +12619,7 @@ class ChemSpace:
             
             # Use existing conformer generation method
             mol_hs, confs, ps = self._generate_conformers(
-                mol_hs, nbr_confs=conformer_count, mmff='MMFF94s'
+                mol_hs, nbr_confs=nbr_confs, mmff='MMFF94s'
             )
 
             if not confs:
@@ -12762,9 +12704,8 @@ class ChemSpace:
                     params = None
 
             # Configure embedding parameters if present
-            nbr_confs = 50
             prune_rms = 0.25
-            max_attempts = 1000
+            max_attempts = 100
             threads = max(1, (multiprocessing.cpu_count() or 1) - 1)
 
             if params is not None:
@@ -13257,7 +13198,7 @@ class ChemSpace:
             columns = [row[1] for row in cursor.fetchall()]
             
             if 'sdf_blob' not in columns:
-                print(f"   🔧 Adding 'sdf_blob' column to table '{source_table}'")
+                #print(f"   🔧 Adding 'sdf_blob' column to table '{source_table}'")
                 try:
                     cursor.execute(f"ALTER TABLE {source_table} ADD COLUMN sdf_blob BLOB")
                     conn.commit()
@@ -13309,4 +13250,6 @@ class ChemSpace:
         except Exception as e:
             print(f"❌ Error storing SDF file to table: {e}")
             return False
+        
+
         
