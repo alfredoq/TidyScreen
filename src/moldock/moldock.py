@@ -2186,7 +2186,7 @@ class MolDock:
         except Exception as e:
             print(f"❌ Error showing table details: {e}")
             
-    def create_receptor_for_docking(self, pdb_file: Optional[str] = None, receptor_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    def create_receptor_for_docking(self, pdb_file: Optional[str] = None, receptor_name: Optional[str] = None, verbose = True) -> Optional[Dict[str, Any]]:
         """
         Create a receptor entry for docking from a PDB file. The user is prompted for a pdb file and receptor name, 
         after which a register for the receptor is created in a database called receptors.db located in the 
@@ -2251,16 +2251,16 @@ class MolDock:
             
             # Step 2: Analyze PDB file
             print("🔬 Analyzing PDB file...")
-            pdb_analysis = self._analyze_pdb_file(pdb_file)
             
-            print(pdb_analysis)
+            pdb_analysis = self._analyze_pdb_file(pdb_file)
             
             
             if not pdb_analysis:
                 print("❌ Failed to analyze PDB file")
                 return None
             
-            self._display_pdb_analysis(pdb_analysis)
+            if verbose:
+                self._display_pdb_analysis(pdb_analysis)
             
             # Step 3: Get receptor name
             if receptor_name is None:
@@ -2328,8 +2328,10 @@ class MolDock:
                 print("❌ Failed to create receptor registry")
                 return None
             
-            # Step 8: Display success summary
-            self._display_receptor_creation_summary(receptor_registry)
+            
+            if verbose:
+                # Step 8: Display success summary
+                self._display_receptor_creation_summary(receptor_registry)
             
             return receptor_registry
             
@@ -2449,16 +2451,8 @@ class MolDock:
 
     def _process_pdb_file(self, pdb_file: str, receptor_folder: str, analysis: Dict[str, Any]) -> str:
         """
-        Process and copy PDB file to receptor folder with chain and ligand selection options.
-        Now also manages alternate locations (altlocs) if present.
-        
-        Args:
-            pdb_file (str): Original PDB file path
-            receptor_folder (str): Receptor folder path
-            analysis (Dict): PDB analysis results
-            
-        Returns:
-            str: Path to processed PDB file
+        Process and copy PDB file to receptor folder with chain, ligand, and water selection options.
+        Now also manages alternate locations (altlocs) and water molecules if present.
         """
         try:
             import shutil
@@ -2533,7 +2527,7 @@ class MolDock:
             selected_ligands = None
             if analysis['has_ligands'] and analysis['ligand_residues']:
                 print(f"\n   💊 Ligand residues detected: {', '.join(analysis['ligand_residues'])}")
-                ligand_details = self._analyze_ligands_in_pdb(original_pdb_path, analysis['ligand_residues'])
+                ligand_details = self._analyze_ligands_in_pdb(original_pdb_path, analysis['ligand_residues'], selected_chains)
                 if ligand_details:
                     self._display_ligand_analysis(ligand_details)
                     while True:
@@ -2584,11 +2578,27 @@ class MolDock:
             else:
                 selected_ligands = []
 
-            # Create processed PDB file with selected chains and ligands
-            if selected_chains != analysis['chains'] or selected_ligands != list(analysis['ligand_residues']):
-                print(f"   🔄 Applying filters to processed PDB...")
-                filtered_pdb_path = self._create_filtered_pdb(
-                    processed_pdb_path, selected_chains, selected_ligands, analysis
+            # --- WATER MANAGEMENT ---
+            selected_waters = []
+            water_details = self._analyze_waters_in_pdb(original_pdb_path, selected_chains)
+            if water_details:
+                print(f"\n   💧 Water molecules detected: {len(water_details)}")
+                selected_waters = self._select_waters_interactive(water_details)
+                if selected_waters is None:
+                    print("   ⚠️  Water selection cancelled, will remove all waters.")
+                    selected_waters = []
+                elif selected_waters:
+                    print(f"   ✅ Will keep {len(selected_waters)} water(s): {', '.join(selected_waters)}")
+                else:
+                    print("   🧹 Will remove all water molecules.")
+
+            # Create processed PDB file with selected chains, ligands, and waters
+            if (selected_chains != analysis['chains'] or
+                selected_ligands != list(analysis['ligand_residues']) or
+                (water_details and selected_waters != list(water_details.keys()))):
+                print(f"   🔄 Applying filters to processed PDB (chains, ligands, waters)...")
+                filtered_pdb_path = self._create_filtered_pdb_with_waters(
+                    processed_pdb_path, selected_chains, selected_ligands, selected_waters, analysis
                 )
                 if not filtered_pdb_path:
                     print("   ❌ Failed to create filtered PDB file")
@@ -2602,13 +2612,201 @@ class MolDock:
                 self._extract_reference_ligands(processed_pdb_path, receptor_folder, selected_ligands)
 
             # Create processing summary file
-            self._create_processing_summary(receptor_folder, original_pdb_path, processed_pdb_path, 
+            self._create_processing_summary(receptor_folder, original_pdb_path, processed_pdb_path,
                                             selected_chains, selected_ligands, analysis)
 
             return processed_pdb_path
 
         except Exception as e:
             print(f"❌ Error processing PDB file: {e}")
+            return ""
+
+    def _analyze_waters_in_pdb(self, pdb_file: str, selected_chains: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+        """
+        Analyze water molecules (HOH) in the PDB file.
+        Only include waters in chains defined in selected_chains if provided.
+        Returns a dict: {water_id: {'chain':..., 'resnum':..., 'center':(x,y,z)}}
+        """
+        try:
+            waters = {}
+            with open(pdb_file, 'r') as f:
+                for line in f:
+                    if line.startswith('HETATM') and line[17:20].strip() == 'HOH':
+                        chain_id = line[21].strip()
+                        # Only include if chain is in selected_chains (if provided)
+                        if selected_chains and chain_id not in selected_chains:
+                            continue
+                        resnum = line[22:26].strip()
+                        atom_name = line[12:16].strip()
+                        water_id = f"HOH_{chain_id}_{resnum}"
+                        if water_id not in waters:
+                            waters[water_id] = {
+                                'chain': chain_id,
+                                'resnum': resnum,
+                                'atoms': [],
+                                'coordinates': []
+                            }
+                        try:
+                            x = float(line[30:38])
+                            y = float(line[38:46])
+                            z = float(line[46:54])
+                            waters[water_id]['coordinates'].append((x, y, z))
+                        except ValueError:
+                            pass
+                        waters[water_id]['atoms'].append(atom_name)
+            
+            print(selected_chains)
+
+            # Calculate center for each water
+            for wid, info in waters.items():
+                if info['coordinates']:
+                    coords = info['coordinates']
+                    center = tuple(sum(c[i] for c in coords) / len(coords) for i in range(3))
+                    info['center'] = center
+                else:
+                    info['center'] = (0, 0, 0)
+            return waters if waters else None
+        except Exception as e:
+            print(f"   ⚠️  Error analyzing waters: {e}")
+            return None
+
+    def _select_waters_interactive(self, water_details: Dict[str, Any]) -> Optional[List[str]]:
+        """
+        Interactive selection of water molecules to keep.
+        Returns a list of water_ids to keep, or None if cancelled.
+        Allows selection only by ResNum.
+        """
+        try:
+            print("\n   💧 WATER SELECTION:")
+            print("   " + "-" * 60)
+            print(f"   {'#':<3} {'Water ID':<12} {'Chain':<6} {'ResNum':<7} {'Atoms':<7} {'Center (Å)':<20}")
+            print("   " + "-" * 60)
+            water_list = list(water_details.items())
+            for i, (wid, info) in enumerate(water_list, 1):
+                center = info['center']
+                print(f"   {i:<3} {wid:<12} {info['chain']:<6} {info['resnum']:<7} {len(info['atoms']):<7} "
+                      f"({center[0]:.1f}, {center[1]:.1f}, {center[2]:.1f})")
+            print("   " + "-" * 60)
+            print("   Commands:")
+            print("   • 'all' to keep all waters")
+            print("   • 'none' to remove all waters")
+            print("   • Comma-separated ResNums (e.g., 101,202) to select by residue number (all chains)")
+            print("   • 'cancel' to abort water selection")
+            while True:
+                selection = input("   💧 Select waters to keep: ").strip().lower()
+                if selection in ['all', 'a']:
+                    return [wid for wid, _ in water_list]
+                elif selection in ['none', 'n']:
+                    return []
+                elif selection in ['cancel', 'quit', 'exit']:
+                    return None
+                else:
+                    try:
+                        selected = set()
+                        items = [x.strip() for x in selection.split(',') if x.strip()]
+                        for item in items:
+                            # Only allow selection by ResNum (must be alphanumeric)
+                            for wid, info in water_list:
+                                if info['resnum'] == item:
+                                    selected.add(wid)
+                        if selected:
+                            return list(selected)
+                        else:
+                            print("   ❌ No valid selections made (use ResNum only)")
+                            continue
+                    except Exception:
+                        print("   ❌ Invalid input. Use ResNums, 'all', or 'none'")
+                        continue
+        except KeyboardInterrupt:
+            return None
+        except Exception as e:
+            print(f"   ⚠️  Error in water selection: {e}")
+            return None
+
+
+    def _create_filtered_pdb_with_waters(self, pdb_file: str, selected_chains: List[str],
+                                        selected_ligands: List[str], selected_waters: List[str],
+                                        analysis: Dict[str, Any]) -> str:
+        """
+        Create a filtered PDB file with only selected chains, ligands, and waters.
+        Adds a 'TER' card after each ligand/water for clarity, and after the last ligand in selected_ligands.
+        """
+        try:
+            temp_filtered_path = f"{pdb_file}.tmp"
+            atoms_kept = 0
+            ligand_atoms_kept = 0
+            water_atoms_kept = 0
+            last_ligand_res = None
+            last_water_res = None
+            last_written_ligand = None
+            with open(pdb_file, 'r') as infile, open(temp_filtered_path, 'w') as outfile:
+                for line in infile:
+                    write_line = False
+                    if line.startswith(('HEADER', 'TITLE', 'COMPND', 'SOURCE', 'REMARK')):
+                        write_line = True
+                    elif line.startswith('ATOM'):
+                        chain_id = line[21].strip()
+                        if not selected_chains or chain_id in selected_chains:
+                            write_line = True
+                            atoms_kept += 1
+                    elif line.startswith('TER'):
+                        chain_id = line[21].strip()
+                        if not selected_chains or chain_id in selected_chains:
+                            write_line = True
+                            atoms_kept += 1
+                    elif line.startswith('HETATM'):
+                        residue_name = line[17:20].strip()
+                        chain_id = line[21].strip()
+                        residue_number = line[22:26].strip()
+                        res_uid = (chain_id, residue_name, residue_number)
+                        water_id = f"HOH_{chain_id}_{residue_number}"
+                        # Waters
+                        if residue_name == 'HOH':
+                            if selected_waters and water_id in selected_waters:
+                                # Write 'TER' before the first water residue is written
+                                if last_water_res is None:
+                                    outfile.write("TER\n")
+                                write_line = True
+                                water_atoms_kept += 1
+                                # Add TER after each water residue
+                                if last_water_res and res_uid != last_water_res:
+                                    outfile.write("TER\n")
+                                last_water_res = res_uid
+                        # Ligands
+                        elif selected_ligands and residue_name in selected_ligands:
+                            if not selected_chains or chain_id in selected_chains:
+                                write_line = True
+                                ligand_atoms_kept += 1
+                                # Add TER after each ligand residue (after all atoms of a ligand)
+                                if last_ligand_res and res_uid != last_ligand_res:
+                                    outfile.write("TER\n")
+                                last_ligand_res = res_uid
+                    if write_line:
+                        outfile.write(line)
+                # After all lines, if any water was written, add a TER card
+                if last_water_res:
+                    outfile.write("TER\n")
+                outfile.write("END\n")
+                outfile.truncate()
+            import shutil
+            shutil.move(temp_filtered_path, pdb_file)
+            print(f"   ✅ Applied filtering to PDB file (chains, ligands, waters).")
+            print(f"      • Chains kept: {', '.join(selected_chains) if selected_chains else 'all'}")
+            print(f"      • Protein atoms: {atoms_kept:,}")
+            if selected_ligands and ligand_atoms_kept > 0:
+                ligand_names = [lig for lig in selected_ligands if lig != 'HOH']
+                if ligand_names:
+                    print(f"      • Ligand atoms: {ligand_atoms_kept:,} ({', '.join(ligand_names)})")
+            if selected_waters and water_atoms_kept > 0:
+                print(f"      • Water atoms: {water_atoms_kept:,}")
+            elif selected_waters == []:
+                print(f"      • All waters removed.")
+            return pdb_file
+        except Exception as e:
+            print(f"   ❌ Error creating filtered PDB with waters: {e}")
+            temp_filtered_path = f"{pdb_file}.tmp"
+            if os.path.exists(temp_filtered_path):
+                os.remove(temp_filtered_path)
             return ""
 
     def _query_altloc_handling(self, pdb_file: str, analysis: Dict[str, Any]) -> Tuple[str, dict]:
@@ -2876,127 +3074,22 @@ class MolDock:
         except Exception as e:
             print(f"   ⚠️  Error extracting reference ligands: {e}")
 
-    def _create_filtered_pdb(self, pdb_file: str, selected_chains: List[str], 
-                        selected_ligands: List[str], analysis: Dict[str, Any]) -> str:
-        """
-        Create a filtered PDB file with only selected chains and ligands.
-        Adds a 'TER' card after each ligand for clarity.
-        
-        Args:
-            pdb_file (str): Input PDB file path
-            selected_chains (List[str]): Chains to keep
-            selected_ligands (List[str]): Ligand residue names to keep
-            analysis (Dict): PDB analysis results
-            
-        Returns:
-            str: Path to filtered PDB file (same as input, modified in place)
-        """
-        try:
-            # Create temporary filtered file
-            temp_filtered_path = f"{pdb_file}.tmp"
-            
-            atoms_kept = 0
-            ligand_atoms_kept = 0
-            water_atoms_kept = 0
-            last_ligand_res = None
-            
-            with open(pdb_file, 'r') as infile, open(temp_filtered_path, 'w') as outfile:
-                # Process each line
-                for line in infile:
-                    write_line = False
-                    
-                    if line.startswith(('HEADER', 'TITLE', 'COMPND', 'SOURCE', 'REMARK')):
-                        # Keep header information
-                        write_line = True
-                    elif line.startswith('ATOM'):
-                        # Process protein atoms
-                        chain_id = line[21].strip()
-                        if not selected_chains or chain_id in selected_chains:
-                            write_line = True
-                            atoms_kept += 1
-                    elif line.startswith('TER'):
-                        # Keep the TER card associated to the chain
-                        chain_id = line[21].strip()
-                        if not selected_chains or chain_id in selected_chains:
-                            write_line = True
-                            atoms_kept += 1
-                    elif line.startswith('HETATM'):
-                        # Process hetero atoms (ligands, waters, etc.)
-                        chain_id = line[21].strip()
-                        residue_name = line[17:20].strip()
-                        residue_number = line[22:26].strip()
-                        res_uid = (chain_id, residue_name, residue_number)
-                        # Check if we should keep this hetero atom
-                        if selected_ligands and residue_name in selected_ligands:
-                            # Check chain selection as well
-                            if not selected_chains or chain_id in selected_chains:
-                                write_line = True
-                                if residue_name == 'HOH':
-                                    water_atoms_kept += 1
-                                else:
-                                    ligand_atoms_kept += 1
-                                # Insert TER if ligand residue changes
-                                if last_ligand_res and res_uid != last_ligand_res:
-                                    outfile.write("TER\n")
-                                last_ligand_res = res_uid
-                    
-                    # elif line.startswith(('END', 'ENDMDL')):
-                    #     # Keep end markers
-                    #     write_line = True
-                    
-                    if write_line:
-                        outfile.write(line)
-                # Add TER at the end if any ligand was written
-                if last_ligand_res:
-                    outfile.write("TER\n")
-                
-                # Add an 'END' card at the end of the processed file
-                outfile.write("END\n")
-                outfile.truncate()
-            
-            
-            # Replace original file with filtered version
-            import shutil
-            shutil.move(temp_filtered_path, pdb_file)
-            
-            print(f"   ✅ Applied filtering to PDB file:")
-            print(f"      • Chains kept: {', '.join(selected_chains) if selected_chains else 'all'}")
-            print(f"      • Protein atoms: {atoms_kept:,}")
-            
-            if selected_ligands:
-                if ligand_atoms_kept > 0:
-                    ligand_names = [lig for lig in selected_ligands if lig != 'HOH']
-                    if ligand_names:
-                        print(f"      • Ligand atoms: {ligand_atoms_kept:,} ({', '.join(ligand_names)})")
-                if water_atoms_kept > 0:
-                    print(f"      • Water atoms: {water_atoms_kept:,}")
-            else:
-                print(f"      • All ligands removed (clean receptor)")
-            
-            return pdb_file
-            
-        except Exception as e:
-            print(f"   ❌ Error creating filtered PDB: {e}")
-            # Clean up temporary file if it exists
-            temp_filtered_path = f"{pdb_file}.tmp"
-            if os.path.exists(temp_filtered_path):
-                os.remove(temp_filtered_path)
-            return ""
-
-    def _analyze_ligands_in_pdb(self, pdb_file: str, ligand_residues: List[str]) -> Optional[Dict[str, Any]]:
+    def _analyze_ligands_in_pdb(self, pdb_file: str, ligand_residues: List[str], selected_chains: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
         """
         Analyze ligands in PDB file to provide detailed information for selection.
-        
+        Only retain ligands in chains defined in selected_chains if provided.
+
         Args:
             pdb_file (str): Path to PDB file
             ligand_residues (List[str]): List of ligand residue names
-            
+            selected_chains (Optional[List[str]]): List of chain IDs to include
+
         Returns:
             Optional[Dict[str, Any]]: Detailed ligand analysis or None if failed
         """
         try:
             ligand_details = {}
-            
+
             with open(pdb_file, 'r') as f:
                 for line in f:
                     if line.startswith('HETATM'):
@@ -3004,11 +3097,15 @@ class MolDock:
                         chain_id = line[21].strip()
                         residue_number = line[22:26].strip()
                         atom_name = line[12:16].strip()
-                        
+
+                        # Only include ligands in selected_chains if provided
+                        if selected_chains and chain_id not in selected_chains:
+                            continue
+
                         if residue_name in ligand_residues:
                             # Create unique ligand identifier
                             ligand_id = f"{residue_name}_{chain_id}_{residue_number}"
-                            
+
                             if ligand_id not in ligand_details:
                                 ligand_details[ligand_id] = {
                                     'residue_name': residue_name,
@@ -3019,7 +3116,7 @@ class MolDock:
                                     'is_water': residue_name == 'HOH',
                                     'coordinates': []
                                 }
-                            
+
                             # Extract coordinates
                             try:
                                 x = float(line[30:38])
@@ -3028,10 +3125,10 @@ class MolDock:
                                 ligand_details[ligand_id]['coordinates'].append((x, y, z))
                             except ValueError:
                                 pass
-                            
+
                             ligand_details[ligand_id]['atoms'].append(atom_name)
                             ligand_details[ligand_id]['atom_count'] += 1
-            
+
             # Calculate ligand properties
             for ligand_id, details in ligand_details.items():
                 if details['coordinates']:
@@ -3041,7 +3138,7 @@ class MolDock:
                     center_y = sum(coord[1] for coord in coords) / len(coords)
                     center_z = sum(coord[2] for coord in coords) / len(coords)
                     details['center'] = (center_x, center_y, center_z)
-                    
+
                     # Calculate size (max distance from center)
                     max_dist = max(
                         ((coord[0] - center_x)**2 + (coord[1] - center_y)**2 + (coord[2] - center_z)**2)**0.5
@@ -3051,9 +3148,9 @@ class MolDock:
                 else:
                     details['center'] = (0, 0, 0)
                     details['size'] = 0
-            
+
             return ligand_details if ligand_details else None
-            
+
         except Exception as e:
             print(f"   ⚠️  Error analyzing ligands: {e}")
             return None
