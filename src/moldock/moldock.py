@@ -4,6 +4,7 @@ import sys
 from typing import Dict, List, Tuple, Optional, Any
 from rdkit.Chem import AllChem
 from rdkit import Chem
+import shutil
 
 # Try to import tqdm for progress bars
 try:
@@ -2341,7 +2342,8 @@ class MolDock:
 
     def _analyze_pdb_file(self, pdb_file: str) -> Optional[Dict[str, Any]]:
         """
-        Analyze PDB file structure and content, including detection and processing of alternate locations (altlocs).
+        Analyze PDB file structure and content, including detection and processing of alternate locations (altlocs)
+        and gaps in the protein structure (missing residues).
         
         Args:
             pdb_file (str): Path to PDB file
@@ -2362,11 +2364,16 @@ class MolDock:
                 'ligand_residues': set(),
                 'resolution': None,
                 'header_info': {},
-                'altlocs': {},  # New: altlocs summary
-                'has_altlocs': False  # New: quick flag
+                'altlocs': {},
+                'has_altlocs': False,
+                'gaps': {},  # New: gaps per chain
+                'total_gaps': 0,  # New: total gaps
+                'gap_residues': []  # New: residues involved in gaps
             }
             altlocs_per_residue = {}
             altloc_counts = {}
+            residues_by_chain = {}
+
             with open(pdb_file, 'r') as f:
                 for line_num, line in enumerate(f, 1):
                     # Parse HEADER information
@@ -2391,15 +2398,17 @@ class MolDock:
                         chain_id = line[21].strip()
                         if chain_id:
                             analysis['chains'].add(chain_id)
-                        # Count unique residues
-                        residue_id = f"{line[21]}{line[22:26].strip()}"
+                        # Track residues by chain for gap analysis
+                        resnum = int(line[22:26].strip())
+                        resname = line[17:20].strip()
+                        residues_by_chain.setdefault(chain_id, set()).add(resnum)
                         analysis['residue_count'] += 1
 
                         # --- ALTLOC detection ---
                         altloc = line[16] if len(line) > 16 else " "
                         if altloc and altloc not in (" ", ""):
                             analysis['has_altlocs'] = True
-                            res_uid = (chain_id, line[17:20].strip(), line[22:26].strip())
+                            res_uid = (chain_id, resname, str(resnum))
                             altlocs_per_residue.setdefault(res_uid, set()).add(altloc)
                             altloc_counts[altloc] = altloc_counts.get(altloc, 0) + 1
 
@@ -2417,9 +2426,11 @@ class MolDock:
                             analysis['chains'].add(chain_id)
                         # --- ALTLOC detection for HETATM ---
                         altloc = line[16] if len(line) > 16 else " "
+                        resnum = int(line[22:26].strip())
+                        resname = line[17:20].strip()
                         if altloc and altloc not in (" ", ""):
                             analysis['has_altlocs'] = True
-                            res_uid = (chain_id, line[17:20].strip(), line[22:26].strip())
+                            res_uid = (chain_id, resname, str(resnum))
                             altlocs_per_residue.setdefault(res_uid, set()).add(altloc)
                             altloc_counts[altloc] = altloc_counts.get(altloc, 0) + 1
 
@@ -2442,6 +2453,26 @@ class MolDock:
                     'altloc_counts': {},
                     'residues_with_altlocs': 0,
                 }
+
+            # --- GAP ANALYSIS ---
+            gap_count = 0
+            gap_residues = []
+            gaps_per_chain = {}
+            for chain_id, resnums in residues_by_chain.items():
+                sorted_resnums = sorted(resnums)
+                chain_gaps = []
+                for i in range(1, len(sorted_resnums)):
+                    prev_res = sorted_resnums[i - 1]
+                    curr_res = sorted_resnums[i]
+                    if curr_res - prev_res > 1:
+                        gap_count += 1
+                        gap_range = (prev_res + 1, curr_res - 1)
+                        chain_gaps.append({'start': prev_res, 'end': curr_res, 'gap_residues': list(range(gap_range[0], gap_range[1] + 1))})
+                        gap_residues.extend([(chain_id, r) for r in range(gap_range[0], gap_range[1] + 1)])
+                gaps_per_chain[chain_id] = chain_gaps
+            analysis['gaps'] = gaps_per_chain
+            analysis['total_gaps'] = gap_count
+            analysis['gap_residues'] = gap_residues
 
             return analysis
 
@@ -2597,7 +2628,7 @@ class MolDock:
                 selected_ligands != list(analysis['ligand_residues']) or
                 (water_details and selected_waters != list(water_details.keys()))):
                 print(f"   🔄 Applying filters to processed PDB (chains, ligands, waters)...")
-                filtered_pdb_path = self._create_filtered_pdb_with_waters(
+                filtered_pdb_path = self._create_filtered_pdb(
                     processed_pdb_path, selected_chains, selected_ligands, selected_waters, analysis
                 )
                 if not filtered_pdb_path:
@@ -2615,11 +2646,20 @@ class MolDock:
             self._create_processing_summary(receptor_folder, original_pdb_path, processed_pdb_path,
                                             selected_chains, selected_ligands, analysis)
 
-            return processed_pdb_path
+            # --- Add missing atoms using tleap as the last step ---
+            tleap_fixed_pdb = self._add_missing_atoms_in_receptor(processed_pdb_path, analysis)
+            if tleap_fixed_pdb:
+                print(f"   ✅ Receptor with missing atoms added: {os.path.relpath(tleap_fixed_pdb)}")
+                return tleap_fixed_pdb
+            else:
+                print(f"   ⚠️  Returning processed PDB without tleap fixing.")
+                return processed_pdb_path
 
         except Exception as e:
             print(f"❌ Error processing PDB file: {e}")
             return ""
+
+
 
     def _analyze_waters_in_pdb(self, pdb_file: str, selected_chains: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
         """
@@ -2723,13 +2763,13 @@ class MolDock:
             print(f"   ⚠️  Error in water selection: {e}")
             return None
 
-
-    def _create_filtered_pdb_with_waters(self, pdb_file: str, selected_chains: List[str],
+    def _create_filtered_pdb(self, pdb_file: str, selected_chains: List[str],
                                         selected_ligands: List[str], selected_waters: List[str],
                                         analysis: Dict[str, Any]) -> str:
         """
         Create a filtered PDB file with only selected chains, ligands, and waters.
-        Adds a 'TER' card after each ligand/water for clarity, and after the last ligand in selected_ligands.
+        Adds a 'TER' card after each ligand/water for clarity, after the last ligand in selected_ligands,
+        and inserts 'TER' cards between gaps as registered in the analysis dictionary.
         """
         try:
             temp_filtered_path = f"{pdb_file}.tmp"
@@ -2738,7 +2778,15 @@ class MolDock:
             water_atoms_kept = 0
             last_ligand_res = None
             last_water_res = None
-            last_written_ligand = None
+
+            # Prepare gap lookup: {chain_id: set of residue numbers that are gap starts}
+            gap_starts = {}
+            for chain_id, gaps in analysis.get('gaps', {}).items():
+                gap_starts[chain_id] = set(gap['start'] for gap in gaps)
+
+            last_chain = None
+            last_resnum = None
+
             with open(pdb_file, 'r') as infile, open(temp_filtered_path, 'w') as outfile:
                 for line in infile:
                     write_line = False
@@ -2746,9 +2794,18 @@ class MolDock:
                         write_line = True
                     elif line.startswith('ATOM'):
                         chain_id = line[21].strip()
+                        resnum = int(line[22:26].strip())
                         if not selected_chains or chain_id in selected_chains:
+                            # Insert TER if a gap is detected before this residue (only once per gap)
+                            if last_chain == chain_id and last_resnum is not None:
+                                # Only insert TER when transitioning from the gap-start residue to the next residue
+                                if chain_id in gap_starts and last_resnum in gap_starts[chain_id]:
+                                    if resnum != last_resnum:
+                                        outfile.write("TER\n")
                             write_line = True
                             atoms_kept += 1
+                            last_chain = chain_id
+                            last_resnum = resnum
                     elif line.startswith('TER'):
                         chain_id = line[21].strip()
                         if not selected_chains or chain_id in selected_chains:
@@ -2763,12 +2820,10 @@ class MolDock:
                         # Waters
                         if residue_name == 'HOH':
                             if selected_waters and water_id in selected_waters:
-                                # Write 'TER' before the first water residue is written
                                 if last_water_res is None:
                                     outfile.write("TER\n")
                                 write_line = True
                                 water_atoms_kept += 1
-                                # Add TER after each water residue
                                 if last_water_res and res_uid != last_water_res:
                                     outfile.write("TER\n")
                                 last_water_res = res_uid
@@ -2777,7 +2832,6 @@ class MolDock:
                             if not selected_chains or chain_id in selected_chains:
                                 write_line = True
                                 ligand_atoms_kept += 1
-                                # Add TER after each ligand residue (after all atoms of a ligand)
                                 if last_ligand_res and res_uid != last_ligand_res:
                                     outfile.write("TER\n")
                                 last_ligand_res = res_uid
@@ -2790,7 +2844,7 @@ class MolDock:
                 outfile.truncate()
             import shutil
             shutil.move(temp_filtered_path, pdb_file)
-            print(f"   ✅ Applied filtering to PDB file (chains, ligands, waters).")
+            print(f"   ✅ Applied filtering to PDB file (chains, ligands, waters, gaps).")
             print(f"      • Chains kept: {', '.join(selected_chains) if selected_chains else 'all'}")
             print(f"      • Protein atoms: {atoms_kept:,}")
             if selected_ligands and ligand_atoms_kept > 0:
@@ -3375,6 +3429,22 @@ class MolDock:
             else:
                 print(f"\n✅ No alternate location (altloc) atoms detected.")
 
+            # Inform about gaps in the protein structure
+            if analysis.get('total_gaps', 0) > 0:
+                print(f"\n⚠️  Gaps detected in protein structure:")
+                print(f"   • Number of gaps: {analysis['total_gaps']}")
+                print(f"   • Residues involved in gaps: {len(analysis['gap_residues'])}")
+                # Optionally, show a few gap details
+                for chain_id, gaps in analysis.get('gaps', {}).items():
+                    if gaps:
+                        print(f"   • Chain {chain_id}: {len(gaps)} gap(s)")
+                        for gap in gaps[:3]:  # Show up to 3 gaps per chain
+                            print(f"      - Between residues {gap['start']} and {gap['end']}: missing {len(gap['gap_residues'])} residue(s)")
+                        if len(gaps) > 3:
+                            print(f"      ... {len(gaps) - 3} more gaps in chain {chain_id}")
+            else:
+                print(f"\n✅ No gaps detected in protein structure.")
+
             # Assessment
             print(f"\n✅ DOCKING SUITABILITY:")
             issues = []
@@ -3669,4 +3739,145 @@ class MolDock:
             
         except Exception as e:
             print(f"⚠️  Error displaying receptor summary: {e}")
+        
+    def _add_missing_atoms_in_receptor(self, receptor_file, receptor_info):
+        """
+        Will process using tleap a receptor_file by loading the .pdb and saving to a new file.
+        Will use tleap as installed in the environment
+        """
+        import subprocess
+        import tempfile
+        import os
+        import shutil
+
+        try:
+            # Check tleap is available
+            tleap_path = shutil.which("tleap")
+            if tleap_path is None:
+                print("❌ tleap not found in PATH. Please install AmberTools and ensure tleap is available.")
+                return None
+
+            # Prepare output file path
+            receptor_dir = os.path.dirname(receptor_file)
+            output_pdb = os.path.join(receptor_dir, "receptor_checked.pdb")
+
+            # Prepare tleap input script
+            tleap_script = f"""
+source leaprc.protein.ff14SB
+mol = loadpdb "{receptor_file}"
+savepdb mol "{output_pdb}"
+quit
+"""
+            # Write tleap script to a temp file
+            with tempfile.NamedTemporaryFile("w", delete=False, suffix=".in") as tf:
+                tf.write(tleap_script)
+                tleap_input_path = tf.name
+
+            print(f"🛠️  Running tleap to add missing atoms to receptor...")
+            result = subprocess.run(
+                ["tleap", "-f", tleap_input_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+
+            # Clean up temp file
+            os.remove(tleap_input_path)
+
+            # Check for errors
+            if result.returncode != 0:
+                print("❌ tleap failed to process the receptor file.")
+                print(result.stderr)
+                return None
+
+            # Check if output file was created
+            if not os.path.exists(output_pdb):
+                print("❌ tleap did not produce the expected output file.")
+                return None
+
+            # Reassign chain IDs and residue numbers
+            self._reassign_chain_and_resnums(receptor_file, output_pdb)
+
+            print(f"✅ tleap processing complete. Output: {output_pdb}")
+            return output_pdb
+
+        except Exception as e:
+            print(f"❌ Error running tleap for missing atom addition: {e}")
+            return None
+
+    def _reassign_chain_and_resnums(self, reference_pdb, target_pdb):
+        """
+        Create a dictionary in which the key is formed by residue name, the chain and the residue number in the reference pdb_file, and the value is formed by the residue name and residue number in the target pdb file.
+        Then, process the target file so that each line is updated to use the chain id and residue number from the reference pdb (from the key), while keeping the residue name from the target pdb (from the value).
+        """
+        
+        try:
+            # Step 1: Build mapping dictionary by residue order
+            ref_residues = []
+            with open(reference_pdb, 'r') as ref:
+                for line in ref:
+                    if line.startswith(('ATOM', 'HETATM')):
+                        ref_resname = line[17:20].strip()
+                        ref_chain = line[21].strip()
+                        ref_resnum = line[22:26].strip()
+                        key = (ref_resname, ref_chain, ref_resnum)
+                        if key not in ref_residues:
+                            ref_residues.append(key)
+
+            tgt_residues = []
+            with open(target_pdb, 'r') as tgt:
+                for line in tgt:
+                    if line.startswith(('ATOM', 'HETATM')):
+                        tgt_resname = line[17:20].strip()
+                        tgt_resnum = line[22:26].strip()
+                        key = (tgt_resname, tgt_resnum)
+                        if key not in tgt_residues:
+                            tgt_residues.append(key)
+
+            mapping = {}
+            for i, ref_key in enumerate(ref_residues):
+                if i < len(tgt_residues):
+                    mapping[ref_key] = tgt_residues[i]
+
+            # Step 2: Process target file and update chain id and residue number
+            import shutil
+            temp_out = target_pdb + ".chainfix"
+            tgt_res_idx = 0
+            ref_keys_list = list(mapping.keys())
+            with open(target_pdb, 'r') as tgt, open(temp_out, 'w') as out:
+                for line in tgt:
+                    if line.startswith(('ATOM', 'HETATM')):
+                        tgt_resname = line[17:20].strip()
+                        tgt_resnum = line[22:26].strip()
+                        tgt_key = (tgt_resname, tgt_resnum)
+                        # Find the corresponding ref_key by order
+                        # Find the corresponding ref_key by matching tgt_key in mapping values
+                        ref_key = None
+                        for k, v in mapping.items():
+                            if v == tgt_key:
+                                ref_key = k
+                                break
+                        if ref_key is not None:
+                            ref_resname, ref_chain, ref_resnum = ref_key
+                            # Replace chain id and residue number in the line
+                            new_line = (
+                                line[:17] +
+                                f"{tgt_resname:>3}" +   # residue name from target
+                                line[20:21] +
+                                f"{ref_chain}" +        # chain from reference
+                                f"{int(ref_resnum):4d}" +  # residue number from reference
+                                line[26:]
+                            )
+                            out.write(new_line)
+                            tgt_res_idx += 1
+                        else:
+                            out.write(line)
+                    else:
+                        out.write(line)
+            shutil.move(temp_out, target_pdb)
+            print("✅ Chain IDs and residue numbers reassigned in target PDB using reference mapping.")
+            return mapping
+        except Exception as e:
+            print(f"   ⚠️  Error in residue mapping: {e}")
+            return {}
         
