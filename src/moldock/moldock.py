@@ -3809,82 +3809,6 @@ quit
         except Exception as e:
             print(f"❌ Error running tleap for missing atom addition: {e}")
             return None
-
-    # def _reassign_chain_and_resnums(self, reference_pdb, target_pdb):
-    #     """
-    #     Create a dictionary in which the key is formed by residue name, the chain and the residue number in the reference pdb_file, and the value is formed by the residue name and residue number in the target pdb file.
-    #     Then, process the target file so that each line is updated to use the chain id and residue number from the reference pdb (from the key), while keeping the residue name from the target pdb (from the value).
-    #     """
-        
-    #     try:
-    #         # Step 1: Build mapping dictionary by residue order
-    #         ref_residues = []
-    #         with open(reference_pdb, 'r') as ref:
-    #             for line in ref:
-    #                 if line.startswith(('ATOM', 'HETATM')):
-    #                     ref_resname = line[17:20].strip()
-    #                     ref_chain = line[21].strip()
-    #                     ref_resnum = line[22:26].strip()
-    #                     key = (ref_resname, ref_chain, ref_resnum)
-    #                     if key not in ref_residues:
-    #                         ref_residues.append(key)
-
-    #         tgt_residues = []
-    #         with open(target_pdb, 'r') as tgt:
-    #             for line in tgt:
-    #                 if line.startswith(('ATOM', 'HETATM')):
-    #                     tgt_resname = line[17:20].strip()
-    #                     tgt_resnum = line[22:26].strip()
-    #                     key = (tgt_resname, tgt_resnum)
-    #                     if key not in tgt_residues:
-    #                         tgt_residues.append(key)
-
-    #         mapping = {}
-    #         for i, ref_key in enumerate(ref_residues):
-    #             if i < len(tgt_residues):
-    #                 mapping[ref_key] = tgt_residues[i]
-
-    #         # Step 2: Process target file and update chain id and residue number
-    #         import shutil
-    #         temp_out = target_pdb + ".chainfix"
-    #         tgt_res_idx = 0
-    #         ref_keys_list = list(mapping.keys())
-    #         with open(target_pdb, 'r') as tgt, open(temp_out, 'w') as out:
-    #             for line in tgt:
-    #                 if line.startswith(('ATOM', 'HETATM')):
-    #                     tgt_resname = line[17:20].strip()
-    #                     tgt_resnum = line[22:26].strip()
-    #                     tgt_key = (tgt_resname, tgt_resnum)
-    #                     # Find the corresponding ref_key by order
-    #                     # Find the corresponding ref_key by matching tgt_key in mapping values
-    #                     ref_key = None
-    #                     for k, v in mapping.items():
-    #                         if v == tgt_key:
-    #                             ref_key = k
-    #                             break
-    #                     if ref_key is not None:
-    #                         ref_resname, ref_chain, ref_resnum = ref_key
-    #                         # Replace chain id and residue number in the line
-    #                         new_line = (
-    #                             line[:17] +
-    #                             f"{tgt_resname:>3}" +   # residue name from target
-    #                             line[20:21] +
-    #                             f"{ref_chain}" +        # chain from reference
-    #                             f"{int(ref_resnum):4d}" +  # residue number from reference
-    #                             line[26:]
-    #                         )
-    #                         out.write(new_line)
-    #                         tgt_res_idx += 1
-    #                     else:
-    #                         out.write(line)
-    #                 else:
-    #                     out.write(line)
-    #         shutil.move(temp_out, target_pdb)
-    #         print("✅ Chain IDs and residue numbers reassigned in target PDB using reference mapping.")
-    #         return mapping
-    #     except Exception as e:
-    #         print(f"   ⚠️  Error in residue mapping: {e}")
-    #         return {}
         
     def _reassign_chain_and_resnums(self, reference_pdb, target_pdb):
         """
@@ -3958,7 +3882,6 @@ quit
                         mapping[ref_key] = tgt_key
                         break
 
-
             # Step 2: Process target file and update chain id and residue number
             import shutil
             temp_out = target_pdb + ".chainfix"
@@ -3989,7 +3912,6 @@ quit
                         
                         if ref_key is not None:
                             ref_resname, ref_chain, ref_resnum, ref_name, ref_occupancy, ref_tempFactor, ref_element, ref_x, ref_y, ref_z = ref_key
-                            
                             record = line[0:6]
                             atom_serial = line[6:11]
                             atom_name = line[12:16]
@@ -4002,8 +3924,9 @@ quit
                             y = line[38:46]
                             z = line[46:54]
                             # Set occupancy and tempFactor to default values
-                            occupancy = f"{1.00:6.2f}"
-                            tempFactor = f"{0.00:6.2f}"
+                            #occupancy = f"{ref_occupancy:6.2f}"
+                            occupancy = ref_occupancy
+                            tempFactor = ref_tempFactor
                             # Use element and charge if present
                             element = ref_element
                             charge = line[78:80] if len(line) >= 80 else "  "
