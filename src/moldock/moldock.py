@@ -2628,9 +2628,13 @@ class MolDock:
                 selected_ligands != list(analysis['ligand_residues']) or
                 (water_details and selected_waters != list(water_details.keys()))):
                 print(f"   🔄 Applying filters to processed PDB (chains, ligands, waters)...")
+                
                 filtered_pdb_path = self._create_filtered_pdb(
                     processed_pdb_path, selected_chains, selected_ligands, selected_waters, analysis
                 )
+                
+                print(filtered_pdb_path)
+                
                 if not filtered_pdb_path:
                     print("   ❌ Failed to create filtered PDB file")
                     return ""
@@ -2658,8 +2662,6 @@ class MolDock:
         except Exception as e:
             print(f"❌ Error processing PDB file: {e}")
             return ""
-
-
 
     def _analyze_waters_in_pdb(self, pdb_file: str, selected_chains: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
         """
@@ -2924,6 +2926,7 @@ class MolDock:
     def _filter_altlocs_in_pdb(self, pdb_file: str, handling: str, altloc_map: dict) -> None:
         """
         Filter altlocs in the given pdb_file in-place according to the chosen strategy.
+        Before writing the outfile, the altloc field is cleared (set to a space).
         """
         import tempfile
         tmp_path = pdb_file + ".altloc.tmp"
@@ -2935,19 +2938,16 @@ class MolDock:
                     resname = line[17:20].strip()
                     resnum = line[22:26].strip()
                     res_uid = (chain_id, resname, resnum)
+                    write_this = False
                     if altloc and altloc not in (" ", ""):
                         if handling == "first":
-                            # Keep only the first altloc for each residue
-                            # We assume lines are ordered, so keep only the first altloc encountered
-                            # (This is a simplification; for more robust handling, build a set first)
                             if not hasattr(self, "_altloc_first_seen"):
                                 self._altloc_first_seen = {}
                             if res_uid not in self._altloc_first_seen:
                                 self._altloc_first_seen[res_uid] = altloc
                             if altloc == self._altloc_first_seen[res_uid]:
-                                outfile.write(line)
+                                write_this = True
                         elif handling == "highest_occupancy":
-                            # Parse occupancy and keep highest for each residue
                             if not hasattr(self, "_altloc_occ"):
                                 self._altloc_occ = {}
                             occ = float(line[54:60].strip() or 0)
@@ -2955,27 +2955,32 @@ class MolDock:
                                 self._altloc_occ[res_uid] = (occ, line)
                         elif handling == "manual":
                             if res_uid in altloc_map and altloc == altloc_map[res_uid]:
-                                outfile.write(line)
+                                write_this = True
                         else:
-                            # Unknown handling, write all
-                            outfile.write(line)
+                            write_this = True
                     else:
                         # No altloc, always keep
-                        outfile.write(line)
+                        write_this = True
+
+                    if write_this:
+                        # Clear altloc field (column 17, index 16)
+                        new_line = line[:16] + " " + line[17:]
+                        outfile.write(new_line)
                 else:
                     outfile.write(line)
             # For highest_occupancy, after reading all lines, write the best for each residue
             if handling == "highest_occupancy" and hasattr(self, "_altloc_occ"):
-                # Rewind and write only the highest occupancy lines
-                outfile.seek(0)
                 for occ, line in self._altloc_occ.values():
-                    outfile.write(line)
+                    # Clear altloc field before writing
+                    new_line = line[:16] + " " + line[17:]
+                    outfile.write(new_line)
                 del self._altloc_occ
             if hasattr(self, "_altloc_first_seen"):
                 del self._altloc_first_seen
         # Replace original file
         import shutil
         shutil.move(tmp_path, pdb_file)
+
 
     def _create_processing_summary(self, receptor_folder: str, original_pdb_path: str, 
                                 processed_pdb_path: str, selected_chains: List[str], 
@@ -3805,6 +3810,82 @@ quit
             print(f"❌ Error running tleap for missing atom addition: {e}")
             return None
 
+    # def _reassign_chain_and_resnums(self, reference_pdb, target_pdb):
+    #     """
+    #     Create a dictionary in which the key is formed by residue name, the chain and the residue number in the reference pdb_file, and the value is formed by the residue name and residue number in the target pdb file.
+    #     Then, process the target file so that each line is updated to use the chain id and residue number from the reference pdb (from the key), while keeping the residue name from the target pdb (from the value).
+    #     """
+        
+    #     try:
+    #         # Step 1: Build mapping dictionary by residue order
+    #         ref_residues = []
+    #         with open(reference_pdb, 'r') as ref:
+    #             for line in ref:
+    #                 if line.startswith(('ATOM', 'HETATM')):
+    #                     ref_resname = line[17:20].strip()
+    #                     ref_chain = line[21].strip()
+    #                     ref_resnum = line[22:26].strip()
+    #                     key = (ref_resname, ref_chain, ref_resnum)
+    #                     if key not in ref_residues:
+    #                         ref_residues.append(key)
+
+    #         tgt_residues = []
+    #         with open(target_pdb, 'r') as tgt:
+    #             for line in tgt:
+    #                 if line.startswith(('ATOM', 'HETATM')):
+    #                     tgt_resname = line[17:20].strip()
+    #                     tgt_resnum = line[22:26].strip()
+    #                     key = (tgt_resname, tgt_resnum)
+    #                     if key not in tgt_residues:
+    #                         tgt_residues.append(key)
+
+    #         mapping = {}
+    #         for i, ref_key in enumerate(ref_residues):
+    #             if i < len(tgt_residues):
+    #                 mapping[ref_key] = tgt_residues[i]
+
+    #         # Step 2: Process target file and update chain id and residue number
+    #         import shutil
+    #         temp_out = target_pdb + ".chainfix"
+    #         tgt_res_idx = 0
+    #         ref_keys_list = list(mapping.keys())
+    #         with open(target_pdb, 'r') as tgt, open(temp_out, 'w') as out:
+    #             for line in tgt:
+    #                 if line.startswith(('ATOM', 'HETATM')):
+    #                     tgt_resname = line[17:20].strip()
+    #                     tgt_resnum = line[22:26].strip()
+    #                     tgt_key = (tgt_resname, tgt_resnum)
+    #                     # Find the corresponding ref_key by order
+    #                     # Find the corresponding ref_key by matching tgt_key in mapping values
+    #                     ref_key = None
+    #                     for k, v in mapping.items():
+    #                         if v == tgt_key:
+    #                             ref_key = k
+    #                             break
+    #                     if ref_key is not None:
+    #                         ref_resname, ref_chain, ref_resnum = ref_key
+    #                         # Replace chain id and residue number in the line
+    #                         new_line = (
+    #                             line[:17] +
+    #                             f"{tgt_resname:>3}" +   # residue name from target
+    #                             line[20:21] +
+    #                             f"{ref_chain}" +        # chain from reference
+    #                             f"{int(ref_resnum):4d}" +  # residue number from reference
+    #                             line[26:]
+    #                         )
+    #                         out.write(new_line)
+    #                         tgt_res_idx += 1
+    #                     else:
+    #                         out.write(line)
+    #                 else:
+    #                     out.write(line)
+    #         shutil.move(temp_out, target_pdb)
+    #         print("✅ Chain IDs and residue numbers reassigned in target PDB using reference mapping.")
+    #         return mapping
+    #     except Exception as e:
+    #         print(f"   ⚠️  Error in residue mapping: {e}")
+    #         return {}
+        
     def _reassign_chain_and_resnums(self, reference_pdb, target_pdb):
         """
         Create a dictionary in which the key is formed by residue name, the chain and the residue number in the reference pdb_file, and the value is formed by the residue name and residue number in the target pdb file.
@@ -3814,30 +3895,69 @@ quit
         try:
             # Step 1: Build mapping dictionary by residue order
             ref_residues = []
+            ref_coords = []
             with open(reference_pdb, 'r') as ref:
                 for line in ref:
                     if line.startswith(('ATOM', 'HETATM')):
                         ref_resname = line[17:20].strip()
                         ref_chain = line[21].strip()
                         ref_resnum = line[22:26].strip()
-                        key = (ref_resname, ref_chain, ref_resnum)
+                        ref_name = line[12:16].strip()
+                        ref_occupancy = line[54:60].strip()
+                        ref_tempFactor = line[60:66].strip().replace('\n', '')
+                        ref_element = line[76:78].strip().replace('\n', '')
+                        
+                        # Extract atom coordinates
+                        try:
+                            ref_x = float(line[30:38].strip())
+                            ref_y = float(line[38:46].strip())
+                            ref_z = float(line[46:54].strip())
+                        except ValueError:
+                            ref_x, ref_y, ref_z = None, None, None
+                        key = (
+                            ref_resname, ref_chain, ref_resnum,
+                            ref_name, ref_occupancy, ref_tempFactor, ref_element,
+                            ref_x, ref_y, ref_z
+                        )
+                        if (ref_x, ref_y, ref_z) not in ref_coords:
+                            ref_coords.append((ref_x, ref_y, ref_z))  # Add coordinates tuple
                         if key not in ref_residues:
                             ref_residues.append(key)
 
             tgt_residues = []
+            tgt_coords = []  # New list to store (tgt_x, tgt_y, tgt_z) tuples
             with open(target_pdb, 'r') as tgt:
                 for line in tgt:
                     if line.startswith(('ATOM', 'HETATM')):
                         tgt_resname = line[17:20].strip()
                         tgt_resnum = line[22:26].strip()
-                        key = (tgt_resname, tgt_resnum)
-                        if key not in tgt_residues:
+                        tgt_name = line[12:16].strip()
+                        # Extract atom coordinates
+                        try:
+                            tgt_x = float(line[30:38].strip())
+                            tgt_y = float(line[38:46].strip())
+                            tgt_z = float(line[46:54].strip())
+                        except ValueError:
+                            tgt_x, tgt_y, tgt_z = None, None, None
+                        key = (tgt_resname, tgt_resnum, tgt_name, tgt_x, tgt_y, tgt_z)
+                        if (tgt_x, tgt_y, tgt_z) not in tgt_coords:
+                            tgt_coords.append((tgt_x, tgt_y, tgt_z))  # Add coordinates tuple
+                        if key not in tgt_residues and (tgt_x, tgt_y, tgt_z) in ref_coords:
                             tgt_residues.append(key)
-
+                            
             mapping = {}
-            for i, ref_key in enumerate(ref_residues):
-                if i < len(tgt_residues):
-                    mapping[ref_key] = tgt_residues[i]
+            
+            # Build mapping by matching coordinates (x, y, z) between reference and target
+            for ref_key in ref_residues:
+                ref_x, ref_y, ref_z = ref_key[-3:]
+                ref_coord_tuple = (ref_x, ref_y, ref_z)
+                for tgt_key in tgt_residues:
+                    tgt_x, tgt_y, tgt_z = tgt_key[-3:]
+                    tgt_coord_tuple = (tgt_x, tgt_y, tgt_z)
+                    if ref_coord_tuple == tgt_coord_tuple:
+                        mapping[ref_key] = tgt_key
+                        break
+
 
             # Step 2: Process target file and update chain id and residue number
             import shutil
@@ -3849,29 +3969,122 @@ quit
                     if line.startswith(('ATOM', 'HETATM')):
                         tgt_resname = line[17:20].strip()
                         tgt_resnum = line[22:26].strip()
-                        tgt_key = (tgt_resname, tgt_resnum)
-                        # Find the corresponding ref_key by order
+                        tgt_name = line[12:16].strip()
+                        # Extract atom coordinates
+                        try:
+                            tgt_x = float(line[30:38].strip())
+                            tgt_y = float(line[38:46].strip())
+                            tgt_z = float(line[46:54].strip())
+                        except ValueError:
+                            tgt_x, tgt_y, tgt_z = None, None, None
+                        tgt_key = (tgt_resname, tgt_resnum, tgt_name, tgt_x, tgt_y, tgt_z)
+                        
                         # Find the corresponding ref_key by matching tgt_key in mapping values
                         ref_key = None
+                        
                         for k, v in mapping.items():
                             if v == tgt_key:
                                 ref_key = k
                                 break
+                        
                         if ref_key is not None:
-                            ref_resname, ref_chain, ref_resnum = ref_key
-                            # Replace chain id and residue number in the line
+                            ref_resname, ref_chain, ref_resnum, ref_name, ref_occupancy, ref_tempFactor, ref_element, ref_x, ref_y, ref_z = ref_key
+                            
+                            record = line[0:6]
+                            atom_serial = line[6:11]
+                            atom_name = line[12:16]
+                            altLoc = " "
+                            resName = line[17:20]
+                            insertion = line[20:21]
+                            chainID = ref_chain
+                            resSeq = ref_resnum
+                            x = line[30:38]
+                            y = line[38:46]
+                            z = line[46:54]
+                            # Set occupancy and tempFactor to default values
+                            occupancy = f"{1.00:6.2f}"
+                            tempFactor = f"{0.00:6.2f}"
+                            # Use element and charge if present
+                            element = ref_element
+                            charge = line[78:80] if len(line) >= 80 else "  "
+                            # Reconstruct the line in strict PDB format
+                            # Format fields to strict PDB format (columns)
+                            # Columns: 
+                            #  1-6   Record name   (ATOM  / HETATM)
+                            #  7-11  Atom serial   (right, 5)
+                            # 13-16  Atom name     (left, 4)
+                            # 17     altLoc        (1)
+                            # 18-20  resName       (right, 3)
+                            # 22     chainID       (1)
+                            # 23-26  resSeq        (right, 4)
+                            # 27     iCode         (1)
+                            # 31-38  x             (8.3f)
+                            # 39-46  y             (8.3f)
+                            # 47-54  z             (8.3f)
+                            # 55-60  occupancy     (6.2f)
+                            # 61-66  tempFactor    (6.2f)
+                            # 77-78  element       (right, 2)
+                            # 79-80  charge        (right, 2)
                             new_line = (
-                                line[:17] +
-                                f"{tgt_resname:>3}" +   # residue name from target
-                                line[20:21] +
-                                f"{ref_chain}" +        # chain from reference
-                                f"{int(ref_resnum):4d}" +  # residue number from reference
-                                line[26:]
+                                f"{record:<6}{int(atom_serial):5d} "
+                                f"{atom_name:<4}{altLoc:1}"
+                                f"{resName:>3}{insertion:1}"
+                                f"{chainID:1}"
+                                f"{int(resSeq):4d}"
+                                f"    "
+                                f"{float(x):8.3f}{float(y):8.3f}{float(z):8.3f}"
+                                f"{float(occupancy):6.2f}{float(tempFactor):6.2f}"
+                                f"          "
+                                f"{element:>2}{charge:>2}\n"
                             )
+                            
+                            # Write the new_line to a temporary file for debugging
+                            with open("debug_chainfix_output_heavy.txt", "a") as debug_out:
+                                debug_out.write(new_line)
+                            
                             out.write(new_line)
                             tgt_res_idx += 1
                         else:
-                            out.write(line)
+                            # If no mapping, parse the line and reconstruct using PDB fields
+                            # Parse fields from the original line
+                            record = line[0:6]
+                            atom_serial = line[6:11]
+                            atom_name = line[12:16]
+                            altLoc = line[16]
+                            resName = line[17:20]
+                            insertion = line[20:21]
+                            #chainID = line[21:22]
+                            chainID = chainID
+                            #resSeq = line[22:26]
+                            resSeq = resSeq
+                            x = line[30:38]
+                            y = line[38:46]
+                            z = line[46:54]
+                            # Set occupancy and tempFactor to default values
+                            occupancy = f"{1.00:6.2f}"
+                            tempFactor = f"{0.00:6.2f}"
+                            # Use element and charge if present
+                            element = line[76:78] if len(line) >= 78 else " H"
+                            charge = line[78:80] if len(line) >= 80 else "  "
+                            # Reconstruct the line in strict PDB format
+                            new_line = (
+                                f"{record:<6}{int(atom_serial):5d} "
+                                f"{atom_name:<4}{altLoc:1}"
+                                f"{resName:>3}{insertion:1}"
+                                f"{chainID:1}"
+                                f"{int(resSeq):4d}"
+                                f"    "
+                                f"{float(x):8.3f}{float(y):8.3f}{float(z):8.3f}"
+                                f"{float(occupancy):6.2f}{float(tempFactor):6.2f}"
+                                f"          "
+                                f"{element:>2}{charge:>2}\n"
+                            )
+                            
+                            # Write the new_line to a temporary file for debugging
+                            with open("debug_chainfix_output.txt", "a") as debug_out:
+                                debug_out.write(new_line)
+                            
+                            out.write(new_line)
                     else:
                         out.write(line)
             shutil.move(temp_out, target_pdb)
@@ -3880,4 +4093,3 @@ quit
         except Exception as e:
             print(f"   ⚠️  Error in residue mapping: {e}")
             return {}
-        
