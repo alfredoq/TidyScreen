@@ -2187,10 +2187,10 @@ class MolDock:
         except Exception as e:
             print(f"❌ Error showing table details: {e}")
             
-    def prepare_pdb_for_docking(self, pdb_file: Optional[str] = None, receptor_name: Optional[str] = None, verbose = True) -> Optional[Dict[str, Any]]:
+    def prepare_pdb_for_docking(self, pdb_file: Optional[str] = None, pdb_name: Optional[str] = None, verbose = True) -> Optional[Dict[str, Any]]:
         """
         Create a receptor entry for docking from a PDB file. The user is prompted for a pdb file and receptor name, 
-        after which a register for the receptor is created in a database called receptors.db located in the 
+        after which a register for the receptor is created in a database called pdbs.db located in the 
         project_path/docking/receptors directory.
         
         Args:
@@ -2201,7 +2201,7 @@ class MolDock:
             Optional[Dict[str, Any]]: Receptor registry information or None if failed
         """
         try:
-            print(f"🧬 CREATE RECEPTOR FOR DOCKING")
+            print(f"🧬 CREATE/PROCESS PDB FILE FOR DOCKING")
             print("=" * 50)
             
             # Step 1: Get PDB file path
@@ -2255,7 +2255,6 @@ class MolDock:
             
             pdb_analysis = self._analyze_pdb_file(pdb_file)
             
-            
             if not pdb_analysis:
                 print("❌ Failed to analyze PDB file")
                 return None
@@ -2264,40 +2263,40 @@ class MolDock:
                 self._display_pdb_analysis(pdb_analysis)
             
             # Step 3: Get receptor name
-            if receptor_name is None:
+            if pdb_name is None:
                 while True:
                     try:
                         default_name = os.path.splitext(os.path.basename(pdb_file))[0]
-                        receptor_name = input(f"🏷️  Enter receptor name (default: {default_name}): ").strip()
+                        pdb_name = input(f"🏷️  Enter PDB name (default: {default_name}): ").strip()
                         
-                        if not receptor_name:
-                            receptor_name = default_name
+                        if not pdb_name:
+                            pdb_name = default_name
                         
-                        if receptor_name.lower() in ['cancel', 'quit', 'exit']:
-                            print("❌ Receptor creation cancelled")
+                        if pdb_name.lower() in ['cancel', 'quit', 'exit']:
+                            print("❌ PDB creation cancelled")
                             return None
                         
                         # Validate receptor name
-                        if not receptor_name.replace('_', '').replace('-', '').replace(' ', '').isalnum():
-                            print("❌ Receptor name can only contain letters, numbers, spaces, hyphens, and underscores")
+                        if not pdb_name.replace('_', '').replace('-', '').replace(' ', '').isalnum():
+                            print("❌ PDB name can only contain letters, numbers, spaces, hyphens, and underscores")
                             continue
                         
                         break
                         
                     except KeyboardInterrupt:
-                        print("\n❌ Receptor creation cancelled")
+                        print("\n❌ PDB creation cancelled")
                         return None
             
             # Step 4: Check if receptor name already exists
-            existing_check = self._check_receptor_name_exists(receptor_name)
+            existing_check = self._check_pdb_name_exists(pdb_name)
             if existing_check:
                 while True:
-                    overwrite = input(f"⚠️  Receptor '{receptor_name}' already exists. Overwrite? (y/n): ").strip().lower()
+                    overwrite = input(f"⚠️  Receptor '{pdb_name}' already exists. Overwrite? (y/n): ").strip().lower()
                     if overwrite in ['y', 'yes']:
-                        print("🔄 Will overwrite existing receptor")
+                        print("🔄 Will overwrite existing PDB")
                         break
                     elif overwrite in ['n', 'no']:
-                        print("❌ Receptor creation cancelled - name already exists")
+                        print("❌ PDB creation cancelled - name already exists")
                         return None
                     else:
                         print("❌ Please answer 'y' or 'n'")
@@ -2307,37 +2306,37 @@ class MolDock:
             os.makedirs(receptors_base_dir, exist_ok=True)
             
             # Create receptor-specific directory
-            receptor_folder = self._create_receptor_folder(receptors_base_dir, receptor_name)
+            pdb_folder = self._create_receptor_folder(receptors_base_dir, pdb_name)
             
-            if not receptor_folder:
-                print("❌ Failed to create receptor folder")
+            if not pdb_folder:
+                print("❌ Failed to create PDB folder")
                 return None
             
             # Step 6: Copy and process PDB file
-            processed_pdb_path, checked_pdb_path = self._process_pdb_file(pdb_file, receptor_folder, pdb_analysis)
+            processed_pdb_path, checked_pdb_path = self._process_pdb_file(pdb_file, pdb_folder, pdb_analysis)
             
             if not processed_pdb_path:
                 print("❌ Failed to process PDB file")
                 return None
             
             # Step 7: Create receptor registry entry
-            receptor_registry = self._create_receptor_registry_entry(
-                receptor_name, pdb_file, processed_pdb_path, receptor_folder, pdb_analysis, checked_pdb_path
+            pdb_registry = self._create_pdb_registry_entry(
+                pdb_name, pdb_file, processed_pdb_path, pdb_folder, pdb_analysis, checked_pdb_path
             )
             
-            if not receptor_registry:
-                print("❌ Failed to create receptor registry")
+            if not pdb_registry:
+                print("❌ Failed to create PDB registry")
                 return None
             
             
             if verbose:
                 # Step 8: Display success summary
-                self._display_receptor_creation_summary(receptor_registry)
+                self._display_pdb_creation_summary(pdb_registry)
             
-            return receptor_registry
+            return pdb_registry
             
         except Exception as e:
-            print(f"❌ Error creating receptor for docking: {e}")
+            print(f"❌ Error creating PDB register: {e}")
             return None
 
     def _analyze_pdb_file(self, pdb_file: str) -> Optional[Dict[str, Any]]:
@@ -2480,7 +2479,7 @@ class MolDock:
             print(f"❌ Error analyzing PDB file: {e}")
             return None
 
-    def _process_pdb_file(self, pdb_file: str, receptor_folder: str, analysis: Dict[str, Any]) -> str:
+    def _process_pdb_file(self, pdb_file: str, pdb_folder: str, analysis: Dict[str, Any]) -> str:
         """
         Process and copy PDB file to receptor folder with chain, ligand, and water selection options.
         Now also manages alternate locations (altlocs) and water molecules if present.
@@ -2489,14 +2488,14 @@ class MolDock:
             import shutil
 
             # Copy original PDB to original folder
-            original_dir = os.path.join(receptor_folder, 'original')
+            original_dir = os.path.join(pdb_folder, 'original')
             original_pdb_path = os.path.join(original_dir, 'receptor_original.pdb')
             os.makedirs(original_dir, exist_ok=True)
             shutil.copy2(pdb_file, original_pdb_path)
             print(f"   📋 Copied original PDB file to: {os.path.relpath(original_pdb_path)}")
 
             # Create processed PDB path in processed folder
-            processed_dir = os.path.join(receptor_folder, 'processed')
+            processed_dir = os.path.join(pdb_folder, 'processed')
             os.makedirs(processed_dir, exist_ok=True)
             processed_pdb_path = os.path.join(processed_dir, 'receptor.pdb')
             shutil.copy2(original_pdb_path, processed_pdb_path)
@@ -2642,17 +2641,16 @@ class MolDock:
 
             # Create reference ligand file if ligands were kept
             if selected_ligands:
-                self._extract_reference_ligands(processed_pdb_path, receptor_folder, selected_ligands)
+                self._extract_reference_ligands(processed_pdb_path, pdb_folder, selected_ligands)
 
             # Create processing summary file
-            self._create_processing_summary(receptor_folder, original_pdb_path, processed_pdb_path,
-                                            selected_chains, selected_ligands, analysis)
+            self._create_processing_summary(pdb_folder, original_pdb_path, processed_pdb_path, selected_chains, selected_ligands, analysis)
 
             # # --- Add missing atoms using tleap as the last step ---
             # tleap_fixed_pdb = self._add_missing_atoms_in_receptor_tleap(processed_pdb_path, analysis)
             
             # --- Add missing atoms using prody as the last step ---
-            receptor_checked = self._add_missing_atoms_in_receptor_prody(processed_pdb_path, analysis)
+            receptor_checked = self._add_missing_atoms_in_pdb_prody(processed_pdb_path, analysis)
             
             # if tleap_fixed_pdb:
             #     print(f"   ✅ Receptor with missing atoms added: {os.path.relpath(tleap_fixed_pdb)}")
@@ -3482,7 +3480,7 @@ class MolDock:
         except Exception as e:
             print(f"⚠️  Error displaying PDB analysis: {e}")
 
-    def _check_receptor_name_exists(self, receptor_name: str) -> bool:
+    def _check_pdb_name_exists(self, receptor_name: str) -> bool:
         """
         Check if receptor name already exists in the database.
         
@@ -3493,7 +3491,7 @@ class MolDock:
             bool: True if name exists, False otherwise
         """
         try:
-            receptors_db_path = os.path.join(self.path, 'docking', 'receptors', 'receptors.db')
+            receptors_db_path = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
             
             if not os.path.exists(receptors_db_path):
                 return False
@@ -3613,17 +3611,17 @@ class MolDock:
             print(f"   ❌ Error extracting chain: {e}")
             return ""
 
-    def _create_receptor_registry_entry(self, receptor_name: str, original_pdb_path: str, 
-                                    processed_pdb_path: str, receptor_folder: str, 
+    def _create_pdb_registry_entry(self, pdb_name: str, original_pdb_path: str, 
+                                    processed_pdb_path: str, pdb_folder: str, 
                                     analysis: Dict[str, Any], checked_pdb_path) -> Optional[Dict[str, Any]]:
         """
-        Create receptor registry entry in receptors.db
+        Create PDB registry entry in pdbs.db
         
         Args:
-            receptor_name (str): Name of the receptor
+            pdb_name (str): Name of the PDB
             original_pdb_path (str): Path to original PDB file
             processed_pdb_path (str): Path to processed PDB file
-            receptor_folder (str): Path to receptor folder
+            pdb_folder (str): Path to PDB folder
             analysis (Dict): PDB analysis results
             
         Returns:
@@ -3631,25 +3629,25 @@ class MolDock:
         """
         try:
             # Create receptors database
-            receptors_db_path = os.path.join(self.path, 'docking', 'receptors', 'receptors.db')
+            pdbs_db_path = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
             
             import sqlite3
             import json
             from datetime import datetime
             
-            conn = sqlite3.connect(receptors_db_path)
+            conn = sqlite3.connect(pdbs_db_path)
             cursor = conn.cursor()
             
             # Create receptors table
             cursor.execute('''
-                CREATE TABLE IF NOT EXISTS receptors (
-                    receptor_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    receptor_name TEXT UNIQUE NOT NULL,
+                CREATE TABLE IF NOT EXISTS pdbs (
+                    pdb_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    pdb_name TEXT UNIQUE NOT NULL,
                     project_name TEXT,
                     original_pdb_path TEXT NOT NULL,
                     processed_pdb_path TEXT NOT NULL,
                     checked_pdb_path TEXT NOT NULL,
-                    receptor_folder_path TEXT NOT NULL,
+                    pdb_folder_path TEXT NOT NULL,
                     pdb_analysis TEXT,
                     chains TEXT,
                     resolution REAL,
@@ -3668,53 +3666,53 @@ class MolDock:
             
             # Insert or update receptor entry
             cursor.execute('''
-                INSERT OR REPLACE INTO receptors (
-                    receptor_name, project_name, original_pdb_path, processed_pdb_path, checked_pdb_path,
-                    receptor_folder_path, pdb_analysis, chains, resolution, atom_count,
+                INSERT OR REPLACE INTO pdbs (
+                    pdb_name, project_name, original_pdb_path, processed_pdb_path, checked_pdb_path,
+                    pdb_folder_path, pdb_analysis, chains, resolution, atom_count,
                     has_ligands, status, notes
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
-                receptor_name,
+                pdb_name,
                 self.name,
                 original_pdb_path,
                 processed_pdb_path,
                 checked_pdb_path,
-                receptor_folder,
+                pdb_folder,
                 pdb_analysis_json,
                 chains_str,
                 analysis.get('resolution'),
                 analysis['atom_count'],
                 analysis['has_ligands'],
                 'created',
-                f"Receptor created from PDB file: {os.path.basename(original_pdb_path)}"
+                f"PDB model created from PDB file: {os.path.basename(original_pdb_path)}"
             ))
             
-            receptor_id = cursor.lastrowid or cursor.execute(
-                "SELECT receptor_id FROM receptors WHERE receptor_name = ?", 
-                (receptor_name,)
+            pdb_id = cursor.lastrowid or cursor.execute(
+                "SELECT pdb_id FROM pdbs WHERE pdb_name = ?", 
+                (pdb_name,)
             ).fetchone()[0]
             
             conn.commit()
             conn.close()
             
             return {
-                'receptor_id': receptor_id,
-                'receptor_name': receptor_name,
+                'pdb_id': pdb_id,
+                'pdb_name': pdb_name,
                 'project_name': self.name,
                 'original_pdb_path': original_pdb_path,
                 'processed_pdb_path': processed_pdb_path,
                 'checked_pdb_path': checked_pdb_path,
-                'receptor_folder_path': receptor_folder,
-                'database_path': receptors_db_path,
+                'pdb_folder_path': pdb_folder,
+                'database_path': pdbs_db_path,
                 'pdb_analysis': analysis,
                 'created_date': datetime.now().isoformat()
             }
             
         except Exception as e:
-            print(f"❌ Error creating receptor registry: {e}")
+            print(f"❌ Error creating PDB registry: {e}")
             return None
 
-    def _display_receptor_creation_summary(self, receptor_info: Dict[str, Any]) -> None:
+    def _display_pdb_creation_summary(self, pdb_registry: Dict[str, Any]) -> None:
         """
         Display summary of created receptor.
         
@@ -3722,16 +3720,16 @@ class MolDock:
             receptor_info (Dict): Receptor registry information
         """
         try:
-            print(f"\n✅ RECEPTOR CREATED SUCCESSFULLY")
+            print(f"\n✅ PDB FILE CREATED SUCCESSFULLY")
             print("=" * 60)
-            print(f"🆔 Receptor ID: {receptor_info['receptor_id']}")
-            print(f"🏷️  Receptor Name: {receptor_info['receptor_name']}")
-            print(f"📁 Original PDB: {os.path.basename(receptor_info['original_pdb_path'])}")
-            print(f"📋 Processed PDB: {os.path.relpath(receptor_info['processed_pdb_path'])}")
-            print(f"📂 Receptor Folder: {os.path.relpath(receptor_info['receptor_folder_path'])}")
-            print(f"💾 Database: {os.path.relpath(receptor_info['database_path'])}")
+            print(f"🆔 PDB ID: {pdb_registry['pdb_id']}")
+            print(f"🏷️  PDB Name: {pdb_registry['pdb_name']}")
+            print(f"📁 Original PDB: {os.path.basename(pdb_registry['original_pdb_path'])}")
+            print(f"📋 Processed PDB: {os.path.relpath(pdb_registry['processed_pdb_path'])}")
+            print(f"📂 PDB Folder: {os.path.relpath(pdb_registry['pdb_folder_path'])}")
+            print(f"💾 Database: {os.path.relpath(pdb_registry['database_path'])}")
             
-            analysis = receptor_info['pdb_analysis']
+            analysis = pdb_registry['pdb_analysis']
             print(f"\n📊 STRUCTURE INFO:")
             print(f"   ⚛️  Atoms: {analysis['atom_count']:,}")
             print(f"   🔗 Chains: {', '.join(analysis['chains'])}")
@@ -3869,7 +3867,7 @@ quit
             print(f"❌ Error running tleap for missing atom addition: {e}")
             return None
 
-    def _add_missing_atoms_in_receptor_prody(self, receptor_file, receptor_info):
+    def _add_missing_atoms_in_pdb_prody(self, receptor_file, receptor_info):
 
         import prody
 
@@ -4091,3 +4089,87 @@ quit
         except Exception as e:
             print(f"   ⚠️  Error in residue mapping: {e}")
             return {}
+        
+    def create_receptor_for_docking(self):
+        """
+        Will load the pdbs.db database from project_path/docking/receptors and prompt the user to select one of the receptors available to create a pdbqt file for docking puporses using helper function to be created.
+        """
+        import sqlite3
+
+        receptors_db_path = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
+        if not os.path.exists(receptors_db_path):
+            print(f"❌ No receptor database found at {receptors_db_path}")
+            return None
+
+        try:
+            conn = sqlite3.connect(receptors_db_path)
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT receptor_id, receptor_name, processed_pdb_path, checked_pdb_path, receptor_folder_path
+                FROM receptors
+                ORDER BY created_date DESC
+            ''')
+            receptors = cursor.fetchall()
+            conn.close()
+        except Exception as e:
+            print(f"❌ Error loading PDB files database: {e}")
+            return None
+
+        if not receptors:
+            print("❌ No PDB files found in the database.")
+            return None
+
+        print("\n📋 Available PDB files:")
+        print("=" * 60)
+        for i, (rid, name, processed_pdb, checked_pdb, folder) in enumerate(receptors, 1):
+            print(f"{i}. {name} (ID: {rid})")
+            print(f"   Processed PDB: {os.path.basename(processed_pdb)}")
+            print(f"   Checked PDB: {os.path.basename(checked_pdb)}")
+            print(f"   Folder: {os.path.relpath(folder)}")
+        print("=" * 60)
+
+        # Prompt user to select a receptor
+        while True:
+            try:
+                selection = input("Select the pdb file by number (or 'cancel'): ").strip()
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    print("❌ PDB file selection cancelled.")
+                    return None
+                try:
+                    idx = int(selection) - 1
+                    if 0 <= idx < len(receptors):
+                        selected = receptors[idx]
+                        break
+                    else:
+                        print(f"❌ Invalid selection. Enter a number between 1 and {len(receptors)}.")
+                except ValueError:
+                    print("❌ Please enter a valid number.")
+            except KeyboardInterrupt:
+                print("\n❌ Receptor selection cancelled.")
+                return None
+
+        receptor_id, receptor_name, processed_pdb_path, checked_pdb_path, receptor_folder_path = selected
+
+        # Prompt user for which file to use
+        print("\nWhich file do you want to convert to PDBQT?")
+        print(f"1. Processed PDB: {processed_pdb_path}")
+        print(f"2. Checked PDB (with missing atoms added): {checked_pdb_path}")
+        while True:
+            file_choice = input("Enter 1 or 2 (default 2): ").strip()
+            if file_choice in ['', '2']:
+                pdb_to_convert = checked_pdb_path
+                break
+            elif file_choice == '1':
+                pdb_to_convert = processed_pdb_path
+                break
+            else:
+                print("❌ Please enter 1, 2, or press Enter for default (2).")
+
+        # Call helper to create PDBQT
+        pdbqt_path = self._create_pdbqt_from_pdb(pdb_to_convert, receptor_folder_path, receptor_name)
+        if pdbqt_path:
+            print(f"✅ PDBQT file created: {pdbqt_path}")
+            return pdbqt_path
+        else:
+            print("❌ Failed to create PDBQT file.")
+            return None
