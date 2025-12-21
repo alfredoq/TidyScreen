@@ -2314,7 +2314,7 @@ class MolDock:
                 return None
             
             # Step 6: Copy and process PDB file
-            processed_pdb_path = self._process_pdb_file(pdb_file, receptor_folder, pdb_analysis)
+            processed_pdb_path, receptor_checked = self._process_pdb_file(pdb_file, receptor_folder, pdb_analysis)
             
             if not processed_pdb_path:
                 print("❌ Failed to process PDB file")
@@ -2633,8 +2633,6 @@ class MolDock:
                     processed_pdb_path, selected_chains, selected_ligands, selected_waters, analysis
                 )
                 
-                print(filtered_pdb_path)
-                
                 if not filtered_pdb_path:
                     print("   ❌ Failed to create filtered PDB file")
                     return ""
@@ -2650,14 +2648,20 @@ class MolDock:
             self._create_processing_summary(receptor_folder, original_pdb_path, processed_pdb_path,
                                             selected_chains, selected_ligands, analysis)
 
-            # --- Add missing atoms using tleap as the last step ---
-            tleap_fixed_pdb = self._add_missing_atoms_in_receptor(processed_pdb_path, analysis)
-            if tleap_fixed_pdb:
-                print(f"   ✅ Receptor with missing atoms added: {os.path.relpath(tleap_fixed_pdb)}")
-                return tleap_fixed_pdb
-            else:
-                print(f"   ⚠️  Returning processed PDB without tleap fixing.")
-                return processed_pdb_path
+            # # --- Add missing atoms using tleap as the last step ---
+            # tleap_fixed_pdb = self._add_missing_atoms_in_receptor_tleap(processed_pdb_path, analysis)
+            
+            # --- Add missing atoms using prody as the last step ---
+            receptor_checked = self._add_missing_atoms_in_receptor_prody(processed_pdb_path, analysis)
+            
+            # if tleap_fixed_pdb:
+            #     print(f"   ✅ Receptor with missing atoms added: {os.path.relpath(tleap_fixed_pdb)}")
+            #     return tleap_fixed_pdb
+            # else:
+            #     print(f"   ⚠️  Returning processed PDB without tleap fixing.")
+            #     return processed_pdb_path
+
+            return processed_pdb_path, receptor_checked
 
         except Exception as e:
             print(f"❌ Error processing PDB file: {e}")
@@ -2980,7 +2984,6 @@ class MolDock:
         # Replace original file
         import shutil
         shutil.move(tmp_path, pdb_file)
-
 
     def _create_processing_summary(self, receptor_folder: str, original_pdb_path: str, 
                                 processed_pdb_path: str, selected_chains: List[str], 
@@ -3745,7 +3748,7 @@ class MolDock:
         except Exception as e:
             print(f"⚠️  Error displaying receptor summary: {e}")
         
-    def _add_missing_atoms_in_receptor(self, receptor_file, receptor_info):
+    def _add_missing_atoms_in_receptor_tleap(self, receptor_file, receptor_info):
         """
         Will process using tleap a receptor_file by loading the .pdb and saving to a new file.
         Will use tleap as installed in the environment
@@ -3778,6 +3781,8 @@ quit
                 tf.write(tleap_script)
                 tleap_input_path = tf.name
 
+
+            ## This first tleap run will ensure addition of missing heavy atoms
             print(f"🛠️  Running tleap to add missing atoms to receptor...")
             result = subprocess.run(
                 ["tleap", "-f", tleap_input_path],
@@ -3800,6 +3805,57 @@ quit
                 print("❌ tleap did not produce the expected output file.")
                 return None
 
+            # Hydrogen atoms will deleted using pdb4amber available in the environment
+            intermediate_receptor_file = receptor_dir + "/receptor_checked.pdb"
+            output_receptor_file_intermediate = receptor_dir + "/receptor_checked_woHs.pdb"
+
+            result = subprocess.run(
+                ["pdb4amber", f"{intermediate_receptor_file}", "-y", "-o", f"{output_receptor_file_intermediate}"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+
+            # Move the intermediate file (without hydrogens) to the final output path
+            shutil.move(output_receptor_file_intermediate, output_pdb)
+
+#             # A second round of tleap processing will be performed on the receptor containing all heavy atoms
+
+#             # Prepare tleap input script. The original output_pdb will be overwritten.
+#             tleap_script = f"""
+# source leaprc.protein.ff14SB
+# mol = loadpdb "{output_receptor_file_intermediate}"
+# savepdb mol "{output_pdb}"
+# quit
+# """
+
+#             # Write tleap script to a temp file
+#             with tempfile.NamedTemporaryFile("w", delete=False, suffix=".in") as tf:
+#                 tf.write(tleap_script)
+#                 tleap_input_path = tf.name
+
+#             ## This second tleap run will ensure addition of hydrogens on all added heavy atoms
+#             result = subprocess.run(
+#                 ["tleap", "-f", tleap_input_path],
+#                 stdout=subprocess.PIPE,
+#                 stderr=subprocess.PIPE,
+#                 text=True
+#             )
+
+#             # Clean up temp file
+#             os.remove(tleap_input_path)
+
+#             # Check for errors
+#             if result.returncode != 0:
+#                 print("❌ tleap failed to process the receptor file.")
+#                 print(result.stderr)
+#                 return None
+
+#             # Check if output file was created
+#             if not os.path.exists(output_pdb):
+#                 print("❌ tleap did not produce the expected output file.")
+#                 return None
+
             # Reassign chain IDs and residue numbers
             self._reassign_chain_and_resnums(receptor_file, output_pdb)
 
@@ -3809,7 +3865,24 @@ quit
         except Exception as e:
             print(f"❌ Error running tleap for missing atom addition: {e}")
             return None
+
+    def _add_missing_atoms_in_receptor_prody(self, receptor_file, receptor_info):
+
+        import prody
+
+        PDBname = receptor_file
+        receptor_path = os.path.dirname(receptor_file)
+        print(f"folder: {receptor_path}")
+        final_file = receptor_file.replace(".pdb","_checked.pdb")
         
+        ## Add missing atoms (including heavy and hydrogens) using prody
+        prody.addMissingAtoms(PDBname, method='pdbfixer')
+
+        ## Rename the default output of prody 
+        shutil.move(receptor_path + '/addH_receptor.pdb', final_file)
+
+        return final_file
+
     def _reassign_chain_and_resnums(self, reference_pdb, target_pdb):
         """
         Create a dictionary in which the key is formed by residue name, the chain and the residue number in the reference pdb_file, and the value is formed by the residue name and residue number in the target pdb file.
@@ -3924,7 +3997,6 @@ quit
                             y = line[38:46]
                             z = line[46:54]
                             # Set occupancy and tempFactor to default values
-                            #occupancy = f"{ref_occupancy:6.2f}"
                             occupancy = ref_occupancy
                             tempFactor = ref_tempFactor
                             # Use element and charge if present
