@@ -2187,7 +2187,7 @@ class MolDock:
         except Exception as e:
             print(f"❌ Error showing table details: {e}")
             
-    def create_receptor_for_docking(self, pdb_file: Optional[str] = None, receptor_name: Optional[str] = None, verbose = True) -> Optional[Dict[str, Any]]:
+    def prepare_pdb_for_docking(self, pdb_file: Optional[str] = None, receptor_name: Optional[str] = None, verbose = True) -> Optional[Dict[str, Any]]:
         """
         Create a receptor entry for docking from a PDB file. The user is prompted for a pdb file and receptor name, 
         after which a register for the receptor is created in a database called receptors.db located in the 
@@ -2314,7 +2314,7 @@ class MolDock:
                 return None
             
             # Step 6: Copy and process PDB file
-            processed_pdb_path, receptor_checked = self._process_pdb_file(pdb_file, receptor_folder, pdb_analysis)
+            processed_pdb_path, checked_pdb_path = self._process_pdb_file(pdb_file, receptor_folder, pdb_analysis)
             
             if not processed_pdb_path:
                 print("❌ Failed to process PDB file")
@@ -2322,7 +2322,7 @@ class MolDock:
             
             # Step 7: Create receptor registry entry
             receptor_registry = self._create_receptor_registry_entry(
-                receptor_name, pdb_file, processed_pdb_path, receptor_folder, pdb_analysis
+                receptor_name, pdb_file, processed_pdb_path, receptor_folder, pdb_analysis, checked_pdb_path
             )
             
             if not receptor_registry:
@@ -3615,7 +3615,7 @@ class MolDock:
 
     def _create_receptor_registry_entry(self, receptor_name: str, original_pdb_path: str, 
                                     processed_pdb_path: str, receptor_folder: str, 
-                                    analysis: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+                                    analysis: Dict[str, Any], checked_pdb_path) -> Optional[Dict[str, Any]]:
         """
         Create receptor registry entry in receptors.db
         
@@ -3648,6 +3648,7 @@ class MolDock:
                     project_name TEXT,
                     original_pdb_path TEXT NOT NULL,
                     processed_pdb_path TEXT NOT NULL,
+                    checked_pdb_path TEXT NOT NULL,
                     receptor_folder_path TEXT NOT NULL,
                     pdb_analysis TEXT,
                     chains TEXT,
@@ -3668,15 +3669,16 @@ class MolDock:
             # Insert or update receptor entry
             cursor.execute('''
                 INSERT OR REPLACE INTO receptors (
-                    receptor_name, project_name, original_pdb_path, processed_pdb_path,
+                    receptor_name, project_name, original_pdb_path, processed_pdb_path, checked_pdb_path,
                     receptor_folder_path, pdb_analysis, chains, resolution, atom_count,
                     has_ligands, status, notes
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 receptor_name,
                 self.name,
                 original_pdb_path,
                 processed_pdb_path,
+                checked_pdb_path,
                 receptor_folder,
                 pdb_analysis_json,
                 chains_str,
@@ -3701,6 +3703,7 @@ class MolDock:
                 'project_name': self.name,
                 'original_pdb_path': original_pdb_path,
                 'processed_pdb_path': processed_pdb_path,
+                'checked_pdb_path': checked_pdb_path,
                 'receptor_folder_path': receptor_folder,
                 'database_path': receptors_db_path,
                 'pdb_analysis': analysis,
