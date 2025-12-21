@@ -4089,87 +4089,261 @@ quit
         except Exception as e:
             print(f"   ⚠️  Error in residue mapping: {e}")
             return {}
-        
-    def create_receptor_for_docking(self):
+    
+    def create_receptor_for_docking(self, selection: int = None):
         """
-        Will load the pdbs.db database from project_path/docking/receptors and prompt the user to select one of the receptors available to create a pdbqt file for docking puporses using helper function to be created.
+        Will load the pdbs.db database from project_path/docking/receptors and prompt the user to select one of the PBD models available to create a pdbqt file for docking purposes using helper function to be created.
+        If 'selection' is provided, it will be used directly; otherwise, the user will be prompted.
         """
         import sqlite3
 
-        receptors_db_path = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
-        if not os.path.exists(receptors_db_path):
-            print(f"❌ No receptor database found at {receptors_db_path}")
+        pdbs_db_path = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
+        if not os.path.exists(pdbs_db_path):
+            print(f"❌ No pdbs database found at {pdbs_db_path}")
             return None
 
         try:
-            conn = sqlite3.connect(receptors_db_path)
+            conn = sqlite3.connect(pdbs_db_path)
             cursor = conn.cursor()
             cursor.execute('''
-                SELECT receptor_id, receptor_name, processed_pdb_path, checked_pdb_path, receptor_folder_path
-                FROM receptors
+                SELECT pdb_id, pdb_name, processed_pdb_path, checked_pdb_path, pdb_folder_path
+                FROM pdbs
                 ORDER BY created_date DESC
             ''')
-            receptors = cursor.fetchall()
+            pdbs = cursor.fetchall()
             conn.close()
         except Exception as e:
             print(f"❌ Error loading PDB files database: {e}")
             return None
 
-        if not receptors:
+        if not pdbs:
             print("❌ No PDB files found in the database.")
             return None
 
         print("\n📋 Available PDB files:")
         print("=" * 60)
-        for i, (rid, name, processed_pdb, checked_pdb, folder) in enumerate(receptors, 1):
+        for i, (rid, name, processed_pdb, checked_pdb, folder) in enumerate(pdbs, 1):
             print(f"{i}. {name} (ID: {rid})")
             print(f"   Processed PDB: {os.path.basename(processed_pdb)}")
             print(f"   Checked PDB: {os.path.basename(checked_pdb)}")
             print(f"   Folder: {os.path.relpath(folder)}")
         print("=" * 60)
 
-        # Prompt user to select a receptor
-        while True:
-            try:
-                selection = input("Select the pdb file by number (or 'cancel'): ").strip()
-                if selection.lower() in ['cancel', 'quit', 'exit']:
-                    print("❌ PDB file selection cancelled.")
-                    return None
+        # Prompt user to select a receptor only if selection is not provided
+        if selection is None:
+            while True:
                 try:
-                    idx = int(selection) - 1
-                    if 0 <= idx < len(receptors):
-                        selected = receptors[idx]
-                        break
-                    else:
-                        print(f"❌ Invalid selection. Enter a number between 1 and {len(receptors)}.")
-                except ValueError:
-                    print("❌ Please enter a valid number.")
-            except KeyboardInterrupt:
-                print("\n❌ Receptor selection cancelled.")
+                    selection_input = input("Select the pdb file by number (or 'cancel'): ").strip()
+                    if selection_input.lower() in ['cancel', 'quit', 'exit']:
+                        print("❌ PDB file selection cancelled.")
+                        return None
+                    try:
+                        idx = int(selection_input) - 1
+                        if 0 <= idx < len(pdbs):
+                            selected = pdbs[idx]
+                            break
+                        else:
+                            print(f"❌ Invalid selection. Enter a number between 1 and {len(pdbs)}.")
+                    except ValueError:
+                        print("❌ Please enter a valid number.")
+                except KeyboardInterrupt:
+                    print("\n❌ PDB selection cancelled.")
+                    return None
+        else:
+            idx = selection - 1
+            if 0 <= idx < len(pdbs):
+                selected = pdbs[idx]
+            else:
+                print(f"❌ Invalid selection. Enter a number between 1 and {len(pdbs)}.")
                 return None
 
-        receptor_id, receptor_name, processed_pdb_path, checked_pdb_path, receptor_folder_path = selected
+        pdb_id, pdb_name, processed_pdb_path, checked_pdb_path, pdb_folder_path = selected
 
-        # Prompt user for which file to use
-        print("\nWhich file do you want to convert to PDBQT?")
-        print(f"1. Processed PDB: {processed_pdb_path}")
-        print(f"2. Checked PDB (with missing atoms added): {checked_pdb_path}")
-        while True:
-            file_choice = input("Enter 1 or 2 (default 2): ").strip()
-            if file_choice in ['', '2']:
-                pdb_to_convert = checked_pdb_path
-                break
-            elif file_choice == '1':
-                pdb_to_convert = processed_pdb_path
-                break
-            else:
-                print("❌ Please enter 1, 2, or press Enter for default (2).")
+        # Select the pdb file to convert to .pdbqt
+        pdb_to_convert = checked_pdb_path
 
         # Call helper to create PDBQT
-        pdbqt_path = self._create_pdbqt_from_pdb(pdb_to_convert, receptor_folder_path, receptor_name)
-        if pdbqt_path:
-            print(f"✅ PDBQT file created: {pdbqt_path}")
-            return pdbqt_path
+        pdbqt_file, configs = self._create_pdbqt_from_pdb(pdb_to_convert, pdb_folder_path, pdb_name)
+        
+        if pdbqt_file:
+            
+            self._create_receptor_register(pdb_id, pdb_name, pdb_to_convert, pdbqt_file, configs)
+            
+            print(f"✅ PDBQT file created: {pdbqt_file}")
+        
         else:
             print("❌ Failed to create PDBQT file.")
             return None
+        
+    def _create_pdbqt_from_pdb(self, pdb_to_convert, pdb_folder_path, pdb_name):
+        
+        from meeko import MoleculePreparation, ResidueChemTemplates
+        from meeko import Polymer
+
+        print(pdb_to_convert)
+        print(pdb_folder_path)
+        print(pdb_name)
+        destination_pdbqt = pdb_to_convert.replace(".pdb",".pdbqt")
+
+        structure = self._create_prody_selection(pdb_to_convert)
+        
+        configs = self._prompt_recprep_opts()
+        
+        mk_prep = MoleculePreparation()
+        chem_templates = ResidueChemTemplates.create_from_defaults()
+        mypol = Polymer.from_prody(structure, chem_templates, mk_prep)
+
+        self._write_pdbqt(mypol, destination_pdbqt)
+        
+        if os.path.exists(destination_pdbqt):
+            return destination_pdbqt, configs
+        else:
+            print(f"❌ Failed to create PDBQT file at {destination_pdbqt}")
+            return False
+
+    def _create_prody_selection(self, pdb_to_convert):
+        
+        from prody import parsePDB
+        
+        structure = parsePDB(pdb_to_convert)
+        
+        return structure
+    
+    def _prompt_recprep_opts(self):
+
+
+        ## Here the user will be prompted to enter coordinates for the box
+        # Prompt for box center coordinates
+        while True:
+            try:
+                x = input("Enter X coordinate (e.g., 12.34): ").strip()
+                y = input("Enter Y coordinate (e.g., -56.78): ").strip()
+                z = input("Enter Z coordinate (e.g., 90.12): ").strip()
+                try:
+                    x = float(x)
+                    y = float(y)
+                    z = float(z)
+                    x = round(x, 2)
+                    y = round(y, 2)
+                    z = round(z, 2)
+                    print(f"Coordinates entered: ({x:.2f}, {y:.2f}, {z:.2f})")
+                    coords = {'x': x, 'y': y, 'z': z}
+                except ValueError:
+                    print("❌ Please enter valid numbers for all coordinates (e.g., 12.34)")
+                    continue
+                break
+            except KeyboardInterrupt:
+                print("\n❌ Coordinate entry cancelled.")
+                return None
+
+        # Prompt for box dimensions
+        while True:
+            try:
+                x = input("Enter X box size (e.g., 20): ").strip()
+                y = input("Enter Y box size (e.g., 20): ").strip()
+                z = input("Enter Z box size (e.g., 20): ").strip()
+                try:
+                    x = int(x)
+                    y = int(y)
+                    z = int(z)
+                    print(f"Sizes entered: ({x}, {y}, {z})")
+                    sizes = {'x': x, 'y': y, 'z': z}
+                except ValueError:
+                    print("❌ Please enter valid numbers for all box dimensions")
+                    continue
+                break
+            except KeyboardInterrupt:
+                print("\n❌ Box size entry cancelled.")
+                return None
+
+        return {'center': coords, 'size': sizes}
+
+    
+    def _write_pdbqt(self, mypol, destination_pdbqt):
+        
+        from meeko import PDBQTWriterLegacy
+    
+        rigid_pdbqt_string, flex_pdbqt_string = PDBQTWriterLegacy.write_string_from_polymer(mypol)
+        
+        with open(destination_pdbqt, "w") as f:
+            f.write(rigid_pdbqt_string)
+
+    def _create_receptor_register(self, 
+                                 pdb_id: int,                 
+                                 pdb_name: str, 
+                                 pdb_to_convert: str,
+                                 pdbqt_file: str,
+                                 configs: dict, 
+                                 notes: str = None
+                                ) -> bool:
+        
+        """
+        Create a receptor register entry in the database for this project.
+        Stores information about the processed receptor, including chains, ligands, waters, and file paths.
+
+        Args:
+            pdb_id (int): ID for the pdb file originating the .pdbqt file
+            pdb_name (str): Name of the processed PDB file originating the .pdbqt file
+            pdb_to_convert (str): Path to the PDB file originating the .pdbqt file
+            pdbqt_file (list): Path to the .pdqbt file created file
+            configs: a dictionary containing box information for docking
+            notes (str): Optional notes
+
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            import sqlite3
+            import json
+            from datetime import datetime
+
+            receptors_db_path = os.path.join(self.path, 'docking', 'receptors', 'receptors.db')
+
+            if notes is None:
+                try:
+                    notes = input("Enter a note for this .pdbqt file (Enter: empty note): ").strip()
+                    if not notes:
+                        notes = ""
+                except KeyboardInterrupt:
+                    print("\n   ⚠️  Note entry cancelled. Using empty note.")
+                    notes = ""
+
+            conn = sqlite3.connect(receptors_db_path)
+            cursor = conn.cursor()
+
+            # Create table if it doesn't exist
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS receptor_registers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    pdb_id INTEGER NOT NULL,
+                    pdb_name TEXT NOT NULL,
+                    pdb_to_convert TEXT NOT NULL,
+                    pdbqt_file TEXT,
+                    configs TEXT,
+                    notes TEXT,
+                    created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
+            # Insert register entry
+            cursor.execute('''
+                INSERT INTO receptor_registers (
+                    pdb_id, pdb_name, pdb_to_convert, pdbqt_file, configs, notes
+                ) VALUES (?, ?, ?, ?, ?, ?)
+            ''', (
+                pdb_id,
+                pdb_name,
+                pdb_to_convert,
+                pdbqt_file,
+                json.dumps(configs) if configs is not None else None,
+                notes
+            ))
+
+            conn.commit()
+            conn.close()
+            print(f"   ✅ Receptor register created for PDB ID: '{pdb_id}'")
+            return True
+
+        except Exception as e:
+            print(f"   ❌ Error creating receptor register: {e}")
+            return False
