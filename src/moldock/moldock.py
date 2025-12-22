@@ -4163,8 +4163,12 @@ quit
         pdb_to_convert = checked_pdb_path
 
         # Call helper to create PDBQT
-        pdbqt_file, configs = self._create_pdbqt_from_pdb(pdb_to_convert, pdb_folder_path, pdb_name)
-        
+        pdbqt_file, configs = self._create_pdbqt_from_pdb(pdb_to_convert)
+
+        # Call helper method to create receptor grids
+        self._create_receptor_grids(pdbqt_file, configs, pdb_folder_path)
+
+
         if pdbqt_file:
             
             self._create_receptor_register(pdb_id, pdb_name, pdb_to_convert, pdbqt_file, configs)
@@ -4175,14 +4179,12 @@ quit
             print("❌ Failed to create PDBQT file.")
             return None
         
-    def _create_pdbqt_from_pdb(self, pdb_to_convert, pdb_folder_path, pdb_name):
+    def _create_pdbqt_from_pdb(self, pdb_to_convert):
         
         from meeko import MoleculePreparation, ResidueChemTemplates
         from meeko import Polymer
 
-        print(pdb_to_convert)
-        print(pdb_folder_path)
-        print(pdb_name)
+    
         destination_pdbqt = pdb_to_convert.replace(".pdb",".pdbqt")
 
         structure = self._create_prody_selection(pdb_to_convert)
@@ -4209,25 +4211,34 @@ quit
         
         return structure
     
-    def _prompt_recprep_opts(self):
+    def _prompt_recprep_opts(self) -> Optional[dict]:
+        """
+        Prompt the user to enter docking box center coordinates and box size for receptor preparation.
 
+        This method interactively asks the user for the X, Y, Z coordinates of the box center and the
+        X, Y, Z dimensions (size) of the docking box. It validates the input and returns a dictionary
+        with the box configuration, suitable for use in docking setup and registry.
 
-        ## Here the user will be prompted to enter coordinates for the box
+        Returns:
+            dict: Dictionary with keys 'center' and 'size', each mapping to a dict with 'x', 'y', 'z' values.
+                Example: {'center': {'x': 10.0, 'y': 20.0, 'z': 30.0}, 'size': {'x': 20, 'y': 20, 'z': 20}}
+            None: If the user cancels the input.
+
+        Raises:
+            None: All exceptions are handled internally with user feedback.
+        """
         # Prompt for box center coordinates
         while True:
             try:
-                x = input("Enter X coordinate (e.g., 12.34): ").strip()
-                y = input("Enter Y coordinate (e.g., -56.78): ").strip()
-                z = input("Enter Z coordinate (e.g., 90.12): ").strip()
+                x = input("Enter X coordinate for box center (e.g., 12.34): ").strip()
+                y = input("Enter Y coordinate for box center (e.g., -56.78): ").strip()
+                z = input("Enter Z coordinate for box center (e.g., 90.12): ").strip()
                 try:
                     x = float(x)
                     y = float(y)
                     z = float(z)
-                    x = round(x, 2)
-                    y = round(y, 2)
-                    z = round(z, 2)
-                    print(f"Coordinates entered: ({x:.2f}, {y:.2f}, {z:.2f})")
-                    coords = {'x': x, 'y': y, 'z': z}
+                    coords = {'x': round(x, 2), 'y': round(y, 2), 'z': round(z, 2)}
+                    print(f"Coordinates entered: ({coords['x']:.2f}, {coords['y']:.2f}, {coords['z']:.2f})")
                 except ValueError:
                     print("❌ Please enter valid numbers for all coordinates (e.g., 12.34)")
                     continue
@@ -4246,51 +4257,221 @@ quit
                     x = int(x)
                     y = int(y)
                     z = int(z)
-                    print(f"Sizes entered: ({x}, {y}, {z})")
                     sizes = {'x': x, 'y': y, 'z': z}
+                    print(f"Sizes entered: ({x}, {y}, {z})")
                 except ValueError:
-                    print("❌ Please enter valid numbers for all box dimensions")
+                    print("❌ Please enter valid integers for all box dimensions")
                     continue
                 break
             except KeyboardInterrupt:
                 print("\n❌ Box size entry cancelled.")
                 return None
 
-        return {'center': coords, 'size': sizes}
+        # Prompt for dielectric constant
+        while True:
+            try:
+                dielectric = input("Enter dielectric constant to use (default: -42): ").strip()
+                if not dielectric:
+                    dielectric = -42
+                else:
+                    try:
+                        dielectric = int(dielectric)
+                    except ValueError:
+                        print("❌ Please enter a valid integer for the dielectric constant")
+                        continue
+                try:
+                    dielectric = int(dielectric)
+                    misc = {'dielectric': dielectric}
+                    print(f"Dielectric constant: ({dielectric})")
+                except ValueError:
+                    print("❌ Please enter valid integers for dielectric constant")
+                    continue
+                break
+            except KeyboardInterrupt:
+                print("\n❌ Dielectric constant entry cancelled.")
+                return None
 
-    
-    def _write_pdbqt(self, mypol, destination_pdbqt):
-        
-        from meeko import PDBQTWriterLegacy
-    
-        rigid_pdbqt_string, flex_pdbqt_string = PDBQTWriterLegacy.write_string_from_polymer(mypol)
-        
-        with open(destination_pdbqt, "w") as f:
-            f.write(rigid_pdbqt_string)
+        # Prompt for smooth constant
+        while True:
+            try:
+                smooth = input("Enter smooth constant to use (default: 0.5): ").strip()
+                if not smooth:
+                    smooth = 0.5
+                else:
+                    try:
+                        smooth = float(smooth)
+                    except ValueError:
+                        print("❌ Please enter a valid float for the smooth constant")
+                        continue
+                try:
+                    smooth = float(smooth)
+                    misc = {'smooth': smooth}
+                    print(f"Smooth value: ({smooth})")
+                except ValueError:
+                    print("❌ Please enter valid float for smooth value")
+                    continue
+                break
+            except KeyboardInterrupt:
+                print("\n❌ Smooth value entry cancelled.")
+                return None
 
-    def _create_receptor_register(self, 
-                                 pdb_id: int,                 
-                                 pdb_name: str, 
-                                 pdb_to_convert: str,
-                                 pdbqt_file: str,
-                                 configs: dict, 
-                                 notes: str = None
-                                ) -> bool:
-        
+        # Prompt for spacing constant
+        while True:
+            try:
+                spacing = input("Enter spacing to use (default: 0.375): ").strip()
+                if not spacing:
+                    spacing = 0.375
+                else:
+                    try:
+                        spacing = float(spacing)
+                    except ValueError:
+                        print("❌ Please enter a valid float for the spacing constant")
+                        continue
+                try:
+                    spacing = float(spacing)
+                    misc = {'spacing': spacing}
+                    print(f"Spacing value: ({spacing})")
+                except ValueError:
+                    print("❌ Please enter valid float for spacing value")
+                    continue
+                break
+            except KeyboardInterrupt:
+                print("\n❌ Spacing value entry cancelled.")
+                return None
+
+        return {'center': coords, 'size': sizes, 'dielectric': dielectric, 'smooth': smooth, 'spacing': spacing}
+
+    def _write_pdbqt(self, mypol, destination_pdbqt: str) -> None:
         """
-        Create a receptor register entry in the database for this project.
-        Stores information about the processed receptor, including chains, ligands, waters, and file paths.
+        Write a PDBQT file from a Meeko Polymer object.
+
+        This method uses Meeko's PDBQTWriterLegacy to generate the PDBQT string from the provided
+        Polymer object and writes it to the specified destination file. Only the rigid PDBQT string
+        is written (no flexible residues).
 
         Args:
-            pdb_id (int): ID for the pdb file originating the .pdbqt file
-            pdb_name (str): Name of the processed PDB file originating the .pdbqt file
-            pdb_to_convert (str): Path to the PDB file originating the .pdbqt file
-            pdbqt_file (list): Path to the .pdqbt file created file
-            configs: a dictionary containing box information for docking
-            notes (str): Optional notes
+            mypol: Meeko Polymer object representing the prepared receptor or ligand.
+            destination_pdbqt (str): Path to the output .pdbqt file.
 
         Returns:
-            bool: True if successful, False otherwise
+            None
+
+        Raises:
+            Exception: If writing the file fails.
+        """
+        try:
+            from meeko import PDBQTWriterLegacy
+
+            rigid_pdbqt_string, _ = PDBQTWriterLegacy.write_string_from_polymer(mypol)
+            with open(destination_pdbqt, "w") as f:
+                f.write(rigid_pdbqt_string)
+            print(f"   ✅ PDBQT file written: {destination_pdbqt}")
+        except Exception as e:
+            print(f"   ❌ Error writing PDBQT file: {e}")
+            raise
+
+    def _create_receptor_grids(self, pdbqt_file, configs, rec_main_path):
+
+        from meeko.gridbox import get_gpf_string
+        import subprocess
+
+        # Set ligand atom types
+        any_lig_base_types = [
+            "HD", "C", "A", "N", "NA", "OA", "F", "P", "SA", "S", "Cl", "Br", "I",
+        ]
+
+        # Set receptor atom types
+        rec_types = [
+            "HD", "C", "A", "N", "NA", "OA", "F", "P", "SA", "S", "Cl", "Br", "I",
+            "Mg", "Ca", "Mn", "Fe", "Zn",
+        ]
+
+        ## Get box center from configs
+        grid_center = list(configs['center'].values())
+
+        ## Get box dimensiones from configs
+        box_dims = list(configs['size'].values())
+
+        print(f"dielectric={configs['dielectric']}")
+
+        ## write the .gpf file for the receptor
+        grids_path = os.path.join(rec_main_path, 'grid_files')
+        os.makedirs(grids_path, exist_ok=True)
+        grids_file_path = os.path.join(grids_path, 'receptor.gpf')
+        grid_log_file = grids_file_path.replace(".gpf", ".glg")
+
+        with open(grids_file_path, "w") as f:
+            gpf_string, (npts_x, npts_y, npts_z) = get_gpf_string(
+                grid_center, box_dims, pdbqt_file, rec_types, any_lig_base_types,
+                dielectric=configs['dielectric'], smooth=configs['smooth'], spacing=configs['spacing']
+            )
+            # Write the .gpf file
+            f.write(gpf_string)
+
+        # --- Run AutoGrid4 using the .gpf file ---
+        print(f"🛠️  Running AutoGrid4 with {os.path.basename(grids_file_path)} ...")
+        try:
+            # Change working directory to grids_path before running autogrid4
+            result = subprocess.run(
+                ["autogrid4", "-p", os.path.basename(grids_file_path), "-l", os.path.basename(grid_log_file)],
+                cwd=grids_path,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            if result.returncode == 0:
+                print(f"✅ AutoGrid4 completed successfully. Log: {grid_log_file}")
+            else:
+                print(f"❌ AutoGrid4 failed. See log for details: {grid_log_file}")
+                print(result.stderr)
+        except FileNotFoundError:
+            print("❌ AutoGrid4 executable not found. Please ensure it is installed and in your PATH.")
+        except Exception as e:
+            print(f"❌ Error running AutoGrid4: {e}")
+
+
+    def _create_receptor_register(self, 
+                             pdb_id: int,                 
+                             pdb_name: str, 
+                             pdb_to_convert: str,
+                             pdbqt_file: str,
+                             configs: dict, 
+                             notes: str = None
+                            ) -> bool:
+        """
+        Create a receptor register entry in the database for this project.
+
+        This method stores metadata about a prepared receptor for docking, including:
+        - The originating PDB file and its database ID
+        - The processed PDBQT file path
+        - The docking box configuration (center and size)
+        - Optional user notes
+        - Timestamp of creation
+
+        The register is stored in the SQLite database:
+            project_path/docking/receptors/receptors.db
+        in a table called 'receptor_registers'.
+
+        Args:
+            pdb_id (int): ID for the PDB file originating the .pdbqt file (from pdbs.db)
+            pdb_name (str): Name of the processed PDB file originating the .pdbqt file
+            pdb_to_convert (str): Path to the PDB file used for conversion
+            pdbqt_file (str): Path to the generated .pdbqt file
+            configs (dict): Dictionary containing box information for docking (e.g., {'center': {...}, 'size': {...}})
+            notes (str, optional): Optional notes about this receptor preparation
+
+        Returns:
+            bool: True if the register was created successfully, False otherwise
+
+        Example:
+            self._create_receptor_register(
+                pdb_id=1,
+                pdb_name="1abc",
+                pdb_to_convert="/path/to/1abc_checked.pdb",
+                pdbqt_file="/path/to/1abc_checked.pdbqt",
+                configs={'center': {'x': 10, 'y': 20, 'z': 30}, 'size': {'x': 20, 'y': 20, 'z': 20}},
+                notes="Prepared for Vina docking"
+            )
         """
         try:
             import sqlite3
@@ -4299,6 +4480,7 @@ quit
 
             receptors_db_path = os.path.join(self.path, 'docking', 'receptors', 'receptors.db')
 
+            # Prompt for notes if not provided
             if notes is None:
                 try:
                     notes = input("Enter a note for this .pdbqt file (Enter: empty note): ").strip()
@@ -4307,6 +4489,9 @@ quit
                 except KeyboardInterrupt:
                     print("\n   ⚠️  Note entry cancelled. Using empty note.")
                     notes = ""
+
+            # Ensure the directory exists
+            os.makedirs(os.path.dirname(receptors_db_path), exist_ok=True)
 
             conn = sqlite3.connect(receptors_db_path)
             cursor = conn.cursor()
@@ -4335,13 +4520,13 @@ quit
                 pdb_name,
                 pdb_to_convert,
                 pdbqt_file,
-                json.dumps(configs) if configs is not None else None,
+                json.dumps(configs, indent=2) if configs is not None else None,
                 notes
             ))
 
             conn.commit()
             conn.close()
-            print(f"   ✅ Receptor register created for PDB ID: '{pdb_id}'")
+            print(f"   ✅ Receptor register created for PDB ID: '{pdb_id}' (PDBQT: {os.path.basename(pdbqt_file)})")
             return True
 
         except Exception as e:
