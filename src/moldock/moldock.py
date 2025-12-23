@@ -3663,7 +3663,16 @@ class MolDock:
             # Prepare data for insertion
             pdb_analysis_json = json.dumps(analysis, indent=2)
             chains_str = ','.join(analysis['chains'])
-            
+
+            # Prompt for notes
+            try:
+                notes = input("Enter a note for this PDB file (Enter: empty note): ").strip()
+                if not notes:
+                    notes = ""
+            except KeyboardInterrupt:
+                print("\n   ⚠️  Note entry cancelled. Using empty note.")
+                notes = ""
+
             # Insert or update receptor entry
             cursor.execute('''
                 INSERT OR REPLACE INTO pdbs (
@@ -3684,7 +3693,7 @@ class MolDock:
                 analysis['atom_count'],
                 analysis['has_ligands'],
                 'created',
-                f"PDB model created from PDB file: {os.path.basename(original_pdb_path)}"
+                notes if notes is not None else f"PDB model created from PDB file: {os.path.basename(original_pdb_path)}"
             ))
             
             pdb_id = cursor.lastrowid or cursor.execute(
@@ -3705,7 +3714,8 @@ class MolDock:
                 'pdb_folder_path': pdb_folder,
                 'database_path': pdbs_db_path,
                 'pdb_analysis': analysis,
-                'created_date': datetime.now().isoformat()
+                'created_date': datetime.now().isoformat(),
+                'notes': notes
             }
             
         except Exception as e:
@@ -4106,7 +4116,7 @@ quit
             conn = sqlite3.connect(pdbs_db_path)
             cursor = conn.cursor()
             cursor.execute('''
-                SELECT pdb_id, pdb_name, processed_pdb_path, checked_pdb_path, pdb_folder_path
+                SELECT pdb_id, pdb_name, processed_pdb_path, checked_pdb_path, pdb_folder_path, notes
                 FROM pdbs
                 ORDER BY created_date DESC
             ''')
@@ -4122,11 +4132,12 @@ quit
 
         print("\n📋 Available PDB files:")
         print("=" * 60)
-        for i, (rid, name, processed_pdb, checked_pdb, folder) in enumerate(pdbs, 1):
+        for i, (rid, name, processed_pdb, checked_pdb, folder, notes) in enumerate(pdbs, 1):
             print(f"{i}. {name} (ID: {rid})")
             print(f"   Processed PDB: {os.path.basename(processed_pdb)}")
             print(f"   Checked PDB: {os.path.basename(checked_pdb)}")
             print(f"   Folder: {os.path.relpath(folder)}")
+            print(f"   Notes: {notes}")
         print("=" * 60)
 
         # Prompt user to select a receptor only if selection is not provided
@@ -4157,7 +4168,7 @@ quit
                 print(f"❌ Invalid selection. Enter a number between 1 and {len(pdbs)}.")
                 return None
 
-        pdb_id, pdb_name, processed_pdb_path, checked_pdb_path, pdb_folder_path = selected
+        pdb_id, pdb_name, processed_pdb_path, checked_pdb_path, rec_main_path, notes = selected
 
         # Select the pdb file to convert to .pdbqt
         pdb_to_convert = checked_pdb_path
@@ -4165,12 +4176,33 @@ quit
         # Call helper to create PDBQT
         pdbqt_file, configs = self._create_pdbqt_from_pdb(pdb_to_convert)
 
-        # Call helper method to create receptor grids
-        self._create_receptor_grids(pdbqt_file, configs, pdb_folder_path)
+        # Check if pdbqt receptor file contains a Zinc ion in order to apply AutoDock4Zn parameters
+        has_ZN = self._check_ZN_presence(pdbqt_file, rec_main_path)
 
+        if has_ZN:
+            
+            print("⚠️  Zn atom(s) detected in the receptor structure.")
+            while True:
+                zn_choice = input("Do you want to process with AutoDock4Zn parameters? (y/n): ").strip().lower()
+                if zn_choice in ['y', 'yes']:
+                    print("✅ AutoDock4Zn parameters will be applied.")
+                    self._apply_ad4zn_params(pdbqt_file, rec_main_path)
+                    break
+
+                elif zn_choice in ['n', 'no']:
+                    print("ℹ️  Skipping AutoDock4Zn processing.")
+                    has_ZN = False
+                    break
+                else:
+                    print("❌ Please answer 'y' or 'n'.")
+
+            print("✅ AutoDock4Zn parameters to be applied.")
+
+        # Call helper method to create receptor grids
+        self._create_receptor_grids(pdbqt_file, configs, rec_main_path, has_ZN)
 
         if pdbqt_file:
-            
+
             self._create_receptor_register(pdb_id, pdb_name, pdb_to_convert, pdbqt_file, configs)
             
             print(f"✅ PDBQT file created: {pdbqt_file}")
@@ -4370,48 +4402,84 @@ quit
             print(f"   ❌ Error writing PDBQT file: {e}")
             raise
 
-    def _create_receptor_grids(self, pdbqt_file, configs, rec_main_path):
+    def _create_receptor_grids(self, pdbqt_file, configs, rec_main_path, has_ZN):
+        """
+        Generate AutoGrid4 grid parameter files (.gpf) for the prepared receptor.
 
-        from meeko.gridbox import get_gpf_string
+        This method writes the grid parameter file using Meeko's get_gpf_string, applies Zn parameters if needed,
+        and runs AutoGrid4 to generate grid maps. Handles Zn-specific parameter file and grid settings.
+
+        Args:
+            pdbqt_file (str): Path to the receptor PDBQT file.
+            configs (dict): Docking box configuration (center, size, dielectric, smooth, spacing).
+            rec_main_path (str): Path to the receptor's main folder.
+            has_ZN (bool): Whether the receptor contains a Zn atom.
+
+        Returns:
+            None
+        """
+        import os
+        import shutil
         import subprocess
+        import site
+        from meeko.gridbox import get_gpf_string
 
-        # Set ligand atom types
-        any_lig_base_types = [
-            "HD", "C", "A", "N", "NA", "OA", "F", "P", "SA", "S", "Cl", "Br", "I",
-        ]
+        # Atom types
+        ligand_types = ["HD", "C", "A", "N", "NA", "OA", "F", "P", "SA", "S", "Cl", "Br"]
+        receptor_types = ligand_types + (["ZN", "TZ", "Zn"] if has_ZN else ["Zn"])
 
-        # Set receptor atom types
-        rec_types = [
-            "HD", "C", "A", "N", "NA", "OA", "F", "P", "SA", "S", "Cl", "Br", "I",
-            "Mg", "Ca", "Mn", "Fe", "Zn",
-        ]
-
-        ## Get box center from configs
+        # Box center and dimensions
         grid_center = list(configs['center'].values())
-
-        ## Get box dimensiones from configs
         box_dims = list(configs['size'].values())
 
-        print(f"dielectric={configs['dielectric']}")
-
-        ## write the .gpf file for the receptor
+        # Prepare grid files directory
         grids_path = os.path.join(rec_main_path, 'grid_files')
         os.makedirs(grids_path, exist_ok=True)
         grids_file_path = os.path.join(grids_path, 'receptor.gpf')
         grid_log_file = grids_file_path.replace(".gpf", ".glg")
 
+        # Write .gpf file
         with open(grids_file_path, "w") as f:
-            gpf_string, (npts_x, npts_y, npts_z) = get_gpf_string(
-                grid_center, box_dims, pdbqt_file, rec_types, any_lig_base_types,
+            gpf_string, _ = get_gpf_string(
+                grid_center, box_dims, pdbqt_file, receptor_types, ligand_types,
                 dielectric=configs['dielectric'], smooth=configs['smooth'], spacing=configs['spacing']
             )
-            # Write the .gpf file
             f.write(gpf_string)
 
-        # --- Run AutoGrid4 using the .gpf file ---
+            # If Zn present, copy AD4Zn.dat and add Zn grid parameters
+            if has_ZN:
+                try:
+                    ad4zn_src = os.path.join(site.getsitepackages()[0], "tidyscreen/config/AD4Zn.dat")
+                    shutil.copy(ad4zn_src, grids_path)
+                    print(f"✅ Copied Zn parameters file: {ad4zn_src} → {grids_path}")
+                except Exception as e:
+                    print(f"⚠️  Error copying Zn parameters file: {e}")
+
+                # Write Zn-specific grid parameters
+                zn_params = [
+                    "nbp_r_eps 0.25 23.2135 12 6 NA TZ",
+                    "nbp_r_eps 2.1   3.8453 12 6 OA Zn",
+                    "nbp_r_eps 2.25  7.5914 12 6 SA Zn",
+                    "nbp_r_eps 1.0   0.0    12 6 HD Zn",
+                    "nbp_r_eps 2.0   0.0060 12 6 NA Zn",
+                    "nbp_r_eps 2.0   0.2966 12 6  N Zn"
+                ]
+                for line in zn_params:
+                    f.write(line + "\n")
+
+        # Prepend parameter file instruction if Zn present
+        if has_ZN:
+            try:
+                with open(grids_file_path, 'r') as f:
+                    original_content = f.read()
+                with open(grids_file_path, 'w') as f:
+                    f.write("parameter_file AD4Zn.dat\n" + original_content)
+            except Exception as e:
+                print(f"⚠️  Error prepending Zn parameter instruction: {e}")
+
+        # Run AutoGrid4
         print(f"🛠️  Running AutoGrid4 with {os.path.basename(grids_file_path)} ...")
         try:
-            # Change working directory to grids_path before running autogrid4
             result = subprocess.run(
                 ["autogrid4", "-p", os.path.basename(grids_file_path), "-l", os.path.basename(grid_log_file)],
                 cwd=grids_path,
@@ -4427,8 +4495,7 @@ quit
         except FileNotFoundError:
             print("❌ AutoGrid4 executable not found. Please ensure it is installed and in your PATH.")
         except Exception as e:
-            print(f"❌ Error running AutoGrid4: {e}")
-
+            print(f"❌ Error running AutoGrid4: {e}") 
 
     def _create_receptor_register(self, 
                              pdb_id: int,                 
@@ -4532,3 +4599,81 @@ quit
         except Exception as e:
             print(f"   ❌ Error creating receptor register: {e}")
             return False
+        
+    def _check_ZN_presence(self, pdbqt_file: str, rec_main_path: str) -> bool:
+        """
+        Check if a Zinc (ZN) atom is present in the given PDBQT file.
+
+        This method scans the PDBQT file for lines containing a ZN atom (in columns 13-16)
+        and returns True if at least one is found, otherwise False.
+
+        Args:
+            pdbqt_file (str): Path to the PDBQT file to check.
+            rec_main_path (str): Path to the receptor's main folder (unused, kept for compatibility).
+
+        Returns:
+            bool: True if a ZN atom is present, False otherwise.
+
+        Raises:
+            None. All exceptions are handled internally with user feedback.
+        """
+        try:
+            with open(pdbqt_file, 'r') as f:
+                for line in f:
+                    if line.startswith(('ATOM', 'HETATM')) and ' ZN ' in line[12:16]:
+                        return True
+            return False
+        except Exception as e:
+            print(f"   ❌ Error checking Zn presence: {e}")
+            return False
+
+    def _apply_ad4zn_params(self, pdbqt_file: str, rec_main_path: str) -> None:
+        """
+        Apply AutoDock4Zn parameters to a receptor PDBQT file by running the zinc_pseudo.py script.
+
+        This method uses the zinc_pseudo.py script (from the TidyScreen package) to add the TZ pseudo atom
+        required for proper AutoDock4Zn scoring. It runs the script in the 'adt' conda environment and
+        replaces the original PDBQT file with the processed one containing the TZ atom.
+
+        Args:
+            pdbqt_file (str): Path to the receptor PDBQT file to process.
+            rec_main_path (str): Path to the receptor's main folder (not used, kept for compatibility).
+
+        Returns:
+            None
+
+        Raises:
+            None. All exceptions are handled internally with user feedback.
+        """
+        import shutil
+        import subprocess
+        import site
+        import os
+
+        try:
+            # Locate the zinc_pseudo.py script in the TidyScreen package
+            zn_script_path = os.path.join(site.getsitepackages()[0], "tidyscreen", "misc", "zinc_pseudo.py")
+            output_pdbqt = pdbqt_file.replace(".pdbqt", "_tz.pdbqt")
+
+            # Run the script in the 'adt' conda environment
+            result = subprocess.run(
+                ["conda", "run", "-n", "adt", "python", zn_script_path, "-r", pdbqt_file, "-o", output_pdbqt],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+
+            # Check if output file was created
+            if os.path.exists(output_pdbqt):
+                shutil.move(output_pdbqt, pdbqt_file)
+                if result.returncode == 0:
+                    print(f"✅ Successfully applied AutoDock4Zn parameters to {os.path.basename(pdbqt_file)}")
+                else:
+                    print(f"⚠️  AutoDock4Zn script returned an error, but output file was created.")
+                    print(result.stderr)
+            else:
+                print(f"❌ Failed to create TZ-modified PDBQT file. See error below:")
+                print(result.stderr)
+
+        except Exception as e:
+            print(f"   ❌ Error applying AD4Zn parameters: {e}")
