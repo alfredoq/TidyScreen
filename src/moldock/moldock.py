@@ -54,6 +54,9 @@ class MolDock:
         # Set up chemspace database path within the project directory
         self.__chemspace_db = os.path.join(self.path, 'chemspace/processed_data', 'chemspace.db')
         
+        # Set up receptors path within the project directory
+        self.__receptor_path = os.path.join(self.path, 'docking/receptors')
+        
         # Set up docking assays registers database path within the project directory
         self.__docking_registers_db = os.path.join(self.path, 'docking/docking_registers', 'registers.db')
 
@@ -85,22 +88,16 @@ class MolDock:
                     'name': 'AutoDockGPU',
                     'description': 'GPU-accelerated AutoDock for high-throughput docking',
                     'requirements': ['GPU with CUDA support', 'AutoDockGPU installation'],
-                    'pros': ['Very fast on GPU', 'Good for large libraries', 'Well-validated'],
-                    'cons': ['Requires CUDA GPU', 'Limited flexibility']
                 },
                 '2': {
                     'name': 'AutoDock',
                     'description': 'Classical AutoDock CPU-based docking',
                     'requirements': ['AutoDock installation', 'AutoDockTools'],
-                    'pros': ['Well-established', 'Highly configurable', 'No GPU required'],
-                    'cons': ['Slower than GPU versions', 'More complex setup']
                 },
                 '3': {
                     'name': 'Vina',
                     'description': 'AutoDock Vina - fast and accurate docking',
                     'requirements': ['AutoDock Vina installation'],
-                    'pros': ['Fast and reliable', 'Easy to use', 'Good accuracy'],
-                    'cons': ['Less configurable', 'CPU-only']
                 }
             }
             
@@ -111,8 +108,6 @@ class MolDock:
             for key, engine in docking_engines.items():
                 print(f"{key}. {engine['name']}")
                 print(f"   📝 {engine['description']}")
-                print(f"   ✅ Pros: {', '.join(engine['pros'])}")
-                print(f"   ⚠️  Cons: {', '.join(engine['cons'])}")
                 print(f"   📋 Requirements: {', '.join(engine['requirements'])}")
                 print("-" * 70)
             
@@ -279,31 +274,169 @@ class MolDock:
             
             if engine_name == 'AutoDockGPU':
                 # AutoDockGPU specific parameters
-                parameters['search_algorithm'] = self._get_parameter_choice(
-                    "Search algorithm",
-                    ['Lamarckian GA', 'Solis-Wets', 'Simulated Annealing'],
-                    default='Lamarckian GA'
+                
+                parameters['heuristics'] = self._get_parameter_choice(
+                    "Apply heuristics algorithm?",
+                    [0, 1],
+                    default=1
                 )
                 
-                parameters['num_runs'] = self._get_parameter_integer(
-                    "Number of docking runs per ligand",
-                    default=10, min_val=1, max_val=100
+                parameters['heurmax'] = self._get_parameter_choice(
+                    "Asymptotic heuristics # evals limit (smooth limit: 10000000-20000000)",
+                    [10000000, 12000000, 15000000, 17000000, 20000000],
+                    default=12000000
                 )
                 
-                parameters['population_size'] = self._get_parameter_integer(
-                    "GA population size",
-                    default=150, min_val=50, max_val=500
+                parameters['autostop'] = self._get_parameter_choice(
+                    "Automatic stopping criterion based on convergence",
+                    [0, 1],
+                    default=1
                 )
                 
-                parameters['max_generations'] = self._get_parameter_integer(
-                    "Maximum GA generations",
-                    default=42000, min_val=1000, max_val=100000
+                parameters['asfreq'] = self._get_parameter_choice(
+                    "AutoStop testing frequency (in # of generations: 1-20)",
+                    [1, 2, 5, 7, 10, 15, 20],
+                    default=5
                 )
                 
-                parameters['gpu_device'] = self._get_parameter_integer(
-                    "GPU device ID (0 for first GPU)",
-                    default=0, min_val=0, max_val=7
+                parameters['nrun'] = self._get_parameter_choice(
+                    "LGA runs (5-500)",
+                    [10, 20, 50, 75, 100, 250, 500],
+                    default=20
                 )
+                
+                parameters['nev'] = self._get_parameter_choice(
+                    "Score evaluations (max.) per LGA run",
+                    [500000, 1000000, 2500000, 5000000, 7500000, 10000000],
+                    default=2500000
+                )
+                
+                parameters['ngen'] = self._get_parameter_choice(
+                    "Generations (max.) per LGA run",
+                    [10000, 20000, 42000, 75000, 100000],
+                    default=42000
+                )
+                
+                parameters['lsmet'] = self._get_parameter_choice(
+                    "Local-search method",
+                    ["ad"],
+                    default="ad"
+                )
+                
+                parameters['lsit'] = self._get_parameter_choice(
+                    "Local-search iterations (max.)",
+                    [100, 300, 500, 750, 1000],
+                    default=300
+                )
+                
+                parameters['psize'] = self._get_parameter_choice(
+                    "Population size",
+                    [50, 75, 100, 125, 150, 175, 200, 250, 300],
+                    default=150
+                )
+                
+                parameters['mrat'] = self._get_parameter_choice(
+                    "Mutation rate",
+                    [0, 2, 7.5, 10, 15, 20],
+                    default=2
+                )
+                
+                parameters['crat'] = self._get_parameter_choice(
+                    "Crossover rate",
+                    [10, 20, 30, 40, 50, 60, 70, 80, 90, 100],
+                    default=80
+                )
+                
+                parameters['lsrat'] = self._get_parameter_choice(
+                    "Local-search rate",
+                    [30, 40, 50, 60, 70, 80, 90, 100],
+                    default=100
+                )
+                
+                parameters['trat'] = self._get_parameter_choice(
+                    "Tournament (selection) rate",
+                    [30, 40, 50, 60, 70, 80, 90, 100],
+                    default=60
+                )
+                
+                parameters['dmov'] = self._get_parameter_choice(
+                    "Maximum LGA movement delta (Angstroms)",
+                    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+                    default=6
+                )
+                
+                parameters['dang'] = self._get_parameter_choice(
+                    "Maximum LGA angle delta (Degrees)",
+                    [10, 20, 30, 40, 50, 60, 70, 80, 90, 120, 150, 180],
+                    default=90
+                )
+                
+                parameters['rholb'] = self._get_parameter_choice(
+                    "Solis-Wets lower bound of rho parameter",
+                    [0.005, 0.01, 0.025],
+                    default=0.01
+                )
+                
+                parameters['lsmov'] = self._get_parameter_choice(
+                    "Solis-Wets movement delta",
+                    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+                    default=2
+                )
+                
+                parameters['lsang'] = self._get_parameter_choice(
+                    "Solis-Wets angle delta (Degrees)",
+                    [10, 20, 30, 40, 50, 60, 75, 85, 100],
+                    default=75
+                )
+                
+                parameters['cslim'] = self._get_parameter_choice(
+                    "Solis-Wets cons. success/failure limit to adjust rho",
+                    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+                    default=4
+                )
+                
+                parameters['stopstd'] = self._get_parameter_choice(
+                    "AutoStop energy standard deviation tolerance (kcal/mol)",
+                    [0.05, 0.10, 0.15, 0.2, 0.3, 0.4, 0.5],
+                    default=0.15
+                )
+                
+                parameters['contact_analysis'] = self._get_parameter_choice(
+                    "Perform distance-based analysis",
+                    [0, 1],
+                    default=1
+                )
+                
+                parameters['xmloutput'] = self._get_parameter_choice(
+                    "Specify if xml output format is wanted",
+                    [0, 1],
+                    default=0
+                )
+                
+                parameters['clustering'] = self._get_parameter_choice(
+                    "Output clustering analysis in dlg and/or xml file ",
+                    [0, 1],
+                    default=1
+                )
+                
+                parameters['output-cluster-poses'] = self._get_parameter_choice(
+                    "Output up to a certain number of poses per cluster (0: all)",
+                    [0, 1],
+                    default=0
+                )
+                
+                parameters['hsym'] = self._get_parameter_choice(
+                    "Handle symmetry in RMSD calc.",
+                    [0, 1],
+                    default=1
+                )
+                
+                parameters['rmstol'] = self._get_parameter_choice(
+                    "RMSD clustering tolerance (Angstroms)",
+                    [0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 2.5, 3],
+                    default=2
+                )
+                
                 
             elif engine_name == 'AutoDock':
                 # AutoDock specific parameters
@@ -355,18 +488,13 @@ class MolDock:
                     default=0, min_val=0, max_val=64
                 )
             
-            # Common parameters for all engines
-            parameters['scoring_function'] = self._get_parameter_choice(
-                "Scoring function",
-                ['Default', 'Custom'],
-                default='Default'
-            )
+                # Common parameters for all engines
+                parameters['scoring_function'] = self._get_parameter_choice(
+                    "Scoring function",
+                    ['vina', 'ad4'],
+                    default='vina'
+                )
             
-            parameters['output_format'] = self._get_parameter_choice(
-                "Output format",
-                ['PDBQT', 'SDF', 'Both'],
-                default='PDBQT'
-            )
             
             return parameters if parameters else None
             
@@ -404,7 +532,7 @@ class MolDock:
                     
             except KeyboardInterrupt:
                 raise
-
+    
     def _get_parameter_integer(self, param_name: str, default: int, min_val: int, max_val: int) -> int:
         """Get integer parameter from user with validation."""
         while True:
@@ -492,7 +620,8 @@ class MolDock:
     def dock_table(self, show_details: bool = True, 
                 filter_by_type: Optional[str] = None,
                 sort_by: str = 'name',
-                show_all_tables: bool = False) -> Optional[Any]:
+                show_all_tables: bool = False,
+                clean_ligand_files: bool = True) -> Optional[Any]:
         """
         List tables available in the chemspace database, select a docking method, and allow selection for docking preparation.
         By default, only shows tables ready for docking (with SDF blobs).
@@ -654,7 +783,7 @@ class MolDock:
                 # Step 9: Show docking setup summary and get user choice
                 user_choice = self._show_docking_setup_summary(selected_table, selected_method, tables_to_display)
                 
-                if user_choice == 1 or user_choice == 2:
+                if user_choice == 1:
                     # Step 10: Create docking assay registry before returning results
                     print(f"\n📝 Creating docking assay registry...")
                     
@@ -675,14 +804,6 @@ class MolDock:
                         print(f"✅ Docking assay registry created with ID: {assay_registry['assay_id']}")
                     
                     if user_choice == 1:
-                        # Return complete docking configuration
-                        return {
-                            'table_name': selected_table,
-                            'docking_method': selected_method,
-                            'assay_registry': assay_registry,
-                            'setup_type': 'configuration_only'
-                        }
-                    elif user_choice == 2:
                         # Load SMILES and return complete setup
                         print(f"\n🧪 Loading SMILES from table '{selected_table}'...")
                         smiles_data = self._get_smiles_from_table(selected_table)
@@ -694,13 +815,6 @@ class MolDock:
                             if assay_registry:
                                 self._update_assay_registry_compound_count(assay_registry['assay_id'], len(smiles_data))
                             
-                            return {
-                                'table_name': selected_table,
-                                'docking_method': selected_method,
-                                'assay_registry': assay_registry,
-                                'smiles_data': smiles_data,
-                                'setup_type': 'ready_for_docking'
-                            }
                         else:
                             print("❌ No valid SMILES found in selected table")
                             
@@ -709,6 +823,16 @@ class MolDock:
                                 self._update_assay_registry_status(assay_registry['assay_id'], 'failed', 'No valid SMILES found')
                             
                             return None
+                        
+                        ## Dock using AutoDockGPU if selected    
+                        if selected_method['docking_engine'] == 'AutoDockGPU':
+                            self._dock_table_with_autodockgpu(selected_table, selected_method, assay_registry, clean_ligand_files)
+                        
+                    else:
+                        
+                        print(f"❌ Docking engine '{selected_method['docking_engine']}' not yet implemented")
+                    
+                    
                 else:
                     return None
             else:
@@ -1428,7 +1552,7 @@ class MolDock:
                 # Show most important parameters based on engine
                 engine = selected_method['docking_engine']
                 if engine == 'AutoDockGPU':
-                    key_params = ['num_runs', 'population_size', 'gpu_device']
+                    key_params = ['nruns', 'psize']
                 elif engine == 'AutoDock':
                     key_params = ['num_runs', 'population_size', 'energy_evaluations']
                 elif engine == 'Vina':
@@ -1453,27 +1577,23 @@ class MolDock:
                         print(f"   • {issue}")
             
             print(f"\n🔄 NEXT STEPS:")
-            print("   1. Save configuration (return table name and method info)")
-            print("   2. Load molecules and prepare for immediate docking")
-            print("   3. Cancel setup")
+            print("   1. Load molecules and prepare for immediate docking")
+            print("   2. Cancel setup")
             print("=" * 60)
             
             # Get user choice
             while True:
                 try:
-                    choice = input("🎯 Select next step (1/2/3): ").strip()
+                    choice = input("🎯 Select next step (1/2): ").strip()
                     
                     if choice == '1':
-                        print("✅ Configuration saved for later use")
-                        return 1
-                    elif choice == '2':
                         print("🧪 Will load molecules for immediate docking preparation")
-                        return 2
-                    elif choice == '3' or choice.lower() in ['cancel', 'quit', 'exit']:
+                        return 1
+                    elif choice == '2' or choice.lower() in ['cancel', 'quit', 'exit']:
                         print("❌ Docking setup cancelled")
                         return None
                     else:
-                        print("❌ Invalid choice. Please enter 1, 2, or 3")
+                        print("❌ Invalid choice. Please enter 1 or 2")
                         continue
                         
                 except KeyboardInterrupt:
@@ -3611,33 +3731,145 @@ class MolDock:
             print(f"   ❌ Error extracting chain: {e}")
             return ""
 
+    # def _create_pdb_registry_entry(self, pdb_name: str, original_pdb_path: str, 
+    #                                 processed_pdb_path: str, pdb_folder: str, 
+    #                                 analysis: Dict[str, Any], checked_pdb_path) -> Optional[Dict[str, Any]]:
+    #     """
+    #     Create PDB registry entry in pdbs.db
+        
+    #     Args:
+    #         pdb_name (str): Name of the PDB
+    #         original_pdb_path (str): Path to original PDB file
+    #         processed_pdb_path (str): Path to processed PDB file
+    #         pdb_folder (str): Path to PDB folder
+    #         analysis (Dict): PDB analysis results
+            
+    #     Returns:
+    #         Optional[Dict[str, Any]]: Registry entry information or None if failed
+    #     """
+    #     try:
+    #         # Create receptors database
+    #         pdbs_db_path = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
+            
+    #         import sqlite3
+    #         import json
+    #         from datetime import datetime
+            
+    #         conn = sqlite3.connect(pdbs_db_path)
+    #         cursor = conn.cursor()
+            
+    #         # Create receptors table
+    #         cursor.execute('''
+    #             CREATE TABLE IF NOT EXISTS pdbs (
+    #                 pdb_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    #                 pdb_name TEXT UNIQUE NOT NULL,
+    #                 project_name TEXT,
+    #                 original_pdb_path TEXT NOT NULL,
+    #                 processed_pdb_path TEXT NOT NULL,
+    #                 checked_pdb_path TEXT NOT NULL,
+    #                 pdb_folder_path TEXT NOT NULL,
+    #                 pdb_analysis TEXT,
+    #                 chains TEXT,
+    #                 resolution REAL,
+    #                 atom_count INTEGER,
+    #                 has_ligands BOOLEAN,
+    #                 status TEXT DEFAULT 'created',
+    #                 created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    #                 last_modified TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    #                 notes TEXT
+    #             )
+    #         ''')
+            
+    #         # Prepare data for insertion
+    #         pdb_analysis_json = json.dumps(analysis, indent=2)
+    #         chains_str = ','.join(analysis['chains'])
+
+    #         # Prompt for notes
+    #         try:
+    #             notes = input("Enter a note for this PDB file (Enter: empty note): ").strip()
+    #             if not notes:
+    #                 notes = ""
+    #         except KeyboardInterrupt:
+    #             print("\n   ⚠️  Note entry cancelled. Using empty note.")
+    #             notes = ""
+
+    #         # Insert or update receptor entry
+    #         cursor.execute('''
+    #             INSERT OR REPLACE INTO pdbs (
+    #                 pdb_name, project_name, original_pdb_path, processed_pdb_path, checked_pdb_path,
+    #                 pdb_folder_path, pdb_analysis, chains, resolution, atom_count,
+    #                 has_ligands, status, notes
+    #             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    #         ''', (
+    #             pdb_name,
+    #             self.name,
+    #             original_pdb_path,
+    #             processed_pdb_path,
+    #             checked_pdb_path,
+    #             pdb_folder,
+    #             pdb_analysis_json,
+    #             chains_str,
+    #             analysis.get('resolution'),
+    #             analysis['atom_count'],
+    #             analysis['has_ligands'],
+    #             'created',
+    #             notes if notes is not None else f"PDB model created from PDB file: {os.path.basename(original_pdb_path)}"
+    #         ))
+            
+    #         pdb_id = cursor.lastrowid or cursor.execute(
+    #             "SELECT pdb_id FROM pdbs WHERE pdb_name = ?", 
+    #             (pdb_name,)
+    #         ).fetchone()[0]
+            
+    #         conn.commit()
+    #         conn.close()
+            
+    #         return {
+    #             'pdb_id': pdb_id,
+    #             'pdb_name': pdb_name,
+    #             'project_name': self.name,
+    #             'original_pdb_path': original_pdb_path,
+    #             'processed_pdb_path': processed_pdb_path,
+    #             'checked_pdb_path': checked_pdb_path,
+    #             'pdb_folder_path': pdb_folder,
+    #             'database_path': pdbs_db_path,
+    #             'pdb_analysis': analysis,
+    #             'created_date': datetime.now().isoformat(),
+    #             'notes': notes
+    #         }
+            
+    #     except Exception as e:
+    #         print(f"❌ Error creating PDB registry: {e}")
+    #         return None
+    
+    
     def _create_pdb_registry_entry(self, pdb_name: str, original_pdb_path: str, 
                                     processed_pdb_path: str, pdb_folder: str, 
                                     analysis: Dict[str, Any], checked_pdb_path) -> Optional[Dict[str, Any]]:
         """
         Create PDB registry entry in pdbs.db
-        
+
         Args:
             pdb_name (str): Name of the PDB
             original_pdb_path (str): Path to original PDB file
             processed_pdb_path (str): Path to processed PDB file
             pdb_folder (str): Path to PDB folder
             analysis (Dict): PDB analysis results
-            
+
         Returns:
             Optional[Dict[str, Any]]: Registry entry information or None if failed
         """
         try:
             # Create receptors database
             pdbs_db_path = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
-            
+
             import sqlite3
             import json
             from datetime import datetime
-            
+
             conn = sqlite3.connect(pdbs_db_path)
             cursor = conn.cursor()
-            
+
             # Create receptors table
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS pdbs (
@@ -3659,10 +3891,39 @@ class MolDock:
                     notes TEXT
                 )
             ''')
-            
+
             # Prepare data for insertion
             pdb_analysis_json = json.dumps(analysis, indent=2)
             chains_str = ','.join(analysis['chains'])
+
+            # Check for identical registry (excluding 'notes')
+            cursor.execute('''
+                SELECT pdb_id, pdb_name, project_name, original_pdb_path, processed_pdb_path, checked_pdb_path,
+                       pdb_folder_path, pdb_analysis, chains, resolution, atom_count, has_ligands, status
+                FROM pdbs
+            ''')
+            new_entry = (
+                pdb_name,
+                self.name,
+                original_pdb_path,
+                processed_pdb_path,
+                checked_pdb_path,
+                pdb_folder,
+                pdb_analysis_json,
+                chains_str,
+                analysis.get('resolution'),
+                analysis['atom_count'],
+                analysis['has_ligands'],
+                'created'
+            )
+            for row in cursor.fetchall():
+                # Compare all fields except notes, created_date, last_modified, and pdb_id
+                existing_entry = row[1:13]  # skip pdb_id
+                if existing_entry == new_entry:
+                    print(f"⚠️  An identical receptor registry already exists (PDB name: {row[1]}).")
+                    print("   No new registry will be created.")
+                    conn.close()
+                    return None
 
             # Prompt for notes
             try:
@@ -3695,15 +3956,15 @@ class MolDock:
                 'created',
                 notes if notes is not None else f"PDB model created from PDB file: {os.path.basename(original_pdb_path)}"
             ))
-            
+
             pdb_id = cursor.lastrowid or cursor.execute(
                 "SELECT pdb_id FROM pdbs WHERE pdb_name = ?", 
                 (pdb_name,)
             ).fetchone()[0]
-            
+
             conn.commit()
             conn.close()
-            
+
             return {
                 'pdb_id': pdb_id,
                 'pdb_name': pdb_name,
@@ -3717,7 +3978,7 @@ class MolDock:
                 'created_date': datetime.now().isoformat(),
                 'notes': notes
             }
-            
+
         except Exception as e:
             print(f"❌ Error creating PDB registry: {e}")
             return None
@@ -4677,3 +4938,387 @@ quit
 
         except Exception as e:
             print(f"   ❌ Error applying AD4Zn parameters: {e}")
+
+    # def _dock_table_with_autodockgpu(self, selected_table, selected_method, assay_registry, clean_ligand_files):
+        
+    #     """
+    #     Will iterate through the compounds in the selected table and perform docking using AutoDockGPU. A first step consists of retrieving the molecule stored in the sdf_blob column of the compounds table and writing it to a temporary .pdbqt file using Meeko. Then, AutoDockGPU will be called with the appropriate parameters to perform the docking against the receptor and grid files specified in the selected_method dictionary.
+        
+    #     """
+        
+    #     import sqlite3
+    #     import tempfile
+    #     import os
+    #     import subprocess
+    #     from meeko import MoleculePreparation
+    #     from rdkit import Chem
+
+    #     print(f"\n🚀 Starting docking with AutoDockGPU for table: {selected_table}")
+
+    #     # Retrieve docking method parameters
+    #     method_params = selected_method.get('parameters', {})
+        
+    #     # Select the receptor to be used for docking
+    #     selected_receptor = self._select_receptor_from_db()
+    #     receptor_main_path = self.__receptor_path + f"/{selected_receptor.get('pdb_name', None)}"
+    #     receptor_pdbqt_file = receptor_main_path + f"/processed/receptor_checked.pdbqt"
+    #     fld_file = receptor_main_path + f"/grid_files/receptor_checked.maps.fld"
+    #     assay_folder = assay_registry['assay_folder_path']
+    
+    #     if not receptor_pdbqt_file:
+    #         print("❌ No receptor .pdbqt file found.")
+    #         return
+        
+    #     if not fld_file:
+    #         print("❌ No receptor .maps.fld file found.")
+    #         return
+            
+    #     # Connect to chemspace database and get compounds
+    #     try:
+    #         conn = sqlite3.connect(self.__chemspace_db)
+    #         cursor = conn.cursor()
+    #         cursor.execute(f"SELECT inchi_key, sdf_blob FROM {selected_table} WHERE sdf_blob IS NOT NULL")
+    #         compounds = cursor.fetchall()
+    #         conn.close()
+    #     except Exception as e:
+    #         print(f"❌ Error retrieving compounds from table: {e}")
+    #         return
+
+    #     if not compounds:
+    #         print("❌ No compounds with SDF blobs found in the selected table.")
+    #         return
+
+    #     print(f"🧪 {len(compounds)} compounds to dock.")
+
+    #     # Prepare output directory for docking results
+    #     docking_results_dir = f"{assay_folder}/results"
+
+    #     # Iterate and dock each compound
+    #     for idx, (inchi_key, sdf_blob) in enumerate(compounds, 1):
+    #         try:
+    #             # Write SDF blob to temp file
+    #             # Use inchi_key as the temporary file name for the SDF
+    #             sdf_filepath = f"{assay_folder}/results/{inchi_key}.sdf"
+                
+    #             with open(sdf_filepath, "wb") as sdf_temp:
+    #                 sdf_temp.write(sdf_blob)
+                
+    #             # Create an RDKit mol object from a sdf file
+    #             mol = self._mol_from_sdf(sdf_filepath)
+                
+    #             ## Generate the ligand.pdbqt file
+    #             ligand_pdbqt_filepath = f"{docking_results_dir}/{inchi_key}.pdbqt"
+    #             self._pdbqt_from_mol(mol, ligand_pdbqt_filepath, inchi_key)
+                
+    #             ## Execute autodockgpu
+                
+    #             self._execute_autodockgpu(ligand_pdbqt_filepath, fld_file, method_params)
+                
+    #             if clean_ligand_files:
+    #                 # Remove the temporary SDF and .pdbqt files
+    #                 os.remove(sdf_filepath)
+    #                 os.remove(ligand_pdbqt_filepath)
+
+    #         except Exception as e:
+    #             print(f"   ❌ Error docking compound {inchi_key}: {e}")
+    #             continue
+
+    #     print(f"\n🎉 Docking completed for table: {selected_table}")
+    #     print(f"Results saved in: {docking_results_dir}")
+        
+        
+    def _dock_table_with_autodockgpu(self, selected_table, selected_method, assay_registry, clean_ligand_files):
+        """
+        Will iterate through the compounds in the selected table and perform docking using AutoDockGPU. A first step consists of retrieving the molecule stored in the sdf_blob column of the compounds table and writing it to a temporary .pdbqt file using Meeko. Then, AutoDockGPU will be called with the appropriate parameters to perform the docking against the receptor and grid files specified in the selected_method dictionary.
+        """
+        import sqlite3
+        import tempfile
+        import os
+        import subprocess
+        from meeko import MoleculePreparation
+        from rdkit import Chem
+
+        # Try to import tqdm for progress bar
+        try:
+            from tqdm import tqdm
+            TQDM_AVAILABLE = True
+        except ImportError:
+            TQDM_AVAILABLE = False
+
+        print(f"\n🚀 Starting docking with AutoDockGPU for table: {selected_table}")
+
+        # Retrieve docking method parameters
+        method_params = selected_method.get('parameters', {})
+        
+        # Select the receptor to be used for docking
+        selected_receptor = self._select_receptor_from_db()
+        receptor_main_path = self.__receptor_path + f"/{selected_receptor.get('pdb_name', None)}"
+        receptor_pdbqt_file = receptor_main_path + f"/processed/receptor_checked.pdbqt"
+        fld_file = receptor_main_path + f"/grid_files/receptor_checked.maps.fld"
+        assay_folder = assay_registry['assay_folder_path']
+    
+        if not receptor_pdbqt_file:
+            print("❌ No receptor .pdbqt file found.")
+            return
+        
+        if not fld_file:
+            print("❌ No receptor .maps.fld file found.")
+            return
+            
+        # Connect to chemspace database and get compounds
+        try:
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            cursor.execute(f"SELECT inchi_key, sdf_blob FROM {selected_table} WHERE sdf_blob IS NOT NULL")
+            compounds = cursor.fetchall()
+            conn.close()
+        except Exception as e:
+            print(f"❌ Error retrieving compounds from table: {e}")
+            return
+
+        if not compounds:
+            print("❌ No compounds with SDF blobs found in the selected table.")
+            return
+
+        print(f"🧪 {len(compounds)} compounds to dock.")
+
+        # Prepare output directory for docking results
+        docking_results_dir = f"{assay_folder}/results"
+
+        # Progress bar setup
+        progress_bar = None
+        if TQDM_AVAILABLE:
+            progress_bar = tqdm(total=len(compounds), desc="Docking compounds", unit="ligand")
+
+        # Iterate and dock each compound
+        for idx, (inchi_key, sdf_blob) in enumerate(compounds, 1):
+            try:
+                # Write SDF blob to temp file
+                # Use inchi_key as the temporary file name for the SDF
+                sdf_filepath = f"{assay_folder}/results/{inchi_key}.sdf"
+                
+                with open(sdf_filepath, "wb") as sdf_temp:
+                    sdf_temp.write(sdf_blob)
+                
+                # Create an RDKit mol object from a sdf file
+                mol = self._mol_from_sdf(sdf_filepath)
+                
+                ## Generate the ligand.pdbqt file
+                ligand_pdbqt_filepath = f"{docking_results_dir}/{inchi_key}.pdbqt"
+                self._pdbqt_from_mol(mol, ligand_pdbqt_filepath, inchi_key)
+                
+                ## Execute autodockgpu
+                self._execute_autodockgpu(ligand_pdbqt_filepath, fld_file, method_params)
+                
+                if clean_ligand_files:
+                    # Remove the temporary SDF and .pdbqt files
+                    os.remove(sdf_filepath)
+                    os.remove(ligand_pdbqt_filepath)
+
+            except Exception as e:
+                print(f"   ❌ Error docking compound {inchi_key}: {e}")
+                continue
+
+            if progress_bar:
+                progress_bar.update(1)
+            elif idx % 100 == 0:
+                print(f"   Docked {idx} compounds...")
+
+        if progress_bar:
+            progress_bar.close()
+
+        print(f"\n🎉 Docking completed for table: {selected_table}")
+        print(f"Results saved in: {docking_results_dir}")
+
+        
+        
+        
+    def _select_receptor_from_db(self) -> Optional[dict]:
+        """
+        Prompt the user to select a receptor from the receptors database.
+
+        This method loads the receptors database from the project's docking/receptors folder,
+        displays a list of available receptors, and prompts the user to select one by number.
+        It returns the value stored at the pdbqt_file column.
+            
+        """
+        
+        import sqlite3
+        import os
+
+        receptors_db_path = os.path.join(self.path, 'docking', 'receptors', 'receptors.db')
+        if not os.path.exists(receptors_db_path):
+            print(f"❌ No receptors database found at {receptors_db_path}")
+            return None
+
+        try:
+            conn = sqlite3.connect(receptors_db_path)
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT id, pdb_id, pdb_name, pdbqt_file, notes, created_date
+                FROM receptor_registers
+                ORDER BY created_date DESC
+            ''')
+            receptors = cursor.fetchall()
+            conn.close()
+        except Exception as e:
+            print(f"❌ Error loading receptors database: {e}")
+            return None
+
+        if not receptors:
+            print("❌ No receptors found in the database.")
+            return None
+
+        print("\n📋 Available Receptors:")
+        print("=" * 70)
+        for i, (rid, pdb_id, pdb_name, pdbqt_file, notes, created_date) in enumerate(receptors, 1):
+            print(f"{i}. {pdb_name} (ID: {pdb_id})")
+            print(f"   PDBQT: {os.path.basename(pdbqt_file) if pdbqt_file else 'N/A'}")
+            print(f"   Notes: {notes}")
+            print(f"   Created: {created_date}")
+        print("=" * 70)
+
+        while True:
+            try:
+                selection = input("Select a receptor by number (or 'cancel'): ").strip()
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    print("❌ Receptor selection cancelled.")
+                    return None
+                try:
+                    idx = int(selection) - 1
+                    if 0 <= idx < len(receptors):
+                        selected = receptors[idx]
+                        # Return as a dictionary for convenience
+                        return {
+                            'id': selected[0],
+                            'pdb_id': selected[1],
+                            'pdb_name': selected[2],
+                            'pdbqt_file': selected[3],
+                            'notes': selected[4],
+                            'created_date': selected[5]
+                        }
+                    else:
+                        print(f"❌ Invalid selection. Enter a number between 1 and {len(receptors)}.")
+                except ValueError:
+                    print("❌ Please enter a valid number.")
+            except KeyboardInterrupt:
+                print("\n❌ Receptor selection cancelled.")
+                return None
+        
+    def _mol_from_sdf(self, sdf_file: str):
+            """
+            Load a molecule from an SDF file using RDKit, restoring atom names if present.
+
+            This method reads the first molecule from the given SDF file using RDKit's SDMolSupplier.
+            If the molecule contains an 'AtomNames' property, atom names are restored and set as
+            RDKit atom properties for compatibility with downstream tools (e.g., Meeko).
+
+            Args:
+                sdf_file (str): Path to the SDF file.
+
+            Returns:
+                mol (rdkit.Chem.Mol): RDKit molecule object with atom names restored, or None if loading fails.
+
+            Raises:
+                None. All exceptions are handled internally with user feedback.
+            """
+            from rdkit.Chem import SDMolSupplier
+
+            try:
+                supplier = SDMolSupplier(sdf_file, removeHs=False)
+                mol = next((m for m in supplier if m is not None), None)
+                if mol is None:
+                    print(f"   ❌ No valid molecule found in SDF file: {sdf_file}")
+                    return None
+
+                # Restore atom names if present
+                if mol.HasProp("AtomNames"):
+                    atom_names = mol.GetProp("AtomNames").split("|")
+                    for i, atom_name in enumerate(atom_names):
+                        if i < mol.GetNumAtoms():
+                            atom = mol.GetAtomWithIdx(i)
+                            atom.SetProp("_Name", atom_name)
+                            atom.SetProp("atomLabel", atom_name)
+
+                return mol
+
+            except Exception as e:
+                print(f"   ❌ Error reading SDF file '{sdf_file}': {e}")
+                return None
+            
+    def _pdbqt_from_mol(self, mol, ligand_pdbqt_file, inchi_key):
+        
+        from meeko import MoleculePreparation
+        from meeko import MoleculeSetup
+        from meeko import PDBQTWriterLegacy
+        
+        
+        try: 
+            mk_prep = MoleculePreparation(merge_these_atom_types=('H',))
+            mol_setup_list = mk_prep.prepare(mol, rename_atoms=True)
+            mol_setup = mol_setup_list[0]
+
+            pdbqt_string = PDBQTWriterLegacy.write_string(mol_setup)
+            
+            with open(ligand_pdbqt_file, "w") as f:
+                f.write(pdbqt_string[0])
+
+
+        except Exception as e:
+            print(f"   ❌ Error creating PDBQT for molecule {inchi_key}: {e}")
+            
+    def _execute_autodockgpu(self, ligand_pdbqt_filepath, fld_file, method_params):
+        import subprocess
+        import os
+
+        fld_file_path = os.path.dirname(fld_file)
+        fld_filename = fld_file.split('/')[-1]
+
+        # Build AutoDockGPU command
+        cmd = [
+            "autodock_gpu_128wi",
+            "-ffile", fld_filename,
+            "-lfile", ligand_pdbqt_filepath,
+            "--heuristics", str(method_params.get('heuristics', 1)),
+            "--heurmax", str(method_params.get('heurmax', 12000000)),
+            "--autostop", str(method_params.get('autostop', 1)),
+            "--asfreq", str(method_params.get('asfreq', 5)),
+            "--nrun", str(method_params.get('nrun', 10)),
+            "--nev", str(method_params.get('nev', 2500000)),
+            "--ngen", str(method_params.get('gen', 42000)),
+            "--lsmet", str(method_params.get('lsmet', "ad")),
+            "--lsit", str(method_params.get('lsit', 300)),
+            "--psize", str(method_params.get('psize', 150)),
+            "--mrat", str(method_params.get('mrat', 2)),
+            "--crat", str(method_params.get('crat', 80)),
+            "--lsrat", str(method_params.get('lsrat', 100)),
+            "--trat", str(method_params.get('trat', 60)),
+            "--dmov", str(method_params.get('dmov', 6)),
+            "--dang", str(method_params.get('dang', 90)),
+            "--rholb", str(method_params.get('rholb', 0.01)),
+            "--lsmov", str(method_params.get('lsmov', 2)),
+            "--lsang", str(method_params.get('lsang', 75)),
+            "--cslim", str(method_params.get('cslim', 4)),
+            "--stopstd", str(method_params.get('stopstd', 0.15)),
+            "--contact_analysis", str(method_params.get('contact_analysis', 1)),
+            "--xmloutput", str(method_params.get('xmloutput', 0)),
+            "--clustering", str(method_params.get('clustering', 1)),
+            "--output-cluster-poses", str(method_params.get('output-cluster-poses', 0)),
+            "--hsym", str(method_params.get('hsym', 1)),
+            "--rmstol", str(method_params.get('rmstol', 2)),
+        ]
+        
+        # Change working directory to docking_results_dir before running the command
+        try:
+            result = subprocess.run(cmd, cwd=fld_file_path, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if result.returncode == 0:
+                #print(f"   ✅ Docking completed for {ligand_pdbqt_filepath.split("/")[-1]}")
+                pass
+            else:
+                print(f"   ❌ Docking failed for {ligand_pdbqt_filepath.split("/")[-1]}")
+                print(result.stderr)
+        except Exception as e:
+            print(f"   ❌ Error running AutoDockGPU for {ligand_pdbqt_filepath.split("/")[-1]}: {e}")
+        
+        
+        
