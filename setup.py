@@ -39,7 +39,7 @@ setup(name='tidyscreen',
 	'sqlite_web',
 	'streamlit'
       ],
-      packages=['tidyscreen', 'tidyscreen.chemspace', 'tidyscreen.config', 'tidyscreen.databases', 'tidyscreen.projects'],
+      packages=['tidyscreen', 'tidyscreen.chemspace', 'tidyscreen.config', 'tidyscreen.databases', 'tidyscreen.projects', 'tidyscreen.moldock, , 'tidyscreen.misc''],
       keywords='drug-discovery',
       classifiers=[
           "Programming Language :: Python :: 3.10",
