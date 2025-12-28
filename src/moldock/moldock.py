@@ -3,7 +3,7 @@ from tidyscreen import tidyscreen
 import sys
 from typing import Dict, List, Tuple, Optional, Any
 from rdkit.Chem import AllChem
-from rdkit import Chem
+#from rdkit import Chem
 import shutil
 
 # Try to import tqdm for progress bars

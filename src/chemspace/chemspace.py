@@ -26,7 +26,7 @@ parent_dir = os.path.dirname(os.path.dirname(__file__))
 sys.path.insert(0, parent_dir)
 
 # Import from our local tidyscreen module
-from tidyscreen import tidyscreen
+#from tidyscreen import tidyscreen
 ActivateProject = tidyscreen.ActivateProject
 
 ## Module level helper functions for multiprocessing workers
