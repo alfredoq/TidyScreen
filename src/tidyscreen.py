@@ -502,13 +502,27 @@ class ActivateProject:
 
 class CreateProject:
     
-    def __init__(self, name, path, description=None):
+    def __init__(self, name=None, path=None, description=None):
+        # Prompt for name if not provided
+        if not name:
+            name = input("Enter the project name: ").strip()
+            while not name:
+                print("❌ Project name cannot be empty.")
+                name = input("Enter the project name: ").strip()
+        self.name = name
+
+        # Prompt for path if not provided
+        if not path:
+            path = input("Enter the base path where the project will be created: ").strip()
+            while not path:
+                print("❌ Project path cannot be empty.")
+                path = input("Enter the base path where the project will be created: ").strip()
+        self.description = description
+
         # Initialize database manager as a component
         self.db_manager = DatabaseManager()
         
         self.__projects_db = f"{site.getsitepackages()[0]}/tidyscreen/projects_db/projects_database.db" 
-        self.name = name
-        self.description = description
         
         # Append project name as the last subdirectory
         self.path = os.path.join(path, name)
@@ -533,6 +547,7 @@ class CreateProject:
         
         # Create the project entry in database
         self.create_project_entry()
+    
     
     def load_project_template(self):
         """
