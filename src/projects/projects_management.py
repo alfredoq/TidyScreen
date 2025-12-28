@@ -12,16 +12,16 @@ class ProjectsManagement(DatabaseManager):
         super().__init__()
         
         self.__projects_db = f"{site.getsitepackages()[0]}/tidyscreen/projects_db/projects_database.db"
-    
+
     def list_all_projects(self, print_output=True):
         """
         List all projects stored in the projects database.
-        
+
         Args:
             print_output (bool): Whether to print formatted output. Default is True.
                                When True, only prints formatted output and returns None.
                                When False, returns list of dictionaries without printing.
-        
+
         Returns:
             list or None: List of dictionaries when print_output=False, None when print_output=True
         """
@@ -30,33 +30,33 @@ class ProjectsManagement(DatabaseManager):
             if print_output:
                 print(f"Database does not exist at: {self.__projects_db}")
                 print("Creating new projects database...")
-            
+
             if not self.create_projects_database(self.__projects_db):
                 if print_output:
                     print("Failed to create database. Cannot proceed.")
                     return None
                 return []
-            
+
             if print_output:
                 print("Database created successfully. No projects found yet.")
                 return None
             return []
-        
+
         try:
             # Validate database structure
             self.check_db(self.__projects_db)
-            
+
             # Connect to database
             conn = self.connect_db(self.__projects_db)
             cursor = conn.cursor()
-            
+
             # Query all projects
             query = "SELECT * FROM projects ORDER BY created_date DESC"
             cursor.execute(query)
-            
+
             # Fetch all project data
             projects_data = cursor.fetchall()
-            
+
             if not projects_data:
                 if print_output:
                     print("No projects found in the database.")
@@ -64,50 +64,57 @@ class ProjectsManagement(DatabaseManager):
                     return None
                 conn.close()
                 return []
-            
+
             # Get column names for better display
             column_names = [description[0] for description in cursor.description]
-            
+
             if print_output:
-                print(f"Found {len(projects_data)} project(s) in database (sorted by creation date):")
-                print("-" * 100)
-            
+                # Table formatting
+                col_widths = [max(len(str(col)), 12) for col in column_names]
+                for row in projects_data:
+                    for i, val in enumerate(row):
+                        col_widths[i] = max(col_widths[i], len(str(val)) if val is not None else 4)
+
+                # Print header
+                header = " | ".join(f"{col:<{col_widths[i]}}" for i, col in enumerate(column_names))
+                print("=" * (sum(col_widths) + 3 * (len(column_names) - 1)))
+                print(header)
+                print("-" * (sum(col_widths) + 3 * (len(column_names) - 1)))
+
             projects_list = []
             for project_row in projects_data:
                 # Create dictionary for each project
                 project_dict = {}
                 for i, column_name in enumerate(column_names):
                     project_dict[column_name] = project_row[i]
-                
+
                 projects_list.append(project_dict)
-                
+
                 if print_output:
-                    # Display project information in a single line
-                    id_val = project_dict.get('id', 'N/A')
-                    name_val = project_dict.get('name', 'N/A')
-                    path_val = project_dict.get('path', 'N/A')
-                    desc_val = project_dict.get('description', 'N/A')
-                    created_val = project_dict.get('created_date', 'N/A')
-                    
-                    print(f"ID: {id_val} | Name: {name_val} | Path: {path_val} | Description: {desc_val} | Created: {created_val}")
-            
+                    row_str = " | ".join(
+                        f"{str(project_row[i]) if project_row[i] is not None else '':<{col_widths[i]}}"
+                        for i in range(len(column_names))
+                    )
+                    print(row_str)
+
             if print_output:
-                print("-" * 100)
-            
+                print("=" * (sum(col_widths) + 3 * (len(column_names) - 1)))
+
             # Close connection
             conn.close()
-            
+
             # Return None when printing formatted output, return list when not printing
             if print_output:
                 return None
             else:
                 return projects_list
-            
+
         except Exception as e:
             if print_output:
                 print(f"Error reading projects database: {e}")
                 return None
             return []
+
 
     def load_project_info(self, project_name):
         """
