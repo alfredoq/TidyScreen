@@ -827,7 +827,17 @@ class MolDock:
                         ## Dock using AutoDockGPU if selected    
                         if selected_method['docking_engine'] == 'AutoDockGPU':
                             self._dock_table_with_autodockgpu(selected_table, selected_method, assay_registry, clean_ligand_files)
-                        
+
+                            # Set the 'docking_mode' variable for Ringtail processing
+                            docking_mode = 'dlg'
+
+
+                        ## After the docking run has been completed, execute the corresponding analysis
+
+                        results_db_file = self._process_docking_assay_results(assay_registry, docking_mode, max_poses=10)
+
+                        print(f"✅ Docking results saved to: {results_db_file}")
+
                     else:
                         
                         print(f"❌ Docking engine '{selected_method['docking_engine']}' not yet implemented")
@@ -3731,118 +3741,6 @@ class MolDock:
             print(f"   ❌ Error extracting chain: {e}")
             return ""
 
-    # def _create_pdb_registry_entry(self, pdb_name: str, original_pdb_path: str, 
-    #                                 processed_pdb_path: str, pdb_folder: str, 
-    #                                 analysis: Dict[str, Any], checked_pdb_path) -> Optional[Dict[str, Any]]:
-    #     """
-    #     Create PDB registry entry in pdbs.db
-        
-    #     Args:
-    #         pdb_name (str): Name of the PDB
-    #         original_pdb_path (str): Path to original PDB file
-    #         processed_pdb_path (str): Path to processed PDB file
-    #         pdb_folder (str): Path to PDB folder
-    #         analysis (Dict): PDB analysis results
-            
-    #     Returns:
-    #         Optional[Dict[str, Any]]: Registry entry information or None if failed
-    #     """
-    #     try:
-    #         # Create receptors database
-    #         pdbs_db_path = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
-            
-    #         import sqlite3
-    #         import json
-    #         from datetime import datetime
-            
-    #         conn = sqlite3.connect(pdbs_db_path)
-    #         cursor = conn.cursor()
-            
-    #         # Create receptors table
-    #         cursor.execute('''
-    #             CREATE TABLE IF NOT EXISTS pdbs (
-    #                 pdb_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    #                 pdb_name TEXT UNIQUE NOT NULL,
-    #                 project_name TEXT,
-    #                 original_pdb_path TEXT NOT NULL,
-    #                 processed_pdb_path TEXT NOT NULL,
-    #                 checked_pdb_path TEXT NOT NULL,
-    #                 pdb_folder_path TEXT NOT NULL,
-    #                 pdb_analysis TEXT,
-    #                 chains TEXT,
-    #                 resolution REAL,
-    #                 atom_count INTEGER,
-    #                 has_ligands BOOLEAN,
-    #                 status TEXT DEFAULT 'created',
-    #                 created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    #                 last_modified TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    #                 notes TEXT
-    #             )
-    #         ''')
-            
-    #         # Prepare data for insertion
-    #         pdb_analysis_json = json.dumps(analysis, indent=2)
-    #         chains_str = ','.join(analysis['chains'])
-
-    #         # Prompt for notes
-    #         try:
-    #             notes = input("Enter a note for this PDB file (Enter: empty note): ").strip()
-    #             if not notes:
-    #                 notes = ""
-    #         except KeyboardInterrupt:
-    #             print("\n   ⚠️  Note entry cancelled. Using empty note.")
-    #             notes = ""
-
-    #         # Insert or update receptor entry
-    #         cursor.execute('''
-    #             INSERT OR REPLACE INTO pdbs (
-    #                 pdb_name, project_name, original_pdb_path, processed_pdb_path, checked_pdb_path,
-    #                 pdb_folder_path, pdb_analysis, chains, resolution, atom_count,
-    #                 has_ligands, status, notes
-    #             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    #         ''', (
-    #             pdb_name,
-    #             self.name,
-    #             original_pdb_path,
-    #             processed_pdb_path,
-    #             checked_pdb_path,
-    #             pdb_folder,
-    #             pdb_analysis_json,
-    #             chains_str,
-    #             analysis.get('resolution'),
-    #             analysis['atom_count'],
-    #             analysis['has_ligands'],
-    #             'created',
-    #             notes if notes is not None else f"PDB model created from PDB file: {os.path.basename(original_pdb_path)}"
-    #         ))
-            
-    #         pdb_id = cursor.lastrowid or cursor.execute(
-    #             "SELECT pdb_id FROM pdbs WHERE pdb_name = ?", 
-    #             (pdb_name,)
-    #         ).fetchone()[0]
-            
-    #         conn.commit()
-    #         conn.close()
-            
-    #         return {
-    #             'pdb_id': pdb_id,
-    #             'pdb_name': pdb_name,
-    #             'project_name': self.name,
-    #             'original_pdb_path': original_pdb_path,
-    #             'processed_pdb_path': processed_pdb_path,
-    #             'checked_pdb_path': checked_pdb_path,
-    #             'pdb_folder_path': pdb_folder,
-    #             'database_path': pdbs_db_path,
-    #             'pdb_analysis': analysis,
-    #             'created_date': datetime.now().isoformat(),
-    #             'notes': notes
-    #         }
-            
-    #     except Exception as e:
-    #         print(f"❌ Error creating PDB registry: {e}")
-    #         return None
-    
-    
     def _create_pdb_registry_entry(self, pdb_name: str, original_pdb_path: str, 
                                     processed_pdb_path: str, pdb_folder: str, 
                                     analysis: Dict[str, Any], checked_pdb_path) -> Optional[Dict[str, Any]]:
@@ -4759,13 +4657,13 @@ quit
             print(f"❌ Error running AutoGrid4: {e}") 
 
     def _create_receptor_register(self, 
-                             pdb_id: int,                 
-                             pdb_name: str, 
-                             pdb_to_convert: str,
-                             pdbqt_file: str,
-                             configs: dict, 
-                             notes: str = None
-                            ) -> bool:
+                                pdb_id: int,                 
+                                pdb_name: str, 
+                                pdb_to_convert: str,
+                                pdbqt_file: str,
+                                configs: dict, 
+                                notes: str = None
+                                ) -> bool:
         """
         Create a receptor register entry in the database for this project.
 
@@ -4808,16 +4706,6 @@ quit
 
             receptors_db_path = os.path.join(self.path, 'docking', 'receptors', 'receptors.db')
 
-            # Prompt for notes if not provided
-            if notes is None:
-                try:
-                    notes = input("Enter a note for this .pdbqt file (Enter: empty note): ").strip()
-                    if not notes:
-                        notes = ""
-                except KeyboardInterrupt:
-                    print("\n   ⚠️  Note entry cancelled. Using empty note.")
-                    notes = ""
-
             # Ensure the directory exists
             os.makedirs(os.path.dirname(receptors_db_path), exist_ok=True)
 
@@ -4837,6 +4725,42 @@ quit
                     created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
+
+            # Check for identical register (excluding 'notes')
+            cursor.execute('''
+                SELECT pdb_id, pdb_name, pdb_to_convert, pdbqt_file, configs
+                FROM receptor_registers
+            ''')
+            new_entry = (
+                pdb_id,
+                pdb_name,
+                pdb_to_convert,
+                pdbqt_file,
+                json.dumps(configs, indent=2) if configs is not None else None
+            )
+            for row in cursor.fetchall():
+                # Compare all fields except notes and created_date
+                if row == new_entry:
+                    print(f"⚠️  An identical receptor register already exists for PDB name: {pdb_name}.")
+                    print(f"   Existing register details:")
+                    print(f"   - pdb_id: {row[0]}")
+                    print(f"   - pdb_name: {row[1]}")
+                    print(f"   - pdb_to_convert: {row[2]}")
+                    print(f"   - pdbqt_file: {row[3]}")
+                    print(f"   - configs: {row[4]}")
+                    print("   No new register will be created.")
+                    conn.close()
+                    return False
+
+            # Prompt for notes if not provided
+            if notes is None:
+                try:
+                    notes = input("Enter a note for this .pdbqt file (Enter: empty note): ").strip()
+                    if not notes:
+                        notes = ""
+                except KeyboardInterrupt:
+                    print("\n   ⚠️  Note entry cancelled. Using empty note.")
+                    notes = ""
 
             # Insert register entry
             cursor.execute('''
@@ -4938,94 +4862,6 @@ quit
 
         except Exception as e:
             print(f"   ❌ Error applying AD4Zn parameters: {e}")
-
-    # def _dock_table_with_autodockgpu(self, selected_table, selected_method, assay_registry, clean_ligand_files):
-        
-    #     """
-    #     Will iterate through the compounds in the selected table and perform docking using AutoDockGPU. A first step consists of retrieving the molecule stored in the sdf_blob column of the compounds table and writing it to a temporary .pdbqt file using Meeko. Then, AutoDockGPU will be called with the appropriate parameters to perform the docking against the receptor and grid files specified in the selected_method dictionary.
-        
-    #     """
-        
-    #     import sqlite3
-    #     import tempfile
-    #     import os
-    #     import subprocess
-    #     from meeko import MoleculePreparation
-    #     from rdkit import Chem
-
-    #     print(f"\n🚀 Starting docking with AutoDockGPU for table: {selected_table}")
-
-    #     # Retrieve docking method parameters
-    #     method_params = selected_method.get('parameters', {})
-        
-    #     # Select the receptor to be used for docking
-    #     selected_receptor = self._select_receptor_from_db()
-    #     receptor_main_path = self.__receptor_path + f"/{selected_receptor.get('pdb_name', None)}"
-    #     receptor_pdbqt_file = receptor_main_path + f"/processed/receptor_checked.pdbqt"
-    #     fld_file = receptor_main_path + f"/grid_files/receptor_checked.maps.fld"
-    #     assay_folder = assay_registry['assay_folder_path']
-    
-    #     if not receptor_pdbqt_file:
-    #         print("❌ No receptor .pdbqt file found.")
-    #         return
-        
-    #     if not fld_file:
-    #         print("❌ No receptor .maps.fld file found.")
-    #         return
-            
-    #     # Connect to chemspace database and get compounds
-    #     try:
-    #         conn = sqlite3.connect(self.__chemspace_db)
-    #         cursor = conn.cursor()
-    #         cursor.execute(f"SELECT inchi_key, sdf_blob FROM {selected_table} WHERE sdf_blob IS NOT NULL")
-    #         compounds = cursor.fetchall()
-    #         conn.close()
-    #     except Exception as e:
-    #         print(f"❌ Error retrieving compounds from table: {e}")
-    #         return
-
-    #     if not compounds:
-    #         print("❌ No compounds with SDF blobs found in the selected table.")
-    #         return
-
-    #     print(f"🧪 {len(compounds)} compounds to dock.")
-
-    #     # Prepare output directory for docking results
-    #     docking_results_dir = f"{assay_folder}/results"
-
-    #     # Iterate and dock each compound
-    #     for idx, (inchi_key, sdf_blob) in enumerate(compounds, 1):
-    #         try:
-    #             # Write SDF blob to temp file
-    #             # Use inchi_key as the temporary file name for the SDF
-    #             sdf_filepath = f"{assay_folder}/results/{inchi_key}.sdf"
-                
-    #             with open(sdf_filepath, "wb") as sdf_temp:
-    #                 sdf_temp.write(sdf_blob)
-                
-    #             # Create an RDKit mol object from a sdf file
-    #             mol = self._mol_from_sdf(sdf_filepath)
-                
-    #             ## Generate the ligand.pdbqt file
-    #             ligand_pdbqt_filepath = f"{docking_results_dir}/{inchi_key}.pdbqt"
-    #             self._pdbqt_from_mol(mol, ligand_pdbqt_filepath, inchi_key)
-                
-    #             ## Execute autodockgpu
-                
-    #             self._execute_autodockgpu(ligand_pdbqt_filepath, fld_file, method_params)
-                
-    #             if clean_ligand_files:
-    #                 # Remove the temporary SDF and .pdbqt files
-    #                 os.remove(sdf_filepath)
-    #                 os.remove(ligand_pdbqt_filepath)
-
-    #         except Exception as e:
-    #             print(f"   ❌ Error docking compound {inchi_key}: {e}")
-    #             continue
-
-    #     print(f"\n🎉 Docking completed for table: {selected_table}")
-    #     print(f"Results saved in: {docking_results_dir}")
-        
         
     def _dock_table_with_autodockgpu(self, selected_table, selected_method, assay_registry, clean_ligand_files):
         """
@@ -5129,9 +4965,6 @@ quit
 
         print(f"\n🎉 Docking completed for table: {selected_table}")
         print(f"Results saved in: {docking_results_dir}")
-
-        
-        
         
     def _select_receptor_from_db(self) -> Optional[dict]:
         """
@@ -5319,6 +5152,30 @@ quit
                 print(result.stderr)
         except Exception as e:
             print(f"   ❌ Error running AutoDockGPU for {ligand_pdbqt_filepath.split("/")[-1]}: {e}")
-        
-        
-        
+
+    def _process_docking_assay_results(self, assay_registry, docking_mode, max_poses):
+
+        from ringtail import RingtailCore
+        import os
+
+        try:
+            assay_folder = assay_registry['assay_folder_path']
+            assay_id = assay_registry['assay_id']
+            results_folder = f"{assay_folder}/results"
+            results_db_file = f"{assay_folder}/results/assay_{assay_id}.db"
+            rtc = RingtailCore(db_file = results_db_file, docking_mode=docking_mode )
+            rtc.add_results_from_files(file_path = f"{assay_folder}/results", recursive = True, save_receptor = False, max_poses=max_poses)
+            
+            if os.path.exists(results_db_file) and os.path.getsize(results_db_file) > 0:
+                for fname in os.listdir(results_folder):
+                    if fname.endswith('.dlg'):
+                        try:
+                            os.remove(os.path.join(results_folder, fname))
+                        except Exception as e:
+                            print(f"Warning: could not delete {fname}: {e}")
+
+            return results_db_file
+
+        except Exception as error:
+            print(error)
+            print("Error processing with Ringtail")
