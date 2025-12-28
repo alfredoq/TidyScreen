@@ -36,8 +36,7 @@ setup(name='tidyscreen',
 	'biobb_amber',
 	'importlib_resources',
         'py3Dmol',
-	'sqlite_web',
-	'streamlit'
+	'sqlite_web'
       ],
       packages=['tidyscreen', 'tidyscreen.chemspace', 'tidyscreen.config', 'tidyscreen.databases', 'tidyscreen.projects', 'tidyscreen.moldock', 'tidyscreen.misc'],
       keywords='drug-discovery',
