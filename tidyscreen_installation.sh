@@ -19,7 +19,7 @@ if conda env list | grep -q "^$ENV_NAME "; then
     fi
 fi
 
-# Check if the auxiliaty adt environment already exists
+# Check if the auxiliary adt environment already exists
 if conda env list | grep -q "adt"; then
     echo "Warning: Conda environment 'adt' already exists."
     read -p "Do you want to replace it? (y/N): " REPLACE_ENV
@@ -30,6 +30,21 @@ if conda env list | grep -q "adt"; then
         echo "y" | conda env remove -n adt -y
     else
         echo "Installation cancelled. Environment 'adt' already exists."
+        exit 1
+    fi
+fi
+
+# Check if the auxiliary streamlit environment already exists
+if conda env list | grep -q "streamlit"; then
+    echo "Warning: Conda environment 'streamlit' already exists."
+    read -p "Do you want to replace it? (y/N): " REPLACE_ENV
+    REPLACE_ENV=${REPLACE_ENV:-n}
+    
+    if [[ "$REPLACE_ENV" =~ ^[Yy]$ ]]; then
+        echo "Removing existing environment: streamlit"
+        echo "y" | conda env remove -n streamlit -y
+    else
+        echo "Installation cancelled. Environment 'streamlit' already exists."
         exit 1
     fi
 fi
@@ -72,3 +87,9 @@ conda run -n $ENV_NAME bentoml
 echo "y" | conda create -n adt python=2.7
 
 echo "y" | conda install -n adt -c insilichem autodocktools-prepare
+
+# Streamlit library is installed in its own environment to avoid conflicts
+
+echo "y" | conda create -n streamlit python=3.12
+
+echo "y" | conda install -n streamlit -c conda-forge streamlit
