@@ -163,6 +163,9 @@ class MolDock:
             
             # Get additional parameters based on engine
             additional_params = self._get_engine_specific_parameters(selected_engine['name'])
+                        
+            # Get ligand preparation options
+            ligand_prep_params = self._get_ligand_preparation_parameters()
             
             if additional_params is None:
                 print("❌ Parameter configuration cancelled")
@@ -176,7 +179,7 @@ class MolDock:
                 conn = sqlite3.connect(methods_db_path)
                 cursor = conn.cursor()
                 
-                # Create simplified docking_methods table
+                # Create docking_methods table with ligand_prep_params column
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS docking_methods (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -184,6 +187,7 @@ class MolDock:
                         docking_engine TEXT NOT NULL,
                         description TEXT,
                         parameters TEXT,
+                        ligand_prep_params TEXT,
                         created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 ''')
@@ -192,20 +196,20 @@ class MolDock:
                 cursor.execute("SELECT COUNT(*) FROM docking_methods WHERE method_name = ?", (method_name,))
                 if cursor.fetchone()[0] > 0:
                     print(f"⚠️  Method name '{method_name}' already exists")
-                    
                     while True:
                         overwrite = input("Overwrite existing method? (y/n): ").strip().lower()
                         if overwrite in ['y', 'yes']:
                             # Update existing method
                             cursor.execute('''
                                 UPDATE docking_methods 
-                                SET docking_engine = ?, description = ?, parameters = ?, 
+                                SET docking_engine = ?, description = ?, parameters = ?, ligand_prep_params = ?, 
                                     created_date = CURRENT_TIMESTAMP
                                 WHERE method_name = ?
                             ''', (
                                 selected_engine['name'],
                                 description,
                                 self._serialize_parameters(additional_params),
+                                self._serialize_parameters(ligand_prep_params),
                                 method_name
                             ))
                             print(f"✅ Updated existing docking method '{method_name}'")
@@ -221,13 +225,14 @@ class MolDock:
                     # Insert new method
                     cursor.execute('''
                         INSERT INTO docking_methods 
-                        (method_name, docking_engine, description, parameters)
-                        VALUES (?, ?, ?, ?)
+                        (method_name, docking_engine, description, parameters, ligand_prep_params)
+                        VALUES (?, ?, ?, ?, ?)
                     ''', (
                         method_name,
                         selected_engine['name'],
                         description,
-                        self._serialize_parameters(additional_params)
+                        self._serialize_parameters(additional_params),
+                        self._serialize_parameters(ligand_prep_params)
                     ))
                     print(f"✅ Created new docking method '{method_name}'")
                 
@@ -237,7 +242,7 @@ class MolDock:
                 conn.close()
                 
                 # Display method summary
-                self._display_method_summary(method_id, method_name, selected_engine, description, additional_params, methods_db_path)
+                self._display_method_summary(method_id, method_name, selected_engine, description, additional_params, ligand_prep_params, methods_db_path)
                 
                 return {
                     'method_id': method_id,
@@ -245,6 +250,7 @@ class MolDock:
                     'docking_engine': selected_engine['name'],
                     'description': description,
                     'parameters': additional_params,
+                    'ligand_prep_params': ligand_prep_params,
                     'database_path': methods_db_path
                 }
                 
@@ -281,11 +287,11 @@ class MolDock:
                     default=1
                 )
                 
-                parameters['heurmax'] = self._get_parameter_choice(
-                    "Asymptotic heuristics # evals limit (smooth limit: 10000000-20000000)",
-                    [10000000, 12000000, 15000000, 17000000, 20000000],
+                parameters['heurmax'] = self._input_parameter_choice(
+                    "Asymptotic heuristics # evals limit (smooth limit: 10000000-20000000. Default: 12000000)",
                     default=12000000
                 )
+                
                 
                 parameters['autostop'] = self._get_parameter_choice(
                     "Automatic stopping criterion based on convergence",
@@ -293,27 +299,23 @@ class MolDock:
                     default=1
                 )
                 
-                parameters['asfreq'] = self._get_parameter_choice(
-                    "AutoStop testing frequency (in # of generations: 1-20)",
-                    [1, 2, 5, 7, 10, 15, 20],
+                parameters['asfreq'] = self._input_parameter_choice(
+                    "AutoStop testing frequency (in # of generations: 1-20. Default: 5)",
                     default=5
                 )
                 
-                parameters['nrun'] = self._get_parameter_choice(
-                    "LGA runs (5-500)",
-                    [10, 20, 50, 75, 100, 250, 500],
+                parameters['nrun'] = self._input_parameter_choice(
+                    "LGA runs (5-500). Default: 20",
                     default=20
                 )
                 
-                parameters['nev'] = self._get_parameter_choice(
+                parameters['nev'] = self._input_parameter_choice(
                     "Score evaluations (max.) per LGA run",
-                    [500000, 1000000, 2500000, 5000000, 7500000, 10000000],
                     default=2500000
                 )
                 
-                parameters['ngen'] = self._get_parameter_choice(
-                    "Generations (max.) per LGA run",
-                    [10000, 20000, 42000, 75000, 100000],
+                parameters['ngen'] = self._input_parameter_choice(
+                    "Generations (max.) per LGA run. Default: 42000",
                     default=42000
                 )
                 
@@ -323,81 +325,68 @@ class MolDock:
                     default="ad"
                 )
                 
-                parameters['lsit'] = self._get_parameter_choice(
+                parameters['lsit'] = self._input_parameter_choice(
                     "Local-search iterations (max.)",
-                    [100, 300, 500, 750, 1000],
                     default=300
                 )
                 
-                parameters['psize'] = self._get_parameter_choice(
-                    "Population size",
-                    [50, 75, 100, 125, 150, 175, 200, 250, 300],
+                parameters['psize'] = self._input_parameter_choice(
+                    "Population size. Default: 150",
                     default=150
                 )
                 
-                parameters['mrat'] = self._get_parameter_choice(
-                    "Mutation rate",
-                    [0, 2, 7.5, 10, 15, 20],
+                parameters['mrat'] = self._input_parameter_choice(
+                    "Mutation rate (%). Default: 2",
                     default=2
                 )
                 
-                parameters['crat'] = self._get_parameter_choice(
-                    "Crossover rate",
-                    [10, 20, 30, 40, 50, 60, 70, 80, 90, 100],
+                parameters['crat'] = self._input_parameter_choice(
+                    "Crossover rate (%). Default: 80",
                     default=80
                 )
                 
-                parameters['lsrat'] = self._get_parameter_choice(
-                    "Local-search rate",
-                    [30, 40, 50, 60, 70, 80, 90, 100],
+                parameters['lsrat'] = self._input_parameter_choice(
+                    "Local-search rate (%). Default: 100",
                     default=100
                 )
                 
-                parameters['trat'] = self._get_parameter_choice(
-                    "Tournament (selection) rate",
-                    [30, 40, 50, 60, 70, 80, 90, 100],
+                parameters['trat'] = self._input_parameter_choice(
+                    "Tournament (selection) rate (%). Default: 60",
                     default=60
                 )
                 
-                parameters['dmov'] = self._get_parameter_choice(
-                    "Maximum LGA movement delta (Angstroms)",
-                    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+                parameters['dmov'] = self._input_parameter_choice(
+                    "Maximum LGA movement delta (Angstroms). Default: 6",
                     default=6
                 )
                 
-                parameters['dang'] = self._get_parameter_choice(
-                    "Maximum LGA angle delta (Degrees)",
-                    [10, 20, 30, 40, 50, 60, 70, 80, 90, 120, 150, 180],
+                parameters['dang'] = self._input_parameter_choice(
+                    "Maximum LGA angle delta (Degrees). Default: 90",
                     default=90
                 )
                 
-                parameters['rholb'] = self._get_parameter_choice(
-                    "Solis-Wets lower bound of rho parameter",
-                    [0.005, 0.01, 0.025],
+                parameters['rholb'] = self._input_parameter_choice(
+                    "Solis-Wets lower bound of rho parameter. Default=0.01",
                     default=0.01
                 )
                 
-                parameters['lsmov'] = self._get_parameter_choice(
-                    "Solis-Wets movement delta",
-                    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+                parameters['lsmov'] = self._input_parameter_choice(
+                    "Solis-Wets movement delta (A). Default=2",
                     default=2
                 )
                 
-                parameters['lsang'] = self._get_parameter_choice(
-                    "Solis-Wets angle delta (Degrees)",
-                    [10, 20, 30, 40, 50, 60, 75, 85, 100],
+                parameters['lsang'] = self._input_parameter_choice(
+                    "Solis-Wets angle delta (Degrees). Default=75",
                     default=75
                 )
                 
-                parameters['cslim'] = self._get_parameter_choice(
-                    "Solis-Wets cons. success/failure limit to adjust rho",
-                    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+                parameters['cslim'] = self._input_parameter_choice(
+                    "Solis-Wets cons. success/failure limit to adjust rho. Default=4",
                     default=4
                 )
                 
-                parameters['stopstd'] = self._get_parameter_choice(
-                    "AutoStop energy standard deviation tolerance (kcal/mol)",
-                    [0.05, 0.10, 0.15, 0.2, 0.3, 0.4, 0.5],
+                parameters['stopstd'] = self._input_parameter_choice(
+                    "AutoStop energy standard deviation tolerance (kcal/mol). Default=0.15",
                     default=0.15
                 )
                 
@@ -431,12 +420,10 @@ class MolDock:
                     default=1
                 )
                 
-                parameters['rmstol'] = self._get_parameter_choice(
-                    "RMSD clustering tolerance (Angstroms)",
-                    [0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 2.5, 3],
+                parameters['rmstol'] = self._input_parameter_choice(
+                    "RMSD clustering tolerance (Angstroms). Default=2",
                     default=2
                 )
-                
                 
             elif engine_name == 'AutoDock':
                 # AutoDock specific parameters
@@ -533,6 +520,35 @@ class MolDock:
             except KeyboardInterrupt:
                 raise
     
+    def _input_parameter_choice(self, param_name: str, default: str = None) -> str:
+        """
+        Prompt the user to input a parameter value directly (no predefined options).
+
+        Args:
+            param_name (str): Name or description of the parameter to prompt for.
+            default (str, optional): Default value to use if the user presses Enter.
+
+        Returns:
+            str: The value entered by the user, or the default if provided and no input is given.
+        """
+        while True:
+            try:
+                print(f"\n📋 {param_name}:")
+                prompt = f"Enter value for {param_name}"
+                if default is not None:
+                    prompt += f" (default: {default})"
+                prompt += ": "
+                value = input(prompt).strip()
+                if not value:
+                    if default is not None:
+                        return default
+                    else:
+                        return None
+                return value
+            except KeyboardInterrupt:
+                print("\n❌ Parameter input cancelled.")
+                return None
+    
     def _get_parameter_integer(self, param_name: str, default: int, min_val: int, max_val: int) -> int:
         """Get integer parameter from user with validation."""
         while True:
@@ -588,7 +604,7 @@ class MolDock:
             return str(parameters)
 
     def _display_method_summary(self, method_id: int, method_name: str, engine_info: Dict,
-                            description: str, parameters: Dict[str, Any], db_path: str) -> None:
+                            description: str, parameters: Dict[str, Any], ligand_prep_params: Dict[str, Any], db_path: str) -> None:
         """Display summary of created docking method."""
         try:
             print(f"\n🎯 DOCKING METHOD CREATED SUCCESSFULLY")
@@ -602,18 +618,25 @@ class MolDock:
             print(f"\n⚙️  CONFIGURED PARAMETERS:")
             for key, value in parameters.items():
                 print(f"   • {key.replace('_', ' ').title()}: {value}")
-            
+
+            print(f"\n🧪 LIGAND PREPARATION PARAMETERS:")
+            if ligand_prep_params:
+                for key, value in ligand_prep_params.items():
+                    print(f"   • {key.replace('_', ' ').title()}: {value}")
+            else:
+                print("   • None")
+
             print(f"\n📋 REQUIREMENTS:")
             for req in engine_info['requirements']:
                 print(f"   • {req}")
-            
+
             print(f"\n💡 NEXT STEPS:")
             print("   1. Ensure all requirements are installed")
             print("   2. Use this method for docking experiments")
             print("   3. Configure receptor files for docking")
-            
+
             print("=" * 60)
-            
+
         except Exception as e:
             print(f"⚠️  Error displaying method summary: {e}")
    
@@ -1361,13 +1384,12 @@ class MolDock:
                 conn = sqlite3.connect(methods_db_path)
                 cursor = conn.cursor()
                 
-                # Get available docking methods
+                # Get available docking methods, including ligand_prep_params
                 cursor.execute('''
-                    SELECT id, method_name, docking_engine, description, parameters, created_date
+                    SELECT id, method_name, docking_engine, description, parameters, ligand_prep_params, created_date
                     FROM docking_methods
                     ORDER BY created_date DESC
                 ''')
-                
                 methods = cursor.fetchall()
                 conn.close()
                 
@@ -1388,14 +1410,16 @@ class MolDock:
             # Display available methods
             method_list = []
             for i, method in enumerate(methods, 1):
-                method_id, method_name, docking_engine, description, parameters_json, created_date = method
-                
+                method_id, method_name, docking_engine, description, parameters_json, ligand_prep_params_json, created_date = method
                 # Parse parameters for display
                 try:
                     parameters = json.loads(parameters_json) if parameters_json else {}
                 except:
                     parameters = {}
-                
+                try:
+                    ligand_prep_parameters = json.loads(ligand_prep_params_json) if ligand_prep_params_json else {}
+                except:
+                    ligand_prep_parameters = {}
                 # Format created date
                 try:
                     from datetime import datetime
@@ -1403,18 +1427,16 @@ class MolDock:
                     created_str = created_dt.strftime('%Y-%m-%d')
                 except:
                     created_str = created_date[:10] if created_date else 'Unknown'
-                
                 # Truncate description for display
                 desc_short = (description[:27] + '...') if len(description) > 30 else description
-                
                 print(f"{i:<3} {method_name[:19]:<20} {docking_engine[:14]:<15} {desc_short:<30} {created_str:<12}")
-                
                 method_list.append({
                     'method_id': method_id,
                     'method_name': method_name,
                     'docking_engine': docking_engine,
                     'description': description,
                     'parameters': parameters,
+                    'ligand_prep_parameters': ligand_prep_parameters,
                     'created_date': created_date
                 })
             
@@ -4886,6 +4908,9 @@ quit
         # Retrieve docking method parameters
         method_params = selected_method.get('parameters', {})
         
+        # Retrieve ligand preparation params
+        ligand_prep_params = selected_method.get('ligand_prep_params', {})
+        
         # Select the receptor to be used for docking
         selected_receptor = self._select_receptor_from_db()
         receptor_main_path = self.__receptor_path + f"/{selected_receptor.get('pdb_name', None)}"
@@ -4941,7 +4966,7 @@ quit
                 
                 ## Generate the ligand.pdbqt file
                 ligand_pdbqt_filepath = f"{docking_results_dir}/{inchi_key}.pdbqt"
-                self._pdbqt_from_mol(mol, ligand_pdbqt_filepath, inchi_key)
+                self._pdbqt_from_mol(mol, ligand_pdbqt_filepath, inchi_key, ligand_prep_params)
                 
                 ## Execute autodockgpu
                 self._execute_autodockgpu(ligand_pdbqt_filepath, fld_file, method_params)
@@ -5079,23 +5104,23 @@ quit
                 print(f"   ❌ Error reading SDF file '{sdf_file}': {e}")
                 return None
             
-    def _pdbqt_from_mol(self, mol, ligand_pdbqt_file, inchi_key):
+    def _pdbqt_from_mol(self, mol, ligand_pdbqt_file, inchi_key, ligand_prep_params):
         
         from meeko import MoleculePreparation
         from meeko import MoleculeSetup
         from meeko import PDBQTWriterLegacy
         
         
-        try: 
-            mk_prep = MoleculePreparation(merge_these_atom_types=('H',))
+        try:
+            # Compose MoleculePreparation arguments from ligand_prep_params
+            mk_prep = MoleculePreparation(**ligand_prep_params)
             mol_setup_list = mk_prep.prepare(mol, rename_atoms=True)
             mol_setup = mol_setup_list[0]
 
             pdbqt_string = PDBQTWriterLegacy.write_string(mol_setup)
-            
+
             with open(ligand_pdbqt_file, "w") as f:
                 f.write(pdbqt_string[0])
-
 
         except Exception as e:
             print(f"   ❌ Error creating PDBQT for molecule {inchi_key}: {e}")
@@ -5267,4 +5292,49 @@ quit
             print(f"Notes: {notes}")
             print("-" * 40)
         
+    def _get_ligand_preparation_parameters(self):
+        """
+        Get ligand preparation parameters to be used for Meeko procedures
         
+        """    
+        
+        try:
+            print(f"\n⚙️  CONFIGURE LIGAND PREPARATION PARAMETERS (MEEKO)")
+            print("-" * 50)
+            
+            ligand_prep_parameters = {}
+            
+            ## Meeko specific parameters
+            
+            ligand_prep_parameters['merge_these_atom_types'] = self._input_parameter_choice(
+                "Atom types to merge. Default: '(H,)'",
+                default="(H,)"
+            )
+            
+            ligand_prep_parameters['hydrate'] = self._get_parameter_choice(
+                "Add water molecules to the structure for hydrated docking.",
+                [False, True],
+                default=False
+            )
+            
+            ligand_prep_parameters['add_atom_types'] = self._input_parameter_choice(
+                "Specify additional atom types to assign in JSON format, with SMARTS patterns and atom type names. (i.e.: '[{'smarts': '[#1][#6X3]:[#6X3]([#6])[#7]:[#7][#7][#6]', 'atype': 'HD'}]' for 1,2,3-triazole donor HD in 4 position. Default: None)",
+                default=None
+            )
+            
+            ligand_prep_parameters['charge'] = self._get_parameter_choice(
+                "Choose the charge model.",
+                ["gasteiger", "espaloma", "zero"],
+                default="gasteiger"
+            )
+            
+            return ligand_prep_parameters if ligand_prep_parameters else None
+            
+        except KeyboardInterrupt:
+            print("\n❌ Ligands parameter configuration cancelled")
+            return None
+        except Exception as e:
+            print(f"❌ Error configuring ligands parameters: {e}")
+            return None
+        pass
+    
