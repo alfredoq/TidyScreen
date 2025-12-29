@@ -326,6 +326,50 @@ def add_chemical_reaction():
         print(f"❌ Error adding chemical reaction: {e}")
         return False
 
+def gui():
+    """
+    Launch the Streamlit GUI for TidyScreen.
+    """
+    import site
+    import os
+    import subprocess
+
+    try:
+        # Find the tidyscreen package path
+        package_path = site.getsitepackages()[0]
+        script_path = os.path.join(package_path, "tidyscreen", "misc", "streamlit_gui.py")
+
+        if not os.path.exists(script_path):
+            print(f"❌ Streamlit GUI script not found at: {script_path}")
+            return
+
+        print("How do you want to access the Streamlit GUI?")
+        print("1. Local browser (default)")
+        print("2. SSH/remote (run with --server.address 0.0.0.0)")
+        choice = input("Enter 1 for local or 2 for SSH/remote: ").strip()
+
+        if choice == "2":
+            cmd = [
+                "conda", "run", "-n", "streamlit",
+                "streamlit", "run", script_path,
+                "--server.address", "0.0.0.0"
+            ]
+        
+            print(f"🚀 Launching TidyScreen Streamlit GUI... \n Remote connection enabled. \n Connect to http://localhost:8501 to access the gui. \n (Be sure to connect to the server as follows: ssh -N -L 8501:localhost:8501 username@remote_server_ip)")
+            
+        else:
+            cmd = [
+                "conda", "run", "-n", "streamlit",
+                "streamlit", "run", script_path
+            ]
+
+            print(f"🚀 Launching TidyScreen Streamlit GUI... \n Local connection enabled.")
+        
+        subprocess.run(cmd)
+    except Exception as e:
+        print(f"❌ Failed to launch Streamlit GUI: {e}")
+
+
 class ActivateProject:
     
     def __init__(self, name):

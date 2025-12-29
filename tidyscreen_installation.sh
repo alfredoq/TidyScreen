@@ -56,7 +56,7 @@ echo "Installing TidyScreen"
 
 conda run -n $ENV_NAME pip install git+https://github.com/alfredoq/TidyScreen
 
-echo "Installing Dependencies"
+# echo "Installing Dependencies"
 
 echo "y" | conda install -n $ENV_NAME -c conda-forge ambertools==23.6 espaloma espaloma_charge chemicalite visidata vmd-python vina pdbfixer
 
@@ -66,7 +66,7 @@ echo "y" | conda install -n $ENV_NAME -c bioconda autodock autogrid
 
 echo "y" | conda install -n $ENV_NAME -c conda-forge redis-server
 
-echo "Installing Ersilia Hub"
+# echo "Installing Ersilia Hub"
 
 # Try to delete if already exists
 if [ -d "/tmp/ersilia" ]; then
@@ -88,8 +88,6 @@ echo "y" | conda create -n adt python=2.7
 
 echo "y" | conda install -n adt -c insilichem autodocktools-prepare
 
-# Streamlit library is installed in its own environment to avoid conflicts
-
-echo "y" | conda create -n streamlit python=3.12
-
+## Install Streamlit
 echo "y" | conda install -n streamlit -c conda-forge streamlit
+
