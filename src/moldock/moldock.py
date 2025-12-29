@@ -5179,3 +5179,92 @@ quit
         except Exception as error:
             print(error)
             print("Error processing with Ringtail")
+
+    def list_pdb_templates(self) -> None:
+        """
+        Reads the 'pdbs.db' database located in the project_path/docking/receptors folder
+        and prints out the following columns from the 'pdbs' table:
+        - 'pdb_name'
+        - 'pdb_analysis'
+        - 'processed_pdb_path'
+        - 'notes'
+        Each field in the rows is printed in a new line.
+        """
+        import sqlite3
+        pdbs_db_path = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
+        if not os.path.exists(pdbs_db_path):
+            print(f"❌ Database not found: {pdbs_db_path}")
+            return
+
+        try:
+            conn = sqlite3.connect(pdbs_db_path)
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT pdb_name, processed_pdb_path, notes
+                FROM pdbs
+                ORDER BY created_date DESC
+            ''')
+            rows = cursor.fetchall()
+            conn.close()
+        except Exception as e:
+            print(f"❌ Error reading pdbs.db: {e}")
+            return
+
+        if not rows:
+            print("📋 No PDB templates found in the database.")
+            return
+
+        print("\n📋 PDB Templates:")
+        print("=" * 40)
+        for pdb_name, processed_pdb_path, notes in rows:
+            print(f"Name: {pdb_name}")
+            print(f"Processed PDB Path: {processed_pdb_path}")
+            print(f"Notes: {notes}")
+            print("-" * 40)
+            
+    def list_receptor_models(self):
+        """
+        Reads the 'receptors.db' database located in the project_path/docking/receptors folder
+        and prints out the following columns from the 'receptor_registers' table:
+        - 'pdb_name'
+        - 'pdb_to_convert'
+        - 'pdbqt_file'
+        - 'configs'
+        - 'notes'
+        Each field in the rows is printed in a new line.
+        """
+        import sqlite3
+        receptors_db_path = os.path.join(self.path, 'docking', 'receptors', 'receptors.db')
+        if not os.path.exists(receptors_db_path):
+            print(f"❌ Database not found: {receptors_db_path}")
+            return
+
+        try:
+            conn = sqlite3.connect(receptors_db_path)
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT pdb_name, pdb_to_convert, pdbqt_file, configs, notes
+                FROM receptor_registers
+                ORDER BY created_date DESC
+            ''')
+            rows = cursor.fetchall()
+            conn.close()
+        except Exception as e:
+            print(f"❌ Error reading receptors.db: {e}")
+            return
+
+        if not rows:
+            print("📋 No receptor models found in the database.")
+            return
+
+        print("\n📋 Receptor Models:")
+        print("=" * 40)
+        for pdb_name, pdb_to_convert, pdbqt_file, configs, notes in rows:
+            print(f"PDB Name: {pdb_name}")
+            print(f"PDB to Convert: {pdb_to_convert}")
+            print(f"PDBQT File: {pdbqt_file}")
+            print(f"Configs: {configs}")
+            print(f"Notes: {notes}")
+            print("-" * 40)
+        
+        
