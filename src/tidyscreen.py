@@ -371,7 +371,6 @@ def gui():
     except Exception as e:
         print(f"❌ Failed to launch Streamlit GUI: {e}")
 
-
 class ActivateProject:
     
     def __init__(self, name):
@@ -547,6 +546,26 @@ class ActivateProject:
             print(f"❌ Error getting ChemSpace summary: {e}")
 
 class CreateProject:
+    """
+        Class to create and register a new project in the TidyScreen system.
+
+        This class handles the creation of a new project directory, prompts the user for project details
+        (name, path, and optional description), and registers the project in the projects database.
+        If the database does not exist, it will be created automatically. The class also ensures the
+        project directory structure is set up according to a template or a default structure.
+
+        Args:
+            name (str, optional): Name of the project. If not provided, the user will be prompted.
+            path (str, optional): Base path for the project. If not provided, the user will be prompted.
+            description (str, optional): Project description. If not provided, the user will be prompted (can be empty).
+
+        Attributes:
+            name (str): Project name.
+            path (str): Full path to the project directory.
+            description (str): Project description (can be empty).
+            db_manager (DatabaseManager): Instance for managing the projects database.
+            _project_created (bool): Status flag for project creation.
+        """
     
     def __init__(self, name=None, path=None, description=None):
         # Prompt for name if not provided
@@ -563,6 +582,10 @@ class CreateProject:
             while not path:
                 print("❌ Project path cannot be empty.")
                 path = input("Enter the base path where the project will be created: ").strip()
+
+        # Prompt for description if not provided
+        if description is None:
+            description = input("Enter a project description (optional, press Enter to leave empty): ")
         self.description = description
 
         # Initialize database manager as a component
@@ -741,30 +764,39 @@ class CreateProject:
 
 class DeleteProject:
     
-    def __init__(self, name, delete_directory=True, confirm=True):
+    def __init__(self, name=None, delete_directory=True, confirm=True):
         # Initialize database manager as a component
         self.db_manager = DatabaseManager()
-        
+
         self.__projects_db = f"{site.getsitepackages()[0]}/tidyscreen/projects_db/projects_database.db"
-        self.name = name
         self.delete_directory = delete_directory
         self.confirm = confirm
-        
+
+        # Prompt for project name if not provided
+        if not name:
+            print("Available projects:")
+            projects()  # Call the global projects() function to list all projects
+            name = input("Enter the name of the project to delete: ").strip()
+            while not name:
+                print("❌ Project name cannot be empty.")
+                name = input("Enter the name of the project to delete: ").strip()
+        self.name = name
+
         # Check if database exists, create it if it doesn't
         if not os.path.exists(self.__projects_db):
             print(f"Projects database does not exist at: {self.__projects_db}")
             print("Creating new projects database...")
-            
+
             if not self.db_manager.create_projects_database(self.__projects_db):
                 print("❌ Failed to create projects database. Cannot proceed.")
                 self._project_deleted = False
                 return
-            
+
             print("✅ Projects database created successfully.")
-        
+
         # Validate database structure
         self.db_manager.check_db(self.__projects_db)
-        
+
         # Delete the project entry from database
         self.delete_project_entry()
     

@@ -1,5 +1,6 @@
 import sqlite3
 import pandas as pd
+import matplotlib.pyplot as plt
 
 def read_database_as_dataframe(db_path, table_name):
     """
@@ -66,7 +67,7 @@ def get_docking_assay_registers(db_path):
         conn.close()
         return df
     except Exception as e:
-        return pd.DataFrame(columns + ['error']).append({'error': str(e)}, ignore_index=True)
+        return None
     
 def get_docking_results(db_path):
     """
@@ -87,6 +88,33 @@ def get_docking_results(db_path):
         conn.close()
         return df
     except Exception as e:
-        return pd.DataFrame(columns + ['error']).append({'error': str(e)}, ignore_index=True)
+        
+        return None
 
 
+def construct_hist_for_ligand(df, ligand_name):
+    """
+    Filter the dataframe for the given ligand name in the 'LigName' column and plot a barplot of 'pose_rank' vs 'cluster_size'.
+
+    Args:
+        df (pd.DataFrame): The input DataFrame containing at least 'LigName', 'pose_rank', and 'cluster_size' columns.
+        ligand_name (str): The ligand name to filter by.
+
+    Returns:
+        matplotlib.figure.Figure: The matplotlib Figure object containing the barplot.
+    """
+    if df is None or df.empty or 'LigName' not in df.columns or 'cluster_size' not in df.columns or 'pose_rank' not in df.columns:
+        raise ValueError("DataFrame must contain 'LigName', 'pose_rank', and 'cluster_size' columns and not be empty.")
+    filtered = df[df['LigName'] == ligand_name]
+    if filtered.empty:
+        raise ValueError(f"No rows found for ligand: {ligand_name}")
+    fig, ax = plt.subplots()
+    ax.bar(filtered['pose_rank'], filtered['cluster_size'], color='skyblue', edgecolor='black')
+    ax.set_title(f"{ligand_name}: Pose Rank vs Cluster Size", size=8)
+    ax.set_xlabel('Pose Rank', size=8)
+    ax.set_ylabel('Cluster Size', size=8)
+    
+    fig.set_size_inches(3, 3)  # width, height in inches
+    
+    return fig
+    

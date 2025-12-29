@@ -622,6 +622,7 @@ class ChemSpace:
                 smiles TEXT NOT NULL,
                 name TEXT NOT NULL,
                 flag TEXT,
+                flag_description TEXT,
                 inchi_key TEXT,
                 UNIQUE(name, smiles)
             )
@@ -722,10 +723,10 @@ class ChemSpace:
             print(f"❌ Error renaming table '{old_name}' to '{new_name}': {e}")
             return False
     
-    def load_csv_file(self, csv_file_path: str, 
+    def load_csv_file(self, csv_file_path: str = None, 
                      smiles_column: str = 'smiles', 
-                     name_column: Optional[str] = 'name', 
-                     flag_column: Optional[str] = 'flag',
+                     name_column: str = 'name', 
+                     flag_column: str = 'flag',
                      skip_duplicates: bool = True,
                      compute_inchi: bool = True,
                      parallel_threshold: int = 10000,
@@ -752,6 +753,12 @@ class ChemSpace:
             dict: Results containing success status, counts, and messages
         """
         try:
+            # Prompt for file path if not provided
+            if not csv_file_path:
+                csv_file_path = input("Enter the path to the CSV file: ").strip()
+                while not csv_file_path:
+                    print("❌ CSV file path cannot be empty.")
+                    csv_file_path = input("Enter the path to the CSV file: ").strip()
             # Validate file exists
             if not os.path.exists(csv_file_path):
                 return {
@@ -762,13 +769,57 @@ class ChemSpace:
                     'errors': 1
                 }
             
-            # Extract table name from CSV file prefix
+            ## Prepare table name asking the user the intended behavior
             csv_filename = os.path.basename(csv_file_path)
-            table_name = os.path.splitext(csv_filename)[0]  # Remove .csv extension
-            
+            default_table_name = os.path.splitext(csv_filename)[0]  # Remove .csv extension
+            print(f"Default table name (from file): '{default_table_name}'")
+            use_custom = input("Do you want to input a custom table name? (y/N): ").strip().lower()
+            if use_custom in ['y', 'yes']:
+                custom_name = ''
+                while not custom_name:
+                    custom_name = input("Enter custom table name: ").strip()
+                    if not custom_name:
+                        table_name = default_table_name
+                        print(f"Using custom table name: {default_table_name}.")
+                table_name = custom_name
+            else:
+                table_name = default_table_name
             # Sanitize table name for SQLite (remove special characters, ensure it starts with letter)
             table_name = self._sanitize_table_name(table_name)
-            
+
+            # Check if table already exists
+            existing_tables = self.get_all_tables()
+            if table_name in existing_tables:
+                print(f"⚠️  Table '{table_name}' already exists in the database.")
+                replace = input(f"Do you want to replace the existing table '{table_name}'? (y/N): ").strip().lower()
+                if replace in ['y', 'yes']:
+                    # Drop the existing table
+                    try:
+                        conn = sqlite3.connect(self.__chemspace_db)
+                        cursor = conn.cursor()
+                        cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
+                        conn.commit()
+                        conn.close()
+                        print(f"✅ Table '{table_name}' is to be replaced.")
+                    except Exception as e:
+                        return {
+                            'success': False,
+                            'message': f"Failed to replace table '{table_name}': {e}",
+                            'compounds_added': 0,
+                            'duplicates_skipped': 0,
+                            'errors': 1
+                        }
+                else:
+                    print("Quiting .csv file addition")
+                    
+                    return {
+                        'success': False,
+                        'message': f"Table '{table_name}' already exists and was not replaced.",
+                        'compounds_added': 0,
+                        'duplicates_skipped': 0,
+                        'errors': 1
+                    }
+
             # Create table for this CSV file
             if not self._create_compounds_table(table_name):
                 return {
@@ -782,7 +833,14 @@ class ChemSpace:
             # Read CSV file
             print(f"📖 Reading CSV file: {csv_file_path}")
             print(f"📋 Target table: {table_name}")
+            
+            # Read the .csv file to be inputed
             df = pd.read_csv(csv_file_path)
+            
+            # Parse the df to check columns and information
+            df = self._parse_df_from_csv_file(df, smiles_column, name_column, flag_column)
+            
+            print(df)
             
             # Validate required columns (only SMILES is mandatory)
             if smiles_column not in df.columns:
@@ -797,65 +855,64 @@ class ChemSpace:
             # Check if optional columns exist and warn if they don't
             name_available = name_column and name_column in df.columns
             flag_available = flag_column and flag_column in df.columns
-            
+            flag_description_available = 'flag_description' in df.columns
+
             if not name_available:
                 print(f"⚠️  Name column '{name_column}' not found. Will use 'nd' as default.")
             if not flag_available:
                 print(f"⚠️  Flag column '{flag_column}' not found. Will use 'nd' as default.")
+            if not flag_description_available:
+                print(f"⚠️  Flag description column 'flag_description' not found. Will use 'nd' as default.")
             
             # Determine if parallel processing should be used
             use_parallel = len(df) > parallel_threshold
             
             if use_parallel:
                 print(f"🚀 Large dataset detected ({len(df)} rows). Using parallel processing...")
-                
                 # Set up parallel processing parameters
                 if max_workers is None:
                     max_workers = min(cpu_count(), 8)  # Limit to reasonable number
-                
                 if chunk_size is None:
                     chunk_size = max(1000, len(df) // (max_workers * 4))  # Ensure reasonable chunk size
-                
                 print(f"   👥 Workers: {max_workers}")
                 print(f"   📦 Chunk size: {chunk_size}")
-                
                 # Process in parallel chunks
                 result = self._process_csv_parallel(
                     df, table_name, smiles_column, name_column, flag_column,
-                    name_available, flag_available, skip_duplicates,
+                    name_available, flag_available, flag_description_available, skip_duplicates,
                     max_workers, chunk_size
                 )
             else:
                 print(f"📝 Processing {len(df)} rows sequentially...")
-                
                 # Sequential processing for smaller files
                 compounds_data = []
-                
                 for idx, row in df.iterrows():
                     smiles = str(row[smiles_column]).strip()
-                    
                     # Handle name column - use provided column or generate from index
                     if name_available:
                         name = str(row[name_column]).strip()
                         if not name or name.lower() in ['nan', 'none', '']:
-                            name = f"compound_{idx + 1}"  # Generate name if empty
+                            name = f"compound_{idx + 1}"
                     else:
-                        name = f"compound_{idx + 1}"  # Generate name if column doesn't exist
-                    
+                        name = f"compound_{idx + 1}"
                     # Handle flag column - use provided column or default to "nd"
                     if flag_available:
                         flag = str(row[flag_column]).strip()
                         if not flag or flag.lower() in ['nan', 'none', '']:
-                            flag = "nd"  # Default flag if empty
+                            flag = "nd"
                     else:
-                        flag = "nd"  # Default flag if column doesn't exist
-                    
+                        flag = "nd"
+                    # Handle flag_description column - use provided column or default to "nd"
+                    if flag_description_available:
+                        flag_description = str(row['flag_description']) if 'flag_description' in row else 'nd'
+                        if not flag_description or flag_description.lower() in ['nan', 'none', '']:
+                            flag_description = "nd"
+                    else:
+                        flag_description = "nd"
                     # Skip empty SMILES rows (only SMILES is mandatory)
                     if not smiles or smiles.lower() in ['nan', 'none', '']:
                         continue
-                    
-                    compounds_data.append((smiles, name, flag))
-                
+                    compounds_data.append((smiles, name, flag, flag_description))
                 # Insert compounds into database
                 result = self._insert_compounds(compounds_data, table_name, skip_duplicates)
             
@@ -896,13 +953,93 @@ class ChemSpace:
             return result
             
         except Exception as e:
+            error_message = f"Error loading CSV file: {e}"
+            print(f"❌ {error_message}")
             return {
                 'success': False,
-                'message': f"Error loading CSV file: {e}",
+                'message': error_message,
                 'compounds_added': 0,
                 'duplicates_skipped': 0,
                 'errors': 1
             }
+    
+    def _parse_df_from_csv_file(self, df, smiles_column, name_column, flag_column):
+        
+        print("Parsing dataframe from .csv file to check columns and information...")
+        
+        # Parsing the smiles column
+        if smiles_column not in df.columns:
+            print(f"❌ The specified SMILES column '{smiles_column}' was not found in the CSV file.")
+            print("Available columns:")
+            for idx, col in enumerate(df.columns):
+                print(f"  [{idx}] {col}")
+            selected_idx = None
+            while selected_idx is None:
+                try:
+                    user_input = input("Please enter the number of the column to use as SMILES: ").strip()
+                    selected_idx = int(user_input)
+                    if selected_idx < 0 or selected_idx >= len(df.columns):
+                        print("Invalid selection. Please try again.")
+                        selected_idx = None
+                except ValueError:
+                    print("Invalid input. Please enter a valid number.")
+            selected_col = df.columns[selected_idx]
+            print(f"Renaming column '{selected_col}' to '{smiles_column}'.")
+            df.rename(columns={selected_col: smiles_column}, inplace=True)
+        
+        # Parsing the name column        
+        if name_column not in df.columns:
+            print(f"❌ The specified NAMES column '{name_column}' was not found in the CSV file.")
+            print("Available columns:")
+            for idx, col in enumerate(df.columns):
+                print(f"  [{idx}] {col}")
+            selected_idx = None
+            while selected_idx is None:
+                try:
+                    user_input = input("Please enter the number of the column to use as NAMES: ").strip()
+                    selected_idx = int(user_input)
+                    if selected_idx < 0 or selected_idx >= len(df.columns):
+                        print("Invalid selection. Please try again.")
+                        selected_idx = None
+                except ValueError:
+                    print("Invalid input. Please enter a valid number.")
+            selected_col = df.columns[selected_idx]
+            print(f"Renaming column '{selected_col}' to '{name_column}'.")
+            df.rename(columns={selected_col: name_column}, inplace=True)
+        
+        # Parsing the flag column
+        if flag_column not in df.columns:
+            print(f"❌ The specified FLAG column '{flag_column}' was not found in the CSV file.")
+            print("Available columns:")
+            for idx, col in enumerate(df.columns):
+                print(f"  [{idx}] {col}")
+            selected_idx = None
+            while selected_idx is None:
+                try:
+                    user_input = input("Please enter the number of the column to use as FLAGS: ").strip()
+                    selected_idx = int(user_input)
+                    if selected_idx < 0 or selected_idx >= len(df.columns):
+                        print("Invalid selection. Please try again.")
+                        selected_idx = None
+                except ValueError:
+                    print("Invalid input. Please enter a valid number.")
+            selected_col = df.columns[selected_idx]
+            print(f"Renaming column '{selected_col}' to '{flag_column}'.")
+            df.rename(columns={selected_col: flag_column}, inplace=True)
+        
+        # Add 'flag_description' column to the dataframe
+        flag_description = input("Enter a description for the 'flag' column to be added to all rows: ").strip()
+        df['flag_description'] = flag_description
+
+        # Only keep the required columns
+        required_columns = [smiles_column, name_column, flag_column, 'flag_description']
+        # If any required column is missing, add it with default value 'nd' (except flag_description)
+        for col in [smiles_column, name_column, flag_column]:
+            if col not in df.columns:
+                df[col] = 'nd'
+        df = df[required_columns]
+        
+        return df
     
     def _insert_compounds(self, compounds_data: List[Tuple], table_name: str, skip_duplicates: bool = True) -> Dict[str, Any]:
         """
@@ -925,8 +1062,8 @@ class ChemSpace:
             errors = 0
             
             insert_query = f"""
-            INSERT INTO {table_name} (smiles, name, flag)
-            VALUES (?, ?, ?)
+            INSERT INTO {table_name} (smiles, name, flag, flag_description)
+            VALUES (?, ?, ?, ?)
             """
             
             for compound_data in compounds_data:
