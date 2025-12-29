@@ -337,6 +337,7 @@ def gui():
     try:
         # Find the tidyscreen package path
         package_path = site.getsitepackages()[0]
+        tidyscreen_path = os.path.join(package_path, "tidyscreen")
         script_path = os.path.join(package_path, "tidyscreen", "misc", "streamlit_gui.py")
 
         if not os.path.exists(script_path):
@@ -352,7 +353,7 @@ def gui():
             cmd = [
                 "conda", "run", "-n", "streamlit",
                 "streamlit", "run", script_path,
-                "--server.address", "0.0.0.0"
+                "--server.address", "0.0.0.0", tidyscreen_path
             ]
         
             print(f"🚀 Launching TidyScreen Streamlit GUI... \n Remote connection enabled. \n Connect to http://localhost:8501 to access the gui. \n (Be sure to connect to the server as follows: ssh -N -L 8501:localhost:8501 username@remote_server_ip)")
@@ -360,10 +361,11 @@ def gui():
         else:
             cmd = [
                 "conda", "run", "-n", "streamlit",
-                "streamlit", "run", script_path
+                "streamlit", "run", script_path, tidyscreen_path
             ]
 
             print(f"🚀 Launching TidyScreen Streamlit GUI... \n Local connection enabled.")
+        
         
         subprocess.run(cmd)
     except Exception as e:

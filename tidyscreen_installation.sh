@@ -88,6 +88,11 @@ echo "y" | conda create -n adt python=2.7
 
 echo "y" | conda install -n adt -c insilichem autodocktools-prepare
 
-## Install Streamlit
+## Install Streamlit in a separate environment to avoid conflicts with TidyScreen dependencies
+
+echo "y" | conda create -n streamlit python=3.12
+
 echo "y" | conda install -n streamlit -c conda-forge streamlit
 
+## Will install TidyScreen in the streamlit environment to ensure all dependencies are met for gui actions
+conda run -n streamlit pip install git+https://github.com/alfredoq/TidyScreen
