@@ -1,4 +1,7 @@
+import ast
 import os
+import sqlite3
+from turtle import pd
 from tidyscreen import tidyscreen
 import sys
 from typing import Dict, List, Tuple, Optional, Any
@@ -857,7 +860,7 @@ class MolDock:
 
                         ## After the docking run has been completed, execute the corresponding analysis
 
-                        results_db_file = self._process_docking_assay_results(assay_registry, docking_mode, max_poses=10)
+                        results_db_file = self._process_docking_assay_results(assay_registry, docking_mode, clean_ligand_files, max_poses=10)
 
                         print(f"✅ Docking results saved to: {results_db_file}")
 
@@ -5178,7 +5181,7 @@ quit
         except Exception as e:
             print(f"   ❌ Error running AutoDockGPU for {ligand_pdbqt_filepath.split("/")[-1]}: {e}")
 
-    def _process_docking_assay_results(self, assay_registry, docking_mode, max_poses):
+    def _process_docking_assay_results(self, assay_registry, docking_mode, clean_ligand_files, max_poses):
 
         from ringtail import RingtailCore
         import os
@@ -5191,13 +5194,17 @@ quit
             rtc = RingtailCore(db_file = results_db_file, docking_mode=docking_mode )
             rtc.add_results_from_files(file_path = f"{assay_folder}/results", recursive = True, save_receptor = False, max_poses=max_poses)
             
-            if os.path.exists(results_db_file) and os.path.getsize(results_db_file) > 0:
-                for fname in os.listdir(results_folder):
-                    if fname.endswith('.dlg'):
-                        try:
-                            os.remove(os.path.join(results_folder, fname))
-                        except Exception as e:
-                            print(f"Warning: could not delete {fname}: {e}")
+            
+            ## Clean the .dlg files is requested
+            
+            if clean_ligand_files:
+                if os.path.exists(results_db_file) and os.path.getsize(results_db_file) > 0:
+                    for fname in os.listdir(results_folder):
+                        if fname.endswith('.dlg'):
+                            try:
+                                os.remove(os.path.join(results_folder, fname))
+                            except Exception as e:
+                                print(f"Warning: could not delete {fname}: {e}")
 
             return results_db_file
 
@@ -5338,3 +5345,351 @@ quit
             return None
         pass
     
+    def extract_docked_poses(self, assay=None):
+        """
+        This method will receive an assay which is optional. If not provided, query the user to select a docking assay as registered in the project_path/docking/docking_registers/docking_assays.db
+        """
+        import os
+        import sqlite3
+
+        # Path to docking assay registry
+        registry_db = os.path.join(self.path, 'docking', 'docking_registers', 'docking_assays.db')
+        if not os.path.exists(registry_db):
+            print(f"❌ Docking assay registry not found at {registry_db}")
+            return None
+
+        # Connect to registry and fetch assays
+        try:
+            conn = sqlite3.connect(registry_db)
+            cursor = conn.cursor()
+            cursor.execute("SELECT assay_id, assay_name, assay_folder_path, status FROM docking_assays")
+            assays = cursor.fetchall()
+            conn.close()
+        except Exception as e:
+            print(f"❌ Error reading docking assay registry: {e}")
+            return None
+
+        if not assays:
+            print("❌ No docking assays found in the registry.")
+            return None
+
+        # If assay is not provided, prompt user to select one
+        selected_assay = None
+        if assay is None:
+            print("\n📋 Available Docking Assays:")
+            print("=" * 60)
+            for i, (aid, name, folder, status) in enumerate(assays, 1):
+                print(f"{i}. {name} (ID: {aid}, Status: {status})\n   Folder: {folder}")
+            print("=" * 60)
+            while True:
+                try:
+                    choice = input("Select an assay by number (or press Enter to cancel): ").strip()
+                    if not choice:
+                        print("❌ Operation cancelled.")
+                        return None
+                    idx = int(choice) - 1
+                    if 0 <= idx < len(assays):
+                        selected_assay = assays[idx]
+                        break
+                    else:
+                        print("Invalid selection. Try again.")
+                except (ValueError, KeyboardInterrupt):
+                    print("❌ Operation cancelled.")
+                    return None
+        else:
+            # If assay is provided as ID or name, find it
+            for a in assays:
+                if (isinstance(assay, int) and a[0] == assay) or (isinstance(assay, str) and a[1] == assay):
+                    selected_assay = a
+                    break
+            if not selected_assay:
+                print(f"❌ Assay '{assay}' not found in registry.")
+                return None
+
+        assay_id, assay_name, assay_folder, status = selected_assay
+
+        # Locate results directory
+        results_dir = os.path.join(assay_folder, "results")
+        if not os.path.exists(results_dir):
+            print(f"❌ Results directory not found: {results_dir}")
+            return None
+
+        # Create the path were the database to be analyzed lives
+        db_path = os.path.join(results_dir, f"assay_{assay_id}.db")
+
+        ## Start the analysis
+
+        print("Select an option:")
+        print("1 - Select lowest energy poses")
+        print("2 - Select most populated poses")
+        print("3 - Select most lowest energy AND populated poses (both criteria)")
+        selection = input("Enter your choice (1, 2, or 3): ").strip()
+
+        ## Prompt the user which selection to make
+        while selection not in ("1", "2", "3"):
+            print("Invalid selection. Only 1, 2, or 3 can be selected.")
+            selection = input("Enter your choice (1, 2, or 3): ").strip()
+
+        # Act according to user selection
+        if selection == "1":
+            print("You selected: lowest energy poses")
+            # Create output directory for most stable poses
+            output_dir = os.path.join(os.path.dirname(os.path.abspath(db_path)), "most_stable_poses")
+            os.makedirs(output_dir, exist_ok=True)
+            
+            df = self._select_most_stable_poses(db_path)
+        
+        elif selection == "2":
+            print("You selected: most populated poses")
+            # Create output directory for most populated poses
+            output_dir = os.path.join(os.path.dirname(os.path.abspath(db_path)), "most_populated_poses")
+            os.makedirs(output_dir, exist_ok=True)
+            df = self._select_most_populated_poses(db_path)
+
+        elif selection == "3":
+            print("You selected: most populated AND lowest energy poses")
+            # Create output directory for most populated and stable poses
+            output_dir = os.path.join(os.path.dirname(os.path.abspath(db_path)), "most_populated_and_stable_poses")
+            os.makedirs(output_dir, exist_ok=True)
+            df = self._select_most_populated_and_stable_poses(db_path)
+
+        # Continye pprocessing the selected poses
+        for row in df.iterrows():
+            ligname = row[1]['LigName']
+            pose_id = row[1]['Pose_ID']
+            run_number = row[1]['run_number']
+            
+            input_model, pose_coords_json = self._retrieve_pose_info(db_path, pose_id)
+            pdb_dict = self._process_input_model_for_moldf(input_model, pose_coords_json)
+            self._write_pdb_with_moldf(pdb_dict, ligname, run_number, output_dir)
+
+        if selection == "1":
+            print(f"Most stable poses extracted and saved as PDB files to: \n \t {output_dir}")
+        elif selection == "2":
+            print(f"Most populated poses extracted and saved as PDB files to: \n \t {output_dir}")
+        elif selection == "3":
+            print(f"Most populated and stable poses extracted and saved as PDB files to: \n \t {output_dir}")
+
+    def _select_most_stable_poses(self, db_path):
+        """
+        Select the most stable pose (lowest docking score) for each ligand
+        from the Ringtail database located at db_path.
+        Returns a DataFrame with LigName, Pose_ID, and docking_score.
+        """
+        import sqlite3
+        import pandas as pd
+        
+        conn = sqlite3.connect(db_path)
+        query = """
+        SELECT LigName, Pose_ID, docking_score, run_number
+        FROM Results AS R1
+        WHERE docking_score = (
+            SELECT MIN(docking_score)
+            FROM Results AS R2
+            WHERE R1.LigName = R2.LigName
+        )
+        """
+        df = pd.read_sql(query, conn)
+        conn.close()
+        
+        return df
+
+    def _select_most_populated_poses(self, db_path):
+        """
+        Select the most populated pose (highest value in the 'cluster_size' column) for each ligand
+        from the Ringtail database located at db_path.
+        Returns a DataFrame with LigName, Pose_ID, and docking_score.
+        """
+
+        import sqlite3
+        import pandas as pd
+
+        conn = sqlite3.connect(db_path)
+        query = """
+        SELECT LigName, Pose_ID, cluster_size, run_number
+        FROM Results AS R1
+        WHERE cluster_size = (
+            SELECT MAX(cluster_size)
+            FROM Results AS R2
+            WHERE R1.LigName = R2.LigName
+        )
+        """
+        df = pd.read_sql(query, conn)
+        conn.close()
+        
+        return df
+
+    def _select_most_populated_and_stable_poses(self, db_path):
+        """
+        Selects the most populated and stable docking poses for each ligand from a SQLite database.
+        This method connects to the specified SQLite database, queries the 'Results' table,
+        and retrieves the pose(s) for each ligand that have the largest cluster size (most populated)
+        and the lowest docking score (most stable). The results are returned as a pandas DataFrame.
+        Args:
+            db_path (str): Path to the SQLite database file containing the docking results.
+        Returns:
+            pandas.DataFrame: A DataFrame containing the ligand name, pose ID, cluster size, docking score, and run number for the selected poses.
+        """
+
+        import sqlite3
+        import pandas as pd
+
+        conn = sqlite3.connect(db_path)
+        query = """
+        SELECT LigName, Pose_ID, cluster_size, docking_score, run_number
+        FROM Results AS R1
+        WHERE cluster_size = (
+            SELECT MAX(cluster_size)
+            FROM Results AS R2
+            WHERE R1.LigName = R2.LigName
+        )
+        AND docking_score = (
+            SELECT MIN(docking_score)
+            FROM Results AS R3
+            WHERE R1.LigName = R3.LigName
+        )
+        """
+        df = pd.read_sql(query, conn)
+        conn.close()    
+        
+        return df
+
+    def _retrieve_pose_info(self, db_path, pose_id):
+        """
+        Retrieves ligand pose information from the database for a given pose ID.
+        Connects to the specified SQLite database, queries the Ligands and Results tables
+        to obtain the input model and ligand coordinates associated with the provided pose ID.
+        Args:
+            db_path (str): Path to the SQLite database file.
+            pose_id (int or str): Identifier of the pose to retrieve.
+        Returns:
+            tuple: A tuple containing:
+                - input_model (str): The input model data for the ligand.
+                - pose_coords_json (str): JSON string of the ligand coordinates.
+        Raises:
+            sqlite3.DatabaseError: If there is an error connecting to or querying the database.
+            TypeError: If the query does not return any results.
+        """
+       
+        import sqlite3
+
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+
+        # Retrieve the info required to reconstruct the ligand pose
+        cursor.execute("""
+        SELECT L.input_model, R.ligand_coordinates FROM Ligands L
+        JOIN Results R ON L.LigName = R.LigName
+        WHERE R.Pose_ID = ?
+        """, (pose_id,))
+        row = cursor.fetchone()
+        
+        input_model, pose_coords_json = row
+        
+        return input_model, pose_coords_json
+
+
+    def _process_input_model_for_moldf(self, input_model, coords_json):
+        """
+        Processes an input molecular model and coordinates to generate a DataFrame suitable for moldf.
+        This method parses the input model (as a string representation of a list), extracts atom information,
+        replaces atomic coordinates with those provided in `coords_json`, and formats the data into a DataFrame
+        with standardized columns for molecular data. The resulting DataFrame is returned in a dictionary under
+        the key '_atom_site', suitable for use with moldf.
+        Args:
+            input_model (str): String representation of a list containing atom records. Each record can be a string
+                or a list/tuple, where the first element should be 'ATOM'.
+            coords_json (str): JSON-encoded list of new coordinates (list of [x, y, z]) to replace the original
+                coordinates in the input model.
+        Returns:
+            dict: A dictionary with a single key '_atom_site', whose value is a pandas DataFrame containing the
+                processed atom data with updated coordinates and standardized columns.
+        """
+
+        import ast
+        import pandas as pd
+        import json
+
+
+        input_model_list = ast.literal_eval(input_model)
+        atom_rows = []
+        for item in input_model_list:
+            # If item is a string, split it and check if first element is 'ATOM'
+            if isinstance(item, str):
+                parts = item.split()
+                if len(parts) > 0 and parts[0] == 'ATOM':
+                    atom_rows.append(parts)
+            # If item is a list/tuple, check if first element is 'ATOM'
+            elif isinstance(item, (list, tuple)) and len(item) > 0 and item[0] == 'ATOM':
+                atom_rows.append(item)
+        
+        
+        df = pd.DataFrame(atom_rows)
+        
+        # Rename columns using a list of column names
+        column_names = [
+            'record_name', 'atom_number', 'atom_name', 'residue_name',
+            'residue_number', 'x_coord', 'y_coord', 'z_coord',
+            'occupancy', 'b_factor', 'charge', 'element_symbol'
+        ]
+        df.columns = column_names[:len(df.columns)]
+        
+        # Insert an empty column 'alt_loc' at the fourth position (index 3)
+        df.insert(3, 'alt_loc', '')
+        df.insert(5, 'chain_id', '')
+        df.insert(7, 'insertion', '')
+        df.insert(13, 'segment_id', '')
+
+        # Move 'charge' column to the last position
+        if 'charge' in df.columns:
+            charge_col = df.pop('charge')
+            df['charge'] = charge_col
+
+        # Replace 'charge' column with empty items of type object
+        if 'charge' in df.columns:
+            df['charge'] = pd.Series([''] * len(df), dtype=object)
+
+        ## Replace the coordinates with the ones from coords_json for the given pose
+        coords_list = json.loads(coords_json)
+
+        for i, coord in enumerate(coords_list):
+            # Replace the original coordinates with the new ones corresponding to the pose
+            df.at[i, 'x_coord'] = coord[0]
+            df.at[i, 'y_coord'] = coord[1]
+            df.at[i, 'z_coord'] = coord[2]  
+
+            # Attempt to convert columns to appropriate types
+        for col in df.columns:
+            # Try to convert to int, then float, else keep as string
+            try:
+                df[col] = df[col].astype(int)
+            except ValueError:
+                try:
+                    df[col] = df[col].astype(float)
+                except ValueError:
+                    pass
+
+        # Return as dictionary for moldf
+        return {'_atom_site': df}
+
+    def _write_pdb_with_moldf(self,pdb_dict, ligname, run_number, output_dir):
+        """
+        Writes a PDB file using the provided molecular data dictionary and saves it to the specified output directory.
+
+        Args:
+            pdb_dict (dict): Dictionary containing the molecular structure data to be written to the PDB file.
+            ligname (str): Name of the ligand, used as part of the output filename.
+            run_number (int or str): Identifier for the run, used as part of the output filename.
+            output_dir (str): Directory path where the output PDB file will be saved.
+
+        Returns:
+            None
+
+        Side Effects:
+            Creates a PDB file in the specified output directory with a filename formatted as "{ligname}_{run_number}.pdb".
+        """
+        from moldf import write_pdb
+        import os
+
+        output_file = os.path.join(output_dir, f"{ligname}_{run_number}.pdb")
+        write_pdb(pdb_dict, output_file)
