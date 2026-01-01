@@ -458,14 +458,41 @@ class MolDock:
                 
             elif engine_name == 'Vina':
                 # AutoDock Vina specific parameters
+                
+                parameters['sf_name'] = self._get_parameter_choice(
+                    "Scoring function name to use",
+                    ['vina', 'ad4'],
+                    default='vina'
+                )
+
+                parameters['cpu'] = self._get_parameter_integer(
+                    "Number of CPU to use (default: 0; use all of them)",
+                    default=0, min_val=0, max_val=64
+                )
+                
                 parameters['exhaustiveness'] = self._get_parameter_integer(
-                    "Search exhaustiveness",
+                    "Search exhaustiveness (1-32)",
                     default=8, min_val=1, max_val=32
                 )
                 
+                parameters['n_poses'] = self._get_parameter_integer(
+                    "Number of poses to generate in MC search (1-100)",
+                    default=20, min_val=1, max_val=100
+                )
+
+                parameters['min_rmsd'] = self._get_parameter_float(
+                    "minimum RMSD difference between poses in MC search (0.1-3)",
+                    default=1, min_val=0.1, max_val=3
+                )
+
                 parameters['num_modes'] = self._get_parameter_integer(
                     "Number of binding modes to return",
                     default=9, min_val=1, max_val=20
+                )
+
+                parameters['max_evals'] = self._get_parameter_integer(
+                    "Maximum number of evaluations in MC search (default: 0; use heuristics rules)",
+                    default=0, min_val=0, max_val=10000000
                 )
                 
                 parameters['energy_range'] = self._get_parameter_float(
@@ -478,13 +505,15 @@ class MolDock:
                     default=0, min_val=0, max_val=64
                 )
             
-                # Common parameters for all engines
-                parameters['scoring_function'] = self._get_parameter_choice(
-                    "Scoring function",
-                    ['vina', 'ad4'],
-                    default='vina'
+                parameters['n_poses'] = self._get_parameter_integer(
+                    "Number of poses to write in output",
+                    default=9, min_val=1, max_val=100
                 )
-            
+
+                parameters['energy_range'] = self._get_parameter_float(
+                    "Maximum energy difference from best pose (kcal/mol)",
+                    default=3, min_val=0.1, max_val=10.0
+                )
             
             return parameters if parameters else None
             
