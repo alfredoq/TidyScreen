@@ -695,7 +695,7 @@ class MolDock:
             print(f"🧬 MOLDOCK - Table and Method Selection for Docking")
             print("=" * 70)
             
-            # Step 1: Select docking method first
+            # Step 1: Select docking method first and return a dictionary of method parameters (selected_method)
             selected_method = self._select_docking_method()
             
             if not selected_method:
@@ -885,6 +885,13 @@ class MolDock:
 
                             # Set the 'docking_mode' variable for Ringtail processing
                             docking_mode = 'dlg'
+
+                        ## Dock using Vina if selected    
+                        elif selected_method['docking_engine'] == 'Vina':
+                            self._dock_table_with_vina(selected_table, selected_method, assay_registry, clean_ligand_files)
+
+                            # Set the 'docking_mode' variable for Ringtail processing
+                            docking_mode = 'vina'
 
 
                         ## After the docking run has been completed, execute the corresponding analysis
@@ -4919,8 +4926,49 @@ quit
         
     def _dock_table_with_autodockgpu(self, selected_table, selected_method, assay_registry, clean_ligand_files):
         """
-        Will iterate through the compounds in the selected table and perform docking using AutoDockGPU. A first step consists of retrieving the molecule stored in the sdf_blob column of the compounds table and writing it to a temporary .pdbqt file using Meeko. Then, AutoDockGPU will be called with the appropriate parameters to perform the docking against the receptor and grid files specified in the selected_method dictionary.
+        Perform molecular docking of compounds using AutoDockGPU.
+        This method iterates through compounds stored in a database table and performs
+        docking simulations against a specified receptor using AutoDockGPU. The workflow
+        includes:
+        1. Retrieving molecular structures from the sdf_blob column
+        2. Converting molecules to PDBQT format using Meeko
+        3. Executing AutoDockGPU with configured parameters
+        4. Optionally cleaning up temporary files
+        Parameters
+        ----------
+        selected_table : str
+            The name of the database table containing compounds to dock.
+            Expected to have columns: inchi_key and sdf_blob.
+        selected_method : dict
+            Configuration dictionary containing:
+            - 'parameters' (dict): AutoDockGPU parameters (e.g., exhaustiveness, number of modes)
+            - 'ligand_prep_params' (dict): Meeko ligand preparation parameters
+        assay_registry : dict
+            Registry dictionary containing:
+            - 'assay_folder_path' (str): Base directory for assay results and intermediate files
+        clean_ligand_files : bool
+            If True, removes temporary SDF and PDBQT files after successful docking.
+            If False, retains all intermediate files for inspection.
+        Returns
+        -------
+        None
+            Results are written to disk in the assay results directory.
+        Notes
+        -----
+        - Requires receptor PDBQT and grid field files (.fld) to be pre-processed
+        - Displays progress using tqdm if available, otherwise prints status every 100 compounds
+        - Errors in individual compound docking are caught and logged; processing continues
+        - Output PDBQT files are named using inchi_key for compound identification
+        Raises
+        ------
+        No exceptions are raised; errors are logged to console and processing continues.
+        Warnings
+        --------
+        - If no receptor PDBQT file is found, the method returns early without docking
+        - If no receptor grid field file is found, the method returns early without docking
+        - If no compounds with SDF blobs are found, the method returns early
         """
+        
         import sqlite3
         import tempfile
         import os
@@ -5094,6 +5142,95 @@ quit
             except KeyboardInterrupt:
                 print("\n❌ Receptor selection cancelled.")
                 return None
+    
+    def _get_receptor_conditions(self, receptor_id):
+        """
+        Retrieve receptor configuration and metadata from the receptors database.
+        This method queries the receptors.db SQLite database located in the project's
+        docking/receptors directory to fetch detailed information about a specific receptor
+        based on its unique identifier.
+        Args:
+            receptor_id: The unique identifier (int or str) of the receptor to retrieve.
+        Returns:
+            dict or None: A dictionary containing receptor information with the following keys:
+                - id (int): Unique receptor identifier
+                - pdb_id (str): PDB identifier code
+                - pdb_name (str): Human-readable receptor name
+                - pdb_to_convert (str): Path to the PDB file requiring conversion
+                - pdbqt_file (str): Path to the converted PDBQT file
+                - configs (dict or None): Parsed JSON configuration object, or None if invalid/absent
+                - notes (str): Additional notes or comments about the receptor
+                - created_date (str): Timestamp of receptor record creation
+            Returns None if:
+                - The receptors database file does not exist
+                - No receptor with the given ID is found
+                - An error occurs during database query execution
+        Raises:
+            Catches and handles sqlite3 and json.JSONDecodeError exceptions internally,
+            printing error messages to stdout.
+        Side Effects:
+            Prints status messages to stdout:
+            - ❌ Error message if database not found
+            - ❌ Error message if receptor not found
+            - ⚠️  Warning if JSON config parsing fails
+            - ❌ Error message if database query fails
+        Note:
+            The configs field contains JSON-serialized configuration data. Malformed
+            JSON is logged as a warning but does not raise an exception.
+        """ 
+        
+    
+        import sqlite3
+        import json
+        
+        receptors_db_path = os.path.join(self.path, 'docking', 'receptors', 'receptors.db')
+        
+        if not os.path.exists(receptors_db_path):
+            print(f"❌ No receptors database found at {receptors_db_path}")
+            
+            return None
+        
+        try:
+            conn = sqlite3.connect(receptors_db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT id, pdb_id, pdb_name, pdb_to_convert, pdbqt_file, configs, notes, created_date
+                FROM receptor_registers
+                WHERE id = ?
+            ''', (receptor_id,))
+            
+            receptor = cursor.fetchone()
+            conn.close()
+            
+            if not receptor:
+                print(f"❌ No receptor found with ID: {receptor_id}")
+                return None
+            
+            # Parse configs JSON if present
+            configs = None
+            if receptor[5]:
+                try:
+                    configs = json.loads(receptor[5])
+                except json.JSONDecodeError:
+                    print(f"⚠️  Warning: Could not parse configs for receptor ID {receptor_id}")
+                    configs = None
+            
+            # Return as dictionary
+            return {
+                'id': receptor[0],
+                'pdb_id': receptor[1],
+                'pdb_name': receptor[2],
+                'pdb_to_convert': receptor[3],
+                'pdbqt_file': receptor[4],
+                'configs': configs,
+                'notes': receptor[6],
+                'created_date': receptor[7]
+            }
+            
+        except Exception as e:
+            print(f"❌ Error retrieving receptor conditions: {e}")
+            return None
         
     def _mol_from_sdf(self, sdf_file: str):
             """
@@ -5617,7 +5754,6 @@ quit
         
         return input_model, pose_coords_json
 
-
     def _process_input_model_for_moldf(self, input_model, coords_json):
         """
         Processes an input molecular model and coordinates to generate a DataFrame suitable for moldf.
@@ -5722,3 +5858,215 @@ quit
 
         output_file = os.path.join(output_dir, f"{ligname}_{run_number}.pdb")
         write_pdb(pdb_dict, output_file)
+
+    def _dock_table_with_vina(self, selected_table, selected_method, assay_registry, clean_ligand_files):
+        
+        """
+        Perform molecular docking of compounds using Vina.
+        This method iterates through compounds stored in a database table and performs
+        docking simulations against a specified receptor using Vina. The workflow
+        includes:
+        1. Retrieving molecular structures from the sdf_blob column
+        2. Converting molecules to PDBQT format using Meeko
+
+        """
+
+        import sqlite3
+        import tempfile
+        import os
+        import subprocess
+        from meeko import MoleculePreparation
+        from rdkit import Chem
+
+        # Try to import tqdm for progress bar
+        try:
+            from tqdm import tqdm
+            TQDM_AVAILABLE = True
+        except ImportError:
+            TQDM_AVAILABLE = False
+
+        print(f"\n🚀 Starting docking with AutoDockGPU for table: {selected_table}")
+
+
+        # Retrieve docking method parameters
+        method_params = selected_method.get('parameters', {})
+        
+        # Retrieve ligand preparation params
+        ligand_prep_params = selected_method.get('ligand_prep_params', {})
+        
+        # Select the receptor to be used for docking
+        selected_receptor = self._select_receptor_from_db()
+        receptor_conditions = self._get_receptor_conditions(selected_receptor.get('id', None))
+        receptor_main_path = self.__receptor_path + f"/{selected_receptor.get('pdb_name', None)}"
+        receptor_pdbqt_file = receptor_main_path + f"/processed/receptor_checked.pdbqt"
+        fld_file = receptor_main_path + f"/grid_files/receptor_checked.maps.fld"
+        assay_folder = assay_registry['assay_folder_path']
+    
+        if not receptor_pdbqt_file:
+            print("❌ No receptor .pdbqt file found.")
+            return
+        
+        if not fld_file:
+            print("❌ No receptor .maps.fld file found.")
+            return
+            
+        # Connect to chemspace database and get compounds
+        try:
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            cursor.execute(f"SELECT inchi_key, sdf_blob FROM {selected_table} WHERE sdf_blob IS NOT NULL")
+            compounds = cursor.fetchall()
+            conn.close()
+        except Exception as e:
+            print(f"❌ Error retrieving compounds from table: {e}")
+            return
+
+        if not compounds:
+            print("❌ No compounds with SDF blobs found in the selected table.")
+            return
+
+        print(f"🧪 {len(compounds)} compounds to dock.")
+
+        # Prepare output directory for docking results
+        docking_results_dir = f"{assay_folder}/results"
+
+        # Progress bar setup
+        progress_bar = None
+        if TQDM_AVAILABLE:
+            progress_bar = tqdm(total=len(compounds), desc="Docking compounds", unit="ligand")
+
+
+        ## If 'vina' scoring function is to be applied, compute the maps once for batch docking
+        if method_params['sf_name'] == 'vina':          
+            vina_rec_object = self._prepare_vina_receptor(method_params, receptor_pdbqt_file, receptor_conditions)
+
+        # Iterate and dock each compound
+        for idx, (inchi_key, sdf_blob) in enumerate(compounds, 1):
+            try:
+                # Write SDF blob to temp file
+                # Use inchi_key as the temporary file name for the SDF
+                sdf_filepath = f"{assay_folder}/results/{inchi_key}.sdf"
+                
+                with open(sdf_filepath, "wb") as sdf_temp:
+                    sdf_temp.write(sdf_blob)
+                
+                # Create an RDKit mol object from a sdf file
+                mol = self._mol_from_sdf(sdf_filepath)
+                
+                ## Generate the ligand.pdbqt file
+                ligand_pdbqt_filepath = f"{docking_results_dir}/{inchi_key}.pdbqt"
+                self._pdbqt_from_mol(mol, ligand_pdbqt_filepath, inchi_key, ligand_prep_params)
+
+                ## Execute vina
+                self._execute_vina(ligand_pdbqt_filepath, assay_registry, method_params, receptor_pdbqt_file, receptor_conditions, vina_rec_object=None)
+                
+                if clean_ligand_files:
+                    # Remove the temporary SDF and .pdbqt files
+                    os.remove(sdf_filepath)
+                    os.remove(ligand_pdbqt_filepath)
+
+            except Exception as e:
+                print(f"   ❌ Error docking compound {inchi_key}: {e}")
+                continue
+
+            if progress_bar:
+                progress_bar.update(1)
+            elif idx % 100 == 0:
+                print(f"   Docked {idx} compounds...")
+
+        if progress_bar:
+            progress_bar.close()
+
+        print(f"\n🎉 Docking completed for table: {selected_table}")
+        print(f"Results saved in: {docking_results_dir}")
+    
+    def _prepare_vina_receptor(self, method_params, receptor_pdbqt_file, receptor_conditions):
+        
+        from vina import Vina
+        
+        vina_rec_object = Vina(sf_name=method_params['sf_name'])
+        
+        vina_rec_object.set_receptor(receptor_pdbqt_file)
+        
+        box_center = [receptor_conditions['configs']['center']['x'], receptor_conditions['configs']['center']['y'], receptor_conditions['configs']['center']['z']]
+        
+        box_size = [receptor_conditions['configs']['size']['x'], receptor_conditions['configs']['size']['y'], receptor_conditions['configs']['size']['z']]
+
+        vina_rec_object.compute_vina_maps(center=box_center, box_size=box_size)        
+        
+        return vina_rec_object
+    
+    
+    def _execute_vina(self, ligand_pdbqt_filepath, assay_registry, method_params, receptor_pdbqt_file, receptor_conditions, vina_rec_object):
+        """
+        Execute molecular docking using AutoDock Vina with specified scoring function.
+        This method performs batch docking of a ligand against a receptor using either
+        the 'vina' or 'ad4' (AutoDock 4) scoring functions. It handles ligand preparation,
+        docking execution, and output file generation.
+        Parameters
+        ----------
+        ligand_pdbqt_filepath : str
+            Full file path to the ligand PDBQT file to be docked.
+        assay_registry : dict or object
+            Registry containing assay-related information and metadata.
+        method_params : dict
+            Dictionary containing docking method parameters:
+            - 'sf_name' : str
+                Scoring function name ('vina' or 'ad4').
+            - 'exhaustiveness' : int
+                Exhaustiveness parameter for docking search space exploration.
+            - 'n_poses' : int
+                Number of output poses to generate.
+        receptor_pdbqt_file : str
+            File path to the receptor PDBQT file.
+        receptor_conditions : dict
+            Dictionary containing receptor-related conditions:
+            - 'pdbqt_file' : str
+                Path to the processed receptor PDBQT file.
+        vina_rec_object : Vina or None
+            Pre-initialized Vina object for 'vina' scoring function, or None for 'ad4'.
+        Returns
+        -------
+        None
+            Results are written to output PDBQT files (ligand_*_out.pdbqt).
+        Notes
+        -----
+        - For 'vina' scoring function: Uses pre-loaded receptor maps from vina_rec_object.
+        - For 'ad4' scoring function: Initializes new Vina object and loads affinity maps
+          from the grid_files directory.
+        - Output files are generated with '_out.pdbqt' suffix, replacing '.pdbqt' in
+          the original ligand filename.
+        - Existing output files are overwritten if they exist.
+        """
+        
+
+        from vina import Vina
+        
+        ## This will apply batch docking using the 'vina' scoring function
+        if method_params['sf_name'] == 'vina' and vina_rec_object is not None:
+
+            vina_rec_object.set_ligand_from_file(ligand_pdbqt_filepath)
+
+            vina_rec_object.dock(exhaustiveness=method_params['exhaustiveness'], n_poses=method_params['n_poses'])
+
+            results_file = ligand_pdbqt_filepath.replace('.pdbqt', '_out.pdbqt')
+
+            vina_rec_object.write_poses(results_file, n_poses=method_params['n_poses'], overwrite=True)
+
+    
+        # This will apply docking using the 'ad4' scoring function
+        elif method_params['sf_name'] == 'ad4':
+            
+            vina_rec_object = Vina(method_params['sf_name'])
+            
+            # Determine the grids files path using the receptor file as reference and load affinity maps for docking
+            grid_maps_path = receptor_conditions['pdbqt_file'].replace('processed/receptor_checked.pdbqt', 'grid_files/receptor_checked')
+            vina_rec_object.load_maps(grid_maps_path)
+            
+            vina_rec_object.set_ligand_from_file(ligand_pdbqt_filepath)
+            
+            vina_rec_object.dock(exhaustiveness=method_params['exhaustiveness'], n_poses=method_params['n_poses'])
+            
+            results_file = ligand_pdbqt_filepath.replace('.pdbqt', '_out.pdbqt')
+
+            vina_rec_object.write_poses(results_file, n_poses=method_params['n_poses'], overwrite=True)
