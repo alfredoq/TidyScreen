@@ -841,8 +841,6 @@ class ChemSpace:
             # Parse the df to check columns and information
             df = self._parse_df_from_csv_file(df, smiles_column, name_column, flag_column)
             
-            print(df)
-            
             # Validate required columns (only SMILES is mandatory)
             if smiles_column not in df.columns:
                 return {
@@ -2068,25 +2066,63 @@ class ChemSpace:
         
         print("="*80)
     
-    def create_table_from_sql(self, sql_query: str, 
-                             source_db_path: str,
-                             clean_files = True):
+    def create_table_from_sql(self, sql_query: Optional[str] = None, 
+                         source_db_path: Optional[str] = None,
+                         clean_files: bool = True,
+                         dry_run: bool = False):
         """
         Create a molecules table in the chemspace database from an SQL query executed on an external database.
         
         Args:
-            sql_query (str): SQL SELECT query to execute on the source database
-            source_db_path (str): Path to the source SQLite database file
-            target_table_name (str): Name for the new table in the chemspace database
-            smiles_column (str): Name of the column containing SMILES strings
-            name_column (Optional[str]): Name of the column containing compound names. If None or not found, fills with "nd"
-            flag_column (Optional[str]): Name of the column containing flags. If None or not found, fills with "nd"
-            compute_inchi (bool): Whether to automatically compute InChI keys after loading
+            sql_query (Optional[str]): SQL SELECT query to execute on the source database.
+                If not provided, will be prompted from user input.
+            source_db_path (Optional[str]): Path to the source SQLite database file.
+                If not provided, will be prompted from user input.
+            clean_files (bool): Whether to remove temporary files after loading. Default is True.
             
         Returns:
             dict: Results containing success status, counts, and messages
         """
+    
         try:
+            
+            # Prompt for sql_query if not provided
+            if sql_query is None:
+                print("📝 Please enter your SQL SELECT query:")
+                print("💡 Example: SELECT smiles, name, flag FROM compounds LIMIT 100")
+                print("   (Press Enter twice when done)")
+                lines = []
+                while True:
+                    line = input()
+                    if line:
+                        lines.append(line)
+                    else:
+                        if lines:
+                            break
+                sql_query = " ".join(lines).strip()
+                
+                if not sql_query:
+                    return {
+                        'success': False,
+                        'message': "No SQL query provided",
+                        'compounds_added': 0,
+                        'duplicates_skipped': 0,
+                        'errors': 1,
+                        'inchi_keys_computed': 0
+                    }
+            
+            # Prompt for source_db_path if not provided
+            if source_db_path is None:
+                user_input = input("🗄️  Enter the path to the source database file (press Enter for default: chemspace.db): ").strip()
+                
+                if user_input:
+                    # User provided a path
+                    source_db_path = user_input
+                else:
+                    # User pressed Enter without input, use default path
+                    source_db_path = os.path.join(self.path, 'chemspace', 'processed_data', 'chemspace.db')
+                    print(f"📂 Using default source database: {source_db_path}")
+            
             # Validate source database exists
             if not os.path.exists(source_db_path):
                 return {
@@ -2118,17 +2154,29 @@ class ChemSpace:
                     'inchi_keys_computed': 0
                 }
             
-            ## Write the df to a tempory dataframe for further loading
-            temp_csv_file = os.path.join(self.path, 'chemspace/processed_data', 'temp_csv.db')
             
-            df.to_csv(temp_csv_file, header=True, index=False)
+            ## If dry_run is false, store the query the db
+            if not dry_run:
             
-            # Use the standar method to load the generated .csv file
-            result = self.load_csv_file(temp_csv_file)
-            
-            if clean_files: 
-                # After loading the .csv file remove it if requested
-                os.remove(temp_csv_file)
+                ## Write the df to a tempory dataframe for further loading
+                temp_csv_file = os.path.join(self.path, 'chemspace/processed_data', 'temp_csv.db')
+                
+                df.to_csv(temp_csv_file, header=True, index=False)
+                
+                # Use the standard method to load the generated .csv file
+                result = self.load_csv_file(temp_csv_file)
+                
+                # Register the SQL query in the chemspace.db
+                target_table_name = result['table_name']
+                self._register_sql_operation(sql_query, source_db_path, target_table_name, result)                
+                
+                if clean_files: 
+                    # After loading the .csv file remove it if requested
+                    os.remove(temp_csv_file)
+                    
+            else:
+                # If a dry_run is requested, just print the query df
+                print(df)
             
         except Exception as e:
             print(f"Error loading table from sql: {e}")
@@ -2151,47 +2199,47 @@ class ChemSpace:
             
             return error_result
     
-    def execute_custom_query(self, sql_query: str, 
-                           source_db_path: Optional[str] = None) -> pd.DataFrame:
-        """
-        Execute a custom SQL query on either the chemspace database or an external database.
+    # def execute_custom_query(self, sql_query: str, 
+    #                        source_db_path: Optional[str] = None) -> pd.DataFrame:
+    #     """
+    #     Execute a custom SQL query on either the chemspace database or an external database.
         
-        Args:
-            sql_query (str): SQL query to execute
-            source_db_path (Optional[str]): Path to external database. If None, uses chemspace database
+    #     Args:
+    #         sql_query (str): SQL query to execute
+    #         source_db_path (Optional[str]): Path to external database. If None, uses chemspace database
             
-        Returns:
-            pd.DataFrame: Query results as DataFrame, empty DataFrame if error occurs
-        """
-        try:
-            # Determine which database to use
-            db_path = source_db_path if source_db_path else self.__chemspace_db
+    #     Returns:
+    #         pd.DataFrame: Query results as DataFrame, empty DataFrame if error occurs
+    #     """
+    #     try:
+    #         # Determine which database to use
+    #         db_path = source_db_path if source_db_path else self.__chemspace_db
             
-            if not os.path.exists(db_path):
-                print(f"❌ Database not found: {db_path}")
-                return pd.DataFrame()
+    #         if not os.path.exists(db_path):
+    #             print(f"❌ Database not found: {db_path}")
+    #             return pd.DataFrame()
             
-            print(f"📊 Executing custom query on: {db_path}")
-            print(f"🔍 Query: {sql_query}")
+    #         print(f"📊 Executing custom query on: {db_path}")
+    #         print(f"🔍 Query: {sql_query}")
             
-            # Connect to database and execute query
-            conn = sqlite3.connect(db_path)
+    #         # Connect to database and execute query
+    #         conn = sqlite3.connect(db_path)
             
-            try:
-                df = pd.read_sql_query(sql_query, conn)
-                conn.close()
+    #         try:
+    #             df = pd.read_sql_query(sql_query, conn)
+    #             conn.close()
                 
-                print(f"✅ Query executed successfully, returned {len(df)} rows")
-                return df
+    #             print(f"✅ Query executed successfully, returned {len(df)} rows")
+    #             return df
                 
-            except Exception as e:
-                conn.close()
-                print(f"❌ Error executing query: {e}")
-                return pd.DataFrame()
+    #         except Exception as e:
+    #             conn.close()
+    #             print(f"❌ Error executing query: {e}")
+    #             return pd.DataFrame()
             
-        except Exception as e:
-            print(f"❌ Error with custom query execution: {e}")
-            return pd.DataFrame()
+    #     except Exception as e:
+    #         print(f"❌ Error with custom query execution: {e}")
+    #         return pd.DataFrame()
     
     def _process_csv_parallel(self, df: pd.DataFrame, table_name: str,
                              smiles_column: str, name_column: Optional[str], flag_column: Optional[str],
@@ -3767,6 +3815,7 @@ class ChemSpace:
                     try:
                         smiles = compound['smiles']
                         name = compound.get('name', f'compound_{compound.get("id", "")}')
+                        id = compound.get('id', f'compound_{compound.get("id", "")}')
                         
                         mol = Chem.MolFromSmiles(smiles)
                         if mol is None:
@@ -3774,7 +3823,7 @@ class ChemSpace:
                             continue
                         
                         mols.append(mol)
-                        legends.append(name[:20])  # Truncate long names
+                        legends.append(f"{name[:20]} \n id: {str(id)}")  # Truncate long names
                         
                         # Prepare highlighting
                         highlight_atoms = []
