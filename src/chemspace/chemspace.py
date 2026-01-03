@@ -784,6 +784,7 @@ class ChemSpace:
                 table_name = custom_name
             else:
                 table_name = default_table_name
+            
             # Sanitize table name for SQLite (remove special characters, ensure it starts with letter)
             table_name = self._sanitize_table_name(table_name)
 
@@ -950,6 +951,7 @@ class ChemSpace:
                     result['inchi_keys_computed'] = 0
             
             result['table_name'] = table_name
+            
             return result
             
         except Exception as e:
@@ -2068,11 +2070,7 @@ class ChemSpace:
     
     def create_table_from_sql(self, sql_query: str, 
                              source_db_path: str,
-                             target_table_name: str,
-                             smiles_column: str = 'smiles',
-                             name_column: Optional[str] = 'name', 
-                             flag_column: Optional[str] = 'flag',
-                             compute_inchi: bool = True) -> Dict[str, Any]:
+                             clean_files = True):
         """
         Create a molecules table in the chemspace database from an SQL query executed on an external database.
         
@@ -2100,11 +2098,7 @@ class ChemSpace:
                     'inchi_keys_computed': 0
                 }
             
-            # Sanitize target table name
-            target_table_name = self._sanitize_table_name(target_table_name)
-            
             print(f"📊 Executing SQL query on source database: {source_db_path}")
-            print(f"📋 Target table: {target_table_name}")
             print(f"🔍 Query: {sql_query}")
             
             # Connect to source database and execute query
@@ -2124,124 +2118,21 @@ class ChemSpace:
                     'inchi_keys_computed': 0
                 }
             
-            if df.empty:
-                return {
-                    'success': False,
-                    'message': "SQL query returned no results",
-                    'compounds_added': 0,
-                    'duplicates_skipped': 0,
-                    'errors': 1,
-                    'inchi_keys_computed': 0
-                }
+            ## Write the df to a tempory dataframe for further loading
+            temp_csv_file = os.path.join(self.path, 'chemspace/processed_data', 'temp_csv.db')
             
-            print(f"📊 Query returned {len(df)} rows")
+            df.to_csv(temp_csv_file, header=True, index=False)
             
-            # Validate required columns exist in query result (only SMILES is mandatory)
-            if smiles_column not in df.columns:
-                return {
-                    'success': False,
-                    'message': f"Query result missing required SMILES column: {smiles_column}. Available columns: {list(df.columns)}",
-                    'compounds_added': 0,
-                    'duplicates_skipped': 0,
-                    'errors': 1,
-                    'inchi_keys_computed': 0
-                }
+            # Use the standar method to load the generated .csv file
+            result = self.load_csv_file(temp_csv_file)
             
-            # Check if optional columns exist and warn if they don't
-            name_available = name_column and name_column in df.columns
-            flag_available = flag_column and flag_column in df.columns
-            
-            if not name_available:
-                print(f"⚠️  Name column '{name_column}' not found in query result. Will use 'nd' as default.")
-            if not flag_available:
-                print(f"⚠️  Flag column '{flag_column}' not found in query result. Will use 'nd' as default.")
-            
-            # Create target table in chemspace database
-            if not self._create_compounds_table(target_table_name):
-                return {
-                    'success': False,
-                    'message': f"Failed to create target table '{target_table_name}'",
-                    'compounds_added': 0,
-                    'duplicates_skipped': 0,
-                    'errors': 1,
-                    'inchi_keys_computed': 0
-                }
-            
-            # Prepare data for insertion
-            compounds_data = []
-            skipped_rows = 0
-            
-            for _, row in df.iterrows():
-                smiles = str(row[smiles_column]).strip()
-                name = str(row[name_column]).strip()
-                flag = str(row.get(flag_column, '')).strip() if flag_column in df.columns else ''
-                
-                # Skip empty or invalid rows
-                if not smiles or not name or smiles.lower() in ['nan', 'none', '']:
-                    skipped_rows += 1
-                    continue
-                
-                compounds_data.append((smiles, name, flag))
-            
-            if skipped_rows > 0:
-                print(f"⚠️  Skipped {skipped_rows} rows with missing/invalid data")
-            
-            if not compounds_data:
-                return {
-                    'success': False,
-                    'message': "No valid compound data found in query results",
-                    'compounds_added': 0,
-                    'duplicates_skipped': 0,
-                    'errors': 1,
-                    'inchi_keys_computed': 0
-                }
-            
-            # Insert compounds into chemspace database
-            result = self._insert_compounds(compounds_data, target_table_name, skip_duplicates=True)
-            
-            if result['success']:
-                self._compounds_loaded = True
-                table_count = self.get_compound_count(table_name=target_table_name)
-                
-                print(f"✅ Successfully created table '{target_table_name}' from SQL query")
-                print(f"   📊 Compounds added: {result['compounds_added']}")
-                print(f"   🔄 Duplicates skipped: {result['duplicates_skipped']}")
-                print(f"   ❌ Errors: {result['errors']}")
-                print(f"   📈 Total compounds in table: {table_count}")
-                
-                # Automatically compute InChI keys if requested
-                if compute_inchi and result['compounds_added'] > 0:
-                    print(f"\n🧪 Computing InChI keys for imported compounds...")
-                    try:
-                        inchi_df = self.compute_inchi_keys(target_table_name, update_database=True)
-                        if not inchi_df.empty:
-                            # Count successful InChI computations
-                            valid_inchi_count = len(inchi_df[
-                                (inchi_df['inchi_key'].notna()) & 
-                                (~inchi_df['inchi_key'].isin(['INVALID_SMILES', 'ERROR']))
-                            ])
-                            result['inchi_keys_computed'] = valid_inchi_count
-                            print(f"   🔬 InChI keys computed: {valid_inchi_count}")
-                        else:
-                            result['inchi_keys_computed'] = 0
-                            print(f"   ⚠️  No InChI keys computed")
-                    except Exception as inchi_error:
-                        print(f"   ⚠️  Warning: InChI key computation failed: {inchi_error}")
-                        result['inchi_keys_computed'] = 0
-                else:
-                    result['inchi_keys_computed'] = 0
-            
-            result['table_name'] = target_table_name
-            result['source_database'] = source_db_path
-            result['rows_processed'] = len(df)
-            result['rows_skipped'] = skipped_rows
-            
-            # Register the SQL operation
-            self._register_sql_operation(sql_query, source_db_path, target_table_name, result)
-            
-            return result
+            if clean_files: 
+                # After loading the .csv file remove it if requested
+                os.remove(temp_csv_file)
             
         except Exception as e:
+            print(f"Error loading table from sql: {e}")
+            
             error_result = {
                 'success': False,
                 'message': f"Error creating table from SQL query: {e}",
@@ -2253,9 +2144,10 @@ class ChemSpace:
             
             # Register the failed SQL operation
             try:
+                target_table_name = result['table_name']
                 self._register_sql_operation(sql_query, source_db_path, target_table_name, error_result)
-            except:
-                pass  # Don't fail if registration fails
+            except Exception as e:
+                print(f"Error registering the table creation process: {e}")
             
             return error_result
     
