@@ -2199,48 +2199,6 @@ class ChemSpace:
             
             return error_result
     
-    # def execute_custom_query(self, sql_query: str, 
-    #                        source_db_path: Optional[str] = None) -> pd.DataFrame:
-    #     """
-    #     Execute a custom SQL query on either the chemspace database or an external database.
-        
-    #     Args:
-    #         sql_query (str): SQL query to execute
-    #         source_db_path (Optional[str]): Path to external database. If None, uses chemspace database
-            
-    #     Returns:
-    #         pd.DataFrame: Query results as DataFrame, empty DataFrame if error occurs
-    #     """
-    #     try:
-    #         # Determine which database to use
-    #         db_path = source_db_path if source_db_path else self.__chemspace_db
-            
-    #         if not os.path.exists(db_path):
-    #             print(f"❌ Database not found: {db_path}")
-    #             return pd.DataFrame()
-            
-    #         print(f"📊 Executing custom query on: {db_path}")
-    #         print(f"🔍 Query: {sql_query}")
-            
-    #         # Connect to database and execute query
-    #         conn = sqlite3.connect(db_path)
-            
-    #         try:
-    #             df = pd.read_sql_query(sql_query, conn)
-    #             conn.close()
-                
-    #             print(f"✅ Query executed successfully, returned {len(df)} rows")
-    #             return df
-                
-    #         except Exception as e:
-    #             conn.close()
-    #             print(f"❌ Error executing query: {e}")
-    #             return pd.DataFrame()
-            
-    #     except Exception as e:
-    #         print(f"❌ Error with custom query execution: {e}")
-    #         return pd.DataFrame()
-    
     def _process_csv_parallel(self, df: pd.DataFrame, table_name: str,
                              smiles_column: str, name_column: Optional[str], flag_column: Optional[str],
                              name_available: bool, flag_available: bool, skip_duplicates: bool,
@@ -13330,4 +13288,312 @@ class ChemSpace:
             return False
         
 
-        
+    def subset_table(self):
+
+        """
+        Will query the user for a table to subset, the it whill show the columns in the table and query the column to use as criteria    for subseting. Then an infinite loop is created querying the user for filtering values until a -1 is entered. When finishing the addition of values, the user is queried for a table name in which to store the filtered values and the corresponding table is written to the chemspace.db
+        """
+        try:
+            # Get available tables
+            available_tables = self.get_all_tables()
+            
+            if not available_tables:
+                print("❌ No tables available in chemspace database")
+                return
+            
+            # Interactive table selection
+            print(f"\n🔍 TABLE SUBSETTING")
+            print("=" * 70)
+            print("Select a table to subset:")
+            print("-" * 70)
+            
+            table_info = []
+            for i, table_name in enumerate(available_tables, 1):
+                try:
+                    compound_count = self.get_compound_count(table_name=table_name)
+                    print(f"{i:3d}. {table_name:<35} ({compound_count:>6,} compounds)")
+                    table_info.append({
+                        'index': i,
+                        'name': table_name,
+                        'count': compound_count
+                    })
+                except Exception as e:
+                    print(f"{i:3d}. {table_name:<35} (Error: {e})")
+                    table_info.append({
+                        'index': i,
+                        'name': table_name,
+                        'count': 0,
+                        'error': str(e)
+                    })
+            
+            print("-" * 70)
+            
+            # Get table selection from user
+            while True:
+                try:
+                    selection = input("Select table (number or name, or 'cancel'): ").strip()
+                    
+                    if selection.lower() in ['cancel', 'quit', 'exit']:
+                        print("❌ Table subsetting cancelled")
+                        return
+                    
+                    # Try as number
+                    try:
+                        table_idx = int(selection) - 1
+                        if 0 <= table_idx < len(available_tables):
+                            selected_table = available_tables[table_idx]
+                            break
+                        else:
+                            print(f"❌ Invalid selection. Please enter 1-{len(available_tables)}")
+                            continue
+                    except ValueError:
+                        # Try as table name
+                        matching_tables = [t for t in available_tables if t.lower() == selection.lower()]
+                        if matching_tables:
+                            selected_table = matching_tables[0]
+                            break
+                        else:
+                            print(f"❌ Table '{selection}' not found")
+                            continue
+                except KeyboardInterrupt:
+                    print("\n❌ Table selection cancelled")
+                    return
+            
+            print(f"\n✅ Selected table: '{selected_table}'")
+            
+            # Get table data
+            table_df = self._get_table_as_dataframe(selected_table)
+            
+            if table_df.empty:
+                print(f"❌ No data found in table '{selected_table}'")
+                return
+            
+            # Display available columns
+            print(f"\n📋 COLUMN SELECTION")
+            print("=" * 70)
+            print(f"Available columns in table '{selected_table}':")
+            print("-" * 70)
+            
+            available_columns = list(table_df.columns)
+            for i, col_name in enumerate(available_columns, 1):
+                unique_count = table_df[col_name].nunique()
+                col_type = str(table_df[col_name].dtype)
+                print(f"{i:2d}. {col_name:<20} ({col_type:<10}) - {unique_count:,} unique values")
+            
+            print("-" * 70)
+            
+            # Get column selection from user
+            while True:
+                try:
+                    col_selection = input("Select column for filtering (number or name): ").strip()
+                    
+                    # Try as number
+                    try:
+                        col_idx = int(col_selection) - 1
+                        if 0 <= col_idx < len(available_columns):
+                            selected_column = available_columns[col_idx]
+                            break
+                        else:
+                            print(f"❌ Invalid selection. Please enter 1-{len(available_columns)}")
+                            continue
+                    except ValueError:
+                        # Try as column name
+                        if col_selection in available_columns:
+                            selected_column = col_selection
+                            break
+                        else:
+                            print(f"❌ Column '{col_selection}' not found")
+                            continue
+                except KeyboardInterrupt:
+                    print("\n❌ Column selection cancelled")
+                    return
+            
+            print(f"\n✅ Selected column: '{selected_column}'")
+            
+            # Show unique values in the column
+            unique_values = sorted(table_df[selected_column].unique())
+            print(f"\n📊 Unique values in column '{selected_column}':")
+            print("=" * 70)
+            
+            # Display unique values (limit to first 50 to avoid clutter)
+            max_display = min(50, len(unique_values))
+            for i, value in enumerate(unique_values[:max_display], 1):
+                value_str = str(value)[:50] + "..." if len(str(value)) > 50 else str(value)
+                print(f"   {i:3d}. {value_str}")
+            
+            if len(unique_values) > max_display:
+                print(f"   ... and {len(unique_values) - max_display} more values")
+            
+            print("-" * 70)
+            
+            # Collect filter values from user
+            filter_values = []
+            filter_counter = 1
+            
+            print(f"\n🔍 FILTERING VALUES INPUT")
+            print("=" * 70)
+            print(f"Enter values to filter by in column '{selected_column}'")
+            print("Enter -1 when finished adding values")
+            print("=" * 70)
+            
+            while True:
+                try:
+                    user_input = input(f"\n🔢 Filter value {filter_counter} (or -1 to finish): ").strip()
+                    
+                    if user_input == "-1":
+                        if not filter_values:
+                            print("❌ You must enter at least one filter value")
+                            continue
+                        print(f"\n✅ Finished entering filter values")
+                        break
+                    
+                    if not user_input:
+                        print("⚠️  Please enter a value or -1 to finish")
+                        continue
+                    
+                    # Try to match the value in the column
+                    # Handle different data types
+                    matching_values = []
+                    for unique_val in unique_values:
+                        if str(unique_val).lower() == user_input.lower():
+                            matching_values.append(unique_val)
+                    
+                    if matching_values:
+                        selected_value = matching_values[0]
+                        filter_values.append(selected_value)
+                        print(f"   ✅ Added: {selected_value}")
+                        filter_counter += 1
+                    else:
+                        # Try to parse as the column's data type
+                        try:
+                            col_dtype = table_df[selected_column].dtype
+                            
+                            if col_dtype in ['int64', 'int32', 'int16', 'int8']:
+                                parsed_value = int(user_input)
+                            elif col_dtype in ['float64', 'float32']:
+                                parsed_value = float(user_input)
+                            else:
+                                parsed_value = user_input
+                            
+                            filter_values.append(parsed_value)
+                            print(f"   ✅ Added: {parsed_value}")
+                            filter_counter += 1
+                            
+                        except ValueError:
+                            print(f"❌ Cannot parse '{user_input}' as {col_dtype}. Please try again.")
+                            continue
+                
+                except KeyboardInterrupt:
+                    print("\n❌ Filter value input cancelled")
+                    return
+            
+            # Apply filters to create subset
+            print(f"\n📊 APPLYING FILTERS")
+            print("=" * 70)
+            print(f"Filtering table '{selected_table}' where '{selected_column}' in {filter_values}")
+            
+            subset_df = table_df[table_df[selected_column].isin(filter_values)]
+            
+            print(f"✅ Filter applied successfully")
+            print(f"   📊 Original rows: {len(table_df):,}")
+            print(f"   🔍 Filtered rows: {len(subset_df):,}")
+            print(f"   📈 Retention rate: {(len(subset_df)/len(table_df))*100:.2f}%")
+            
+            if subset_df.empty:
+                print("❌ No rows matched the filter criteria")
+                return
+            
+            # Get output table name from user
+            print(f"\n💾 OUTPUT TABLE CONFIGURATION")
+            print("=" * 70)
+            
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            default_table_name = f"{selected_table}_subset_{timestamp}"
+            
+            user_table_name = input(f"Enter table name for subset (default: {default_table_name}): ").strip()
+            output_table_name = user_table_name if user_table_name else default_table_name
+            output_table_name = self._sanitize_table_name(output_table_name)
+            
+            print(f"✅ Output table name: '{output_table_name}'")
+            
+            # Save subset to database
+            print(f"\n💾 SAVING SUBSET TO DATABASE")
+            print("-" * 70)
+            
+            try:
+                conn = sqlite3.connect(self.__chemspace_db)
+                cursor = conn.cursor()
+                
+                # Create new table with same schema as original
+                # Get original table schema
+                cursor.execute(f"PRAGMA table_info({selected_table})")
+                columns_info = cursor.fetchall()
+                
+                # Build CREATE TABLE statement
+                column_defs = []
+                for col_info in columns_info:
+                    col_name = col_info[1]
+                    col_type = col_info[2]
+                    col_notnull = col_info[3]
+                    col_default = col_info[4]
+                    col_pk = col_info[5]
+                    
+                    col_def = f"{col_name} {col_type}"
+                    
+                    if col_notnull:
+                        col_def += " NOT NULL"
+                    
+                    if col_default is not None:
+                        col_def += f" DEFAULT {col_default}"
+                    
+                    if col_pk:
+                        col_def += " PRIMARY KEY AUTOINCREMENT"
+                    
+                    column_defs.append(col_def)
+                
+                # Add UNIQUE constraint if present
+                unique_constraint = ""
+                cursor.execute(f"SELECT sql FROM sqlite_master WHERE type='table' AND name='{selected_table}'")
+                original_sql = cursor.fetchone()
+                if original_sql and 'UNIQUE' in original_sql[0]:
+                    if 'UNIQUE(smiles, name)' in original_sql[0]:
+                        unique_constraint = ", UNIQUE(smiles, name)"
+                
+                create_table_sql = f"CREATE TABLE {output_table_name} ({', '.join(column_defs)}{unique_constraint})"
+                
+                cursor.execute(create_table_sql)
+                
+                # Create indexes
+                cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{output_table_name}_smiles ON {output_table_name}(smiles)")
+                cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{output_table_name}_name ON {output_table_name}(name)")
+                
+                # Insert subset data
+                insert_columns = [col[1] for col in columns_info if col[1] != 'id']  # Exclude auto-increment id
+                placeholders = ', '.join(['?'] * len(insert_columns))
+                insert_sql = f"INSERT INTO {output_table_name} ({', '.join(insert_columns)}) VALUES ({placeholders})"
+                
+                inserted_count = 0
+                for _, row in subset_df.iterrows():
+                    try:
+                        values = [row[col] for col in insert_columns]
+                        cursor.execute(insert_sql, values)
+                        inserted_count += 1
+                    except sqlite3.IntegrityError:
+                        continue  # Skip duplicates
+                
+                conn.commit()
+                conn.close()
+                
+                print(f"✅ Successfully created subset table '{output_table_name}'")
+                print(f"   📊 Rows inserted: {inserted_count:,}")
+                print(f"   🔍 Filter criteria: {selected_column} in {filter_values}")
+                print(f"   📈 Original table: {selected_table}")
+                
+            except Exception as e:
+                print(f"❌ Error creating subset table: {e}")
+                return
+
+        except Exception as e:
+            print(f"❌ Error in subset_table method: {e}")
+
+
