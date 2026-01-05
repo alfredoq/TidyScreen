@@ -265,6 +265,131 @@ class MolDock:
             print(f"❌ Error in create_docking_method: {e}")
             return None
 
+    def list_docking_methods(self):
+        "Will read the docking_methods.db under project path in the docking/docking_registers folder and inform the user about available methods"
+        
+        import sqlite3
+        import json
+        
+        try:
+            # Path to docking methods database
+            docking_registers_dir = os.path.dirname(self.__docking_registers_db)
+            methods_db_path = os.path.join(docking_registers_dir, 'docking_methods.db')
+            
+            # Check if database exists
+            if not os.path.exists(methods_db_path):
+                print(f"❌ No docking methods database found")
+                print(f"   Expected location: {methods_db_path}")
+                print(f"\n💡 Create a docking method first using create_docking_method()")
+                return None
+            
+            # Connect to database
+            conn = sqlite3.connect(methods_db_path)
+            cursor = conn.cursor()
+            
+            # Check if table exists
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='docking_methods'")
+            if not cursor.fetchone():
+                print(f"❌ Docking methods table not found in database")
+                conn.close()
+                return None
+            
+            # Retrieve all docking methods
+            cursor.execute('''
+                SELECT id, method_name, docking_engine, description, parameters, 
+                    ligand_prep_params, created_date
+                FROM docking_methods
+                ORDER BY created_date DESC
+            ''')
+            
+            methods = cursor.fetchall()
+            conn.close()
+            
+            # Check if any methods exist
+            if not methods:
+                print(f"📋 NO DOCKING METHODS FOUND")
+                print(f"   Database exists but contains no methods")
+                print(f"\n💡 Create a docking method using create_docking_method()")
+                return None
+            
+            # Display methods
+            print(f"\n🧬 AVAILABLE DOCKING METHODS")
+            print("=" * 80)
+            print(f"   Found {len(methods)} method(s) in database")
+            print(f"   Database: {methods_db_path}")
+            print("=" * 80)
+            
+            methods_list = []
+            
+            for idx, (method_id, method_name, engine, description, params_json, 
+                    ligand_prep_json, created_date) in enumerate(methods, 1):
+                
+                # Parse JSON parameters
+                try:
+                    parameters = json.loads(params_json) if params_json else {}
+                    ligand_prep_params = json.loads(ligand_prep_json) if ligand_prep_json else {}
+                except json.JSONDecodeError:
+                    parameters = {}
+                    ligand_prep_params = {}
+                
+                # Store method info
+                method_info = {
+                    'id': method_id,
+                    'method_name': method_name,
+                    'docking_engine': engine,
+                    'description': description,
+                    'parameters': parameters,
+                    'ligand_prep_params': ligand_prep_params,
+                    'created_date': created_date
+                }
+                methods_list.append(method_info)
+                
+                # Display method details
+                print(f"\n{idx}. 🏷️  {method_name}")
+                print(f"   {'─' * 76}")
+                print(f"   📋 ID: {method_id}")
+                print(f"   🧬 Engine: {engine}")
+                print(f"   📝 Description: {description or 'No description'}")
+                print(f"   📅 Created: {created_date}")
+                
+                # Display engine parameters
+                if parameters:
+                    print(f"\n   ⚙️  Engine Parameters:")
+                    for key, value in parameters.items():
+                        # Format parameter name
+                        param_display = key.replace('_', ' ').title()
+                        print(f"      • {param_display}: {value}")
+                else:
+                    print(f"\n   ⚙️  Engine Parameters: None configured")
+                
+                # Display ligand preparation parameters
+                if ligand_prep_params:
+                    print(f"\n   🧪 Ligand Preparation:")
+                    for key, value in ligand_prep_params.items():
+                        param_display = key.replace('_', ' ').title()
+                        print(f"      • {param_display}: {value}")
+                else:
+                    print(f"\n   🧪 Ligand Preparation: Default settings")
+                
+                print(f"   {'─' * 76}")
+            
+            print("=" * 80)
+            print(f"\n💡 Use these methods with dock_table() for docking experiments")
+            
+            return methods_list
+            
+        except sqlite3.Error as e:
+            print(f"❌ Database error: {e}")
+            return None
+        except Exception as e:
+            print(f"❌ Error listing docking methods: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+        
+        
+    
+
     def _get_engine_specific_parameters(self, engine_name: str) -> Optional[Dict[str, Any]]:
         """
         Get engine-specific parameters from user input.
@@ -671,7 +796,7 @@ class MolDock:
 
         except Exception as e:
             print(f"⚠️  Error displaying method summary: {e}")
-   
+
     def dock_table(self, show_details: bool = True, 
                 filter_by_type: Optional[str] = None,
                 sort_by: str = 'name',
@@ -682,11 +807,16 @@ class MolDock:
         By default, only shows tables ready for docking (with SDF blobs).
         Creates a docking assay registry upon successful completion.
         
+        Allows user to choose between:
+        - Running in current console (foreground)
+        - Running as background process (detached, survives SSH disconnect)
+        
         Args:
             show_details (bool): Whether to show detailed information including compound counts
             filter_by_type (Optional[str]): Filter tables by type ('original', 'reaction_products', 'filtered_compounds', etc.)
             sort_by (str): Sort criteria ('name', 'compounds', 'type', 'date')
             show_all_tables (bool): If True, shows all tables regardless of docking readiness
+            clean_ligand_files (bool): Whether to clean up ligand files after processing
             
         Returns:
             Optional[Any]: Dictionary with selected table name, docking method, assay registry info and SMILES data if requested, or None if cancelled
@@ -704,6 +834,12 @@ class MolDock:
             
             print(f"\n✅ Selected docking method: '{selected_method['method_name']}' ({selected_method['docking_engine']})")
             print("-" * 70)
+            
+            # Step 1b: Prompt user for execution mode
+            execution_mode = self._prompt_execution_mode()
+            if execution_mode is None:
+                print("❌ Docking preparation cancelled")
+                return None
             
             # Step 2: Check if chemspace database exists
             if not os.path.exists(self.__chemspace_db):
@@ -879,41 +1015,230 @@ class MolDock:
                             
                             return None
                         
-                        ## Dock using AutoDockGPU if selected    
-                        if selected_method['docking_engine'] == 'AutoDockGPU':
-                            self._dock_table_with_autodockgpu(selected_table, selected_method, assay_registry, clean_ligand_files)
-
-                            # Set the 'docking_mode' variable for Ringtail processing
-                            docking_mode = 'dlg'
-
-                        ## Dock using Vina if selected    
-                        elif selected_method['docking_engine'] == 'Vina':
-                            self._dock_table_with_vina(selected_table, selected_method, assay_registry, clean_ligand_files)
-
-                            # Set the 'docking_mode' variable for Ringtail processing
-                            docking_mode = 'vina'
-
-
-                        ## After the docking run has been completed, execute the corresponding analysis
-
-                        results_db_file = self._process_docking_assay_results(assay_registry, docking_mode, clean_ligand_files, max_poses=10)
-
-                        print(f"✅ Docking results saved to: {results_db_file}")
-
-                    else:
+                        # Select receptor before executing docking
+                        print(f"\n🧬 Selecting receptor for docking...")
+                        receptor_info = self._select_receptor_from_db()
                         
+                        if not receptor_info:
+                            print("❌ No receptor selected. Docking cancelled.")
+                            return None
+                        
+                        print(f"✅ Selected receptor: '{receptor_info['pdb_name']}'")
+                        
+                        # Execute docking based on execution mode
+                        if execution_mode == 'foreground':
+                            # Run directly in current console
+                            self._run_docking_foreground(selected_table, selected_method, assay_registry, clean_ligand_files, receptor_info)
+                        else:
+                            # Run as background/detached process
+                            self._run_docking_background(selected_table, selected_method, assay_registry, clean_ligand_files, receptor_info)
+                        
+                    else:
                         print(f"❌ Docking engine '{selected_method['docking_engine']}' not yet implemented")
-                    
                     
                 else:
                     return None
             else:
                 print("❌ No table selected for docking preparation")
                 return None
-            
+                
         except Exception as e:
             print(f"❌ Error in dock_table method: {e}")
+            import traceback
+            traceback.print_exc()
             return None
+
+    def _prompt_execution_mode(self) -> Optional[str]:
+        """
+        Prompt user to choose between foreground (current console) or background (detached) execution.
+        
+        Returns:
+            Optional[str]: 'foreground', 'background', or None if cancelled
+        """
+        print(f"\n🚀 EXECUTION MODE SELECTION")
+        print("=" * 70)
+        print(f"How would you like to run the docking process?")
+        print(f"\nOptions:")
+        print(f"   1. FOREGROUND: Run in current console")
+        print(f"      - Process will stop if SSH connection is closed")
+        print(f"      - Real-time output and progress visible")
+        print(f"      - Easier to debug if issues occur")
+        print(f"")
+        print(f"   2. BACKGROUND: Run as detached process")
+        print(f"      - Process continues even if SSH connection is closed")
+        print(f"      - Output redirected to log file")
+        print(f"      - Better for long-running jobs over SSH")
+        print(f"      - Free up console for other work")
+        print("=" * 70)
+        
+        while True:
+            try:
+                choice = input(f"\n🧬 Choose execution mode (1/2, or 'cancel'): ").strip().lower()
+                
+                if choice in ['1', 'foreground', 'fg']:
+                    print(f"✅ Selected: FOREGROUND execution")
+                    return 'foreground'
+                elif choice in ['2', 'background', 'bg']:
+                    print(f"✅ Selected: BACKGROUND execution")
+                    return 'background'
+                elif choice in ['cancel', 'quit', 'exit', 'c']:
+                    print(f"❌ Execution mode selection cancelled")
+                    return None
+                else:
+                    print(f"❌ Invalid choice. Please enter 1, 2, or 'cancel'")
+                    continue
+                    
+            except KeyboardInterrupt:
+                print(f"\n❌ Execution mode selection cancelled")
+                return None
+
+    def _run_docking_foreground(self, 
+                                selected_table: str, 
+                                selected_method: Dict[str, Any], 
+                                assay_registry: Dict[str, Any], 
+                                clean_ligand_files: bool,
+                                receptor_info: Dict[str, Any]
+        ) -> None:
+        """
+        Run docking in foreground (current console).
+        
+        Args:
+            selected_table (str): Name of the selected table
+            selected_method (Dict): Docking method information
+            assay_registry (Dict): Assay registry information
+            clean_ligand_files (bool): Whether to clean ligand files
+        """
+        try:
+            print(f"\n💻 Running docking in FOREGROUND mode...")
+            print(f"   Process will run in current console")
+            
+            ## Dock using AutoDockGPU if selected    
+            if selected_method['docking_engine'] == 'AutoDockGPU':
+                self._dock_table_with_autodockgpu(selected_table, selected_method, assay_registry, clean_ligand_files, receptor_info)
+                docking_mode = 'dlg'
+
+            ## Dock using Vina if selected    
+            elif selected_method['docking_engine'] == 'Vina':
+                self._dock_table_with_vina(selected_table, selected_method, assay_registry, clean_ligand_files, receptor_info)
+                docking_mode = 'vina'
+            else:
+                print(f"❌ Docking engine '{selected_method['docking_engine']}' not yet implemented")
+                return
+
+            ## After the docking run has been completed, execute the corresponding analysis
+            results_db_file = self._process_docking_assay_results(assay_registry, docking_mode, clean_ligand_files, max_poses=10)
+            print(f"✅ Docking results saved to: {results_db_file}")
+            
+        except Exception as e:
+            print(f"❌ Error during foreground docking execution: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _run_docking_background(self, 
+                                selected_table: str, 
+                                selected_method: Dict[str, Any], 
+                                assay_registry: Dict[str, Any], 
+                                clean_ligand_files: bool,
+                                receptor_info: Dict[str, Any]
+            ) -> None:
+        """
+        Run docking as background/detached process (survives SSH disconnect).
+        Uses nohup to detach from parent process and output to log file.
+        
+        Args:
+            selected_table (str): Name of the selected table
+            selected_method (Dict): Docking method information
+            assay_registry (Dict): Assay registry information
+            clean_ligand_files (bool): Whether to clean ligand files
+        """
+        import subprocess
+        import sys
+        from datetime import datetime
+        
+        try:
+            print(f"\n🔄 Launching docking as BACKGROUND process...")
+            
+            # Create log file path
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            log_file = os.path.join(
+                self.path, 
+                f'docking/logs/docking_assay_{assay_registry["assay_id"]}_{timestamp}.log'
+            )
+            os.makedirs(os.path.dirname(log_file), exist_ok=True)
+            
+            # Build Python command to run docking
+            python_script = f"""
+import sys
+import os
+sys.path.insert(0, '{self.path}')
+
+from tidyscreen import tidyscreen
+from tidyscreen.moldock.moldock import MolDock
+
+try:
+    # Recreate the project and MolDock objects
+    project = tidyscreen.ActivateProject('{self.name}')
+    moldock = MolDock(project)
+    
+    # Retrieve method info from assay registry
+    assay_id = {assay_registry['assay_id']}
+    
+    # Prepare parameters
+    selected_table = '{selected_table}'
+    selected_method = {selected_method}
+    assay_registry = {assay_registry}
+    clean_ligand_files = {clean_ligand_files}
+    receptor_info = {receptor_info}
+    
+    # Run docking
+    moldock._run_docking_foreground(selected_table, selected_method, assay_registry, clean_ligand_files, receptor_info)
+    
+    print(f'✅ Background docking process completed successfully')
+    sys.exit(0)
+    
+except Exception as e:
+    print(f'❌ Error in background docking process: {{e}}')
+    import traceback
+    traceback.print_exc()
+    sys.exit(1)
+    """
+            
+            # Write script to temporary file
+            script_file = os.path.join(
+                self.path,
+                f'docking/scripts/docking_process_{assay_registry["assay_id"]}_{timestamp}.py'
+            )
+            os.makedirs(os.path.dirname(script_file), exist_ok=True)
+            
+            with open(script_file, 'w') as f:
+                f.write(python_script)
+            
+            # Launch process using nohup (survives SSH disconnect)
+            with open(log_file, 'w') as logf:
+                process = subprocess.Popen(
+                    [sys.executable, script_file],
+                    stdout=logf,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    #preexec_fn=os.setpgrp if hasattr(os, 'setpgrp') else None,  # Detach from parent process
+                    start_new_session=True  # Windows-compatible detachment
+                )
+            
+            process_id = process.pid
+            
+            print(f"✅ Background docking process started successfully!")
+            print(f"   🆔 Process ID: {process_id}")
+            print(f"   📝 Log file: {log_file}")
+            print(f"   🔄 Assay ID: {assay_registry['assay_id']}")
+            print(f"\n💡 You can safely close this SSH connection.")
+            print(f"   The docking process will continue running in the background.")
+            print(f"\n📊 To monitor progress, use:")
+            print(f"   tail -f {log_file}")
+            
+        except Exception as e:
+            print(f"❌ Error launching background docking process: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _create_docking_assay_registry(self, table_name: str, docking_method: Dict[str, Any], 
                                     table_info: Optional[Dict[str, Any]], setup_type: int) -> Optional[Dict[str, Any]]:
@@ -1443,7 +1768,7 @@ class MolDock:
             
             print(f"📋 Available Docking Methods ({len(methods)} found):")
             print("-" * 80)
-            print(f"{'#':<3} {'Method Name':<20} {'Engine':<15} {'Description':<30} {'Created':<12}")
+            print(f"{'#':<3} {'Method ID':<10} {'Method Name':<20} {'Engine':<15} {'Description':<30} {'Created':<12}")
             print("-" * 80)
             
             # Display available methods
@@ -1468,7 +1793,7 @@ class MolDock:
                     created_str = created_date[:10] if created_date else 'Unknown'
                 # Truncate description for display
                 desc_short = (description[:27] + '...') if len(description) > 30 else description
-                print(f"{i:<3} {method_name[:19]:<20} {docking_engine[:14]:<15} {desc_short:<30} {created_str:<12}")
+                print(f"{i:<3}{method_id:>10} {method_name[:19]:>20} {docking_engine[:14]:>15} {desc_short:>30} {created_str:>12}")
                 method_list.append({
                     'method_id': method_id,
                     'method_name': method_name,
@@ -1550,14 +1875,23 @@ class MolDock:
             print(f"📝 Description: {method_info['description']}")
             print(f"📅 Created: {method_info['created_date']}")
             
-            print(f"\n⚙️  CONFIGURED PARAMETERS:")
+            print(f"\n⚙️  CONFIGURED DOCKING PARAMETERS:")
             parameters = method_info.get('parameters', {})
             if parameters:
                 for key, value in parameters.items():
                     param_name = key.replace('_', ' ').title()
                     print(f"   • {param_name}: {value}")
             else:
-                print("   • No specific parameters configured")
+                print("   • No specific docking parameters configured")
+                
+            print(f"\n⚙️  CONFIGURED LIGANDS PREP PARAMETERS:")
+            lig_parameters = method_info.get('ligand_prep_parameters', {})
+            if lig_parameters:
+                for key, value in lig_parameters.items():
+                    param_name = key.replace('_', ' ').title()
+                    print(f"   • {param_name}: {value}")
+            else:
+                print("   • No specific ligand preparation parameters configured")
             
             # Show engine-specific information
             engine = method_info['docking_engine']
@@ -4924,7 +5258,7 @@ quit
         except Exception as e:
             print(f"   ❌ Error applying AD4Zn parameters: {e}")
         
-    def _dock_table_with_autodockgpu(self, selected_table, selected_method, assay_registry, clean_ligand_files):
+    def _dock_table_with_autodockgpu(self, selected_table, selected_method, assay_registry, clean_ligand_files, receptor_info):
         """
         Perform molecular docking of compounds using AutoDockGPU.
         This method iterates through compounds stored in a database table and performs
@@ -4992,8 +5326,7 @@ quit
         ligand_prep_params = selected_method.get('ligand_prep_params', {})
         
         # Select the receptor to be used for docking
-        selected_receptor = self._select_receptor_from_db()
-        receptor_main_path = self.__receptor_path + f"/{selected_receptor.get('pdb_name', None)}"
+        receptor_main_path = self.__receptor_path + f"/{receptor_info.get('pdb_name', None)}"
         receptor_pdbqt_file = receptor_main_path + f"/processed/receptor_checked.pdbqt"
         fld_file = receptor_main_path + f"/grid_files/receptor_checked.maps.fld"
         assay_folder = assay_registry['assay_folder_path']
@@ -5859,7 +6192,7 @@ quit
         output_file = os.path.join(output_dir, f"{ligname}_{run_number}.pdb")
         write_pdb(pdb_dict, output_file)
 
-    def _dock_table_with_vina(self, selected_table, selected_method, assay_registry, clean_ligand_files):
+    def _dock_table_with_vina(self, selected_table, selected_method, assay_registry, clean_ligand_files, receptor_info):
         
         """
         Perform molecular docking of compounds using Vina.
@@ -5895,9 +6228,10 @@ quit
         ligand_prep_params = selected_method.get('ligand_prep_params', {})
         
         # Select the receptor to be used for docking
-        selected_receptor = self._select_receptor_from_db()
-        receptor_conditions = self._get_receptor_conditions(selected_receptor.get('id', None))
-        receptor_main_path = self.__receptor_path + f"/{selected_receptor.get('pdb_name', None)}"
+        #selected_receptor = self._select_receptor_from_db()
+        
+        receptor_conditions = self._get_receptor_conditions(receptor_info.get('id', None))
+        receptor_main_path = self.__receptor_path + f"/{receptor_info.get('pdb_name', None)}"
         receptor_pdbqt_file = receptor_main_path + f"/processed/receptor_checked.pdbqt"
         fld_file = receptor_main_path + f"/grid_files/receptor_checked.maps.fld"
         assay_folder = assay_registry['assay_folder_path']
@@ -5934,7 +6268,6 @@ quit
         progress_bar = None
         if TQDM_AVAILABLE:
             progress_bar = tqdm(total=len(compounds), desc="Docking compounds", unit="ligand")
-
 
         ## If 'vina' scoring function is to be applied, compute the maps once for batch docking
         if method_params['sf_name'] == 'vina':          

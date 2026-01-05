@@ -13289,10 +13289,44 @@ class ChemSpace:
         
 
     def subset_table(self):
+        """
+        Create a subset of a database table based on user-defined filter criteria.
+        This method provides an interactive workflow for users to:
+        1. Select a table from the chemspace database
+        2. Choose a column to filter on
+        3. Specify filter values for that column
+        4. Choose whether to INCLUDE or EXCLUDE rows matching the filter values
+        5. Create a new table containing only the filtered rows
+        The process includes validation at each step and displays relevant metadata
+        (e.g., row counts, unique value counts) to help users make informed selections.
+        The filtered subset is saved as a new table in the database with the same schema
+        as the original table, including indexes on 'smiles' and 'name' columns.
+        Workflow:
+            - Lists all available tables with compound counts
+            - Displays column information (type, unique values) for the selected table
+            - Accepts user input for filter values with data type parsing
+            - Prompts for INCLUSION or EXCLUSION mode
+            - Shows filtering statistics (original rows, filtered rows, retention rate)
+            - Prompts for output table name (with timestamp-based default)
+            - Creates new table and inserts filtered data, skipping duplicates
+            - Displays final operation summary
+        Returns:
+            None. Creates a new table in the database as a side effect.
+        Raises:
+            Handled internally - prints error messages on failure rather than raising exceptions.
+            KeyboardInterrupt: Gracefully cancels the operation at any interactive prompt.
+        Notes:
+            - User can cancel at any selection prompt (table, column, filter values, or mode)
+            - Filter values are case-insensitive for string matching
+            - Numeric values are parsed according to the column's data type
+            - User must choose between INCLUSION (keep matching rows) or EXCLUSION (remove matching rows)
+            - Duplicate rows (determined by UNIQUE constraints) are skipped during insertion
+            - Table names are sanitized before use
+            - The process requires an active database connection
+            - If the output table already exists, user is prompted to replace it
+        """
 
-        """
-        Will query the user for a table to subset, the it whill show the columns in the table and query the column to use as criteria    for subseting. Then an infinite loop is created querying the user for filtering values until a -1 is entered. When finishing the addition of values, the user is queried for a table name in which to store the filtered values and the corresponding table is written to the chemspace.db
-        """
+        
         try:
             # Get available tables
             available_tables = self.get_all_tables()
@@ -13487,17 +13521,58 @@ class ChemSpace:
                     print("\n❌ Filter value input cancelled")
                     return
             
-            # Apply filters to create subset
+            # Prompt user for INCLUSION or EXCLUSION mode
+            print(f"\n🔄 FILTER MODE SELECTION")
+            print("=" * 70)
+            print(f"How should the filter be applied to column '{selected_column}'?")
+            print("\nOptions:")
+            print("   1. INCLUSION: Keep rows WHERE column is IN {filter_values}")
+            print("      (Create a subset containing only the specified values)")
+            print(f"      Example: Keep rows where '{selected_column}' = {filter_values[:2] if len(filter_values) > 1 else filter_values}")
+            print()
+            print("   2. EXCLUSION: Keep rows WHERE column is NOT IN {filter_values}")
+            print("      (Create a subset excluding the specified values)")
+            print(f"      Example: Remove rows where '{selected_column}' = {filter_values[:2] if len(filter_values) > 1 else filter_values}")
+            print("=" * 70)
+            
+            filter_mode = None
+            while filter_mode is None:
+                try:
+                    mode_choice = input("\nSelect filter mode (1 for INCLUSION, 2 for EXCLUSION, or 'cancel'): ").strip()
+                    
+                    if mode_choice.lower() in ['cancel', 'quit', 'exit']:
+                        print("❌ Filter mode selection cancelled")
+                        return
+                    
+                    if mode_choice == '1':
+                        filter_mode = 'inclusion'
+                        print("✅ Selected: INCLUSION mode (keep matching rows)")
+                    elif mode_choice == '2':
+                        filter_mode = 'exclusion'
+                        print("✅ Selected: EXCLUSION mode (remove matching rows)")
+                    else:
+                        print("❌ Invalid selection. Please enter 1, 2, or 'cancel'")
+                        
+                except KeyboardInterrupt:
+                    print("\n❌ Filter mode selection cancelled")
+                    return
+            
+            # Apply filters to create subset based on selected mode
             print(f"\n📊 APPLYING FILTERS")
             print("=" * 70)
-            print(f"Filtering table '{selected_table}' where '{selected_column}' in {filter_values}")
             
-            subset_df = table_df[table_df[selected_column].isin(filter_values)]
+            if filter_mode == 'inclusion':
+                print(f"Filtering table '{selected_table}' WHERE '{selected_column}' IN {filter_values}")
+                subset_df = table_df[table_df[selected_column].isin(filter_values)]
+            else:  # exclusion mode
+                print(f"Filtering table '{selected_table}' WHERE '{selected_column}' NOT IN {filter_values}")
+                subset_df = table_df[~table_df[selected_column].isin(filter_values)]
             
             print(f"✅ Filter applied successfully")
             print(f"   📊 Original rows: {len(table_df):,}")
             print(f"   🔍 Filtered rows: {len(subset_df):,}")
             print(f"   📈 Retention rate: {(len(subset_df)/len(table_df))*100:.2f}%")
+            print(f"   🔄 Filter mode: {filter_mode.upper()}")
             
             if subset_df.empty:
                 print("❌ No rows matched the filter criteria")
@@ -13508,12 +13583,35 @@ class ChemSpace:
             print("=" * 70)
             
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            default_table_name = f"{selected_table}_subset_{timestamp}"
+            default_table_name = f"{selected_table}_{filter_mode}_{timestamp}"
             
             user_table_name = input(f"Enter table name for subset (default: {default_table_name}): ").strip()
             output_table_name = user_table_name if user_table_name else default_table_name
             output_table_name = self._sanitize_table_name(output_table_name)
             
+            # Check if output table already exists
+            available_tables = self.get_all_tables()
+            
+            while output_table_name in available_tables:
+                print(f"\n⚠️  Table '{output_table_name}' already exists!")
+                
+                # Ask user for a new name
+                user_table_name = input(f"Enter a different table name (or 'cancel' to abort): ").strip()
+                
+                if user_table_name.lower() in ['cancel', 'quit', 'exit']:
+                    print("❌ Table subsetting cancelled by user")
+                    return
+                
+                output_table_name = self._sanitize_table_name(user_table_name)
+                
+                # Refresh available tables list
+                available_tables = self.get_all_tables()
+                
+                if output_table_name in available_tables:
+                    print(f"⚠️  Table '{output_table_name}' still exists. Please try a different name.")
+                else:
+                    print(f"✅ New table name accepted: '{output_table_name}'")
+                
             print(f"✅ Output table name: '{output_table_name}'")
             
             # Save subset to database
@@ -13543,8 +13641,17 @@ class ChemSpace:
                     if col_notnull:
                         col_def += " NOT NULL"
                     
-                    if col_default is not None:
-                        col_def += f" DEFAULT {col_default}"
+                    # Only add DEFAULT when non-empty; quote string defaults if needed
+                    if col_default is not None and str(col_default).strip() != "":
+                        default_str = str(col_default).strip()
+                        if default_str.upper() == "NULL":
+                            col_def += " DEFAULT NULL"
+                        elif default_str.replace(".", "", 1).lstrip("-").isdigit():
+                            col_def += f" DEFAULT {default_str}"
+                        else:
+                            if not (default_str.startswith("'") or default_str.startswith('"')):
+                                default_str = f"'{default_str}'"
+                            col_def += f" DEFAULT {default_str}"
                     
                     if col_pk:
                         col_def += " PRIMARY KEY AUTOINCREMENT"
@@ -13560,7 +13667,7 @@ class ChemSpace:
                         unique_constraint = ", UNIQUE(smiles, name)"
                 
                 create_table_sql = f"CREATE TABLE {output_table_name} ({', '.join(column_defs)}{unique_constraint})"
-                
+
                 cursor.execute(create_table_sql)
                 
                 # Create indexes
@@ -13586,8 +13693,9 @@ class ChemSpace:
                 
                 print(f"✅ Successfully created subset table '{output_table_name}'")
                 print(f"   📊 Rows inserted: {inserted_count:,}")
-                print(f"   🔍 Filter criteria: {selected_column} in {filter_values}")
+                print(f"   🔍 Filter criteria: {selected_column} {filter_mode.upper()} {filter_values}")
                 print(f"   📈 Original table: {selected_table}")
+                print(f"   🔄 Filter mode: {filter_mode.upper()}")
                 
             except Exception as e:
                 print(f"❌ Error creating subset table: {e}")
