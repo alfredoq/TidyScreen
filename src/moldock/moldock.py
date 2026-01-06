@@ -386,9 +386,6 @@ class MolDock:
             import traceback
             traceback.print_exc()
             return None
-        
-        
-    
 
     def _get_engine_specific_parameters(self, engine_name: str) -> Optional[Dict[str, Any]]:
         """
@@ -801,7 +798,8 @@ class MolDock:
                 filter_by_type: Optional[str] = None,
                 sort_by: str = 'name',
                 show_all_tables: bool = False,
-                clean_ligand_files: bool = True) -> Optional[Any]:
+                clean_ligand_files: bool = True,
+                notes: Optional[str] = None) -> Optional[Any]:
         """
         List tables available in the chemspace database, select a docking method, and allow selection for docking preparation.
         By default, only shows tables ready for docking (with SDF blobs).
@@ -817,6 +815,7 @@ class MolDock:
             sort_by (str): Sort criteria ('name', 'compounds', 'type', 'date')
             show_all_tables (bool): If True, shows all tables regardless of docking readiness
             clean_ligand_files (bool): Whether to clean up ligand files after processing
+            notes (Optional[str]): Optional notes to store in the assay registry; prompts if None
             
         Returns:
             Optional[Any]: Dictionary with selected table name, docking method, assay registry info and SMILES data if requested, or None if cancelled
@@ -977,6 +976,15 @@ class MolDock:
                 if user_choice == 1:
                     # Step 10: Create docking assay registry before returning results
                     print(f"\n📝 Creating docking assay registry...")
+                    note_text = notes
+                    if note_text is None:
+                        try:
+                            note_text = input(f"\n📝 Enter notes for this docking assay (press Enter to leave blank): ")
+                        except KeyboardInterrupt:
+                            print("\n❌ Docking preparation cancelled")
+                            return None
+                    if note_text is None:
+                        note_text = ""
                     
                     # Get selected table info for registry
                     selected_table_info = next((t for t in tables_to_display if t['name'] == selected_table), None)
@@ -986,7 +994,8 @@ class MolDock:
                         selected_table, 
                         selected_method, 
                         selected_table_info,
-                        user_choice
+                        user_choice,
+                        note_text
                     )
                     
                     if not assay_registry:
@@ -1241,7 +1250,8 @@ except Exception as e:
             traceback.print_exc()
 
     def _create_docking_assay_registry(self, table_name: str, docking_method: Dict[str, Any], 
-                                    table_info: Optional[Dict[str, Any]], setup_type: int) -> Optional[Dict[str, Any]]:
+                                    table_info: Optional[Dict[str, Any]], setup_type: int,
+                                    notes: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
         Create a docking assay registry entry in the docking_assays database and create associated folder.
         
@@ -1250,11 +1260,13 @@ except Exception as e:
             docking_method (Dict): Selected docking method information
             table_info (Optional[Dict]): Table information dictionary
             setup_type (int): Setup type (1=configuration_only, 2=ready_for_docking)
+            notes (Optional[str]): Notes to store alongside the registry entry
             
         Returns:
             Optional[Dict[str, Any]]: Assay registry information or None if failed
         """
         try:
+            note_text = notes if notes is not None else ""
             # Ensure docking registers directory exists
             docking_registers_dir = os.path.dirname(self.__docking_registers_db)
             os.makedirs(docking_registers_dir, exist_ok=True)
@@ -1317,7 +1329,7 @@ except Exception as e:
                 'created',
                 table_info['readiness_score'] if table_info else 0,
                 table_info['docking_status'] if table_info else 'unknown',
-                f"Assay created via dock_table method",
+                note_text,
                 '{}',  # Temporary empty configuration - will be updated
                 ''     # Temporary empty folder path - will be updated
             ))
@@ -1366,7 +1378,7 @@ except Exception as e:
                 assay_name,
                 json.dumps(configuration_data, indent=2),
                 assay_folder_path,
-                f"Assay created via dock_table method for {'configuration_only' if setup_type == 1 else 'ready_for_docking'}",
+                note_text,
                 assay_id
             ))
             
@@ -1392,7 +1404,8 @@ except Exception as e:
                 'status': 'created',
                 'database_path': assays_db_path,
                 'assay_folder_path': assay_folder_path,
-                'created_date': datetime.now().isoformat()
+                'created_date': datetime.now().isoformat(),
+                'notes': note_text
             }
             
         except Exception as e:
@@ -4979,8 +4992,8 @@ quit
         from meeko.gridbox import get_gpf_string
 
         # Atom types
-        ligand_types = ["HD", "C", "A", "N", "NA", "OA", "F", "P", "SA", "S", "Cl", "Br"]
-        receptor_types = ligand_types + (["ZN", "TZ", "Zn"] if has_ZN else ["Zn"])
+        ligand_types = ["HD", "C", "A", "N", "NA", "OA", "F", "P", "SA", "S", "Cl", "Br", "I"]
+        receptor_types = ligand_types[:-1] + (["ZN", "TZ", "Zn"] if has_ZN else ["Zn"]) # Iodine is removed from receptor types because grids fails to compute
 
         # Box center and dimensions
         grid_center = list(configs['center'].values())
@@ -6317,7 +6330,7 @@ quit
         
         from vina import Vina
         
-        vina_rec_object = Vina(sf_name=method_params['sf_name'])
+        vina_rec_object = Vina(sf_name=method_params['sf_name'], verbosity=0)
         
         vina_rec_object.set_receptor(receptor_pdbqt_file)
         
