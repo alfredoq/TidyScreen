@@ -1652,7 +1652,7 @@ except Exception as e:
             
             cursor.execute('''
                 SELECT assay_id, assay_name, table_name, docking_method_name, 
-                    docking_engine, status, created_date, assay_folder_path
+                    docking_engine, status, created_date, assay_folder_path, notes
                 FROM docking_assays 
                 WHERE project_name = ?
                 ORDER BY created_date DESC
@@ -1667,17 +1667,18 @@ except Exception as e:
             
             assay_list = []
             print(f"\n📋 DOCKING ASSAYS FOR PROJECT: {self.name}")
-            print("=" * 80)
-            print(f"{'ID':<5} {'Assay Name':<25} {'Table':<15} {'Method':<15} {'Status':<12} {'Folder Exists':<13}")
-            print("=" * 80)
+            print("=" * 130)
+            print(f"{'ID':<5} {'Assay Name':<25} {'Table':<20} {'Method':<15} {'Notes':<60}")
+            print("=" * 130)
             
             for row in results:
-                assay_id, assay_name, table_name, method_name, engine, status, created_date, folder_path = row
+                assay_id, assay_name, table_name, method_name, engine, status, created_date, folder_path, notes = row
                 
                 folder_exists = "✅ Yes" if folder_path and os.path.exists(folder_path) else "❌ No"
+                note_preview = (notes or "").replace('\n', ' ')[:60]
                 
-                print(f"{assay_id:<5} {assay_name[:24]:<25} {table_name[:14]:<15} "
-                    f"{method_name[:14]:<15} {status[:11]:<12} {folder_exists:<13}")
+                print(f"{assay_id:<5} {assay_name[:24]:<25} {table_name[:14]:<20} "
+                    f"{method_name[:14]:<15} {note_preview:<60}")
                 
                 assay_list.append({
                     'assay_id': assay_id,
@@ -1688,10 +1689,11 @@ except Exception as e:
                     'status': status,
                     'created_date': created_date,
                     'assay_folder_path': folder_path,
-                    'folder_exists': folder_path and os.path.exists(folder_path)
+                    'folder_exists': folder_path and os.path.exists(folder_path),
+                    'notes': notes
                 })
             
-            print("=" * 80)
+            print("=" * 130)
             print(f"Total assays: {len(assay_list)}")
             
             return assay_list
@@ -5707,6 +5709,19 @@ quit
             rtc.add_results_from_files(file_path = f"{assay_folder}/results", recursive = True, save_receptor = False, max_poses=max_poses)
             
             
+            ## Add ligand input model if docking with docking output is .pdqbt type
+            if docking_mode == 'vina':
+                
+                import glob
+                
+                # Get all .out.pdbqt files from the results directory
+                out_pdbqt_files = glob.glob(os.path.join(assay_folder, 'results', '*_out.pdbqt'))
+
+                # Add ligand input models to the ringtail results
+                for out_file in out_pdbqt_files:
+                    input_model = self._parse_pdbqt_output(out_file)
+                    self._add_input_model_in_db(results_db_file, input_model, out_file)
+                    
             ## Clean the .dlg files is requested
             
             if clean_ligand_files:
@@ -5859,8 +5874,42 @@ quit
     
     def extract_docked_poses(self, assay=None):
         """
-        This method will receive an assay which is optional. If not provided, query the user to select a docking assay as registered in the project_path/docking/docking_registers/docking_assays.db
+        Extract docked poses from a docking assay and save them as PDB files based on user-selected criteria.
+        This method allows users to select a docking assay from the registry and extract poses based on three
+        different selection criteria: lowest energy poses, most populated poses, or a combination of both.
+        The selected poses are processed and saved as individual PDB files in an output directory.
+        Parameters
+        ----------
+        assay : int, str, or None, optional
+            The docking assay identifier to process. Can be:
+            - None (default): User is prompted to select from available assays
+            - int: Assay ID to match against the registry
+            - str: Assay name to match against the registry
+        Returns
+        -------
+        None
+            The method does not return a value. Output is written to PDB files in the designated
+            output directory based on the selection criteria.
+        Raises
+        ------
+        None
+            Errors are caught internally and reported via print statements. Returns None on failure.
+        Notes
+        -----
+        - Requires a valid docking assay registry at 'docking/docking_registers/docking_assays.db'
+        - Selection criteria options:
+            1. Lowest energy poses: Selects poses with minimum binding energy
+            2. Most populated poses: Selects poses with highest population/frequency
+            3. Both criteria: Selects poses meeting both lowest energy and highest population thresholds
+        - Output directories are created automatically in the results directory with descriptive names
+        - Each extracted pose is saved as a separate PDB file named with ligand name and run number
+        Examples
+        --------
+        >>> moldock_instance.extract_docked_poses()  # Interactive mode - prompts user selection
+        >>> moldock_instance.extract_docked_poses(assay=1)  # Extract from assay with ID 1
+        >>> moldock_instance.extract_docked_poses(assay="kinase_screen")  # Extract from named assay
         """
+        
         import os
         import sqlite3
 
@@ -5874,7 +5923,7 @@ quit
         try:
             conn = sqlite3.connect(registry_db)
             cursor = conn.cursor()
-            cursor.execute("SELECT assay_id, assay_name, assay_folder_path, status FROM docking_assays")
+            cursor.execute("SELECT assay_id, assay_name, docking_engine, assay_folder_path, status FROM docking_assays")
             assays = cursor.fetchall()
             conn.close()
         except Exception as e:
@@ -5890,8 +5939,8 @@ quit
         if assay is None:
             print("\n📋 Available Docking Assays:")
             print("=" * 60)
-            for i, (aid, name, folder, status) in enumerate(assays, 1):
-                print(f"{i}. {name} (ID: {aid}, Status: {status})\n   Folder: {folder}")
+            for i, (aid, name, engine, folder, status) in enumerate(assays, 1):
+                print(f"{i}. {name} (ID: {aid}, Engine: {engine}, Status: {status})\n   Folder: {folder}")
             print("=" * 60)
             while True:
                 try:
@@ -5918,7 +5967,7 @@ quit
                 print(f"❌ Assay '{assay}' not found in registry.")
                 return None
 
-        assay_id, assay_name, assay_folder, status = selected_assay
+        assay_id, assay_name, docking_engine, assay_folder, status = selected_assay
 
         # Locate results directory
         results_dir = os.path.join(assay_folder, "results")
@@ -5929,8 +5978,18 @@ quit
         # Create the path were the database to be analyzed lives
         db_path = os.path.join(results_dir, f"assay_{assay_id}.db")
 
-        ## Start the analysis
+        ## Evaluate the docking engine in order to use the corresponding pose extraction method
+        if docking_engine == "AutoDockGPU":
+            self._extract_docked_poses_autodockgpu(db_path)
+            
+        elif docking_engine == "Vina":
+            self._extract_docked_poses_autodockvina(db_path)
 
+    def _extract_docked_poses_autodockgpu(self, db_path):
+    
+        ## Start the analysis
+        print("Starting poses extraction for engine AutoDockGPU")
+        print("")
         print("Select an option:")
         print("1 - Select lowest energy poses")
         print("2 - Select most populated poses")
@@ -5965,13 +6024,14 @@ quit
             os.makedirs(output_dir, exist_ok=True)
             df = self._select_most_populated_and_stable_poses(db_path)
 
-        # Continye pprocessing the selected poses
+        # Continue pprocessing the selected poses
         for row in df.iterrows():
             ligname = row[1]['LigName']
             pose_id = row[1]['Pose_ID']
             run_number = row[1]['run_number']
             
             input_model, pose_coords_json = self._retrieve_pose_info(db_path, pose_id)
+            print(type(input_model))
             pdb_dict = self._process_input_model_for_moldf(input_model, pose_coords_json)
             self._write_pdb_with_moldf(pdb_dict, ligname, run_number, output_dir)
 
@@ -5980,7 +6040,49 @@ quit
         elif selection == "2":
             print(f"Most populated poses extracted and saved as PDB files to: \n \t {output_dir}")
         elif selection == "3":
-            print(f"Most populated and stable poses extracted and saved as PDB files to: \n \t {output_dir}")
+            print(f"Most populated and stable poses extracted and saved as PDB files to: \n \t {output_dir}")    
+    
+    def _extract_docked_poses_autodockvina(self, db_path):
+        
+        ## Start the analysis
+        print("Starting poses extraction for engine Vina")
+        print("")
+        print("Select an option:")
+        print("1 - Extract lowest energy pose")
+        print("2 - Extract all poses")
+        selection = input("Enter your choice (1 or 2): ").strip()
+        
+        ## Prompt the user which selection to make
+        while selection not in ("1", "2"):
+            print("Invalid selection. Only 1 or 2 can be selected.")
+            selection = input("Enter your choice (1 or 2): ").strip()
+        
+        # Act according to user selection
+        if selection == "1":
+            print("You selected: lowest energy poses")
+            # Create output directory for most stable poses
+            output_dir = os.path.join(os.path.dirname(os.path.abspath(db_path)), "most_stable_poses")
+            os.makedirs(output_dir, exist_ok=True)
+            
+            df = self._select_most_stable_poses(db_path)
+
+        elif selection == "2":
+            print("You selected: all poses")
+            # Create output directory for all poses
+            output_dir = os.path.join(os.path.dirname(os.path.abspath(db_path)), "all_poses")
+            os.makedirs(output_dir, exist_ok=True)
+            
+            df = self._select_all_poses(db_path)
+
+        # Continue pprocessing the selected poses
+        for row in df.iterrows():
+            ligname = row[1]['LigName']
+            pose_id = row[1]['Pose_ID']
+            run_number = row[1]['run_number']
+            
+            input_model, pose_coords_json = self._retrieve_pose_info(db_path, pose_id)
+            pdb_dict = self._process_input_model_for_moldf(input_model, pose_coords_json)
+            self._write_pdb_with_moldf(pdb_dict, ligname, run_number, output_dir)
 
     def _select_most_stable_poses(self, db_path):
         """
@@ -6000,6 +6102,25 @@ quit
             FROM Results AS R2
             WHERE R1.LigName = R2.LigName
         )
+        """
+        df = pd.read_sql(query, conn)
+        conn.close()
+        
+        return df
+
+    def _select_all_poses(self, db_path):
+        """
+        Select all the poses for each ligand
+        from the Ringtail database located at db_path.
+        Returns a DataFrame with LigName, Pose_ID, and docking_score.
+        """
+        import sqlite3
+        import pandas as pd
+        
+        conn = sqlite3.connect(db_path)
+        query = """
+        SELECT LigName, Pose_ID, docking_score, run_number
+        FROM Results 
         """
         df = pd.read_sql(query, conn)
         conn.close()
@@ -6233,7 +6354,6 @@ quit
 
         print(f"\n🚀 Starting docking with AutoDockGPU for table: {selected_table}")
 
-
         # Retrieve docking method parameters
         method_params = selected_method.get('parameters', {})
         
@@ -6342,7 +6462,6 @@ quit
         
         return vina_rec_object
     
-    
     def _execute_vina(self, ligand_pdbqt_filepath, assay_registry, method_params, receptor_pdbqt_file, receptor_conditions, vina_rec_object):
         """
         Execute molecular docking using AutoDock Vina with specified scoring function.
@@ -6416,3 +6535,251 @@ quit
             results_file = ligand_pdbqt_filepath.replace('.pdbqt', '_out.pdbqt')
 
             vina_rec_object.write_poses(results_file, n_poses=method_params['n_poses'], overwrite=True)
+            
+    def compute_roc_curve(self):
+        
+        """
+        Prompt the user to select docking assays for binders (positives) and decoys (negatives)
+        using list_assay_folders. Loads the best docking score per ligand from each assay’s
+        Ringtail DB, computes an ROC curve/AUC, and writes ROC data to docking/analysis.
+        """
+        import os
+        import sqlite3
+        from datetime import datetime
+
+        assays = self.list_assay_folders()
+        if not assays:
+            return None
+
+        assay_by_id = {a['assay_id']: a for a in assays}
+
+        print("\nSelect binder (positive) assay:")
+        binder_id = self._prompt_assay("binders", assay_by_id)
+        if binder_id is None:
+            return None
+
+        print("\nSelect decoy (negative) assay:")
+        decoy_id = self._prompt_assay("decoys", assay_by_id)
+        if decoy_id is None:
+            return None
+
+        binder_info = assay_by_id[binder_id]
+        decoy_info = assay_by_id[decoy_id]
+        
+        binder_db = os.path.join(binder_info['assay_folder_path'], "results", f"assay_{binder_id}.db")
+        decoy_db = os.path.join(decoy_info['assay_folder_path'], "results", f"assay_{decoy_id}.db")
+
+        try:
+            binder_scores = self._load_best_scores(binder_db)
+            decoy_scores = self._load_best_scores(decoy_db)
+        except Exception as e:
+            print(f"❌ Error loading scores: {e}")
+            return None
+
+        if not binder_scores or not decoy_scores:
+            print("❌ Missing scores: ensure both assays have populated results databases.")
+            return None
+
+        labels = [1] * len(binder_scores) + [0] * len(decoy_scores)
+        scores = binder_scores + decoy_scores
+        adjusted_scores = [-s for s in scores]  # higher is better binder
+
+        paired = sorted(zip(adjusted_scores, labels), key=lambda x: x[0], reverse=True)
+        pos_total = sum(labels)
+        neg_total = len(labels) - pos_total
+        tp = fp = 0
+        roc_points = []
+
+        for score, label in paired:
+            if label == 1:
+                tp += 1
+            else:
+                fp += 1
+            tpr = tp / pos_total if pos_total else 0.0
+            fpr = fp / neg_total if neg_total else 0.0
+            roc_points.append((fpr, tpr, score, label))
+
+        auc = 0.0
+        prev_fpr = prev_tpr = 0.0
+        for fpr, tpr, _, _ in roc_points:
+            auc += (fpr - prev_fpr) * (tpr + prev_tpr) / 2
+            prev_fpr, prev_tpr = fpr, tpr
+
+        analysis_dir = os.path.join(self.path, "docking", "analysis")
+        os.makedirs(analysis_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_path = os.path.join(analysis_dir, f"roc_assay_{binder_id}_vs_{decoy_id}_{timestamp}.csv")
+
+        try:
+            with open(csv_path, "w") as f:
+                f.write("fpr,tpr,score,label\n")
+                for fpr, tpr, score, label in roc_points:
+                    f.write(f"{fpr},{tpr},{score},{label}\n")
+        except Exception as e:
+            print(f"⚠️ Could not write ROC CSV: {e}")
+            csv_path = None
+
+        print("\nROC analysis complete")
+        print(f"Binders: {len(binder_scores)} | Decoys: {len(decoy_scores)} | AUC: {auc:.3f}")
+        if csv_path:
+            print(f"ROC curve data saved to: {csv_path}")
+
+
+        # Create a plot of the ROC curve
+        if csv_path:
+            print(f"ROC curve data saved to: {csv_path}")
+            
+            # Create ROC plot using matplotlib
+            try:
+                import matplotlib.pyplot as plt
+                import csv
+                
+                # Read the CSV to extract FPR and TPR for plotting
+                fpr_list = []
+                tpr_list = []
+                with open(csv_path, "r") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        fpr_list.append(float(row['fpr']))
+                        tpr_list.append(float(row['tpr']))
+                
+                # Create the plot
+                plt.figure(figsize=(8, 8))
+                plt.plot(fpr_list, tpr_list, 'b-', linewidth=2, label=f'ROC curve (AUC = {auc:.3f})')
+                plt.plot([0, 1], [0, 1], 'r--', linewidth=1, label='Random classifier')
+                plt.xlim([0.0, 1.0])
+                plt.ylim([0.0, 1.0])
+                plt.xlabel('False Positive Rate', fontsize=12)
+                plt.ylabel('True Positive Rate', fontsize=12)
+                plt.title(f'ROC Curve - Assay {binder_id} vs {decoy_id}', fontsize=14)
+                plt.legend(loc="lower right", fontsize=10)
+                plt.grid(True, alpha=0.3)
+                
+                # Save the plot
+                plot_path = csv_path.replace('.csv', '.png')
+                plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+                plt.close()
+                
+                print(f"ROC plot saved to: {plot_path}")
+                
+            except ImportError:
+                print("⚠️ matplotlib not available; ROC plot not created")
+            except Exception as e:
+                print(f"⚠️ Could not create ROC plot: {e}")
+
+        return {
+            "binder_assay_id": binder_id,
+            "decoy_assay_id": decoy_id,
+            "auc": auc,
+            "roc_points": roc_points,
+            "csv_path": csv_path,
+        }
+        
+    def _prompt_assay(self, role: str, assay_by_id) -> Optional[int]:
+        
+        while True:
+            choice = input(f"Enter assay ID to use as {role} (press Enter to cancel): ").strip()
+            if not choice:
+                print("❌ Operation cancelled.")
+                return None
+            try:
+                aid = int(choice)
+            except ValueError:
+                print("Please enter a numeric assay ID.")
+                continue
+            if aid not in assay_by_id:
+                print("Assay ID not found; choose one from the list above.")
+                continue
+            return aid
+        
+    def _load_best_scores(self, db_path: str) -> List[float]:
+        if not os.path.exists(db_path):
+            raise FileNotFoundError(f"Results DB not found: {db_path}")
+        
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT MIN(docking_score) AS best_score
+            FROM Results
+            GROUP BY LigName
+        """)
+        
+        rows = cursor.fetchall()
+        conn.close()
+        return [float(r[0]) for r in rows if r[0] is not None]
+    
+    def _parse_pdbqt_output(self, filepath):
+        """
+        Will read a .pdbqt outfile generated by vina, and will parse the lines starting from 'MODEL 1' to 'ENDMDL'. Starting and ending lines are not included
+        """    
+        
+        try:
+            model = []
+            with open(filepath, 'r') as f:
+                
+                in_model = False
+                
+                for line in f:
+                    line = line.rstrip('\n')
+                    
+                    # Check if we're entering a MODEL block
+                    if line.startswith('MODEL 1'):
+                        in_model = True
+                        continue
+                    
+                    # Check if we're exiting a MODEL block
+                    if line.startswith('ENDMDL'):
+                        in_model = False
+                        continue
+                    
+                    # Collect lines within a MODEL block
+                    if in_model:
+                        model.append(line + "\n")
+
+            return model[6:]  # Exclude the first 6 lines to simulate .dlg file registry
+        
+        except FileNotFoundError:
+            print(f"❌ File not found: {filepath}")
+            return None
+        except Exception as e:
+            print(f"❌ Error parsing PDBQT file: {e}")
+            return None
+        
+    def _add_input_model_in_db(self, db, input_model, outfile):
+        """
+        Will connect to db and add the string in input model to the Ligands table, matching the row by outfile_prefix
+        """
+        
+        import sqlite3
+        import json
+    
+        outfile_prefix = os.path.basename(outfile).replace('.pdbqt', '')
+        
+        try:
+            conn = sqlite3.connect(db)
+            cursor = conn.cursor()
+            
+            # Update the Ligands table with the input_model for the matching LigName
+            cursor.execute("""
+                UPDATE Ligands 
+                SET input_model = ? 
+                WHERE LigName = ?
+            """, (json.dumps(input_model), outfile_prefix))
+            
+            conn.commit()
+            conn.close()
+            
+            return True
+            
+        except sqlite3.Error as e:
+            print(f"❌ Database error while adding input model for {outfile_prefix}: {e}")
+            return False
+        except Exception as e:
+            print(f"❌ Error adding input model for {outfile_prefix}: {e}")
+            return False
+        
+        
+        
+        
+    
+    
