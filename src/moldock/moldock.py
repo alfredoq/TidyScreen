@@ -2859,6 +2859,8 @@ except Exception as e:
                 print("❌ Failed to process PDB file")
                 return None
             
+            print(f"Checked pdb path: {checked_pdb_path}")
+            
             # Step 7: Create receptor registry entry
             pdb_registry = self._create_pdb_registry_entry(
                 pdb_name, pdb_file, processed_pdb_path, pdb_folder, pdb_analysis, checked_pdb_path
@@ -3186,20 +3188,21 @@ except Exception as e:
             # Create processing summary file
             self._create_processing_summary(pdb_folder, original_pdb_path, processed_pdb_path, selected_chains, selected_ligands, analysis)
 
-            # # --- Add missing atoms using tleap as the last step ---
-            # tleap_fixed_pdb = self._add_missing_atoms_in_receptor_tleap(processed_pdb_path, analysis)
             
-            # --- Add missing atoms using prody as the last step ---
-            receptor_checked = self._add_missing_atoms_in_pdb_prody(processed_pdb_path, analysis)
+            # --- Add missing atoms using tleap ---
+            tleap_processed_file = self._add_missing_atoms_in_pdb_tleap(processed_pdb_path, analysis)
             
-            # if tleap_fixed_pdb:
-            #     print(f"   ✅ Receptor with missing atoms added: {os.path.relpath(tleap_fixed_pdb)}")
-            #     return tleap_fixed_pdb
-            # else:
-            #     print(f"   ⚠️  Returning processed PDB without tleap fixing.")
-            #     return processed_pdb_path
+            # Process tleap_processed_file to add the element name column if missing
+            receptor_moldf_dict = self._refine_receptor_model(tleap_processed_file, processed_pdb_path)
 
-            return processed_pdb_path, receptor_checked
+            # Write (overwrite) the tleap_processed_file
+            from moldf import write_pdb
+            write_pdb(receptor_moldf_dict, tleap_processed_file)
+            
+            print(f"✅ tleap processing complete. Output: {tleap_processed_file}")
+            
+            return processed_pdb_path, tleap_processed_file
+            
 
         except Exception as e:
             print(f"❌ Error processing PDB file: {e}")
@@ -4456,13 +4459,84 @@ quit
         final_file = receptor_file.replace(".pdb","_checked.pdb")
         
         ## Add missing atoms (including heavy and hydrogens) using prody
-        prody.addMissingAtoms(PDBname, method='pdbfixer')
+        print("🔨 Adding missing atoms...")
+        structure = prody.addMissingAtoms(PDBname, method='pdbfixer')
 
         ## Rename the default output of prody 
         shutil.move(receptor_path + '/addH_receptor.pdb', final_file)
 
         return final_file
 
+    def _add_missing_atoms_in_pdb_tleap(self, receptor_file, receptor_info):
+        
+        import tempfile
+        import subprocess
+        
+        print(f"Processing pdb: \n {receptor_file} \n with tleap")
+        
+        ## Write a tleap input to load receptor_file
+        try:
+            tleap_path = shutil.which("tleap")
+
+            # Fail is tleap is not available
+            if tleap_path is None:
+                print("❌ tleap not found in PATH. Please install AmberTools and ensure tleap is available.")
+                return None
+        
+            # Process with tleap
+            tleap_processed_file = receptor_file.replace(".pdb", "_checked.pdb")
+            tleap_script = f"""
+source leaprc.protein.ff14SB
+source leaprc.water.tip3p
+HOH = WAT
+mol = loadpdb {receptor_file}
+savepdb mol {tleap_processed_file}
+quit
+"""
+            # Write tleap script to a temp file
+            with tempfile.NamedTemporaryFile("w", delete=False, suffix=".in") as tf:
+                tf.write(tleap_script)
+                tleap_input_path = tf.name
+
+            ## Run tleap to process the receptor
+            print(f"🛠️  Running tleap to process receptor...")
+            result = subprocess.run(
+                ["tleap", "-f", tleap_input_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+
+            ## Rename 'WAT' residues to 'HOH' in the tleap_processed_file
+            with open(tleap_processed_file, 'r') as file:
+                filedata = file.read()
+
+            filedata = filedata.replace(' WAT ', ' HOH ')
+
+            with open(tleap_processed_file, 'w') as file:
+                file.write(filedata)
+
+            # Clean up temp file
+            os.remove(tleap_input_path)
+
+            # Check for errors
+            if result.returncode != 0:
+                print("❌ tleap failed to process the receptor file.")
+                print(result.stderr)
+                return None
+
+            # Check if output file was created
+            if not os.path.exists(tleap_processed_file):
+                print("❌ tleap did not produce the expected output file.")
+                return None
+
+            return tleap_processed_file
+                    
+        except Exception as e:
+            print(f"Failed processing: {receptor_file} with tleap")
+            print(e)
+            return None
+        
     def _reassign_chain_and_resnums(self, reference_pdb, target_pdb):
         """
         Create a dictionary in which the key is formed by residue name, the chain and the residue number in the reference pdb_file, and the value is formed by the residue name and residue number in the target pdb file.
@@ -4742,43 +4816,45 @@ quit
         # Select the pdb file to convert to .pdbqt
         pdb_to_convert = checked_pdb_path
 
+        print(f"PDB to convert: {pdb_to_convert}")
+
         # Call helper to create PDBQT
         pdbqt_file, configs = self._create_pdbqt_from_pdb(pdb_to_convert)
 
-        # Check if pdbqt receptor file contains a Zinc ion in order to apply AutoDock4Zn parameters
-        has_ZN = self._check_ZN_presence(pdbqt_file, rec_main_path)
+        # # Check if pdbqt receptor file contains a Zinc ion in order to apply AutoDock4Zn parameters
+        # has_ZN = self._check_ZN_presence(pdbqt_file, rec_main_path)
 
-        if has_ZN:
+        # if has_ZN:
             
-            print("⚠️  Zn atom(s) detected in the receptor structure.")
-            while True:
-                zn_choice = input("Do you want to process with AutoDock4Zn parameters? (y/n): ").strip().lower()
-                if zn_choice in ['y', 'yes']:
-                    print("✅ AutoDock4Zn parameters will be applied.")
-                    self._apply_ad4zn_params(pdbqt_file, rec_main_path)
-                    break
+        #     print("⚠️  Zn atom(s) detected in the receptor structure.")
+        #     while True:
+        #         zn_choice = input("Do you want to process with AutoDock4Zn parameters? (y/n): ").strip().lower()
+        #         if zn_choice in ['y', 'yes']:
+        #             print("✅ AutoDock4Zn parameters will be applied.")
+        #             self._apply_ad4zn_params(pdbqt_file, rec_main_path)
+        #             break
 
-                elif zn_choice in ['n', 'no']:
-                    print("ℹ️  Skipping AutoDock4Zn processing.")
-                    has_ZN = False
-                    break
-                else:
-                    print("❌ Please answer 'y' or 'n'.")
+        #         elif zn_choice in ['n', 'no']:
+        #             print("ℹ️  Skipping AutoDock4Zn processing.")
+        #             has_ZN = False
+        #             break
+        #         else:
+        #             print("❌ Please answer 'y' or 'n'.")
 
-            print("✅ AutoDock4Zn parameters to be applied.")
+        #     print("✅ AutoDock4Zn parameters to be applied.")
 
-        # Call helper method to create receptor grids
-        self._create_receptor_grids(pdbqt_file, configs, rec_main_path, has_ZN)
+        # # Call helper method to create receptor grids
+        # self._create_receptor_grids(pdbqt_file, configs, rec_main_path, has_ZN)
 
-        if pdbqt_file:
+        # if pdbqt_file:
 
-            self._create_receptor_register(pdb_id, pdb_name, pdb_to_convert, pdbqt_file, configs)
+        #     self._create_receptor_register(pdb_id, pdb_name, pdb_to_convert, pdbqt_file, configs)
             
-            print(f"✅ PDBQT file created: {pdbqt_file}")
+        #     print(f"✅ PDBQT file created: {pdbqt_file}")
         
-        else:
-            print("❌ Failed to create PDBQT file.")
-            return None
+        # else:
+        #     print("❌ Failed to create PDBQT file.")
+        #     return None
         
     def _create_pdbqt_from_pdb(self, pdb_to_convert):
         
@@ -6752,6 +6828,7 @@ quit
         
         import sqlite3
         import json
+
     
         outfile_prefix = os.path.basename(outfile).replace('.pdbqt', '')
         
@@ -6777,9 +6854,179 @@ quit
         except Exception as e:
             print(f"❌ Error adding input model for {outfile_prefix}: {e}")
             return False
+    
+    def _refine_receptor_model(self, tleap_processed_file, processed_pdb_path, minimize_receptor=False):
         
+        ## Create a template of the original receptor to get crystallographic residue numbering
+        original_df_numbering = self._get_crystallographic_numbering(processed_pdb_path)
         
+        if minimize_receptor:
+            # Develop method to minize the receptor model
+            pass
         
+        # Add element column to the tleap processed pdb file
+        moldf_df = self._add_element_column_to_pdb_file(tleap_processed_file)
         
+        # Use original and processed dataframes to get the crystallographic numbering
+        moldf_df_renumbered = self._renumber_moldf_df(original_df_numbering, moldf_df)
+        
+        # Create a moldf type dictionary with the modified df
+        receptor_moldf_dict = {
+            '_atom_site': moldf_df_renumbered
+        }
+        
+        return receptor_moldf_dict
+    
+    def _get_crystallographic_numbering(self, receptor_file):
+        import pandas as pd
+        
+        # Read the original receptor pdb file and keep lines starting with 'ATOM' or 'HETATM'
+        with open(receptor_file, 'r') as f:
+            lines = f.readlines()   
+        filtered_lines = [line for line in lines if line.startswith('ATOM') or line.startswith('HETATM')]
+    
+        # Create a dataframe with the cystallographic numbering
+        original_df = pd.DataFrame([line.split() for line in filtered_lines])
+        # Evaluate the data in each column to convert numeric strings to appropriate numeric types
+        for column in original_df.columns:
+            try:
+                original_df[column] = pd.to_numeric(original_df[column])
+            except (ValueError, TypeError):
+                pass
+    
+        # Create a new dataframe with only relevant columns
+        original_df_numbering = original_df[[2, 3]].copy()
+        # Change the column names
+        original_df_numbering.columns = ['atom_name', 'residue_name']
+    
+        # Evaluate if column index 4 in original_df is int type (i.e. residue number), if so add it to original_df_new. Else, if column index 4 is object type (i.e. chain id), add the next column (index 5=residue number) to original_df_new
+        if pd.api.types.is_integer_dtype(original_df[4]):
+            original_df_numbering['residue_number'] = original_df[4].astype(int)
+            original_df_numbering['x_coord'] = original_df[5].astype(float)
+            original_df_numbering['y_coord'] = original_df[6].astype(float)
+            original_df_numbering['z_coor'] = original_df[7].astype(float)
+        elif pd.api.types.is_integer_dtype(original_df[5]):
+            original_df_numbering['residue_number'] = original_df[5].astype(int)
+            original_df_numbering['x_coord'] = original_df[6].astype(float)
+            original_df_numbering['y_coord'] = original_df[7].astype(float)
+            original_df_numbering['z_coor'] = original_df[8].astype(float)
+    
+        return original_df_numbering
+        
+    def _add_element_column_to_pdb_file(self, tleap_processed_file):
+        
+        from moldf import read_pdb
+        from moldf import write_pdb
+        import pandas as pd
+        
+        # Create a df from the tleap_receptor file
+        df = pd.read_csv(tleap_processed_file, sep=r'\s+', engine='python', header=None)
+        # Change the column names
+        df.columns = ['record_name', 'atom_number', 'atom_name', 'residue_name', 'residue_number', 'x_coord', 'y_coord', 'z_coord', 'occupancy', 'b_factor']
+        # Fill NaN values in the 'atom_number' column with forward fill and then add a cumulative sum to ensure unique atom numbers
+        df['atom_number'] = df['atom_number'].ffill().add(df['atom_number'].isna().astype(int).cumsum()).astype(int)
+        # Fill NaN values with a default value (e.g., 0) and change the residue_number column to integer type
+        df['residue_number'] = df['residue_number'].ffill().fillna(0).astype(int)
+        # Fill NaN atom names with an empty string
+        df['atom_name'] = df['atom_name'].fillna('')
+        # Fil NaN residue names with the same value as above
+        df['residue_name'] = df['residue_name'].ffill().fillna('')
+
+        ## Add missing columns according to moldf format
+        df.insert(3, 'alt_loc', '')
+        df.insert(5, 'chain_id', '')
+        df.insert(7, 'insertion', '')
+        df.insert(13, 'segment_id', '')
+        df.insert(14, 'element_symbol', '')
+        df.insert(15, 'charge', '')
+
+        # Create a list of atom names in pdb file corresponding to carbon atoms
+        carbon_atoms = ['C', 'CA', 'CB', 'CG', 'CD', 'CE', 'CZ', 'CH', 'CW', 'CV', 'CX', 'CY', 'CZ1', 'CZ2', 'CZ3', 'CE1', 'CE2', 'CE3', 'CD1', 'CD2', 'CG1', 'CG2', 'CH2', 'CH3']
+
+        # Check the df for any atom names that are in the carbon_atoms list and change their element_symbol to 'C'
+        for index, row in df.iterrows():
+            if row['atom_name'].strip() in carbon_atoms:
+                df.at[index, 'element_symbol'] = 'C'
+
+        # Create a list of atom names in pdb file corresponding to nitrogen atoms
+        nitrogen_atoms = ['N', 'NA', 'NB', 'NC', 'ND', 'NE', 'NZ', 'NH1', 'NH2', 'ND1', 'ND2', 'NE1', 'NE2']
+
+        # Check the df for any atom names that are in the nitrogen_atoms list and change their element_symbol to 'N'
+        for index, row in df.iterrows():
+            if row['atom_name'].strip() in nitrogen_atoms:
+                df.at[index, 'element_symbol'] = 'N'
+
+        # Create a list of atom names in pdb file corresponding to hydrogen atoms
+        hydrogen_atoms = ['H', 'HA', 'HB', 'HC', 'HD', 'HE', 'HZ', 'HH', 'HN', 'HW', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'H7', 'H8', 'H9', 'HB1', 'HB2', 'HB3', 'HG1', 'HG2', 'HG3', 'HD1', 'HD2', 'HD3', 'HE1', 'HE2', 'HE3', 'HG', 'HH1', 'HH2', 'HD11', 'HD12', 'HD13', 'HE21', 'HE22', 'HE23', 'HD21', 'HD22', 'HD23', 'HZ1', 'HZ2', 'HZ3', 'HN1', 'HN2', 'HN3','HG11', 'HG12', 'HG13', 'HG21', 'HG22', 'HG23', 'HH11', 'HH12', 'HH13', 'HH21', 'HH22', 'HH23', 'HA2', 'HA3']
+
+        # Check the df for any atom names that are in the hydrogen_atoms list and change their element_symbol to 'H'
+        for index, row in df.iterrows():
+            if row['atom_name'].strip() in hydrogen_atoms:
+                df.at[index, 'element_symbol'] = 'H'
+
+        # Create a list of atom names in pdb file corresponding to oxygen atoms
+        oxygen_atoms = ['O', 'OA', 'OB', 'OC', 'OD', 'OE', 'OXT', 'OG', 'OG1', 'OD1', 'OD2', 'OE1', 'OE2', 'OG', 'OH']
+
+        # Check the df for any atom names that are in the oxygen_atoms list and change their element_symbol to 'O'
+        for index, row in df.iterrows():
+            if row['atom_name'].strip() in oxygen_atoms:
+                df.at[index, 'element_symbol'] = 'O'
+
+        # Create a list of atom names in pdb file corresponding to sulfur atoms
+        sulfur_atoms = ['S', 'SD', 'SG']
+
+        # Check the df for any atom names that are in the sulfur_atoms list and change their element_symbol to 'S'
+        for index, row in df.iterrows():
+            if row['atom_name'].strip() in sulfur_atoms:
+                df.at[index, 'element_symbol'] = 'S'
+
+        # Create a list of atom names in pdb file corresponding to zinc atoms
+        zinc_atoms = ['ZN', 'Z']
+
+        # Check the df for any atom names that are in the zinc_atoms list and change their element_symbol to 'Zn'
+        for index, row in df.iterrows():
+            if row['atom_name'].strip() in zinc_atoms:
+                df.at[index, 'element_symbol'] = 'ZN'
+                
+        # Return the moldf like dataframe
+        return df
     
     
+    def _renumber_moldf_df(self, original_df_numbering, moldf_df):
+        
+        ## Loop over the df rows, and for each row, find the matching x, y, z coordinates in original_df_new and get the residue_number from there, and assign it to the df residue_number
+        for index, row in moldf_df.iterrows():
+            x = row['x_coord']
+            y = row['y_coord']
+            z = row['z_coord']
+            
+            # Find the matching row in original_df_numbering
+            match = original_df_numbering[
+                (original_df_numbering['x_coord'] == x) & 
+                (original_df_numbering['y_coord'] == y) & 
+                (original_df_numbering['z_coor'] == z)
+            ]
+            
+            # If a match is found, get the residue_number and assign it to df
+            if not match.empty:
+                moldf_df.at[index, 'residue_number'] = match['residue_number'].values[0]
+                
+        
+        ## Loop over the df rows, and for each row, check if x, y, z coordinates do not match those present in the original_df_new. If so, assign the residue_number to the same value as the previous row
+        for index, row in moldf_df.iterrows():
+            x = row['x_coord']
+            y = row['y_coord']
+            z = row['z_coord']
+            
+            # Find the matching row in original_df_numbering
+            match = original_df_numbering[
+                (original_df_numbering['x_coord'] == x) & 
+                (original_df_numbering['y_coord'] == y) & 
+                (original_df_numbering['z_coor'] == z)
+            ]
+            
+            # If no match is found, assign the residue_number to the same value as the previous row
+            if match.empty and index > 0:
+                moldf_df.at[index, 'residue_number'] = moldf_df.at[index - 1, 'residue_number'] 
+                
+        return moldf_df
