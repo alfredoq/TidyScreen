@@ -427,8 +427,6 @@ class MolDock:
             print(f"❌ Error listing docking methods: {e}")
             return None
 
-
-
     def _get_engine_specific_parameters(self, engine_name: str) -> Optional[Dict[str, Any]]:
         """
         Get engine-specific parameters from user input.
@@ -2768,160 +2766,708 @@ except Exception as e:
             
         except Exception as e:
             print(f"❌ Error showing table details: {e}")
-            
-    def prepare_pdb_for_docking(self, pdb_file: Optional[str] = None, pdb_name: Optional[str] = None, verbose = True) -> Optional[Dict[str, Any]]:
+    
+    def save_pdb_model(self) -> Optional[Dict[str, Any]]:
         """
-        Create a receptor entry for docking from a PDB file. The user is prompted for a pdb file and receptor name, 
-        after which a register for the receptor is created in a database called pdbs.db located in the 
+        The user is prompted to select a PDB file, which will be stored as a blob object in a table named pdb_files in the pdbs.db located in the 
+        project_path/docking/receptors directory
+        
+        Returns:
+            Optional[Dict[str, Any]]: Information about the saved PDB file or None if failed
+        """
+        import sqlite3
+        import json
+        from datetime import datetime
+        
+        try:
+            # Prompt for PDB file path
+            print(f"\n💾 SAVE PDB MODEL TO DATABASE")
+            print("=" * 80)
+            print(f"   This will store a PDB file as a blob in the database")
+            print(f"   Location: {self.path}/docking/receptors/pdbs.db")
+            print("=" * 80)
+            
+            # Get PDB file path
+            while True:
+                try:
+                    pdb_file = input(f"\n📁 Enter path to PDB file: ").strip()
+                    
+                    if not pdb_file:
+                        print(f"❌ No file path provided")
+                        return None
+                    
+                    # Expand user path if needed
+                    pdb_file = os.path.expanduser(pdb_file)
+                    
+                    # Check if file exists
+                    if not os.path.exists(pdb_file):
+                        print(f"❌ File not found: {pdb_file}")
+                        retry = input(f"   Try again? (y/n, default: y): ").strip().lower()
+                        if retry == 'n':
+                            return None
+                        continue
+                    
+                    # Check if it's a PDB file
+                    if not pdb_file.lower().endswith('.pdb'):
+                        print(f"⚠️  Warning: File doesn't have .pdb extension")
+                        proceed = input(f"   Proceed anyway? (y/n, default: n): ").strip().lower()
+                        if proceed != 'y':
+                            continue
+                    
+                    break
+                    
+                except KeyboardInterrupt:
+                    print(f"\n\n❌ Operation cancelled by user")
+                    return None
+            
+            # Get PDB name/identifier
+            default_name = os.path.splitext(os.path.basename(pdb_file))[0]
+            while True:
+                try:
+                    pdb_name = input(f"\n🏷️  Enter name for this PDB (default: {default_name}): ").strip()
+                    
+                    if not pdb_name:
+                        pdb_name = default_name
+                    
+                    # Check if name already exists
+                    pdbs_db_path = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
+                    
+                    if os.path.exists(pdbs_db_path):
+                        conn = sqlite3.connect(pdbs_db_path)
+                        cursor = conn.cursor()
+                        
+                        # Check if table exists
+                        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pdb_files'")
+                        if cursor.fetchone():
+                            cursor.execute("SELECT COUNT(*) FROM pdb_files WHERE pdb_name = ?", (pdb_name,))
+                            if cursor.fetchone()[0] > 0:
+                                print(f"⚠️  PDB name '{pdb_name}' already exists in database")
+                                overwrite = input(f"   Overwrite existing entry? (y/n, default: n): ").strip().lower()
+                                conn.close()
+                                if overwrite != 'y':
+                                    continue
+                        
+                        conn.close()
+                    
+                    break
+                    
+                except KeyboardInterrupt:
+                    print(f"\n\n❌ Operation cancelled by user")
+                    return None
+            
+            # Get optional description
+            try:
+                description = input(f"\n📝 Enter description (optional, press Enter to skip): ").strip()
+            except KeyboardInterrupt:
+                print(f"\n   ⚠️  Description entry cancelled. Using empty description.")
+                description = ""
+            
+            # Read PDB file content
+            print(f"\n📖 Reading PDB file...")
+            try:
+                with open(pdb_file, 'rb') as f:
+                    pdb_blob = f.read()
+                
+                file_size = len(pdb_blob)
+                print(f"   ✓ File read successfully ({file_size:,} bytes)")
+                
+            except Exception as e:
+                print(f"❌ Error reading PDB file: {e}")
+                return None
+            
+            # Get basic file information
+            file_info = {
+                'original_path': pdb_file,
+                'filename': os.path.basename(pdb_file),
+                'file_size': file_size,
+                'modified_date': datetime.fromtimestamp(os.path.getmtime(pdb_file)).isoformat()
+            }
+            
+            # Create database and table
+            os.makedirs(os.path.dirname(pdbs_db_path), exist_ok=True)
+            
+            conn = sqlite3.connect(pdbs_db_path)
+            cursor = conn.cursor()
+            
+            # Create pdb_files table if it doesn't exist
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS pdb_files (
+                    file_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    pdb_name TEXT UNIQUE NOT NULL,
+                    project_name TEXT,
+                    pdb_blob BLOB NOT NULL,
+                    original_path TEXT,
+                    filename TEXT,
+                    file_size INTEGER,
+                    description TEXT,
+                    file_info TEXT,
+                    created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_modified TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    notes TEXT
+                )
+            ''')
+            
+            # Insert or replace PDB file
+            print(f"\n💾 Saving to database...")
+            
+            cursor.execute('''
+                INSERT OR REPLACE INTO pdb_files (
+                    pdb_name, project_name, pdb_blob, original_path, filename,
+                    file_size, description, file_info, notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                pdb_name,
+                self.name,
+                pdb_blob,
+                pdb_file,
+                os.path.basename(pdb_file),
+                file_size,
+                description,
+                json.dumps(file_info, indent=2),
+                f"PDB file saved from: {pdb_file}"
+            ))
+            
+            file_id = cursor.lastrowid or cursor.execute(
+                "SELECT file_id FROM pdb_files WHERE pdb_name = ?", 
+                (pdb_name,)
+            ).fetchone()[0]
+            
+            conn.commit()
+            conn.close()
+            
+            # Display summary
+            print(f"\n{'=' * 80}")
+            print(f"✅ PDB MODEL SAVED SUCCESSFULLY")
+            print(f"{'=' * 80}")
+            print(f"   📋 File ID: {file_id}")
+            print(f"   🏷️  Name: {pdb_name}")
+            print(f"   📁 Original Path: {pdb_file}")
+            print(f"   📊 File Size: {file_size:,} bytes")
+            print(f"   📝 Description: {description or 'None'}")
+            print(f"   💾 Database: {pdbs_db_path}")
+            print(f"   📅 Saved: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"{'=' * 80}")
+            
+            print(f"\n💡 Use list_pdb_templates() to view all saved PDB files")
+            
+            return {
+                'file_id': file_id,
+                'pdb_name': pdb_name,
+                'project_name': self.name,
+                'original_path': pdb_file,
+                'filename': os.path.basename(pdb_file),
+                'file_size': file_size,
+                'description': description,
+                'database_path': pdbs_db_path,
+                'saved_date': datetime.now().isoformat()
+            }
+            
+        except sqlite3.Error as e:
+            print(f"❌ Database error: {e}")
+            return None
+        except Exception as e:
+            print(f"❌ Error saving PDB model: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def write_pdb_model(self):
+        """
+        Will use the list_pdb_models to show the user available pdb files. The user is queried to select one model, after which the pdb file will be written to the project_path/docking/receptors directory using the original name
+        
+        Returns:
+            Optional[Dict[str, Any]]: Information about the written PDB file or None if failed
+        """
+        import sqlite3
+        from datetime import datetime
+        
+        try:
+            # List available PDB models
+            print(f"\n📁 RETRIEVE PDB MODEL FROM DATABASE")
+            print("=" * 80)
+            
+            models_list = self.list_pdb_models()
+            
+            if not models_list:
+                print(f"❌ No PDB models available to retrieve")
+                return None
+            
+            # Prompt user to select a model
+            while True:
+                try:
+                    selection_input = input(f"\nEnter the model number to retrieve (or 'q' to quit): ").strip()
+                    
+                    if selection_input.lower() == 'q':
+                        print(f"❌ Operation cancelled by user")
+                        return None
+                    
+                    try:
+                        model_number = int(selection_input)
+                        if model_number < 1 or model_number > len(models_list):
+                            print(f"❌ Invalid model number. Choose between 1 and {len(models_list)}")
+                            continue
+                        
+                        selected_model = models_list[model_number - 1]
+                        break
+                        
+                    except ValueError:
+                        print(f"❌ Invalid input. Please enter a number or 'q' to quit")
+                        continue
+                        
+                except KeyboardInterrupt:
+                    print(f"\n\n❌ Operation cancelled by user")
+                    return None
+            
+            # Display selected model info
+            print(f"\n{'=' * 80}")
+            print(f"✓ Selected Model: {selected_model['pdb_name']}")
+            print(f"  Original name: {selected_model['filename']}")
+            print(f"  File size: {selected_model['file_size']:,} bytes" if selected_model['file_size'] else "  File size: Unknown")
+            print(f"{'=' * 80}")
+            
+            # Retrieve the PDB blob from database
+            print(f"\n📂 Retrieving PDB file from database...")
+            
+            pdbs_db_path = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
+            conn = sqlite3.connect(pdbs_db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT pdb_blob FROM pdb_files WHERE file_id = ?
+            ''', (selected_model['file_id'],))
+            
+            result = cursor.fetchone()
+            conn.close()
+            
+            if not result or not result[0]:
+                print(f"❌ Failed to retrieve PDB blob from database")
+                return None
+            
+            pdb_blob = result[0]
+            
+            # Determine output path and filename
+            receptors_dir = os.path.join(self.path, 'docking', 'receptors')
+            output_filename = selected_model['filename']  # Use original filename
+            output_path = os.path.join(receptors_dir, output_filename)
+            
+            # Check if file already exists
+            if os.path.exists(output_path):
+                print(f"⚠️  File already exists: {output_path}")
+                overwrite = input(f"   Overwrite? (y/n, default: n): ").strip().lower()
+                if overwrite != 'y':
+                    print(f"❌ Operation cancelled by user")
+                    return None
+            
+            # Write PDB file to disk
+            print(f"\n💾 Writing PDB file to disk...")
+            try:
+                os.makedirs(receptors_dir, exist_ok=True)
+                
+                with open(output_path, 'wb') as f:
+                    f.write(pdb_blob)
+                
+                written_size = len(pdb_blob)
+                print(f"   ✓ File written successfully ({written_size:,} bytes)")
+                
+            except Exception as e:
+                print(f"❌ Error writing PDB file: {e}")
+                return None
+            
+            # Display summary
+            print(f"\n{'=' * 80}")
+            print(f"✅ PDB FILE RETRIEVED AND WRITTEN SUCCESSFULLY")
+            print(f"{'=' * 80}")
+            print(f"   📋 Model ID: {selected_model['file_id']}")
+            print(f"   🏷️  Model Name: {selected_model['pdb_name']}")
+            print(f"   📁 Output Filename: {output_filename}")
+            print(f"   📍 Output Path: {output_path}")
+            print(f"   📊 File Size: {written_size:,} bytes")
+            print(f"   📅 Retrieved: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"{'=' * 80}")
+            
+            print(f"\n💡 PDB file is ready for use in docking workflow")
+            
+            return {
+                'file_id': selected_model['file_id'],
+                'model_name': selected_model['pdb_name'],
+                'filename': output_filename,
+                'output_path': output_path,
+                'file_size': written_size,
+                'retrieved_date': datetime.now().isoformat()
+            }
+            
+        except sqlite3.Error as e:
+            print(f"❌ Database error: {e}")
+            return None
+        except Exception as e:
+            print(f"❌ Error retrieving PDB file: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def list_pdb_models(self) -> Optional[List[Dict[str, Any]]]:
+        """
+        List the PDB models saved in the pdbs.db located in the 
         project_path/docking/receptors directory.
         
+        Returns:
+            Optional[List[Dict[str, Any]]]: List of PDB model information or None if failed
+        """
+        import sqlite3
+        import json
+        from datetime import datetime
+        
+        try:
+            # Path to pdbs database
+            pdbs_db_path = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
+            
+            # Check if database exists
+            if not os.path.exists(pdbs_db_path):
+                print(f"❌ No PDB database found")
+                print(f"   Expected location: {pdbs_db_path}")
+                print(f"\n💡 Save a PDB model first using save_pdb_model()")
+                return None
+            
+            # Connect to database
+            conn = sqlite3.connect(pdbs_db_path)
+            cursor = conn.cursor()
+            
+            # Check if pdb_files table exists
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pdb_files'")
+            if not cursor.fetchone():
+                print(f"❌ PDB files table not found in database")
+                conn.close()
+                return None
+            
+            # Retrieve all PDB models
+            cursor.execute('''
+                SELECT file_id, pdb_name, project_name, original_path, filename,
+                    file_size, description, created_date, last_modified, notes
+                FROM pdb_files
+                ORDER BY created_date DESC
+            ''')
+            
+            pdb_models = cursor.fetchall()
+            conn.close()
+            
+            # Check if any models exist
+            if not pdb_models:
+                print(f"📋 NO PDB MODELS FOUND")
+                print(f"   Database exists but contains no PDB models")
+                print(f"\n💡 Save a PDB model using save_pdb_model()")
+                return None
+            
+            # Display models
+            print(f"\n📦 SAVED PDB MODELS")
+            print("=" * 100)
+            print(f"   Found {len(pdb_models)} PDB model(s) in database")
+            print(f"   Database: {pdbs_db_path}")
+            print("=" * 100)
+            
+            models_list = []
+            
+            for idx, (file_id, pdb_name, project_name, original_path, filename,
+                    file_size, description, created_date, last_modified, notes) in enumerate(pdb_models, 1):
+                
+                # Store model info
+                model_info = {
+                    'file_id': file_id,
+                    'pdb_name': pdb_name,
+                    'project_name': project_name,
+                    'original_path': original_path,
+                    'filename': filename,
+                    'file_size': file_size,
+                    'description': description,
+                    'created_date': created_date,
+                    'last_modified': last_modified,
+                    'notes': notes
+                }
+                models_list.append(model_info)
+                
+                # Display basic model details
+                print(f"\n{idx}. 📦 {pdb_name}")
+                print(f"   {'─' * 96}")
+                print(f"   📋 ID: {file_id}")
+                print(f"   📁 Filename: {filename}")
+                print(f"   📍 Path: {original_path}")
+                print(f"   📊 File Size: {file_size:,} bytes" if file_size else "   📊 File Size: Unknown")
+                print(f"   📝 Description: {description or 'None'}")
+                print(f"   📅 Created: {created_date}")
+                
+                # Display modification date if different from created date
+                if last_modified and last_modified != created_date:
+                    print(f"   🔄 Modified: {last_modified}")
+                
+                print(f"   {'─' * 96}")
+            
+            print("=" * 100)
+            print(f"\n💡 Use save_pdb_model() to add new PDB models")
+            print(f"\n💡 Use write_pdb_model() to save PDB model to disk")
+            print(f"💡 Type 'details <number>' to view full information about a model")
+            
+            # Interactive details viewing
+            while True:
+                try:
+                    user_input = input(f"\nEnter command (or press Enter to exit): ").strip()
+                    
+                    if not user_input:
+                        break
+                    
+                    # Check if user wants details
+                    if user_input.lower().startswith('details'):
+                        parts = user_input.split()
+                        if len(parts) < 2:
+                            print(f"❌ Please specify a model number. Example: details 1")
+                            continue
+                        
+                        try:
+                            model_number = int(parts[1])
+                            if model_number < 1 or model_number > len(models_list):
+                                print(f"❌ Invalid model number. Choose between 1 and {len(models_list)}")
+                                continue
+                            
+                            # Display detailed information for selected model
+                            selected_model = models_list[model_number - 1]
+                            print(f"\n{'═' * 100}")
+                            print(f"🔍 DETAILED INFORMATION FOR: {selected_model['pdb_name']}")
+                            print(f"{'═' * 100}")
+                            print(f"   📋 File ID: {selected_model['file_id']}")
+                            print(f"   🏷️  PDB Name: {selected_model['pdb_name']}")
+                            print(f"   📁 Filename: {selected_model['filename']}")
+                            print(f"   📍 Original Path: {selected_model['original_path']}")
+                            print(f"   📦 Project: {selected_model['project_name']}")
+                            
+                            if selected_model['file_size']:
+                                print(f"\n   📊 SIZE INFORMATION:")
+                                print(f"      • File Size: {selected_model['file_size']:,} bytes")
+                            
+                            if selected_model['description']:
+                                print(f"\n   📝 DESCRIPTION:")
+                                print(f"      {selected_model['description']}")
+                            
+                            print(f"\n   📅 TIMESTAMPS:")
+                            print(f"      • Created: {selected_model['created_date']}")
+                            if selected_model['last_modified'] and selected_model['last_modified'] != selected_model['created_date']:
+                                print(f"      • Last Modified: {selected_model['last_modified']}")
+                            
+                            if selected_model['notes']:
+                                print(f"\n   📋 NOTES:")
+                                print(f"      {selected_model['notes']}")
+                            
+                            print(f"{'═' * 100}")
+                            
+                        except ValueError:
+                            print(f"❌ Invalid number format. Please use: details <number>")
+                            continue
+                    else:
+                        print(f"❌ Unknown command. Use 'details <number>' to view full information")
+                
+                except KeyboardInterrupt:
+                    print(f"\n\n👋 Exiting PDB models list")
+                    break
+            
+            return models_list
+            
+        except sqlite3.Error as e:
+            print(f"❌ Database error: {e}")
+            return None
+        except Exception as e:
+            print(f"❌ Error listing PDB models: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def create_pdb_template(self, pdb_name: Optional[str] = None, verbose=True) -> Optional[Dict[str, Any]]:
+        """
+        Create a PDB file template from a PDB model stored in the database using save_pdb_model.
+        The user is prompted to select a PDB model from the database, after which the PDB file 
+        is analyzed and a register for the receptor is created in the pdb_templates table.
+        
         Args:
-            pdb_file (Optional[str]): Path to PDB file. If None, user will be prompted.
-            receptor_name (Optional[str]): Name for the receptor. If None, user will be prompted.
+            pdb_name (Optional[str]): Name for the receptor template. If None, user will be prompted.
+            verbose (bool): Whether to display detailed output during processing.
             
         Returns:
-            Optional[Dict[str, Any]]: Receptor registry information or None if failed
+            Optional[Dict[str, Any]]: PDB template registry information or None if failed
         """
+        import sqlite3
+        import tempfile
+        from datetime import datetime
+        
         try:
-            print(f"🧬 CREATE/PROCESS PDB FILE FOR DOCKING")
-            print("=" * 50)
+            print(f"🧬 CREATE PDB TEMPLATE FROM DATABASE")
+            print("=" * 80)
             
-            # Step 1: Get PDB file path
-            if pdb_file is None:
-                while True:
+            # Step 1: List and select PDB model from database
+            print(f"\n📂 Retrieving PDB models from database...")
+            models_list = self.list_pdb_models()
+            
+            if not models_list:
+                print(f"❌ No PDB models available in database")
+                return None
+            
+            # Prompt user to select a model
+            while True:
+                try:
+                    selection_input = input(f"\nSelect PDB model number (or 'q' to quit): ").strip()
+                    
+                    if selection_input.lower() == 'q':
+                        print(f"❌ PDB template creation cancelled")
+                        return None
+                    
                     try:
-                        pdb_file = input("📁 Enter path to PDB file (or 'cancel'): ").strip()
-                        
-                        if pdb_file.lower() in ['cancel', 'quit', 'exit']:
-                            print("❌ Receptor creation cancelled")
-                            return None
-                        
-                        if not pdb_file:
-                            print("❌ PDB file path cannot be empty")
+                        model_number = int(selection_input)
+                        if model_number < 1 or model_number > len(models_list):
+                            print(f"❌ Invalid model number. Choose between 1 and {len(models_list)}")
                             continue
                         
-                        # Expand user path and resolve relative paths
-                        pdb_file = os.path.expanduser(pdb_file)
-                        pdb_file = os.path.abspath(pdb_file)
-                        
-                        if not os.path.exists(pdb_file):
-                            print(f"❌ File not found: {pdb_file}")
-                            continue
-                        
-                        if not pdb_file.lower().endswith('.pdb'):
-                            print("❌ File must have .pdb extension")
-                            continue
-                        
+                        selected_model = models_list[model_number - 1]
                         break
                         
-                    except KeyboardInterrupt:
-                        print("\n❌ Receptor creation cancelled")
-                        return None
-            else:
-                # Validate provided PDB file
-                pdb_file = os.path.expanduser(pdb_file)
-                pdb_file = os.path.abspath(pdb_file)
-                
-                if not os.path.exists(pdb_file):
-                    print(f"❌ PDB file not found: {pdb_file}")
-                    return None
-                
-                if not pdb_file.lower().endswith('.pdb'):
-                    print(f"❌ File must have .pdb extension: {pdb_file}")
+                    except ValueError:
+                        print(f"❌ Invalid input. Please enter a number or 'q' to quit")
+                        continue
+                        
+                except KeyboardInterrupt:
+                    print(f"\n❌ PDB template creation cancelled")
                     return None
             
-            print(f"✅ PDB file validated: {os.path.basename(pdb_file)}")
+            # Step 2: Retrieve PDB blob from database
+            print(f"\n📥 Retrieving PDB file from database...")
+            pdbs_db_path = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
+            conn = sqlite3.connect(pdbs_db_path)
+            cursor = conn.cursor()
             
-            # Step 2: Analyze PDB file
-            print("🔬 Analyzing PDB file...")
+            cursor.execute('''
+                SELECT pdb_blob FROM pdb_files WHERE file_id = ?
+            ''', (selected_model['file_id'],))
             
-            pdb_analysis = self._analyze_pdb_file(pdb_file)
+            result = cursor.fetchone()
+            conn.close()
             
-            if not pdb_analysis:
-                print("❌ Failed to analyze PDB file")
+            if not result or not result[0]:
+                print(f"❌ Failed to retrieve PDB blob from database")
                 return None
             
-            if verbose:
-                self._display_pdb_analysis(pdb_analysis)
+            pdb_blob = result[0]
             
-            # Step 3: Get receptor name
-            if pdb_name is None:
-                while True:
-                    try:
-                        default_name = os.path.splitext(os.path.basename(pdb_file))[0]
-                        pdb_name = input(f"🏷️  Enter PDB name (default: {default_name}): ").strip()
-                        
-                        if not pdb_name:
-                            pdb_name = default_name
-                        
-                        if pdb_name.lower() in ['cancel', 'quit', 'exit']:
-                            print("❌ PDB creation cancelled")
+            # Step 3: Write blob to temporary file for analysis
+            print(f"📝 Processing PDB file...")
+            with tempfile.NamedTemporaryFile(mode='wb', suffix='.pdb', delete=False) as tmp_file:
+                tmp_file.write(pdb_blob)
+                temp_pdb_path = tmp_file.name
+            
+            try:
+                # Step 4: Analyze PDB file
+                print(f"🔬 Analyzing PDB structure...")
+                pdb_analysis = self._analyze_pdb_file(temp_pdb_path)
+                
+                if not pdb_analysis:
+                    print(f"❌ Failed to analyze PDB file")
+                    os.unlink(temp_pdb_path)
+                    return None
+                
+                if verbose:
+                    self._display_pdb_analysis(pdb_analysis)
+                
+                # Step 5: Get PDB template name
+                if pdb_name is None:
+                    while True:
+                        try:
+                            default_name = f"{selected_model['pdb_name']}_template"
+                            pdb_name = input(f"\n🏷️  Enter PDB template name (default: {default_name}): ").strip()
+                            
+                            if not pdb_name:
+                                pdb_name = default_name
+                            
+                            if pdb_name.lower() in ['cancel', 'quit', 'exit']:
+                                print("❌ PDB template creation cancelled")
+                                os.unlink(temp_pdb_path)
+                                return None
+                            
+                            # Validate template name
+                            if not pdb_name.replace('_', '').replace('-', '').replace(' ', '').isalnum():
+                                print("❌ Template name can only contain letters, numbers, spaces, hyphens, and underscores")
+                                continue
+                            
+                            break
+                            
+                        except KeyboardInterrupt:
+                            print("\n❌ PDB template creation cancelled")
+                            os.unlink(temp_pdb_path)
                             return None
-                        
-                        # Validate receptor name
-                        if not pdb_name.replace('_', '').replace('-', '').replace(' ', '').isalnum():
-                            print("❌ PDB name can only contain letters, numbers, spaces, hyphens, and underscores")
-                            continue
-                        
-                        break
-                        
-                    except KeyboardInterrupt:
-                        print("\n❌ PDB creation cancelled")
-                        return None
-            
-            # Step 4: Check if receptor name already exists
-            existing_check = self._check_pdb_name_exists(pdb_name)
-            if existing_check:
-                while True:
-                    overwrite = input(f"⚠️  Receptor '{pdb_name}' already exists. Overwrite? (y/n): ").strip().lower()
-                    if overwrite in ['y', 'yes']:
-                        print("🔄 Will overwrite existing PDB")
-                        break
-                    elif overwrite in ['n', 'no']:
-                        print("❌ PDB creation cancelled - name already exists")
-                        return None
-                    else:
-                        print("❌ Please answer 'y' or 'n'")
-            
-            # Step 5: Create receptors directory structure
-            receptors_base_dir = os.path.join(self.path, 'docking', 'receptors')
-            os.makedirs(receptors_base_dir, exist_ok=True)
-            
-            # Create receptor-specific directory
-            pdb_folder = self._create_receptor_folder(receptors_base_dir, pdb_name)
-            
-            if not pdb_folder:
-                print("❌ Failed to create PDB folder")
-                return None
-            
-            # Step 6: Copy and process PDB file
-            processed_pdb_path, checked_pdb_path = self._process_pdb_file(pdb_file, pdb_folder, pdb_analysis)
-            
-            if not processed_pdb_path:
-                print("❌ Failed to process PDB file")
-                return None
-            
-            print(f"Checked pdb path: {checked_pdb_path}")
-            
-            # Step 7: Create receptor registry entry
-            pdb_registry = self._create_pdb_registry_entry(
-                pdb_name, pdb_file, processed_pdb_path, pdb_folder, pdb_analysis, checked_pdb_path
-            )
-            
-            if not pdb_registry:
-                print("❌ Failed to create PDB registry")
-                return None
-            
-            
-            if verbose:
-                # Step 8: Display success summary
-                self._display_pdb_creation_summary(pdb_registry)
-            
-            return pdb_registry
-            
+                
+                # Step 6: Check if template name already exists
+                existing_check = self._check_pdb_name_exists(pdb_name)
+                if existing_check:
+                    while True:
+                        overwrite = input(f"\n⚠️  Template '{pdb_name}' already exists. Overwrite? (y/n): ").strip().lower()
+                        if overwrite in ['y', 'yes']:
+                            print("🔄 Will overwrite existing PDB template")
+                            break
+                        elif overwrite in ['n', 'no']:
+                            print("❌ PDB template creation cancelled - name already exists")
+                            os.unlink(temp_pdb_path)
+                            return None
+                        else:
+                            print("❌ Please answer 'y' or 'n'")
+                
+                # Step 7: Create receptors directory structure
+                receptors_base_dir = os.path.join(self.path, 'docking', 'receptors')
+                os.makedirs(receptors_base_dir, exist_ok=True)
+                
+                # Create template-specific directory
+                pdb_folder = self._create_receptor_folder(receptors_base_dir, pdb_name)
+                
+                if not pdb_folder:
+                    print("❌ Failed to create PDB template folder")
+                    os.unlink(temp_pdb_path)
+                    return None
+                
+                # Step 8: Copy and process PDB file
+                print(f"📂 Processing and saving PDB template...")
+                processed_pdb_path, checked_pdb_path = self._process_pdb_file(temp_pdb_path, pdb_folder, pdb_analysis)
+                
+                if not processed_pdb_path:
+                    print("❌ Failed to process PDB file")
+                    os.unlink(temp_pdb_path)
+                    return None
+                
+                # Step 9: Create template registry entry
+                pdb_registry = self._create_pdb_registry_entry(
+                    pdb_name, selected_model['original_path'], processed_pdb_path, pdb_folder, pdb_analysis, checked_pdb_path
+                )
+                
+                if not pdb_registry:
+                    print("❌ Failed to create PDB template registry")
+                    os.unlink(temp_pdb_path)
+                    return None
+                
+                if verbose:
+                    # Step 10: Display success summary
+                    self._display_pdb_creation_summary(pdb_registry)
+                
+                print(f"\n{'=' * 80}")
+                print(f"✅ PDB TEMPLATE CREATED SUCCESSFULLY FROM DATABASE MODEL")
+                print(f"{'=' * 80}")
+                print(f"   Source Model: {selected_model['pdb_name']}")
+                print(f"   Template Name: {pdb_name}")
+                print(f"   Location: {pdb_folder}")
+                print(f"{'=' * 80}\n")
+                
+                return pdb_registry
+                
+            finally:
+                # Clean up temporary file
+                if os.path.exists(temp_pdb_path):
+                    os.unlink(temp_pdb_path)
+                
         except Exception as e:
-            print(f"❌ Error creating PDB register: {e}")
+            print(f"❌ Error creating PDB template: {e}")
+            import traceback
+            traceback.print_exc()
             return None
+
 
     def _analyze_pdb_file(self, pdb_file: str) -> Optional[Dict[str, Any]]:
         """
@@ -4200,7 +4746,7 @@ except Exception as e:
                                     processed_pdb_path: str, pdb_folder: str, 
                                     analysis: Dict[str, Any], checked_pdb_path) -> Optional[Dict[str, Any]]:
         """
-        Create PDB registry entry in pdbs.db
+        Create PDB templates registry entry in pdbs.db
 
         Args:
             pdb_name (str): Name of the PDB
@@ -4225,7 +4771,7 @@ except Exception as e:
 
             # Create receptors table
             cursor.execute('''
-                CREATE TABLE IF NOT EXISTS pdbs (
+                CREATE TABLE IF NOT EXISTS pdb_templates (
                     pdb_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     pdb_name TEXT UNIQUE NOT NULL,
                     project_name TEXT,
