@@ -266,7 +266,9 @@ class MolDock:
             return None
 
     def list_docking_methods(self):
-        "Will read the docking_methods.db under project path in the docking/docking_registers folder and inform the user about available methods"
+        """
+        Will read the docking_methods.db under project path in the docking/docking_registers folder and inform the user about available methods
+        """
         
         import sqlite3
         import json
@@ -299,7 +301,7 @@ class MolDock:
                 SELECT id, method_name, docking_engine, description, parameters, 
                     ligand_prep_params, created_date
                 FROM docking_methods
-                ORDER BY created_date DESC
+                ORDER BY created_date ASC
             ''')
             
             methods = cursor.fetchall()
@@ -344,37 +346,77 @@ class MolDock:
                 }
                 methods_list.append(method_info)
                 
-                # Display method details
+                # Display basic method details only
                 print(f"\n{idx}. 🏷️  {method_name}")
                 print(f"   {'─' * 76}")
                 print(f"   📋 ID: {method_id}")
                 print(f"   🧬 Engine: {engine}")
                 print(f"   📝 Description: {description or 'No description'}")
                 print(f"   📅 Created: {created_date}")
-                
-                # Display engine parameters
-                if parameters:
-                    print(f"\n   ⚙️  Engine Parameters:")
-                    for key, value in parameters.items():
-                        # Format parameter name
-                        param_display = key.replace('_', ' ').title()
-                        print(f"      • {param_display}: {value}")
-                else:
-                    print(f"\n   ⚙️  Engine Parameters: None configured")
-                
-                # Display ligand preparation parameters
-                if ligand_prep_params:
-                    print(f"\n   🧪 Ligand Preparation:")
-                    for key, value in ligand_prep_params.items():
-                        param_display = key.replace('_', ' ').title()
-                        print(f"      • {param_display}: {value}")
-                else:
-                    print(f"\n   🧪 Ligand Preparation: Default settings")
-                
                 print(f"   {'─' * 76}")
             
             print("=" * 80)
-            print(f"\n💡 Use these methods with dock_table() for docking experiments")
+            print(f"\n💡 Type 'details <number>' to view engine and ligand preparation parameters")
+            print(f"💡 Example: details 1")
+            
+            # Interactive details viewing
+            while True:
+                try:
+                    user_input = input(f"\nEnter command (or press Enter to exit): ").strip()
+                    
+                    if not user_input:
+                        break
+                    
+                    # Check if user wants details
+                    if user_input.lower().startswith('details'):
+                        parts = user_input.split()
+                        if len(parts) < 2:
+                            print(f"❌ Please specify a method number. Example: details 1")
+                            continue
+                        
+                        try:
+                            method_number = int(parts[1])
+                            if method_number < 1 or method_number > len(methods_list):
+                                print(f"❌ Invalid method number. Choose between 1 and {len(methods_list)}")
+                                continue
+                            
+                            # Display detailed parameters for selected method
+                            selected_method = methods_list[method_number - 1]
+                            print(f"\n{'═' * 80}")
+                            print(f"🔍 DETAILED PARAMETERS FOR: {selected_method['method_name']}")
+                            print(f"{'═' * 80}")
+                            
+                            # Display engine parameters
+                            if selected_method['parameters']:
+                                print(f"\n⚙️  ENGINE PARAMETERS ({selected_method['docking_engine']}):")
+                                print(f"   {'─' * 76}")
+                                for key, value in selected_method['parameters'].items():
+                                    param_display = key.replace('_', ' ').title()
+                                    print(f"   • {param_display}: {value}")
+                            else:
+                                print(f"\n⚙️  Engine Parameters: None configured")
+                            
+                            # Display ligand preparation parameters
+                            if selected_method['ligand_prep_params']:
+                                print(f"\n🧪 LIGAND PREPARATION PARAMETERS:")
+                                print(f"   {'─' * 76}")
+                                for key, value in selected_method['ligand_prep_params'].items():
+                                    param_display = key.replace('_', ' ').title()
+                                    print(f"   • {param_display}: {value}")
+                            else:
+                                print(f"\n🧪 Ligand Preparation: Default settings")
+                            
+                            print(f"{'═' * 80}")
+                            
+                        except ValueError:
+                            print(f"❌ Invalid number format. Please use: details <number>")
+                            continue
+                    else:
+                        print(f"❌ Unknown command. Use 'details <number>' to view parameters")
+                
+                except KeyboardInterrupt:
+                    print(f"\n\n👋 Exiting method list")
+                    break
             
             return methods_list
             
@@ -383,9 +425,9 @@ class MolDock:
             return None
         except Exception as e:
             print(f"❌ Error listing docking methods: {e}")
-            import traceback
-            traceback.print_exc()
             return None
+
+
 
     def _get_engine_specific_parameters(self, engine_name: str) -> Optional[Dict[str, Any]]:
         """
@@ -4821,40 +4863,40 @@ quit
         # Call helper to create PDBQT
         pdbqt_file, configs = self._create_pdbqt_from_pdb(pdb_to_convert)
 
-        # # Check if pdbqt receptor file contains a Zinc ion in order to apply AutoDock4Zn parameters
-        # has_ZN = self._check_ZN_presence(pdbqt_file, rec_main_path)
+        # Check if pdbqt receptor file contains a Zinc ion in order to apply AutoDock4Zn parameters
+        has_ZN = self._check_ZN_presence(pdbqt_file, rec_main_path)
 
-        # if has_ZN:
+        if has_ZN:
             
-        #     print("⚠️  Zn atom(s) detected in the receptor structure.")
-        #     while True:
-        #         zn_choice = input("Do you want to process with AutoDock4Zn parameters? (y/n): ").strip().lower()
-        #         if zn_choice in ['y', 'yes']:
-        #             print("✅ AutoDock4Zn parameters will be applied.")
-        #             self._apply_ad4zn_params(pdbqt_file, rec_main_path)
-        #             break
+            print("⚠️  Zn atom(s) detected in the receptor structure.")
+            while True:
+                zn_choice = input("Do you want to process with AutoDock4Zn parameters? (y/n): ").strip().lower()
+                if zn_choice in ['y', 'yes']:
+                    print("✅ AutoDock4Zn parameters will be applied.")
+                    self._apply_ad4zn_params(pdbqt_file, rec_main_path)
+                    break
 
-        #         elif zn_choice in ['n', 'no']:
-        #             print("ℹ️  Skipping AutoDock4Zn processing.")
-        #             has_ZN = False
-        #             break
-        #         else:
-        #             print("❌ Please answer 'y' or 'n'.")
+                elif zn_choice in ['n', 'no']:
+                    print("ℹ️  Skipping AutoDock4Zn processing.")
+                    has_ZN = False
+                    break
+                else:
+                    print("❌ Please answer 'y' or 'n'.")
 
-        #     print("✅ AutoDock4Zn parameters to be applied.")
+            print("✅ AutoDock4Zn parameters to be applied.")
 
-        # # Call helper method to create receptor grids
-        # self._create_receptor_grids(pdbqt_file, configs, rec_main_path, has_ZN)
+        # Call helper method to create receptor grids
+        self._create_receptor_grids(pdbqt_file, configs, rec_main_path, has_ZN)
 
-        # if pdbqt_file:
+        if pdbqt_file:
 
-        #     self._create_receptor_register(pdb_id, pdb_name, pdb_to_convert, pdbqt_file, configs)
+            self._create_receptor_register(pdb_id, pdb_name, pdb_to_convert, pdbqt_file, configs)
             
-        #     print(f"✅ PDBQT file created: {pdbqt_file}")
+            print(f"✅ PDBQT file created: {pdbqt_file}")
         
-        # else:
-        #     print("❌ Failed to create PDBQT file.")
-        #     return None
+        else:
+            print("❌ Failed to create PDBQT file.")
+            return None
         
     def _create_pdbqt_from_pdb(self, pdb_to_convert):
         
