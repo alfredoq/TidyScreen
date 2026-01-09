@@ -1695,7 +1695,7 @@ except Exception as e:
                     docking_engine, status, created_date, assay_folder_path, notes
                 FROM docking_assays 
                 WHERE project_name = ?
-                ORDER BY created_date DESC
+                ORDER BY created_date ASC
             ''', (self.name,))
             
             results = cursor.fetchall()
@@ -1807,7 +1807,7 @@ except Exception as e:
                 cursor.execute('''
                     SELECT id, method_name, docking_engine, description, parameters, ligand_prep_params, created_date
                     FROM docking_methods
-                    ORDER BY created_date DESC
+                    ORDER BY created_date ASC
                 ''')
                 methods = cursor.fetchall()
                 conn.close()
@@ -3144,7 +3144,7 @@ except Exception as e:
                 SELECT file_id, pdb_name, project_name, original_path, filename,
                     file_size, description, created_date, last_modified, notes
                 FROM pdb_files
-                ORDER BY created_date DESC
+                ORDER BY created_date ASC
             ''')
             
             pdb_models = cursor.fetchall()
@@ -3467,7 +3467,6 @@ except Exception as e:
             import traceback
             traceback.print_exc()
             return None
-
 
     def _analyze_pdb_file(self, pdb_file: str) -> Optional[Dict[str, Any]]:
         """
@@ -4799,7 +4798,7 @@ except Exception as e:
             cursor.execute('''
                 SELECT pdb_id, pdb_name, project_name, original_pdb_path, processed_pdb_path, checked_pdb_path,
                        pdb_folder_path, pdb_analysis, chains, resolution, atom_count, has_ligands, status
-                FROM pdbs
+                FROM pdb_templates
             ''')
             new_entry = (
                 pdb_name,
@@ -4835,7 +4834,7 @@ except Exception as e:
 
             # Insert or update receptor entry
             cursor.execute('''
-                INSERT OR REPLACE INTO pdbs (
+                INSERT OR REPLACE INTO pdb_templates (
                     pdb_name, project_name, original_pdb_path, processed_pdb_path, checked_pdb_path,
                     pdb_folder_path, pdb_analysis, chains, resolution, atom_count,
                     has_ligands, status, notes
@@ -4857,7 +4856,7 @@ except Exception as e:
             ))
 
             pdb_id = cursor.lastrowid or cursor.execute(
-                "SELECT pdb_id FROM pdbs WHERE pdb_name = ?", 
+                "SELECT pdb_id FROM pdb_templates WHERE pdb_name = ?", 
                 (pdb_name,)
             ).fetchone()[0]
 
@@ -5348,8 +5347,8 @@ quit
             cursor = conn.cursor()
             cursor.execute('''
                 SELECT pdb_id, pdb_name, processed_pdb_path, checked_pdb_path, pdb_folder_path, notes
-                FROM pdbs
-                ORDER BY created_date DESC
+                FROM pdb_templates
+                ORDER BY created_date ASC
             ''')
             pdbs = cursor.fetchall()
             conn.close()
@@ -6107,7 +6106,7 @@ quit
             cursor.execute('''
                 SELECT id, pdb_id, pdb_name, pdbqt_file, notes, created_date
                 FROM receptor_registers
-                ORDER BY created_date DESC
+                ORDER BY created_date ASC
             ''')
             receptors = cursor.fetchall()
             conn.close()
@@ -6406,7 +6405,7 @@ quit
     def list_pdb_templates(self) -> None:
         """
         Reads the 'pdbs.db' database located in the project_path/docking/receptors folder
-        and prints out the following columns from the 'pdbs' table:
+        and prints out the following columns from the 'pdb_templates' table:
         - 'pdb_name'
         - 'pdb_analysis'
         - 'processed_pdb_path'
@@ -6424,7 +6423,7 @@ quit
             cursor = conn.cursor()
             cursor.execute('''
                 SELECT pdb_name, processed_pdb_path, notes
-                FROM pdbs
+                FROM pdb_templates
                 ORDER BY created_date DESC
             ''')
             rows = cursor.fetchall()
