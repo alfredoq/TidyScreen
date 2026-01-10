@@ -334,7 +334,7 @@ def update_tidyscreen():
 
     try:
         print("🔄 Updating TidyScreen to the latest version...")
-        cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "git+https://github.com/alfredoq/tidyscreen.git"]
+        cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "git+https://github.com/alfredoq/TidyScreen.git"]
         subprocess.run(cmd, check=True)
         print("✅ TidyScreen updated successfully.")
     except subprocess.CalledProcessError as e:
