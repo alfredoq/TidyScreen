@@ -326,6 +326,20 @@ def add_chemical_reaction():
         print(f"❌ Error adding chemical reaction: {e}")
         return False
 
+def update_tidyscreen():
+    """
+    Will update TidyScreen to the latest version from the GitHub repository.
+    """
+    import subprocess
+
+    try:
+        print("🔄 Updating TidyScreen to the latest version...")
+        cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "git+https://github.com/yourusername/tidyscreen.git"]
+        subprocess.run(cmd, check=True)
+        print("✅ TidyScreen updated successfully.")
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Failed to update TidyScreen: {e}")   
+
 def gui():
     """
     Launch the Streamlit GUI for TidyScreen.
