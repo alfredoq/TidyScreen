@@ -345,10 +345,18 @@ def update_tidyscreen():
         branch = "main" if choice == "1" else "develop"
         print(f"📦 Installing from branch: {branch}")
         
-        # Install from GitHub with all dependencies
+        # First, uninstall the current version (ignore errors)
+        print("🗑️  Removing current installation...")
+        uninstall_cmd = [
+            sys.executable, "-m", "pip", "uninstall", "-y", "tidyscreen"
+        ]
+        subprocess.run(uninstall_cmd, capture_output=True)  # Ignore errors
+        
+        # Install from GitHub (without --force-reinstall to avoid dependency issues)
+        print(f"📥 Installing from GitHub ({branch} branch)...")
         cmd = [
             sys.executable, "-m", "pip", "install", 
-            "--upgrade", "--force-reinstall",
+            "--upgrade",
             f"git+https://github.com/alfredoq/TidyScreen.git@{branch}"
         ]
         
@@ -357,7 +365,7 @@ def update_tidyscreen():
         print("✅ TidyScreen updated successfully.")
         print("🔄 Please restart your Python session for changes to take effect.")
     except subprocess.CalledProcessError as e:
-        print(f"❌ Failed to update TidyScreen: {e}")   
+        print(f"❌ Failed to update TidyScreen: {e}")  
 
 
 def testing_function():
