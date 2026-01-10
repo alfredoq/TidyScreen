@@ -369,7 +369,7 @@ def update_tidyscreen():
 
 
 def testing_function():
-    print("Function worked! REALLY!! NOW!! COOL!!")
+    print("Function worked! REALLY!! NOW!! COOL!! UPGRADE!")
 
 def gui():
     """
