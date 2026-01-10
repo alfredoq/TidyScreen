@@ -367,10 +367,6 @@ def update_tidyscreen():
     except subprocess.CalledProcessError as e:
         print(f"❌ Failed to update TidyScreen: {e}")  
 
-
-def testing_function():
-    print("Function worked! REALLY!! NOW!! COOL!! UPGRADE!")
-
 def gui():
     """
     Launch the Streamlit GUI for TidyScreen.
