@@ -6808,9 +6808,8 @@ quit
             
         elif docking_engine == "Vina":
             self._extract_docked_poses_autodockvina(db_path)
-
-    def _extract_docked_poses_autodockgpu(self, db_path):
     
+    def _extract_docked_poses_autodockgpu(self, db_path):
         ## Start the analysis
         print("Starting poses extraction for engine AutoDockGPU")
         print("")
@@ -6818,12 +6817,13 @@ quit
         print("1 - Select lowest energy poses")
         print("2 - Select most populated poses")
         print("3 - Select most lowest energy AND populated poses (both criteria)")
-        selection = input("Enter your choice (1, 2, or 3): ").strip()
+        print("4 - Select ALL poses")
+        selection = input("Enter your choice (1, 2, 3, or 4): ").strip()
 
         ## Prompt the user which selection to make
-        while selection not in ("1", "2", "3"):
-            print("Invalid selection. Only 1, 2, or 3 can be selected.")
-            selection = input("Enter your choice (1, 2, or 3): ").strip()
+        while selection not in ("1", "2", "3", "4"):
+            print("Invalid selection. Only 1, 2, 3, or 4 can be selected.")
+            selection = input("Enter your choice (1, 2, 3, or 4): ").strip()
 
         # Act according to user selection
         if selection == "1":
@@ -6848,7 +6848,14 @@ quit
             os.makedirs(output_dir, exist_ok=True)
             df = self._select_most_populated_and_stable_poses(db_path)
 
-        # Continue pprocessing the selected poses
+        elif selection == "4":
+            print("You selected: ALL poses")
+            # Create output directory for all poses
+            output_dir = os.path.join(os.path.dirname(os.path.abspath(db_path)), "all_poses")
+            os.makedirs(output_dir, exist_ok=True)
+            df = self._select_all_poses(db_path)
+
+        # Continue processing the selected poses
         for row in df.iterrows():
             ligname = row[1]['LigName']
             pose_id = row[1]['Pose_ID']
@@ -6864,7 +6871,10 @@ quit
         elif selection == "2":
             print(f"Most populated poses extracted and saved as PDB files to: \n \t {output_dir}")
         elif selection == "3":
-            print(f"Most populated and stable poses extracted and saved as PDB files to: \n \t {output_dir}")    
+            print(f"Most populated and stable poses extracted and saved as PDB files to: \n \t {output_dir}")
+        elif selection == "4":
+            print(f"All poses extracted and saved as PDB files to: \n \t {output_dir}")    
+    
     
     def _extract_docked_poses_autodockvina(self, db_path):
         

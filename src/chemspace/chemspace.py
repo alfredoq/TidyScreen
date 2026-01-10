@@ -963,6 +963,218 @@ class ChemSpace:
                 'errors': 1
             }
     
+    # def load_single_smiles(self):
+    #     """
+    #     Will prompt the user for a smiles, a name, a flag, and a table name. Then the smiles will be load to the chemspace.db as using the approach followed by the load_csv_file method
+    #     """
+        
+    def load_single_smiles(self) -> Dict[str, Any]:
+        """
+        Will prompt the user for a smiles, a name, a flag, and a table name. 
+        Then the smiles will be loaded to the chemspace.db using the approach followed by the load_csv_file method
+        
+        Returns:
+            Dict[str, Any]: Dictionary containing operation results with keys:
+                - success (bool): Whether the operation was successful
+                - message (str): Descriptive message about the operation
+                - compounds_added (int): Number of compounds added
+                - table_name (str): Name of the table where compound was added
+                - smiles (str): The SMILES string that was added
+        """
+        try:
+            print("\n" + "="*70)
+            print("LOAD SINGLE SMILES")
+            print("="*70)
+            
+            # Prompt for SMILES string
+            print("\n📋 Enter compound information:")
+            smiles = input("🧬 Enter SMILES string: ").strip()
+            
+            if not smiles:
+                print("❌ SMILES string cannot be empty.")
+                return {
+                    'success': False,
+                    'message': 'SMILES string cannot be empty',
+                    'compounds_added': 0,
+                    'table_name': None,
+                    'smiles': None
+                }
+            
+            # Validate SMILES using RDKit
+            try:
+                from rdkit import Chem
+                mol = Chem.MolFromSmiles(smiles)
+                if mol is None:
+                    print(f"❌ Invalid SMILES string: {smiles}")
+                    return {
+                        'success': False,
+                        'message': f'Invalid SMILES string: {smiles}',
+                        'compounds_added': 0,
+                        'table_name': None,
+                        'smiles': smiles
+                    }
+            except ImportError:
+                print("⚠️  Warning: RDKit not available. Skipping SMILES validation.")
+            
+            # Prompt for compound name
+            name = input("📝 Enter compound name: ").strip()
+            if not name:
+                print("❌ Compound name cannot be empty.")
+                return {
+                    'success': False,
+                    'message': 'Compound name cannot be empty',
+                    'compounds_added': 0,
+                    'table_name': None,
+                    'smiles': smiles
+                }
+            
+            # Prompt for flag
+            flag = input("🏷️  Enter flag (optional, press Enter to skip): ").strip()
+            if not flag:
+                flag = None
+            
+            # Prompt for flag description
+            flag_description = input("📌 Enter flag description (optional): ").strip()
+            if not flag_description:
+                flag_description = None
+            
+            # Prompt for table name
+            existing_tables = self.get_all_tables()
+            
+            print("\n📊 Available tables:")
+            if existing_tables:
+                for idx, table in enumerate(existing_tables, 1):
+                    print(f"  [{idx}] {table}")
+            else:
+                print("  No existing tables found.")
+            
+            print(f"  [N] Create new table")
+            
+            table_choice = input("\nSelect table (enter number, table name, or 'N' for new): ").strip()
+            
+            if table_choice.upper() == 'N':
+                # Create new table
+                table_name = input("Enter new table name: ").strip()
+                if not table_name:
+                    print("❌ Table name cannot be empty.")
+                    return {
+                        'success': False,
+                        'message': 'Table name cannot be empty',
+                        'compounds_added': 0,
+                        'table_name': None,
+                        'smiles': smiles
+                    }
+                
+                table_name = self._sanitize_table_name(table_name)
+                
+                # Create the table
+                if not self._create_compounds_table(table_name):
+                    print(f"❌ Failed to create table: {table_name}")
+                    return {
+                        'success': False,
+                        'message': f'Failed to create table: {table_name}',
+                        'compounds_added': 0,
+                        'table_name': table_name,
+                        'smiles': smiles
+                    }
+                
+                print(f"✅ Table created: {table_name}")
+            
+            elif table_choice.isdigit():
+                # Select existing table by number
+                idx = int(table_choice) - 1
+                if idx < 0 or idx >= len(existing_tables):
+                    print("❌ Invalid table selection.")
+                    return {
+                        'success': False,
+                        'message': 'Invalid table selection',
+                        'compounds_added': 0,
+                        'table_name': None,
+                        'smiles': smiles
+                    }
+                table_name = existing_tables[idx]
+            
+            else:
+                # Use the provided table name directly
+                table_name = self._sanitize_table_name(table_choice)
+                if table_name not in existing_tables:
+                    print(f"⚠️  Table '{table_name}' does not exist. Creating new table...")
+                    if not self._create_compounds_table(table_name):
+                        print(f"❌ Failed to create table: {table_name}")
+                        return {
+                            'success': False,
+                            'message': f'Failed to create table: {table_name}',
+                            'compounds_added': 0,
+                            'table_name': table_name,
+                            'smiles': smiles
+                        }
+            
+            # Show summary
+            print("\n" + "="*70)
+            print("COMPOUND SUMMARY")
+            print("="*70)
+            print(f"📊 Table: {table_name}")
+            print(f"🧬 SMILES: {smiles}")
+            print(f"📝 Name: {name}")
+            print(f"🏷️  Flag: {flag or '(none)'}")
+            print(f"📌 Flag Description: {flag_description or '(none)'}")
+            print("="*70)
+            
+            # Confirm insertion
+            confirm = input("\nProceed with insertion? (y/n): ").strip().lower()
+            if confirm not in ['y', 'yes']:
+                print("Operation cancelled.")
+                return {
+                    'success': False,
+                    'message': 'Operation cancelled by user',
+                    'compounds_added': 0,
+                    'table_name': table_name,
+                    'smiles': smiles
+                }
+            
+            # Insert the compound
+            compound_data = [(smiles, name, flag, flag_description)]
+            result = self._insert_compounds(compound_data, table_name, skip_duplicates=True)
+            
+            if result['success']:
+                print(f"\n✅ Compound loaded successfully to table '{table_name}'")
+                return {
+                    'success': True,
+                    'message': f"Compound loaded to table '{table_name}'",
+                    'compounds_added': result['compounds_added'],
+                    'table_name': table_name,
+                    'smiles': smiles
+                }
+            else:
+                print(f"\n❌ Failed to load compound: {result['message']}")
+                return {
+                    'success': False,
+                    'message': result['message'],
+                    'compounds_added': 0,
+                    'table_name': table_name,
+                    'smiles': smiles
+                }
+        
+        except KeyboardInterrupt:
+            print("\n\n⚠️  Operation cancelled by user.")
+            return {
+                'success': False,
+                'message': 'Operation cancelled by user',
+                'compounds_added': 0,
+                'table_name': None,
+                'smiles': None
+            }
+        
+        except Exception as e:
+            print(f"\n❌ Unexpected error: {e}")
+            return {
+                'success': False,
+                'message': f'Unexpected error: {e}',
+                'compounds_added': 0,
+                'table_name': None,
+                'smiles': None
+            }    
+    
     def _parse_df_from_csv_file(self, df, smiles_column, name_column, flag_column):
         
         print("Parsing dataframe from .csv file to check columns and information...")
