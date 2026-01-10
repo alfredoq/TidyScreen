@@ -345,18 +345,14 @@ def update_tidyscreen():
         branch = "main" if choice == "1" else "develop"
         print(f"📦 Installing from branch: {branch}")
         
+        # Install from GitHub with all dependencies
         cmd = [
             sys.executable, "-m", "pip", "install", 
-            "--upgrade", "--force-reinstall", "--no-deps",
+            "--upgrade", "--force-reinstall",
             f"git+https://github.com/alfredoq/TidyScreen.git@{branch}"
         ]
         
         subprocess.run(cmd, check=True)
-        
-        # Reinstall dependencies in case they changed
-        print("📦 Reinstalling dependencies...")
-        cmd_deps = [sys.executable, "-m", "pip", "install", "."]
-        subprocess.run(cmd_deps, check=True, cwd=os.path.dirname(__file__))
         
         print("✅ TidyScreen updated successfully.")
         print("🔄 Please restart your Python session for changes to take effect.")
