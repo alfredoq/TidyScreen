@@ -334,9 +334,32 @@ def update_tidyscreen():
 
     try:
         print("🔄 Updating TidyScreen to the latest version...")
-        cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "git+https://github.com/alfredoq/TidyScreen.git"]
+        print("⚠️  This will reinstall TidyScreen from the GitHub repository.")
+        
+        # Ask which branch to install from
+        print("\nAvailable branches:")
+        print("1. main (stable)")
+        print("2. develop (latest features)")
+        choice = input("Select branch (1/2, default=1): ").strip() or "1"
+        
+        branch = "main" if choice == "1" else "develop"
+        print(f"📦 Installing from branch: {branch}")
+        
+        cmd = [
+            sys.executable, "-m", "pip", "install", 
+            "--upgrade", "--force-reinstall", "--no-deps",
+            f"git+https://github.com/alfredoq/TidyScreen.git@{branch}"
+        ]
+        
         subprocess.run(cmd, check=True)
+        
+        # Reinstall dependencies in case they changed
+        print("📦 Reinstalling dependencies...")
+        cmd_deps = [sys.executable, "-m", "pip", "install", "."]
+        subprocess.run(cmd_deps, check=True, cwd=os.path.dirname(__file__))
+        
         print("✅ TidyScreen updated successfully.")
+        print("🔄 Please restart your Python session for changes to take effect.")
     except subprocess.CalledProcessError as e:
         print(f"❌ Failed to update TidyScreen: {e}")   
 
