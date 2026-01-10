@@ -2971,6 +2971,110 @@ except Exception as e:
             traceback.print_exc()
             return None
     
+    def delete_pdb_model(self):
+        """
+        Will list the available pdb models in the database and prompt the user to select one to delete.
+        """
+        import sqlite3
+        from datetime import datetime
+
+        try:
+            # Path to pdbs database
+            pdbs_db_path = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
+            
+            # Check if database exists
+            if not os.path.exists(pdbs_db_path):
+                print(f"❌ No PDB database found")
+                print(f"   Expected location: {pdbs_db_path}")
+                return None
+            
+            # List available PDB models
+            print(f"\n🗑️  DELETE PDB MODEL FROM DATABASE")
+            print("=" * 80)
+            
+            models_list = self.list_pdb_models()
+            
+            if not models_list:
+                print(f"❌ No PDB models available to delete")
+                return None
+            
+            # Prompt user to select a model
+            while True:
+                try:
+                    selection_input = input(f"\nEnter the model number to delete (or 'q' to quit): ").strip()
+                    
+                    if selection_input.lower() == 'q':
+                        print(f"❌ Operation cancelled by user")
+                        return None
+                    
+                    try:
+                        model_number = int(selection_input)
+                        if model_number < 1 or model_number > len(models_list):
+                            print(f"❌ Invalid model number. Choose between 1 and {len(models_list)}")
+                            continue
+                        
+                        selected_model = models_list[model_number - 1]
+                        break
+                        
+                    except ValueError:
+                        print(f"❌ Please enter a valid number or 'q' to quit")
+                        continue
+                        
+                except KeyboardInterrupt:
+                    print(f"\n\n❌ Operation cancelled by user")
+                    return None
+            
+            # Confirm deletion
+            print(f"\n⚠️  CONFIRM DELETION")
+            print("=" * 80)
+            print(f"   PDB Name: {selected_model['pdb_name']}")
+            print(f"   Filename: {selected_model['filename']}")
+            print(f"   File Size: {selected_model['file_size']:,} bytes" if selected_model['file_size'] else "   File Size: Unknown")
+            print(f"   Created: {selected_model['created_date']}")
+            print(f"   Description: {selected_model['description'] or 'None'}")
+            print("=" * 80)
+            
+            confirm = input(f"\n⚠️  Are you sure you want to delete this PDB model? (yes/no, default: no): ").strip().lower()
+            
+            if confirm != 'yes':
+                print(f"❌ Deletion cancelled by user")
+                return None
+            
+            # Delete from database
+            try:
+                conn = sqlite3.connect(pdbs_db_path)
+                cursor = conn.cursor()
+                
+                # Delete the record
+                cursor.execute("DELETE FROM pdb_files WHERE file_id = ?", (selected_model['file_id'],))
+                
+                if cursor.rowcount == 0:
+                    print(f"❌ Failed to delete PDB model from database")
+                    conn.close()
+                    return None
+                
+                conn.commit()
+                conn.close()
+                
+                print(f"\n✓ PDB model '{selected_model['pdb_name']}' successfully deleted from database")
+                print(f"   File ID: {selected_model['file_id']}")
+                print(f"   Database: {pdbs_db_path}")
+                
+                return {
+                    'status': 'deleted',
+                    'pdb_name': selected_model['pdb_name'],
+                    'file_id': selected_model['file_id'],
+                    'deleted_date': datetime.now().isoformat()
+                }
+                
+            except sqlite3.Error as e:
+                print(f"❌ Database error while deleting PDB model: {e}")
+                return None
+                
+        except Exception as e:
+            print(f"❌ Error deleting PDB model: {e}")
+            return None
+
     def write_pdb_model(self):
         """
         Will use the list_pdb_models to show the user available pdb files. The user is queried to select one model, after which the pdb file will be written to the project_path/docking/receptors directory using the original name
@@ -3201,8 +3305,6 @@ except Exception as e:
                 print(f"   {'─' * 96}")
             
             print("=" * 100)
-            print(f"\n💡 Use save_pdb_model() to add new PDB models")
-            print(f"\n💡 Use write_pdb_model() to save PDB model to disk")
             print(f"💡 Type 'details <number>' to view full information about a model")
             
             # Interactive details viewing
@@ -3774,7 +3876,6 @@ except Exception as e:
 
             # Create processing summary file
             self._create_processing_summary(pdb_folder, original_pdb_path, processed_pdb_path, selected_chains, selected_ligands, analysis)
-
             
             # --- Add missing atoms using tleap ---
             tleap_processed_file = self._add_missing_atoms_in_pdb_tleap(processed_pdb_path, analysis)
@@ -3784,6 +3885,7 @@ except Exception as e:
 
             # Write (overwrite) the tleap_processed_file
             from moldf import write_pdb
+            
             write_pdb(receptor_moldf_dict, tleap_processed_file)
             
             print(f"✅ tleap processing complete. Output: {tleap_processed_file}")
@@ -6422,9 +6524,9 @@ quit
             conn = sqlite3.connect(pdbs_db_path)
             cursor = conn.cursor()
             cursor.execute('''
-                SELECT pdb_name, processed_pdb_path, notes
+                SELECT pdb_id, pdb_name, processed_pdb_path, notes
                 FROM pdb_templates
-                ORDER BY created_date DESC
+                ORDER BY created_date ASC
             ''')
             rows = cursor.fetchall()
             conn.close()
@@ -6438,12 +6540,71 @@ quit
 
         print("\n📋 PDB Templates:")
         print("=" * 40)
-        for pdb_name, processed_pdb_path, notes in rows:
+        for pdb_id, pdb_name, processed_pdb_path, notes in rows:
+            print(f"pdb_id: {pdb_id}")
             print(f"Name: {pdb_name}")
             print(f"Processed PDB Path: {processed_pdb_path}")
             print(f"Notes: {notes}")
             print("-" * 40)
-            
+
+    def remove_pdb_template(self):
+
+        """
+        Will list entried in the pdb_templates table of the pdbs.db database located in the project_path/docking/receptors folder, and query the user which one to delete. The registry is finally deleted from the database.
+        """
+
+        import sqlite3
+        pdbs_db_path = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
+        if not os.path.exists(pdbs_db_path):
+            print(f"❌ Database not found: {pdbs_db_path}")
+            return
+
+        try:
+            conn = sqlite3.connect(pdbs_db_path)
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT pdb_id, pdb_name
+                FROM pdb_templates
+                ORDER BY created_date ASC
+            ''')
+            rows = cursor.fetchall()
+        except Exception as e:
+            print(f"❌ Error reading pdbs.db: {e}")
+            return
+
+        if not rows:
+            print("📋 No PDB templates found in the database.")
+            return
+
+        print("\n📋 PDB Templates:")
+        print("=" * 40)
+        for i, (pdb_id, pdb_name) in enumerate(rows, 1):
+            print(f"{i}. ID: {pdb_id}, Name: {pdb_name}")
+        print("=" * 40)
+
+        while True:
+            try:
+                selection = input("Select a PDB template to delete by number (or 'cancel'): ").strip()
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    print("❌ PDB template deletion cancelled.")
+                    return
+                try:
+                    idx = int(selection) - 1
+                    if 0 <= idx < len(rows):
+                        selected_id = rows[idx][0]
+                        cursor.execute('DELETE FROM pdb_templates WHERE pdb_id = ?', (selected_id,))
+                        conn.commit()
+                        conn.close()
+                        print(f"✅ Deleted PDB template with ID: {selected_id}")
+                        return
+                    else:
+                        print(f"❌ Invalid selection. Enter a number between 1 and {len(rows)}.")
+                except ValueError:
+                    print("❌ Please enter a valid number.")
+            except KeyboardInterrupt:
+                print("\n❌ PDB template deletion cancelled.")
+                return
+
     def list_receptor_models(self):
         """
         Reads the 'receptors.db' database located in the project_path/docking/receptors folder
@@ -6467,7 +6628,7 @@ quit
             cursor.execute('''
                 SELECT pdb_name, pdb_to_convert, pdbqt_file, configs, notes
                 FROM receptor_registers
-                ORDER BY created_date DESC
+                ORDER BY created_date ASC
             ''')
             rows = cursor.fetchall()
             conn.close()
@@ -6746,6 +6907,8 @@ quit
             input_model, pose_coords_json = self._retrieve_pose_info(db_path, pose_id)
             pdb_dict = self._process_input_model_for_moldf(input_model, pose_coords_json)
             self._write_pdb_with_moldf(pdb_dict, ligname, run_number, output_dir)
+
+        print(f"Docked poses extracted to {output_dir}")
 
     def _select_most_stable_poses(self, db_path):
         """
@@ -7442,63 +7605,29 @@ quit
             print(f"❌ Error adding input model for {outfile_prefix}: {e}")
             return False
     
-    def _refine_receptor_model(self, tleap_processed_file, processed_pdb_path, minimize_receptor=False):
+    def _refine_receptor_model(self, tleap_processed_file, processed_pdb_path):
         
-        ## Create a template of the original receptor to get crystallographic residue numbering
-        original_df_numbering = self._get_crystallographic_numbering(processed_pdb_path)
+        # Minize the receptor model as processed with tleap
+        minimized_pdb_file = self._minimize_receptor(tleap_processed_file)
+
+        ## Create residue number matching dictionary
+        renumbering_dict = self._construct_resnumbers_matching_dictionary(processed_pdb_path, minimized_pdb_file)
+
+        ## Renumber the minimize pdb file using the dictioary
+        renumbered_minimized_pdb_file = self._renumber_minimized_pdb_file(minimized_pdb_file, renumbering_dict)
+
+        ## Add element column to the renumbered minimized pdb file 
+        moldf_df = self._add_element_column_to_pdb_file(renumbered_minimized_pdb_file)
         
-        if minimize_receptor:
-            # Develop method to minize the receptor model
-            pass
-        
-        # Add element column to the tleap processed pdb file
-        moldf_df = self._add_element_column_to_pdb_file(tleap_processed_file)
-        
-        # Use original and processed dataframes to get the crystallographic numbering
-        moldf_df_renumbered = self._renumber_moldf_df(original_df_numbering, moldf_df)
-        
+        ## Delete the renumbered file since it is not used any more
+        os.remove(renumbered_minimized_pdb_file)
+
         # Create a moldf type dictionary with the modified df
         receptor_moldf_dict = {
-            '_atom_site': moldf_df_renumbered
+            '_atom_site': moldf_df
         }
         
         return receptor_moldf_dict
-    
-    def _get_crystallographic_numbering(self, receptor_file):
-        import pandas as pd
-        
-        # Read the original receptor pdb file and keep lines starting with 'ATOM' or 'HETATM'
-        with open(receptor_file, 'r') as f:
-            lines = f.readlines()   
-        filtered_lines = [line for line in lines if line.startswith('ATOM') or line.startswith('HETATM')]
-    
-        # Create a dataframe with the cystallographic numbering
-        original_df = pd.DataFrame([line.split() for line in filtered_lines])
-        # Evaluate the data in each column to convert numeric strings to appropriate numeric types
-        for column in original_df.columns:
-            try:
-                original_df[column] = pd.to_numeric(original_df[column])
-            except (ValueError, TypeError):
-                pass
-    
-        # Create a new dataframe with only relevant columns
-        original_df_numbering = original_df[[2, 3]].copy()
-        # Change the column names
-        original_df_numbering.columns = ['atom_name', 'residue_name']
-    
-        # Evaluate if column index 4 in original_df is int type (i.e. residue number), if so add it to original_df_new. Else, if column index 4 is object type (i.e. chain id), add the next column (index 5=residue number) to original_df_new
-        if pd.api.types.is_integer_dtype(original_df[4]):
-            original_df_numbering['residue_number'] = original_df[4].astype(int)
-            original_df_numbering['x_coord'] = original_df[5].astype(float)
-            original_df_numbering['y_coord'] = original_df[6].astype(float)
-            original_df_numbering['z_coor'] = original_df[7].astype(float)
-        elif pd.api.types.is_integer_dtype(original_df[5]):
-            original_df_numbering['residue_number'] = original_df[5].astype(int)
-            original_df_numbering['x_coord'] = original_df[6].astype(float)
-            original_df_numbering['y_coord'] = original_df[7].astype(float)
-            original_df_numbering['z_coor'] = original_df[8].astype(float)
-    
-        return original_df_numbering
         
     def _add_element_column_to_pdb_file(self, tleap_processed_file):
         
@@ -7508,6 +7637,7 @@ quit
         
         # Create a df from the tleap_receptor file
         df = pd.read_csv(tleap_processed_file, sep=r'\s+', engine='python', header=None)
+        
         # Change the column names
         df.columns = ['record_name', 'atom_number', 'atom_name', 'residue_name', 'residue_number', 'x_coord', 'y_coord', 'z_coord', 'occupancy', 'b_factor']
         # Fill NaN values in the 'atom_number' column with forward fill and then add a cumulative sum to ensure unique atom numbers
@@ -7578,42 +7708,193 @@ quit
         # Return the moldf like dataframe
         return df
     
-    
-    def _renumber_moldf_df(self, original_df_numbering, moldf_df):
+    def _minimize_receptor(self, tleap_processed_file):
+        """
+        Will minimize the receptor under processing using sander
+        """
         
-        ## Loop over the df rows, and for each row, find the matching x, y, z coordinates in original_df_new and get the residue_number from there, and assign it to the df residue_number
-        for index, row in moldf_df.iterrows():
-            x = row['x_coord']
-            y = row['y_coord']
-            z = row['z_coord']
-            
-            # Find the matching row in original_df_numbering
-            match = original_df_numbering[
-                (original_df_numbering['x_coord'] == x) & 
-                (original_df_numbering['y_coord'] == y) & 
-                (original_df_numbering['z_coor'] == z)
-            ]
-            
-            # If a match is found, get the residue_number and assign it to df
-            if not match.empty:
-                moldf_df.at[index, 'residue_number'] = match['residue_number'].values[0]
-                
+        import subprocess
+        import os
+        import tempfile
+        import shutil
+
+        print("Minimizing receptor")
+
+        # Create minimization input file in the same directory as tleap_processed_file
+        min_in_file = os.path.join(os.path.dirname(tleap_processed_file), "min.in")
+
+        with open(min_in_file, 'w') as f:
+            f.write("""Initial minimisation of the receptor
+ &cntrl
+  imin=1, maxcyc=50, ncyc=25,
+  cut=16, ntb=0, igb=1,
+ &end
+        """)
+
+        # Create a tleap input file in the same directory as tleap_processed_file
+        tleap_in_file = os.path.join(os.path.dirname(tleap_processed_file), "minimize.in")
+
+        with open(tleap_in_file, 'w') as f:
+            f.write(f"""source leaprc.protein.ff14SB
+source leaprc.water.tip3p
+HOH = WAT
+rec = loadpdb "{tleap_processed_file}"
+saveamberparm rec "{os.path.join(os.path.dirname(tleap_processed_file), 'receptor.prmtop')}" "{os.path.join(os.path.dirname(tleap_processed_file), 'receptor.inpcrd')}"
+quit
+        """)
+
+        # Run tleap to generate prmtop and inpcrd files
+        tleap_command = f"tleap -f {tleap_in_file}"
+        subprocess.run(tleap_command, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        # Set file to run sander to minimize the receptor
+        prmtop_file = os.path.join(os.path.dirname(tleap_processed_file), "receptor.prmtop")
+        inpcrd_file = os.path.join(os.path.dirname(tleap_processed_file), "receptor.inpcrd")
+        min_out_file = os.path.join(os.path.dirname(tleap_processed_file), "min.out")
+        min_rst_file = os.path.join(os.path.dirname(tleap_processed_file), "min.rst")
         
-        ## Loop over the df rows, and for each row, check if x, y, z coordinates do not match those present in the original_df_new. If so, assign the residue_number to the same value as the previous row
-        for index, row in moldf_df.iterrows():
-            x = row['x_coord']
-            y = row['y_coord']
-            z = row['z_coord']
+        # Run sander to minimize the receptor
+        sander_command = f"sander -O -i {min_in_file} -o {min_out_file} -p {prmtop_file} -c {inpcrd_file} -r {min_rst_file}"
+        subprocess.run(sander_command, shell=True, check=True)   
+
+        # Convert minimized restart file back to PDB format
+        minimized_pdb_file = tleap_processed_file.replace('.pdb', '_minimized.pdb')
+        ambpdb_min_command = f"ambpdb -p {prmtop_file} -c {min_rst_file} > {minimized_pdb_file}"
+        subprocess.run(ambpdb_min_command, shell=True, check=True)
+
+        # Rename 'WAT' residues to 'HOH' in the minimized PDB file
+        with open(minimized_pdb_file, 'r') as file:
+            filedata = file.read()
+
+        filedata = filedata.replace(' WAT ', ' HOH ')
+
+        with open(minimized_pdb_file, 'w') as file:
+            file.write(filedata)
+
+        # Remove element column from minimized PDB file
+        with open(minimized_pdb_file, 'r') as file:
+            lines = file.readlines()
+
+        with open(minimized_pdb_file, 'w') as file:
+            for line in lines:
+                if line.startswith(('ATOM', 'HETATM')):
+                    # Keep only columns 0-76 (removes columns 77-80 which contain element symbol)
+                    file.write(line[:76] + '\n')
+                else:
+                    file.write(line)
+
+        return minimized_pdb_file
+        
+    def _pdb_to_moldf_df(self, pdb_file):
+        
+        from moldf import read_pdb
+        from moldf import write_pdb
+        import pandas as pd
+        
+        # Create a df from the tleap_receptor file
+        df = pd.read_csv(pdb_file, sep=r'\s+', engine='python', header=None)
+        # Change the column names
+        df.columns = ['record_name', 'atom_number', 'atom_name', 'residue_name', 'residue_number', 'x_coord', 'y_coord', 'z_coord', 'occupancy', 'b_factor', 'element_symbol']
+        # Fill NaN values in the 'atom_number' column with forward fill and then add a cumulative sum to ensure unique atom numbers
+        df['atom_number'] = df['atom_number'].ffill().add(df['atom_number'].isna().astype(int).cumsum()).astype(int)
+        # Fill NaN values with a default value (e.g., 0) and change the residue_number column to integer type
+        df['residue_number'] = df['residue_number'].ffill().fillna(0).astype(int)
+        # Fill NaN atom names with an empty string
+        df['atom_name'] = df['atom_name'].fillna('')
+        # Fil NaN residue names with the same value as above
+        df['residue_name'] = df['residue_name'].ffill().fillna('')
+
+        ## Add missing columns according to moldf format
+        df.insert(3, 'alt_loc', '')
+        df.insert(5, 'chain_id', '')
+        df.insert(7, 'insertion', '')
+        df.insert(13, 'segment_id', '')
+        df.insert(15, 'charge', '')
+        
+        return df
+
+    def _construct_resnumbers_matching_dictionary(self, processed_pdb_path, minimized_pdb_file):
+
+        with open(processed_pdb_path, 'r') as f:
+            crystallographic_lines = f.readlines()
+
+        with open(minimized_pdb_file, 'r') as f:
+            minimized_lines = f.readlines()
+
+        # Construct a list of keys corresponding the crystallographic numbering
+        crystal_key_list = []
+        for line in crystallographic_lines:
+            if line.startswith('ATOM') or line.startswith('HETATM'):
+                # Extract residue name and number from crystallographic file
+                cryst_res_name = line[17:20].strip()
+                cryst_res_num = int(line[22:26].strip())
+                key = f"{cryst_res_name}_{cryst_res_num}"
+                if key not in crystal_key_list:
+                    crystal_key_list.append(key)
+
+        # Construct a list of keys corresponding the tleap renumbered sequence
+        tleap_key_list = []
+        for line in minimized_lines:
+            if line.startswith('ATOM') or line.startswith('HETATM'):
+                # Extract residue name and number from crystallographic file
+                tleap_res_name = line[17:20].strip()
+                tleap_res_num = int(line[22:26].strip())
+                key = f"{tleap_res_name}_{tleap_res_num}"
+                if key not in tleap_key_list:
+                    tleap_key_list.append(key)
+
+        # Create a dictionary matching the residue numbers between both lists
+        renumbering_dict = dict(zip(tleap_key_list, crystal_key_list))
+
+        return renumbering_dict
+
+    def _renumber_minimized_pdb_file(self, minimized_pdb_file, renumbering_dict):
+
+        """
+        Will read the minimized_pdb_file which a pdb file, and the residue name and residue number fields will be evaluated, construction a key that will be searched in renumbering_dict. The value returned will be used to reassing residue number
+        """
+        
+        try:
+            import shutil
             
-            # Find the matching row in original_df_numbering
-            match = original_df_numbering[
-                (original_df_numbering['x_coord'] == x) & 
-                (original_df_numbering['y_coord'] == y) & 
-                (original_df_numbering['z_coor'] == z)
-            ]
+            # Create temporary output file
+            temp_out = minimized_pdb_file + ".renumbered"
             
-            # If no match is found, assign the residue_number to the same value as the previous row
-            if match.empty and index > 0:
-                moldf_df.at[index, 'residue_number'] = moldf_df.at[index - 1, 'residue_number'] 
-                
-        return moldf_df
+            with open(minimized_pdb_file, 'r') as infile, open(temp_out, 'w') as outfile:
+                for line in infile:
+                    if line.startswith('ATOM') or line.startswith('HETATM'):
+                        # Extract residue name and number from the minimized file
+                        res_name = line[17:20].strip()
+                        res_num = int(line[22:26].strip())
+                        
+                        # Construct the key to search in renumbering_dict
+                        key = f"{res_name}_{res_num}"
+                        
+                        # Look up the crystallographic numbering
+                        if key in renumbering_dict:
+                            # Parse the value to get the new residue number
+                            crystal_value = renumbering_dict[key]
+                            # The value format is "ResName_ResNum"
+                            crystal_res_name, crystal_res_num = crystal_value.rsplit('_', 1)
+                            new_res_num = int(crystal_res_num)
+                            
+                            # Reconstruct the line with the new residue number
+                            # PDB format: columns 23-26 are residue number (right-justified, 4 characters)
+                            new_line = line[:22] + f"{new_res_num:4d}" + line[26:]
+                            outfile.write(new_line)
+                        else:
+                            # If key not found in dictionary, keep original line
+                            outfile.write(line)
+                    else:
+                        # Non-ATOM/HETATM lines are written as-is
+                        outfile.write(line)
+            
+            # Replace original file with renumbered version
+            shutil.move(temp_out, minimized_pdb_file)
+            print(f"✅ Residue numbers renumbered in {minimized_pdb_file}")
+            
+            return minimized_pdb_file
+            
+        except Exception as e:
+            print(f"   ⚠️  Error renumbering minimized PDB file: {e}")
+            return None
