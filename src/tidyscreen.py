@@ -1,6 +1,7 @@
 import sys
 import os
 import json
+import sqlite3
 from tidyscreen.databases.DatabaseManager import DatabaseManager
 from tidyscreen.projects.projects_management import ProjectsManagement
 import site 
@@ -411,6 +412,81 @@ def gui():
         subprocess.run(cmd)
     except Exception as e:
         print(f"❌ Failed to launch Streamlit GUI: {e}")
+
+def notes_management():
+    """
+    Will list the available projects using the projects() function, and prompt the user to select one.
+    This project will be activated and the NotesManagement class will be used to manage notes for that project. 
+    """
+    
+    print("Available projects:")
+    projects()  # Call the global projects() function to list all projects
+    project_id = input("Enter the project ID to manage notes: ").strip()
+    while not project_id or not project_id.isdigit():
+        print("❌ Project ID cannot be empty and must be a number.")
+        project_id = input("Enter the project ID to manage notes: ").strip()
+    
+    # Load project by ID instead of name
+    projects_manager = ProjectsManagement()
+    project_info = projects_manager.load_project_info_by_id(int(project_id))
+    
+    if not project_info.get('_project_exists', False):
+        print(f"❌ Project with ID {project_id} not found.")
+        return
+    
+    name = project_info.get('name')
+    
+    # Activate the project
+    project = ActivateProject(name)
+    
+    if not project.project_exists():
+        print(f"❌ Project '{name}' not found. Cannot manage notes.")
+        return
+    
+    # Initialize NotesManagement
+    notes_manager = NotesManagement(project)
+    
+    # Here you can add methods to manage notes, e.g., add_note(), view_notes(), etc.
+    print(f"✅ Notes management initialized for project: {name}")
+    
+    # Perform actions in a loop
+    action_mapping = {
+        '1': 'list',
+        '2': 'add',
+        '3': 'view',
+        '4': 'delete',
+        '5': 'exit',
+        'list': '1',
+        'add': '2',
+        'view': '3',
+        'delete': '4',
+        'exit': '5'
+    }
+    
+    while True:
+        notes_manager.list_notes_actions()
+        user_input = input("Select an action (1-5 or action name): ").strip().lower()
+        
+        # Convert user input to action ID
+        action_id = action_mapping.get(user_input, '')
+        
+        if not action_id:
+            print("❌ Invalid action. Please enter a number (1-5) or action name (list, add, view, delete, exit).")
+            continue
+        
+        # Execute the corresponding action
+        if action_id == '1':
+            notes_manager.list_notes()
+        elif action_id == '2':
+            notes_manager.add_note()
+        elif action_id == '3':
+            notes_manager.view_note()
+        elif action_id == '4':
+            notes_manager.delete_note()
+        elif action_id == '5':
+            print("👋 Exiting notes management.")
+            break
+
 
 class ActivateProject:
     
@@ -907,4 +983,268 @@ class DeleteProject:
         """
         return getattr(self, '_project_deleted', False)
 
+class NotesManagement:
+    
+    def __init__(self, project: ActivateProject):
+        self.project = project
+        self.notes_db = os.path.join(self.project.path, 'project_notes.db')
 
+        # Ensure the notes database exists with a basic schema
+        conn = sqlite3.connect(self.notes_db)
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS notes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def list_notes_actions(self):
+        """
+        List available actions for managing notes.
+        Accepts both numeric IDs (1-6) and action names (list, add, view, modify, delete, exit).
+        """
+        # Mapping of user input to action
+        action_mapping = {
+            '1': 'list',
+            '2': 'add',
+            '3': 'view',
+            '4': 'modify',
+            '5': 'delete',
+            '6': 'exit',
+            'list': '1',
+            'add': '2',
+            'view': '3',
+            'modify': '4',
+            'delete': '5',
+            'exit': '6'
+        }
+        
+        while True:
+            # Display menu inside the loop so it appears after each action
+            print("\n" + "="*60)
+            print("PROJECT NOTES MANAGEMENT FOR: " + self.project.name)
+            print("="*60)
+            print("Available actions:")
+            print("1. List all notes")
+            print("2. Add a new note")
+            print("3. View a note")
+            print("4. Modify a note")
+            print("5. Delete a note")
+            print("6. Exit notes management")
+            print("="*60)
+            
+            user_input = input("Select an action (1-6 or action name): ").strip().lower()
+            
+            # Convert user input to action ID
+            action_id = action_mapping.get(user_input, '')
+            
+            if not action_id:
+                print("❌ Invalid action. Please enter a number (1-6) or action name (list, add, view, modify, delete, exit).")
+                continue
+            
+            # Execute the corresponding action
+            if action_id == 'list':
+                self.list_notes()
+                input("Press Enter to continue...")
+            elif action_id == 'add':
+                self.add_note()
+                input("Press Enter to continue...")
+            elif action_id == 'view':
+                self.view_note()
+                input("Press Enter to continue...")
+            elif action_id == 'modify':
+                self.modify_note()
+                input("Press Enter to continue...")
+            elif action_id == 'delete':
+                self.delete_note()
+                input("Press Enter to continue...")
+            elif action_id == 'exit':
+                print("👋 Exiting notes management.")
+                break
+    
+    def list_notes(self):
+        """
+        List all notes in the project.
+        """
+        conn = sqlite3.connect(self.notes_db)
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, title, created_at FROM notes ORDER BY created_at ASC")
+            notes = cursor.fetchall()
+            
+            if not notes:
+                print("No notes found.")
+                return
+            
+            print("\n" + "="*60)
+            print("PROJECT NOTES FOR: " + self.project.name)
+            print("="*60)
+            for note in notes:
+                print(f"ID: {note[0]} | Title: {note[1]} | Created At: {note[2]}")
+            print("="*60)
+        finally:
+            conn.close()                
+    
+    def add_note(self):
+        """
+        Add a new note to the project.
+        """
+        title = input("Enter note title: ").strip()
+        content = input("Enter note content: ").strip()
+        
+        if not title or not content:
+            print("❌ Title and content cannot be empty.")
+            return
+        
+        conn = sqlite3.connect(self.notes_db)
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO notes (title, content) VALUES (?, ?)",
+                (title, content)
+            )
+            conn.commit()
+            print("✅ Note added successfully.")
+        finally:
+            conn.close()
+            
+    def view_note(self):
+        """
+        View a specific note by ID.
+        """
+        while True:
+            note_id = input("Enter note ID to view (or 'l' to list notes): ").strip().lower()
+            if note_id in ("l", "list"):
+                self.list_notes()
+                continue
+            if note_id.isdigit():
+                break
+            print("❌ Invalid note ID. Enter a number or 'l' to list notes.")
+        
+        conn = sqlite3.connect(self.notes_db)
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT title, content, created_at FROM notes WHERE id = ?", (note_id,))
+            note = cursor.fetchone()
+            
+            if not note:
+                print(f"❌ Note with ID {note_id} not found.")
+                return
+            
+            print("\n" + "="*60)
+            print(f"Title: {note[0]}")
+            print(f"Created At: {note[2]}")
+            print("-"*60)
+            print(note[1])
+            print("="*60)
+        finally:
+            conn.close()
+            
+    def delete_note(self):
+        """
+        Delete a specific note by ID.
+        """
+        while True:
+            note_id = input("Enter note ID to delete (or 'l' to list notes): ").strip().lower()
+            if note_id in ("l", "list"):
+                self.list_notes()
+                continue
+            if note_id.isdigit():
+                break
+            print("❌ Invalid note ID. Enter a number or 'l' to list notes.")
+        
+        conn = sqlite3.connect(self.notes_db)
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT title FROM notes WHERE id = ?", (note_id,))
+            note = cursor.fetchone()
+            
+            if not note:
+                print(f"❌ Note with ID {note_id} not found.")
+                return
+            
+            confirm = input(f"Are you sure you want to delete the note titled '{note[0]}'? (y/n): ").strip().lower()
+            if confirm != 'y':
+                print("Deletion cancelled.")
+                return
+            
+            cursor.execute("DELETE FROM notes WHERE id = ?", (note_id,))
+            conn.commit()
+            print("✅ Note deleted successfully.")
+        finally:
+            conn.close()
+            
+    
+    def modify_note(self):
+        """
+        Modify an existing note by ID.
+        """
+        while True:
+            note_id = input("Enter note ID to modify (or 'l' to list notes): ").strip().lower()
+            if note_id in ("l", "list"):
+                self.list_notes()
+                continue
+            if note_id.isdigit():
+                break
+            print("❌ Invalid note ID. Enter a number or 'l' to list notes.")
+        
+        conn = sqlite3.connect(self.notes_db)
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT title, content, created_at FROM notes WHERE id = ?", (note_id,))
+            note = cursor.fetchone()
+            
+            if not note:
+                print(f"❌ Note with ID {note_id} not found.")
+                return
+            
+            print("\n" + "="*60)
+            print(f"Current Title: {note[0]}")
+            print(f"Current Content: {note[1]}")
+            print(f"Created At: {note[2]}")
+            print("="*60)
+            
+            # Ask what to modify
+            modify_choice = input("\nWhat would you like to modify? (1=title, 2=content, 3=both, or any other key to cancel): ").strip()
+            
+            new_title = note[0]
+            new_content = note[1]
+            
+            if modify_choice == '1':
+                new_title = input("Enter new title: ").strip()
+                if not new_title:
+                    print("❌ Title cannot be empty.")
+                    return
+            elif modify_choice == '2':
+                new_content = input("Enter new content: ").strip()
+                if not new_content:
+                    print("❌ Content cannot be empty.")
+                    return
+            elif modify_choice == '3':
+                new_title = input("Enter new title: ").strip()
+                new_content = input("Enter new content: ").strip()
+                if not new_title or not new_content:
+                    print("❌ Title and content cannot be empty.")
+                    return
+            else:
+                print("Modification cancelled.")
+                return
+            
+            # Update the note
+            cursor.execute(
+                "UPDATE notes SET title = ?, content = ? WHERE id = ?",
+                (new_title, new_content, note_id)
+            )
+            conn.commit()
+            print("✅ Note modified successfully.")
+        finally:
+            conn.close()

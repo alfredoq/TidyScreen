@@ -51,7 +51,7 @@ class ProjectsManagement(DatabaseManager):
             cursor = conn.cursor()
 
             # Query all projects
-            query = "SELECT * FROM projects ORDER BY created_date DESC"
+            query = "SELECT * FROM projects ORDER BY created_date ASC"
             cursor.execute(query)
 
             # Fetch all project data
@@ -115,7 +115,6 @@ class ProjectsManagement(DatabaseManager):
                 return None
             return []
 
-
     def load_project_info(self, project_name):
         """
         Retrieve project information from the database and return as dictionary.
@@ -170,6 +169,66 @@ class ProjectsManagement(DatabaseManager):
             return {
                 'id': None,
                 'name': project_name,
+                'path': None,
+                'description': None,
+                'created_date': None,
+                '_project_exists': False
+            }
+    
+    def load_project_info_by_id(self, project_id):
+        """
+        Retrieve project information from the database by project ID and return as dictionary.
+        """
+        try:
+            # Connect to the database using inherited method
+            conn = self.connect_db(self.__projects_db)
+            
+            # Query for project information
+            cursor = conn.cursor()
+            query = "SELECT * FROM projects WHERE id = ?"
+            cursor.execute(query, (project_id,))
+            
+            # Fetch the project data
+            project_data = cursor.fetchone()
+            
+            if project_data:
+                # Get column names to map data to attributes
+                column_names = [description[0] for description in cursor.description]
+                
+                # Create dictionary with project information
+                project_dict = {}
+                for i, column_name in enumerate(column_names):
+                    project_dict[column_name] = project_data[i]
+                
+                print(f"Project with ID '{project_id}' loaded successfully from database.")
+                project_dict['_project_exists'] = True
+                
+                # Close the connection
+                conn.close()
+                
+                return project_dict
+                
+            else:
+                print(f"Project with ID '{project_id}' not found in database.")
+                # Close the connection
+                conn.close()
+                
+                # Return default attributes
+                return {
+                    'id': project_id,
+                    'name': None,
+                    'path': None,
+                    'description': None,
+                    'created_date': None,
+                    '_project_exists': False
+                }
+                
+        except Exception as e:
+            print(f"Error loading project information: {e}")
+            # Return default attributes in case of error
+            return {
+                'id': project_id,
+                'name': None,
                 'path': None,
                 'description': None,
                 'created_date': None,
