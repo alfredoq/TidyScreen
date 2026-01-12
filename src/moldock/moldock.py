@@ -6103,7 +6103,7 @@ quit
         method_params = selected_method.get('parameters', {})
         
         # Retrieve ligand preparation params
-        ligand_prep_params = selected_method.get('ligand_prep_params', {})
+        ligand_prep_parameters = selected_method.get('ligand_prep_parameters', {})
         
         # Select the receptor to be used for docking
         receptor_main_path = self.__receptor_path + f"/{receptor_info.get('pdb_name', None)}"
@@ -6159,7 +6159,7 @@ quit
                 
                 ## Generate the ligand.pdbqt file
                 ligand_pdbqt_filepath = f"{docking_results_dir}/{inchi_key}.pdbqt"
-                self._pdbqt_from_mol(mol, ligand_pdbqt_filepath, inchi_key, ligand_prep_params)
+                self._pdbqt_from_mol(mol, ligand_pdbqt_filepath, inchi_key, ligand_prep_parameters)
                 
                 ## Execute autodockgpu
                 self._execute_autodockgpu(ligand_pdbqt_filepath, fld_file, method_params)
@@ -6391,11 +6391,20 @@ quit
         from meeko import MoleculePreparation
         from meeko import MoleculeSetup
         from meeko import PDBQTWriterLegacy
-        
+        import ast
         
         try:
             # Compose MoleculePreparation arguments from ligand_prep_params
-            mk_prep = MoleculePreparation(**ligand_prep_params)
+            merge_atoms = eval(ligand_prep_params.get('merge_these_atom_types', '')) # The eval method is required to convert a string defining the atoms into a tuple as required by MoleculePreparation
+            charge = ligand_prep_params.get('charge', '')
+            hydrate = ligand_prep_params.get('hydrate', '')
+            add_atom_types = ligand_prep_params.get('add_atom_types', '')
+            
+            mk_prep = MoleculePreparation(merge_these_atom_types=merge_atoms,
+                                          charge_model=charge,
+                                          hydrate=hydrate,
+                                          add_atom_types=add_atom_types
+                                         )
             mol_setup_list = mk_prep.prepare(mol, rename_atoms=True)
             mol_setup = mol_setup_list[0]
 
@@ -6665,8 +6674,8 @@ quit
             ## Meeko specific parameters
             
             ligand_prep_parameters['merge_these_atom_types'] = self._input_parameter_choice(
-                "Atom types to merge. Default: '(H,)'",
-                default="(H,)"
+                "Atom types to merge. Default: ('H',)",
+                default="('H',)"
             )
             
             ligand_prep_parameters['hydrate'] = self._get_parameter_choice(
@@ -7193,12 +7202,11 @@ quit
         # Retrieve docking method parameters
         method_params = selected_method.get('parameters', {})
         
+        print(selected_method)
         # Retrieve ligand preparation params
-        ligand_prep_params = selected_method.get('ligand_prep_params', {})
+        ligand_prep_parameters = selected_method.get('ligand_prep_parameters', {})
         
         # Select the receptor to be used for docking
-        #selected_receptor = self._select_receptor_from_db()
-        
         receptor_conditions = self._get_receptor_conditions(receptor_info.get('id', None))
         receptor_main_path = self.__receptor_path + f"/{receptor_info.get('pdb_name', None)}"
         receptor_pdbqt_file = receptor_main_path + f"/processed/receptor_checked.pdbqt"
@@ -7257,7 +7265,7 @@ quit
                 
                 ## Generate the ligand.pdbqt file
                 ligand_pdbqt_filepath = f"{docking_results_dir}/{inchi_key}.pdbqt"
-                self._pdbqt_from_mol(mol, ligand_pdbqt_filepath, inchi_key, ligand_prep_params)
+                self._pdbqt_from_mol(mol, ligand_pdbqt_filepath, inchi_key, ligand_prep_parameters)
 
                 ## Execute vina
                 self._execute_vina(ligand_pdbqt_filepath, assay_registry, method_params, receptor_pdbqt_file, receptor_conditions, vina_rec_object=None)
