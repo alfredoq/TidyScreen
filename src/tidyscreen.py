@@ -446,47 +446,10 @@ def notes_management():
     # Initialize NotesManagement
     notes_manager = NotesManagement(project)
     
-    # Here you can add methods to manage notes, e.g., add_note(), view_notes(), etc.
     print(f"✅ Notes management initialized for project: {name}")
     
-    # Perform actions in a loop
-    action_mapping = {
-        '1': 'list',
-        '2': 'add',
-        '3': 'view',
-        '4': 'delete',
-        '5': 'exit',
-        'list': '1',
-        'add': '2',
-        'view': '3',
-        'delete': '4',
-        'exit': '5'
-    }
-    
-    while True:
-        notes_manager.list_notes_actions()
-        user_input = input("Select an action (1-5 or action name): ").strip().lower()
-        
-        # Convert user input to action ID
-        action_id = action_mapping.get(user_input, '')
-        
-        if not action_id:
-            print("❌ Invalid action. Please enter a number (1-5) or action name (list, add, view, delete, exit).")
-            continue
-        
-        # Execute the corresponding action
-        if action_id == '1':
-            notes_manager.list_notes()
-        elif action_id == '2':
-            notes_manager.add_note()
-        elif action_id == '3':
-            notes_manager.view_note()
-        elif action_id == '4':
-            notes_manager.delete_note()
-        elif action_id == '5':
-            print("👋 Exiting notes management.")
-            break
-
+    # Let list_notes_actions handle all the action logic
+    notes_manager.list_notes_actions()
 
 class ActivateProject:
     

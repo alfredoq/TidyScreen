@@ -963,11 +963,6 @@ class ChemSpace:
                 'errors': 1
             }
     
-    # def load_single_smiles(self):
-    #     """
-    #     Will prompt the user for a smiles, a name, a flag, and a table name. Then the smiles will be load to the chemspace.db as using the approach followed by the load_csv_file method
-    #     """
-        
     def load_single_smiles(self) -> Dict[str, Any]:
         """
         Will prompt the user for a smiles, a name, a flag, and a table name. 
@@ -1138,6 +1133,24 @@ class ChemSpace:
             
             if result['success']:
                 print(f"\n✅ Compound loaded successfully to table '{table_name}'")
+                
+                # Compute InChI key for the inserted compound
+                print(f"\n🧪 Computing InChI key for the loaded compound...")
+                try:
+                    inchi_df = self.compute_inchi_keys(table_name, update_database=True)
+                    if not inchi_df.empty and 'inchi_key' in inchi_df.columns:
+                        match_df = inchi_df[inchi_df['smiles'] == smiles]
+                        if not match_df.empty:
+                            inchi_key_value = match_df.iloc[0].get('inchi_key')
+                            if inchi_key_value and inchi_key_value not in ['INVALID_SMILES', 'ERROR']:
+                                print(f"   🔬 InChI key: {inchi_key_value}")
+                            else:
+                                print("   ⚠️  InChI key not computed for the inserted compound")
+                    else:
+                        print("   ⚠️  No InChI keys computed")
+                except Exception as inchi_error:
+                    print(f"   ⚠️  Warning: InChI key computation failed: {inchi_error}")
+
                 return {
                     'success': True,
                     'message': f"Compound loaded to table '{table_name}'",
@@ -1145,6 +1158,9 @@ class ChemSpace:
                     'table_name': table_name,
                     'smiles': smiles
                 }
+
+            
+
             else:
                 print(f"\n❌ Failed to load compound: {result['message']}")
                 return {
@@ -10246,18 +10262,57 @@ class ChemSpace:
             print(f"❌ Error executing table deletions: {e}")
             return {table: False for table in selected_tables}
 
-    def drop_table(self, table_name: str, confirm: bool = True) -> bool:
+    def drop_table(self, table_name: Optional[str] = None, confirm: bool = True) -> bool:
         """
         Drop a single table from the chemspace database.
         
         Args:
-            table_name (str): Name of the table to drop
+            table_name (Optional[str]): Name of the table to drop. If None, prompts user to select one.
             confirm (bool): Whether to ask for confirmation before deletion
             
         Returns:
             bool: True if table was dropped successfully, False otherwise
         """
         try:
+            # If no table name provided, prompt user to select one
+            if not table_name or not str(table_name).strip():
+                tables = self.get_all_tables()
+                if not tables:
+                    print("📝 No tables found in chemspace database")
+                    return False
+
+                print("\n📊 Available tables:")
+                # Show tables with type icon for clarity
+                for idx, t in enumerate(tables, start=1):
+                    try:
+                        t_type = self._classify_table_type(t)
+                        t_icon = self._get_table_type_icon(t_type)
+                    except Exception:
+                        t_type, t_icon = "unknown", "❓"
+                    print(f"  [{idx}] {t_icon} {t} ({t_type})")
+
+                while True:
+                    choice = input("\nSelect table to drop (number/name) or 'q' to cancel: ").strip()
+                    if choice.lower() in ['q', 'quit', 'cancel', 'n']:
+                        print("❌ Table deletion cancelled.")
+                        return False
+                    if choice.isdigit():
+                        idx = int(choice) - 1
+                        if 0 <= idx < len(tables):
+                            table_name = tables[idx]
+                            break
+                        else:
+                            print("❗ Invalid selection. Please enter a valid number or name.")
+                            continue
+                    else:
+                        # Name provided: validate it exists
+                        if choice in tables:
+                            table_name = choice
+                            break
+                        else:
+                            print(f"❗ Table '{choice}' not found. Please enter a valid number or name.")
+                            continue
+
             # Check if table exists
             tables = self.get_all_tables()
             if table_name not in tables:
