@@ -6,6 +6,8 @@ from tidyscreen import tidyscreen
 import sys
 from typing import Dict, List, Tuple, Optional, Any
 from rdkit.Chem import AllChem
+import warnings
+warnings.filterwarnings('ignore', category=DeprecationWarning)
 #from rdkit import Chem
 import shutil
 
@@ -860,11 +862,12 @@ class MolDock:
         Returns:
             Optional[Any]: Dictionary with selected table name, docking method, assay registry info and SMILES data if requested, or None if cancelled
         """
+        
         try:
             print(f"🧬 MOLDOCK - Table and Method Selection for Docking")
             print("=" * 70)
-            
-            # Step 1: Select docking method first and return a dictionary of method parameters (selected_method)
+
+            ## Step 1: Select docking method first and return a dictionary of method parameters (selected_method)
             selected_method = self._select_docking_method()
             
             if not selected_method:
@@ -873,20 +876,15 @@ class MolDock:
             
             print(f"\n✅ Selected docking method: '{selected_method['method_name']}' ({selected_method['docking_engine']})")
             print("-" * 70)
-            
-            # Step 1b: Prompt user for execution mode
-            execution_mode = self._prompt_execution_mode()
-            if execution_mode is None:
-                print("❌ Docking preparation cancelled")
-                return None
-            
-            # Step 2: Check if chemspace database exists
+
+            ## Step 2: select table to dock:
+                # Check if chemspace database exists
             if not os.path.exists(self.__chemspace_db):
                 print(f"❌ ChemSpace database not found: {self.__chemspace_db}")
                 print("   Please ensure ChemSpace has been initialized for this project.")
                 return None
-            
-            # Step 3: Connect to chemspace database and get available tables
+
+                # Connect to chemspace database and get available tables
             try:
                 import sqlite3
                 conn = sqlite3.connect(self.__chemspace_db)
@@ -907,8 +905,8 @@ class MolDock:
                 return None
             
             print(f"📊 Found {len(available_tables)} table(s) in ChemSpace database")
-            
-            # Step 4: Collect table information using existing patterns
+
+                # Collect table information using existing patterns
             table_data = []
             ready_table_data = []
             not_ready_count = 0
@@ -938,7 +936,7 @@ class MolDock:
                     print(f"   ⚠️  Error analyzing table '{table_name}': {e}")
                     continue
             
-            # Step 5: Show summary of table readiness
+                # Show summary of table readiness
             total_analyzed = len(table_data)
             ready_count = len(ready_table_data)
             
@@ -947,7 +945,7 @@ class MolDock:
             print(f"   ✅ Ready for docking: {ready_count}")
             print(f"   ❌ Not ready for docking: {not_ready_count}")
             
-            # Step 6: Determine which tables to display
+                # Determine which tables to display
             if not show_all_tables:
                 # Default behavior: show only ready tables
                 tables_to_display = ready_table_data
@@ -999,98 +997,102 @@ class MolDock:
                     print("❌ No valid tables found for docking preparation")
                 return None
             
-            # Step 7: Sort tables (reusing existing logic)
+                # Sort tables (reusing existing logic)
             tables_to_display = self._sort_table_data_for_docking(tables_to_display, sort_by)
             
-            # Step 8: Display table list for selection with readiness context
+                # Display table list for selection with readiness context
             selected_table = self._display_and_select_docking_table(
                 tables_to_display, filter_by_type, show_all_tables, ready_count, not_ready_count
             )
+
+            ## Step 3: select receptor for docking studies:
+
+            print(f"\n🧬 Selecting receptor for docking...")
+            receptor_info = self._select_receptor_from_db()
             
+            ## Check consistency between ligands and receptor charge model
+            self.check_charges_consistency(selected_method, receptor_info)
+            
+            if not receptor_info:
+                print("❌ No receptor selected. Docking cancelled.")
+                return None
+            
+            print(f"✅ Selected receptor: '{receptor_info['pdb_name']}'")
+
             if selected_table:
                 print(f"\n✅ Selected table for docking: '{selected_table}'")
                 
                 # Step 9: Show docking setup summary and get user choice
                 user_choice = self._show_docking_setup_summary(selected_table, selected_method, tables_to_display)
+
+            if user_choice == 1:
+                # Creation of the docking assay notes
+                note_text = notes
+                if note_text is None:
+                    try:
+                        note_text = input(f"\n📝 Enter notes for this docking assay (press Enter to leave blank): ")
+                    except KeyboardInterrupt:
+                        print("\n❌ Docking preparation cancelled")
+                        return None
+                if note_text is None:
+                    note_text = ""
+
+                # Get selected table info for registry
+                selected_table_info = next((t for t in tables_to_display if t['name'] == selected_table), None)
+
+                # Create assay registry
+                assay_registry = self._create_docking_assay_registry(
+                    selected_table, 
+                    selected_method, 
+                    selected_table_info,
+                    receptor_info,
+                    user_choice,
+                    note_text
+                )
                 
-                if user_choice == 1:
-                    # Step 10: Create docking assay registry before returning results
-                    print(f"\n📝 Creating docking assay registry...")
-                    note_text = notes
-                    if note_text is None:
-                        try:
-                            note_text = input(f"\n📝 Enter notes for this docking assay (press Enter to leave blank): ")
-                        except KeyboardInterrupt:
-                            print("\n❌ Docking preparation cancelled")
-                            return None
-                    if note_text is None:
-                        note_text = ""
-                    
-                    # Get selected table info for registry
-                    selected_table_info = next((t for t in tables_to_display if t['name'] == selected_table), None)
-                    
-                    # Create assay registry
-                    assay_registry = self._create_docking_assay_registry(
-                        selected_table, 
-                        selected_method, 
-                        selected_table_info,
-                        user_choice,
-                        note_text
-                    )
-                    
-                    if not assay_registry:
+                if not assay_registry:
                         print("⚠️  Warning: Could not create docking assay registry, but continuing...")
-                    else:
-                        print(f"✅ Docking assay registry created with ID: {assay_registry['assay_id']}")
-                    
-                    if user_choice == 1:
-                        # Load SMILES and return complete setup
-                        print(f"\n🧪 Loading SMILES from table '{selected_table}'...")
-                        smiles_data = self._get_smiles_from_table(selected_table)
-                        
-                        if smiles_data:
-                            print(f"✅ Loaded {len(smiles_data)} compounds with SMILES")
-                            
-                            # Update registry with loaded compound count
-                            if assay_registry:
-                                self._update_assay_registry_compound_count(assay_registry['assay_id'], len(smiles_data))
-                            
-                        else:
-                            print("❌ No valid SMILES found in selected table")
-                            
-                            # Update registry status to indicate failure
-                            if assay_registry:
-                                self._update_assay_registry_status(assay_registry['assay_id'], 'failed', 'No valid SMILES found')
-                            
-                            return None
-                        
-                        # Select receptor before executing docking
-                        print(f"\n🧬 Selecting receptor for docking...")
-                        receptor_info = self._select_receptor_from_db()
-                        
-                        if not receptor_info:
-                            print("❌ No receptor selected. Docking cancelled.")
-                            return None
-                        
-                        print(f"✅ Selected receptor: '{receptor_info['pdb_name']}'")
-                        
-                        # Execute docking based on execution mode
-                        if execution_mode == 'foreground':
-                            # Run directly in current console
-                            self._run_docking_foreground(selected_table, selected_method, assay_registry, clean_ligand_files, receptor_info)
-                        else:
-                            # Run as background/detached process
-                            self._run_docking_background(selected_table, selected_method, assay_registry, clean_ligand_files, receptor_info)
-                        
-                    else:
-                        print(f"❌ Docking engine '{selected_method['docking_engine']}' not yet implemented")
-                    
                 else:
+                    print(f"✅ Docking assay registry created with ID: {assay_registry['assay_id']}")
+
+                if user_choice == 1:
+                    # Load SMILES and return complete setup
+                    print(f"\n🧪 Loading SMILES from table '{selected_table}'...")
+                    smiles_data = self._get_smiles_from_table(selected_table)
+                    
+                    if smiles_data:
+                        print(f"✅ Loaded {len(smiles_data)} compounds with SMILES")
+                        
+                        # Update registry with loaded compound count
+                        if assay_registry:
+                            self._update_assay_registry_compound_count(assay_registry['assay_id'], len(smiles_data))
+                        
+                    else:
+                        print("❌ No valid SMILES found in selected table")
+                        
+                        # Update registry status to indicate failure
+                        if assay_registry:
+                            self._update_assay_registry_status(assay_registry['assay_id'], 'failed', 'No valid SMILES found')
+                        
+                        return None
+
+                ## Prompt user for execution mode
+                execution_mode = self._prompt_execution_mode()
+                if execution_mode is None:
+                    print("❌ Docking preparation cancelled")
                     return None
+
+                # Execute docking based on execution mode
+                if execution_mode == 'foreground':
+                    # Run directly in current console
+                    self._run_docking_foreground(selected_table, selected_method, assay_registry, clean_ligand_files, receptor_info)
+                else:
+                    # Run as background/detached process
+                    self._run_docking_background(selected_table, selected_method, assay_registry, clean_ligand_files, receptor_info)
+
             else:
-                print("❌ No table selected for docking preparation")
-                return None
-                
+                print(f"❌ Canceling docking assay.")
+
         except Exception as e:
             print(f"❌ Error in dock_table method: {e}")
             import traceback
@@ -1290,8 +1292,8 @@ except Exception as e:
             traceback.print_exc()
 
     def _create_docking_assay_registry(self, table_name: str, docking_method: Dict[str, Any], 
-                                    table_info: Optional[Dict[str, Any]], setup_type: int,
-                                    notes: Optional[str] = None) -> Optional[Dict[str, Any]]:
+                                table_info: Optional[Dict[str, Any]], receptor_info: Dict[str, Any], setup_type: int,
+                                notes: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
         Create a docking assay registry entry in the docking_assays database and create associated folder.
         
@@ -1299,6 +1301,7 @@ except Exception as e:
             table_name (str): Name of the selected table
             docking_method (Dict): Selected docking method information
             table_info (Optional[Dict]): Table information dictionary
+            receptor_info (Dict): Receptor information dictionary
             setup_type (int): Setup type (1=configuration_only, 2=ready_for_docking)
             notes (Optional[str]): Notes to store alongside the registry entry
             
@@ -1325,7 +1328,7 @@ except Exception as e:
             conn = sqlite3.connect(assays_db_path)
             cursor = conn.cursor()
             
-            # Create docking_assays table with assay_folder_path column
+            # Create docking_assays table with receptor_info JSON column only
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS docking_assays (
                     assay_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1335,6 +1338,7 @@ except Exception as e:
                     docking_method_id INTEGER,
                     docking_method_name TEXT NOT NULL,
                     docking_engine TEXT NOT NULL,
+                    receptor_info TEXT,
                     compound_count INTEGER DEFAULT 0,
                     prepared_molecules INTEGER DEFAULT 0,
                     setup_type TEXT,
@@ -1349,13 +1353,16 @@ except Exception as e:
                 )
             ''')
             
+            # Serialize receptor_info to JSON
+            receptor_info_json = json.dumps(receptor_info, indent=2) if receptor_info else '{}'
+            
             # First, insert a temporary record to get the assay_id
             cursor.execute('''
                 INSERT INTO docking_assays (
                     assay_name, project_name, table_name, docking_method_id, docking_method_name,
-                    docking_engine, compound_count, prepared_molecules, setup_type, status,
+                    docking_engine, receptor_info, compound_count, prepared_molecules, setup_type, status,
                     table_readiness_score, docking_status, notes, configuration, assay_folder_path
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 'temp_assay',  # Temporary name - will be updated
                 self.name,  # project name
@@ -1363,6 +1370,7 @@ except Exception as e:
                 docking_method.get('method_id'),
                 docking_method['method_name'],
                 docking_method['docking_engine'],
+                receptor_info_json,
                 table_info['compound_count'] if table_info else 0,
                 table_info['sdf_blob_count'] if table_info else 0,
                 'configuration_only' if setup_type == 1 else 'ready_for_docking',
@@ -1390,6 +1398,7 @@ except Exception as e:
             # Prepare configuration data
             configuration_data = {
                 'docking_method': docking_method,
+                'receptor_info': receptor_info,
                 'table_info': {
                     'name': table_name,
                     'compound_count': table_info['compound_count'] if table_info else 0,
@@ -1430,6 +1439,7 @@ except Exception as e:
             print(f"   📋 Assay Name: {assay_name}")
             print(f"   📊 Table: {table_name}")
             print(f"   🧬 Method: {docking_method['method_name']} ({docking_method['docking_engine']})")
+            print(f"   🎯 Receptor: {receptor_info.get('pdb_name', 'N/A')} (ID: {receptor_info.get('pdb_id', 'N/A')})")
             print(f"   🔧 Setup Type: {'configuration_only' if setup_type == 1 else 'ready_for_docking'}")
             print(f"   📁 Assay Folder: {assay_folder_path}")
             print(f"   💾 Database: {assays_db_path}")
@@ -1440,6 +1450,7 @@ except Exception as e:
                 'project_name': self.name,
                 'table_name': table_name,
                 'docking_method': docking_method,
+                'receptor_info': receptor_info,
                 'setup_type': 'configuration_only' if setup_type == 1 else 'ready_for_docking',
                 'status': 'created',
                 'database_path': assays_db_path,
@@ -1677,7 +1688,7 @@ except Exception as e:
         List all docking assays and their folder paths for this project.
         
         Returns:
-            Optional[List[Dict]]: List of assay information with folder paths
+            Optional[List[Dict]]: List of assay information with folder paths and receptor info
         """
         try:
             assays_db_path = os.path.join(os.path.dirname(self.__docking_registers_db), 'docking_assays.db')
@@ -1687,12 +1698,13 @@ except Exception as e:
                 return None
             
             import sqlite3
+            import json
             conn = sqlite3.connect(assays_db_path)
             cursor = conn.cursor()
             
             cursor.execute('''
                 SELECT assay_id, assay_name, table_name, docking_method_name, 
-                    docking_engine, status, created_date, assay_folder_path, notes
+                    docking_engine, status, created_date, assay_folder_path, notes, receptor_info
                 FROM docking_assays 
                 WHERE project_name = ?
                 ORDER BY created_date ASC
@@ -1712,10 +1724,18 @@ except Exception as e:
             print("=" * 130)
             
             for row in results:
-                assay_id, assay_name, table_name, method_name, engine, status, created_date, folder_path, notes = row
+                assay_id, assay_name, table_name, method_name, engine, status, created_date, folder_path, notes, receptor_info_json = row
                 
                 folder_exists = "✅ Yes" if folder_path and os.path.exists(folder_path) else "❌ No"
                 note_preview = (notes or "").replace('\n', ' ')[:60]
+                
+                # Parse receptor_info from JSON
+                receptor_info = None
+                if receptor_info_json:
+                    try:
+                        receptor_info = json.loads(receptor_info_json)
+                    except json.JSONDecodeError:
+                        receptor_info = None
                 
                 print(f"{assay_id:<5} {assay_name[:24]:<25} {table_name[:14]:<20} "
                     f"{method_name[:14]:<15} {note_preview:<60}")
@@ -1730,7 +1750,8 @@ except Exception as e:
                     'created_date': created_date,
                     'assay_folder_path': folder_path,
                     'folder_exists': folder_path and os.path.exists(folder_path),
-                    'notes': notes
+                    'notes': notes,
+                    'receptor_info': receptor_info
                 })
             
             print("=" * 130)
@@ -1741,6 +1762,9 @@ except Exception as e:
         except Exception as e:
             print(f"❌ Error listing assay folders: {e}")
             return None
+
+
+
 
     def _update_assay_registry_compound_count(self, assay_id: int, compound_count: int) -> bool:
         """
@@ -4927,7 +4951,7 @@ except Exception as e:
 
             # Prompt for notes
             try:
-                notes = input("Enter a note for this PDB file (Enter: empty note): ").strip()
+                notes = input("Enter a note for this model (Enter: empty note): ").strip()
                 if not notes:
                     notes = ""
             except KeyboardInterrupt:
@@ -5462,7 +5486,7 @@ quit
             print("❌ No PDB files found in the database.")
             return None
 
-        print("\n📋 Available PDB files:")
+        print("\n📋 Available PDB templates:")
         print("=" * 60)
         for i, (rid, name, processed_pdb, checked_pdb, folder, notes) in enumerate(pdbs, 1):
             print(f"{i}. {name} (ID: {rid})")
@@ -5505,8 +5529,6 @@ quit
         # Select the pdb file to convert to .pdbqt
         pdb_to_convert = checked_pdb_path
 
-        print(f"PDB to convert: {pdb_to_convert}")
-
         # Call helper to create PDBQT
         pdbqt_file, configs = self._create_pdbqt_from_pdb(pdb_to_convert)
 
@@ -5533,7 +5555,7 @@ quit
             print("✅ AutoDock4Zn parameters to be applied.")
 
         # Call helper method to create receptor grids
-        self._create_receptor_grids(pdbqt_file, configs, rec_main_path, has_ZN)
+        configs = self._create_receptor_grids(pdbqt_file, configs, rec_main_path, has_ZN)
 
         if pdbqt_file:
 
@@ -5549,15 +5571,19 @@ quit
         
         from meeko import MoleculePreparation, ResidueChemTemplates
         from meeko import Polymer
-
     
-        destination_pdbqt = pdb_to_convert.replace(".pdb",".pdbqt")
-
         structure = self._create_prody_selection(pdb_to_convert)
         
         configs = self._prompt_recprep_opts()
-        
-        mk_prep = MoleculePreparation()
+
+        ## Get the receptor charge model from the configs dictionary
+        receptor_charge_model=configs.get('receptor_charge_model', "unknown")
+
+        ## Define the name of the .pdbqt file to write
+        destination_pdbqt = pdb_to_convert.replace(".pdb",f"_{receptor_charge_model}.pdbqt")
+
+        mk_prep = MoleculePreparation(charge_model=receptor_charge_model)
+        print(f"Creating receptor .pdbqt file applying charge model: {receptor_charge_model}")
         chem_templates = ResidueChemTemplates.create_from_defaults()
         mypol = Polymer.from_prody(structure, chem_templates, mk_prep)
 
@@ -5705,7 +5731,24 @@ quit
                 print("\n❌ Spacing value entry cancelled.")
                 return None
 
-        return {'center': coords, 'size': sizes, 'dielectric': dielectric, 'smooth': smooth, 'spacing': spacing}
+        # Prompt the user which charge model is to be applied to the receptor model
+        print("🔧 Preparing to convert receptor to PDBQT format...")
+        charge_model_receptor = self._get_parameter_choice(
+            "Charge model to apply",
+            ["gasteiger", "espaloma", "read"],
+            default="gasteiger"
+        )
+
+        # Ask for new model selection since "read" is not implemented yet
+        while charge_model_receptor == "read":
+            print("⚠️  The option 'read' requires a .pqr fiel of the receptor. This method has not been implemented yet, please choose another one")
+            charge_model_receptor = self._get_parameter_choice(
+            "Charge model to apply",
+            ["gasteiger", "espaloma"],
+            default="gasteiger"
+            )
+
+        return {'center': coords, 'size': sizes, 'dielectric': dielectric, 'smooth': smooth, 'spacing': spacing, 'receptor_charge_model': charge_model_receptor}
 
     def _write_pdbqt(self, mypol, destination_pdbqt: str) -> None:
         """
@@ -5766,11 +5809,17 @@ quit
         grid_center = list(configs['center'].values())
         box_dims = list(configs['size'].values())
 
+        # Get the receptor charge model to isolate grids in a dedicated folder
+        receptor_model_charge = configs.get('receptor_charge_model', 'unknown')
+
         # Prepare grid files directory
-        grids_path = os.path.join(rec_main_path, 'grid_files')
+        grids_path = os.path.join(rec_main_path, f'grid_files_{receptor_model_charge}')
         os.makedirs(grids_path, exist_ok=True)
         grids_file_path = os.path.join(grids_path, 'receptor.gpf')
         grid_log_file = grids_file_path.replace(".gpf", ".glg")
+
+        # Add grid files directory to configs
+        configs['grids_path'] = grids_path
 
         # Write .gpf file
         with open(grids_file_path, "w") as f:
@@ -5779,6 +5828,12 @@ quit
                 dielectric=configs['dielectric'], smooth=configs['smooth'], spacing=configs['spacing']
             )
             f.write(gpf_string)
+
+            # Check if the receptor charge model is espaloma, and in the case add the qasp lines to the .gpf file
+            
+            if configs["receptor_charge_model"] == "espaloma":
+                print("Detected 'espaloma' charge model for receptor \n tuning 'qsap' in grid parameter file")
+                f.write("qasp 0.00679")
 
             # If Zn present, copy AD4Zn.dat and add Zn grid parameters
             if has_ZN:
@@ -5823,6 +5878,10 @@ quit
             )
             if result.returncode == 0:
                 print(f"✅ AutoGrid4 completed successfully. Log: {grid_log_file}")
+                
+                # Return updated configs containing the corresponding grids path
+                return configs
+            
             else:
                 print(f"❌ AutoGrid4 failed. See log for details: {grid_log_file}")
                 print(result.stderr)
@@ -5831,14 +5890,146 @@ quit
         except Exception as e:
             print(f"❌ Error running AutoGrid4: {e}") 
 
+    # def _create_receptor_register(self, 
+    #                             pdb_id: int,                 
+    #                             pdb_name: str, 
+    #                             pdb_to_convert: str,
+    #                             pdbqt_file: str,
+    #                             configs: dict,
+    #                             notes: str = None
+    #                             ) -> bool:
+    #     """
+    #     Create a receptor register entry in the database for this project.
+
+    #     This method stores metadata about a prepared receptor for docking, including:
+    #     - The originating PDB file and its database ID
+    #     - The processed PDBQT file path
+    #     - The docking box configuration (center and size)
+    #     - Optional user notes
+    #     - Timestamp of creation
+
+    #     The register is stored in the SQLite database:
+    #         project_path/docking/receptors/receptors.db
+    #     in a table called 'receptor_registers'.
+
+    #     Args:
+    #         pdb_id (int): ID for the PDB file originating the .pdbqt file (from pdbs.db)
+    #         pdb_name (str): Name of the processed PDB file originating the .pdbqt file
+    #         pdb_to_convert (str): Path to the PDB file used for conversion
+    #         pdbqt_file (str): Path to the generated .pdbqt file
+    #         configs (dict): Dictionary containing box information for docking (e.g., {'center': {...}, 'size': {...}})
+    #         notes (str, optional): Optional notes about this receptor preparation
+
+    #     Returns:
+    #         bool: True if the register was created successfully, False otherwise
+
+    #     Example:
+    #         self._create_receptor_register(
+    #             pdb_id=1,
+    #             pdb_name="1abc",
+    #             pdb_to_convert="/path/to/1abc_checked.pdb",
+    #             pdbqt_file="/path/to/1abc_checked.pdbqt",
+    #             configs={'center': {'x': 10, 'y': 20, 'z': 30}, 'size': {'x': 20, 'y': 20, 'z': 20}},
+    #             notes="Prepared for Vina docking"
+    #         )
+    #     """
+    #     try:
+    #         import sqlite3
+    #         import json
+    #         from datetime import datetime
+
+    #         receptors_db_path = os.path.join(self.path, 'docking', 'receptors', 'receptors.db')
+
+    #         # Ensure the directory exists
+    #         os.makedirs(os.path.dirname(receptors_db_path), exist_ok=True)
+
+    #         conn = sqlite3.connect(receptors_db_path)
+    #         cursor = conn.cursor()
+
+    #         # Create table if it doesn't exist
+    #         cursor.execute('''
+    #             CREATE TABLE IF NOT EXISTS receptor_registers (
+    #                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+    #                 pdb_id INTEGER NOT NULL,
+    #                 pdb_name TEXT NOT NULL,
+    #                 pdb_to_convert TEXT NOT NULL,
+    #                 pdbqt_file TEXT,
+    #                 configs TEXT,
+    #                 notes TEXT,
+    #                 created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    #             )
+    #         ''')
+
+    #         # Check for identical register (excluding 'notes')
+    #         cursor.execute('''
+    #             SELECT pdb_id, pdb_name, pdb_to_convert, pdbqt_file, configs
+    #             FROM receptor_registers
+    #         ''')
+    #         new_entry = (
+    #             pdb_id,
+    #             pdb_name,
+    #             pdb_to_convert,
+    #             pdbqt_file,
+    #             json.dumps(configs, indent=2) if configs is not None else None
+    #         )
+            
+    #         for row in cursor.fetchall():
+    #             # Compare all fields except notes and created_date
+    #             if row == new_entry:
+    #                 print(f"⚠️  An identical receptor register already exists for PDB name: {pdb_name}.")
+    #                 print(f"   Existing register details:")
+    #                 print(f"   - pdb_id: {row[0]}")
+    #                 print(f"   - pdb_name: {row[1]}")
+    #                 print(f"   - pdb_to_convert: {row[2]}")
+    #                 print(f"   - pdbqt_file: {row[3]}")
+    #                 print(f"   - configs: {row[4]}")
+    #                 print("   No new register will be created.")
+    #                 conn.close()
+    #                 return False
+
+    #         # Prompt for notes if not provided
+    #         if notes is None:
+    #             try:
+    #                 notes = input("Enter a note for this .pdbqt file (Enter: empty note): ").strip()
+    #                 if not notes:
+    #                     notes = ""
+    #             except KeyboardInterrupt:
+    #                 print("\n   ⚠️  Note entry cancelled. Using empty note.")
+    #                 notes = ""
+
+    #         # Insert register entry
+    #         cursor.execute('''
+    #             INSERT INTO receptor_registers (
+    #                 pdb_id, pdb_name, pdb_to_convert, pdbqt_file, configs, notes
+    #             ) VALUES (?, ?, ?, ?, ?, ?)
+    #         ''', (
+    #             pdb_id,
+    #             pdb_name,
+    #             pdb_to_convert,
+    #             pdbqt_file,
+    #             json.dumps(configs, indent=2) if configs is not None else None,
+    #             notes
+    #         ))
+
+    #         conn.commit()
+    #         conn.close()
+    #         print(f"   ✅ Receptor register created for PDB ID: '{pdb_id}' (PDBQT: {os.path.basename(pdbqt_file)})")
+    #         return True
+
+    #     except Exception as e:
+    #         print(f"   ❌ Error creating receptor register: {e}")
+    #         return False
+        
+        
     def _create_receptor_register(self, 
-                                pdb_id: int,                 
-                                pdb_name: str, 
-                                pdb_to_convert: str,
-                                pdbqt_file: str,
-                                configs: dict, 
-                                notes: str = None
-                                ) -> bool:
+                             pdb_id: int,                 
+                             pdb_name: str, 
+                             pdb_to_convert: str,
+                             pdbqt_file: str,
+                             configs: dict,
+                             notes: str = None,
+                             model_name: Optional[str] = None
+                             ) -> bool:
         """
         Create a receptor register entry in the database for this project.
 
@@ -5879,6 +6070,10 @@ quit
             import json
             from datetime import datetime
 
+            # Prompt for model_name if not provided
+            if model_name is None:
+                model_name = input("Enter a model name for this receptor (optional): ").strip()
+
             receptors_db_path = os.path.join(self.path, 'docking', 'receptors', 'receptors.db')
 
             # Ensure the directory exists
@@ -5887,42 +6082,45 @@ quit
             conn = sqlite3.connect(receptors_db_path)
             cursor = conn.cursor()
 
-            # Create table if it doesn't exist
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS receptor_registers (
+            # Ensure the table has a model_name column
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS receptor_models (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    pdb_id INTEGER NOT NULL,
-                    pdb_name TEXT NOT NULL,
-                    pdb_to_convert TEXT NOT NULL,
+                    model_name TEXT,
+                    pdb_id INTEGER,
+                    pdb_name TEXT,
+                    pdb_to_convert TEXT,
                     pdbqt_file TEXT,
                     configs TEXT,
-                    notes TEXT,
-                    created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    notes TEXT
                 )
-            ''')
+            """)
 
             # Check for identical register (excluding 'notes')
             cursor.execute('''
-                SELECT pdb_id, pdb_name, pdb_to_convert, pdbqt_file, configs
-                FROM receptor_registers
+                SELECT pdb_id, model_name, pdb_name, pdb_to_convert, pdbqt_file, configs
+                FROM receptor_models
             ''')
             new_entry = (
                 pdb_id,
+                model_name,
                 pdb_name,
                 pdb_to_convert,
                 pdbqt_file,
                 json.dumps(configs, indent=2) if configs is not None else None
             )
+            
             for row in cursor.fetchall():
                 # Compare all fields except notes and created_date
                 if row == new_entry:
                     print(f"⚠️  An identical receptor register already exists for PDB name: {pdb_name}.")
                     print(f"   Existing register details:")
                     print(f"   - pdb_id: {row[0]}")
-                    print(f"   - pdb_name: {row[1]}")
-                    print(f"   - pdb_to_convert: {row[2]}")
-                    print(f"   - pdbqt_file: {row[3]}")
-                    print(f"   - configs: {row[4]}")
+                    print(f"   - model_name: {row[1]}")
+                    print(f"   - pdb_name: {row[2]}")
+                    print(f"   - pdb_to_convert: {row[3]}")
+                    print(f"   - pdbqt_file: {row[4]}")
+                    print(f"   - configs: {row[5]}")
                     print("   No new register will be created.")
                     conn.close()
                     return False
@@ -5939,11 +6137,12 @@ quit
 
             # Insert register entry
             cursor.execute('''
-                INSERT INTO receptor_registers (
-                    pdb_id, pdb_name, pdb_to_convert, pdbqt_file, configs, notes
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO receptor_models (
+                    pdb_id, model_name, pdb_name, pdb_to_convert, pdbqt_file, configs, notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
             ''', (
                 pdb_id,
+                model_name,
                 pdb_name,
                 pdb_to_convert,
                 pdbqt_file,
@@ -5953,12 +6152,13 @@ quit
 
             conn.commit()
             conn.close()
-            print(f"   ✅ Receptor register created for PDB ID: '{pdb_id}' (PDBQT: {os.path.basename(pdbqt_file)})")
+            print(f"   ✅ Receptor register created for PDB ID: '{pdb_id}' (Model Name: {model_name}, PDBQT: {os.path.basename(pdbqt_file)})")
             return True
 
         except Exception as e:
             print(f"   ❌ Error creating receptor register: {e}")
             return False
+        
         
     def _check_ZN_presence(self, pdbqt_file: str, rec_main_path: str) -> bool:
         """
@@ -6101,14 +6301,24 @@ quit
 
         # Retrieve docking method parameters
         method_params = selected_method.get('parameters', {})
+        ligand_parameters = selected_method.get('ligand_prep_parameters', {})
         
+        # Check if charge model is different that 'gasteiger'. In that case add a key 'modqp' and value 1 to method_params
+        charge_model = ligand_parameters.get('charge', 'gasteiger')
+        if charge_model != 'gasteiger':
+            method_params['modqp'] = 1
+            
         # Retrieve ligand preparation params
         ligand_prep_parameters = selected_method.get('ligand_prep_parameters', {})
         
         # Select the receptor to be used for docking
         receptor_main_path = self.__receptor_path + f"/{receptor_info.get('pdb_name', None)}"
-        receptor_pdbqt_file = receptor_main_path + f"/processed/receptor_checked.pdbqt"
-        fld_file = receptor_main_path + f"/grid_files/receptor_checked.maps.fld"
+        receptor_charge_model = receptor_info.get('configs', None).get('receptor_charge_model', 'unknown')
+        #receptor_pdbqt_file = receptor_main_path + f"/processed/receptor_checked.pdbqt"
+        receptor_pdbqt_file = receptor_info.get('pdbqt_file', None)
+        #fld_file = receptor_main_path + f"/grid_files/receptor_checked.maps.fld"
+        grids_path = receptor_info.get('configs', None).get('grids_path', None)
+        fld_file = grids_path + f"/receptor_checked_{receptor_charge_model}.maps.fld"
         assay_folder = assay_registry['assay_folder_path']
     
         if not receptor_pdbqt_file:
@@ -6196,6 +6406,7 @@ quit
         
         import sqlite3
         import os
+        import json
 
         receptors_db_path = os.path.join(self.path, 'docking', 'receptors', 'receptors.db')
         if not os.path.exists(receptors_db_path):
@@ -6206,27 +6417,41 @@ quit
             conn = sqlite3.connect(receptors_db_path)
             cursor = conn.cursor()
             cursor.execute('''
-                SELECT id, pdb_id, pdb_name, pdbqt_file, notes, created_date
-                FROM receptor_registers
-                ORDER BY created_date ASC
+                SELECT id, pdb_id, pdb_name, pdbqt_file, configs, notes
+                FROM receptor_models
+                ORDER BY id ASC
             ''')
-            receptors = cursor.fetchall()
+            raw_results = cursor.fetchall()
+            receptors = []
+            
+            # Turn the 'configs' into a dictionary
+            for row in raw_results:
+                configs_dict = None
+                if row[4]:  # row[4] is the configs column
+                    try:
+                        configs_dict = json.loads(row[4])
+                    except json.JSONDecodeError:
+                        configs_dict = None
+                receptors.append((row[0], row[1], row[2], row[3], configs_dict, row[5]))
+            
+            #receptors = cursor.fetchall()
             conn.close()
+        
         except Exception as e:
             print(f"❌ Error loading receptors database: {e}")
             return None
 
         if not receptors:
+            print(receptors)
             print("❌ No receptors found in the database.")
             return None
 
         print("\n📋 Available Receptors:")
         print("=" * 70)
-        for i, (rid, pdb_id, pdb_name, pdbqt_file, notes, created_date) in enumerate(receptors, 1):
+        for i, (rid, pdb_id, pdb_name, pdbqt_file, configs, notes) in enumerate(receptors, 1):
             print(f"{i}. {pdb_name} (ID: {pdb_id})")
             print(f"   PDBQT: {os.path.basename(pdbqt_file) if pdbqt_file else 'N/A'}")
             print(f"   Notes: {notes}")
-            print(f"   Created: {created_date}")
         print("=" * 70)
 
         while True:
@@ -6245,8 +6470,8 @@ quit
                             'pdb_id': selected[1],
                             'pdb_name': selected[2],
                             'pdbqt_file': selected[3],
-                            'notes': selected[4],
-                            'created_date': selected[5]
+                            'configs': selected[4],
+                            'notes': selected[5],
                         }
                     else:
                         print(f"❌ Invalid selection. Enter a number between 1 and {len(receptors)}.")
@@ -6423,6 +6648,8 @@ quit
         fld_file_path = os.path.dirname(fld_file)
         fld_filename = fld_file.split('/')[-1]
 
+        print(fld_file_path)
+
         # Build AutoDockGPU command
         cmd = [
             "autodock_gpu_128wi",
@@ -6449,12 +6676,13 @@ quit
             "--lsang", str(method_params.get('lsang', 75)),
             "--cslim", str(method_params.get('cslim', 4)),
             "--stopstd", str(method_params.get('stopstd', 0.15)),
-            "--contact_analysis", str(method_params.get('contact_analysis', 1)),
+            "--contact_analysis", str(method_params.get('contact_analysis', '1')),
             "--xmloutput", str(method_params.get('xmloutput', 0)),
             "--clustering", str(method_params.get('clustering', 1)),
             "--output-cluster-poses", str(method_params.get('output-cluster-poses', 0)),
             "--hsym", str(method_params.get('hsym', 1)),
             "--rmstol", str(method_params.get('rmstol', 2)),
+            "--modqp", str(method_params.get('modqp', 0)),
         ]
         
         # Change working directory to docking_results_dir before running the command
@@ -6635,9 +6863,9 @@ quit
             conn = sqlite3.connect(receptors_db_path)
             cursor = conn.cursor()
             cursor.execute('''
-                SELECT pdb_name, pdb_to_convert, pdbqt_file, configs, notes
-                FROM receptor_registers
-                ORDER BY created_date ASC
+                SELECT id, model_name, pdb_name, pdb_to_convert, pdbqt_file, configs, notes
+                FROM receptor_models
+                ORDER BY id ASC
             ''')
             rows = cursor.fetchall()
             conn.close()
@@ -6651,7 +6879,9 @@ quit
 
         print("\n📋 Receptor Models:")
         print("=" * 40)
-        for pdb_name, pdb_to_convert, pdbqt_file, configs, notes in rows:
+        for id, model_name, pdb_name, pdb_to_convert, pdbqt_file, configs, notes in rows:
+            print(f"ID: {id}")
+            print(f"Model Name: {model_name}")
             print(f"PDB Name: {pdb_name}")
             print(f"PDB to Convert: {pdb_to_convert}")
             print(f"PDBQT File: {pdbqt_file}")
@@ -6871,7 +7101,6 @@ quit
             run_number = row[1]['run_number']
             
             input_model, pose_coords_json = self._retrieve_pose_info(db_path, pose_id)
-            print(type(input_model))
             pdb_dict = self._process_input_model_for_moldf(input_model, pose_coords_json)
             self._write_pdb_with_moldf(pdb_dict, ligname, run_number, output_dir)
 
@@ -6883,7 +7112,6 @@ quit
             print(f"Most populated and stable poses extracted and saved as PDB files to: \n \t {output_dir}")
         elif selection == "4":
             print(f"All poses extracted and saved as PDB files to: \n \t {output_dir}")    
-    
     
     def _extract_docked_poses_autodockvina(self, db_path):
         
@@ -7197,12 +7425,11 @@ quit
         except ImportError:
             TQDM_AVAILABLE = False
 
-        print(f"\n🚀 Starting docking with AutoDockGPU for table: {selected_table}")
+        print(f"\n🚀 Starting docking with Vina for table: {selected_table}")
 
         # Retrieve docking method parameters
         method_params = selected_method.get('parameters', {})
         
-        print(selected_method)
         # Retrieve ligand preparation params
         ligand_prep_parameters = selected_method.get('ligand_prep_parameters', {})
         
@@ -7916,3 +8143,66 @@ quit
         except Exception as e:
             print(f"   ⚠️  Error renumbering minimized PDB file: {e}")
             return None
+
+    def compute_prolif_fps(self):
+        """
+        Will compute the ProLIF fingerprints for all docked ligands in a given assay. 
+        """
+
+        import os
+        import sqlite3
+
+        ## Get the assay on which fps are to be computed
+        assays = self.list_assay_folders()
+        
+        if not assays:
+            return None
+
+        assay_by_id = {a['assay_id']: a for a in assays}
+
+        assay_id = self._prompt_assay("for ProLIF fingerprint computation", assay_by_id)
+        if assay_id is None:
+            return None
+
+        assay_info = assay_by_id[assay_id]
+        results_db = os.path
+
+        #print(assay_by_id)
+        print(assay_info)
+        #print(results_db)
+
+    def check_charges_consistency(self, selected_method, receptor_info):
+        
+        """
+        Will compare the charges assigned to the receptor and ligand during preparation to ensure consistency.
+        """
+        import os
+
+        print("\n🔍 Checking charge consistency between receptor and ligand preparation...")
+
+        ligand_charge_method = selected_method.get('ligand_prep_parameters', {}).get('charge', 'unknown')
+        receptor_charge_method = receptor_info.get('configs', 'unknown').get('receptor_charge_model', 'unknown')
+
+        print(f"   Receptor charge method: {receptor_charge_method}")
+        print(f"   Ligand charge method: {ligand_charge_method}")
+
+        if receptor_charge_method != ligand_charge_method:
+            print("   ⚠️  Warning: Charge methods for receptor and ligands do not match!")
+            print("       This may lead to inconsistent docking results.")
+            while True:
+                try:
+                    response = input("   Do you want to continue anyway? (y/n): ").strip().lower()
+                    if response in ['y', 'yes']:
+                        print("   ℹ️  Proceeding with docking despite charge method mismatch.")
+                        break
+                    elif response in ['n', 'no']:
+                        raise SystemExit("   ❌ Docking cancelled due to charge method inconsistency.")
+                    else:
+                        print("   ❌ Please answer 'y' or 'n'")
+                        continue
+                except KeyboardInterrupt:
+                    print("\n   ❌ Operation cancelled by user.")
+                    return False
+        else:
+            print("   ✅ Charge methods are consistent between receptor and ligands.")
+        
