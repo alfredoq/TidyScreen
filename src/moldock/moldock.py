@@ -6533,8 +6533,8 @@ quit
             cursor = conn.cursor()
             
             cursor.execute('''
-                SELECT id, pdb_id, pdb_name, pdb_to_convert, pdbqt_file, configs, notes, created_date
-                FROM receptor_registers
+                SELECT id, model_name, pdb_id, pdb_name, pdb_to_convert, pdbqt_file, configs, notes
+                FROM receptor_models
                 WHERE id = ?
             ''', (receptor_id,))
             
@@ -6547,23 +6547,24 @@ quit
             
             # Parse configs JSON if present
             configs = None
-            if receptor[5]:
+            if receptor[6]:
                 try:
-                    configs = json.loads(receptor[5])
+                    configs = json.loads(receptor[6])
                 except json.JSONDecodeError:
                     print(f"⚠️  Warning: Could not parse configs for receptor ID {receptor_id}")
                     configs = None
             
             # Return as dictionary
+            
             return {
                 'id': receptor[0],
-                'pdb_id': receptor[1],
-                'pdb_name': receptor[2],
-                'pdb_to_convert': receptor[3],
-                'pdbqt_file': receptor[4],
+                'model_name': receptor[1],
+                'pdb_id': receptor[2],
+                'pdb_name': receptor[3],
+                'pdb_to_convert': receptor[4],
+                'pdbqt_file': receptor[5],
                 'configs': configs,
-                'notes': receptor[6],
-                'created_date': receptor[7]
+                'notes': receptor[7],
             }
             
         except Exception as e:
@@ -7432,14 +7433,16 @@ quit
         
         # Retrieve ligand preparation params
         ligand_prep_parameters = selected_method.get('ligand_prep_parameters', {})
-        
+
         # Select the receptor to be used for docking
         receptor_conditions = self._get_receptor_conditions(receptor_info.get('id', None))
-        receptor_main_path = self.__receptor_path + f"/{receptor_info.get('pdb_name', None)}"
-        receptor_pdbqt_file = receptor_main_path + f"/processed/receptor_checked.pdbqt"
-        fld_file = receptor_main_path + f"/grid_files/receptor_checked.maps.fld"
+        
+        receptor_pdbqt_file = receptor_info.get('pdbqt_file', None)
+        charge_model = receptor_info.get('configs', None).get('receptor_charge_model', None)
+        grids_path = receptor_info.get('grids_path', None)
+        fld_file = f"{grids_path}/receptor_checked_{charge_model}.maps.fld"
         assay_folder = assay_registry['assay_folder_path']
-    
+
         if not receptor_pdbqt_file:
             print("❌ No receptor .pdbqt file found.")
             return
@@ -7576,37 +7579,46 @@ quit
         """
         
 
-        from vina import Vina
+        try:
+
+            from vina import Vina
+            
+            ## This will apply batch docking using the 'vina' scoring function
+            if method_params['sf_name'] == 'vina' and vina_rec_object is not None:
+
+                print(f"Method params: {method_params}")
+
+                vina_rec_object.set_ligand_from_file(ligand_pdbqt_filepath)
+
+                vina_rec_object.dock(exhaustiveness=method_params['exhaustiveness'], n_poses=method_params['n_poses'])
+
+                results_file = ligand_pdbqt_filepath.replace('.pdbqt', '_out.pdbqt')
+
+                vina_rec_object.write_poses(results_file, n_poses=method_params['n_poses'], overwrite=True)
+
         
-        ## This will apply batch docking using the 'vina' scoring function
-        if method_params['sf_name'] == 'vina' and vina_rec_object is not None:
+            # This will apply docking using the 'ad4' scoring function
+            elif method_params['sf_name'] == 'ad4':
+                vina_rec_object = Vina(sf_name = method_params['sf_name'])
+                
+                # Determine the grids files path
+                grid_maps_path = receptor_conditions.get('configs', None).get('grids_path', None)
+                receptor_charge_model = receptor_conditions.get('configs', None).get('receptor_charge_model', None)
+                grid_files_prefix = f"{grid_maps_path}/receptor_checked_{receptor_charge_model}" 
 
-            vina_rec_object.set_ligand_from_file(ligand_pdbqt_filepath)
+                vina_rec_object.load_maps(grid_files_prefix)
+                
+                vina_rec_object.set_ligand_from_file(ligand_pdbqt_filepath)
+                
+                vina_rec_object.dock(exhaustiveness=method_params['exhaustiveness'], n_poses=method_params['n_poses'])
+                
+                results_file = ligand_pdbqt_filepath.replace('.pdbqt', '_out.pdbqt')
 
-            vina_rec_object.dock(exhaustiveness=method_params['exhaustiveness'], n_poses=method_params['n_poses'])
+                vina_rec_object.write_poses(results_file, n_poses=method_params['n_poses'], overwrite=True)
+        
+        except Exception as e:
+            print(f"Error executing Vina: {e}")
 
-            results_file = ligand_pdbqt_filepath.replace('.pdbqt', '_out.pdbqt')
-
-            vina_rec_object.write_poses(results_file, n_poses=method_params['n_poses'], overwrite=True)
-
-    
-        # This will apply docking using the 'ad4' scoring function
-        elif method_params['sf_name'] == 'ad4':
-            
-            vina_rec_object = Vina(method_params['sf_name'])
-            
-            # Determine the grids files path using the receptor file as reference and load affinity maps for docking
-            grid_maps_path = receptor_conditions['pdbqt_file'].replace('processed/receptor_checked.pdbqt', 'grid_files/receptor_checked')
-            vina_rec_object.load_maps(grid_maps_path)
-            
-            vina_rec_object.set_ligand_from_file(ligand_pdbqt_filepath)
-            
-            vina_rec_object.dock(exhaustiveness=method_params['exhaustiveness'], n_poses=method_params['n_poses'])
-            
-            results_file = ligand_pdbqt_filepath.replace('.pdbqt', '_out.pdbqt')
-
-            vina_rec_object.write_poses(results_file, n_poses=method_params['n_poses'], overwrite=True)
-            
     def compute_roc_curve(self):
         
         """
