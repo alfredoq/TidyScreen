@@ -429,6 +429,138 @@ class MolDock:
             print(f"❌ Error listing docking methods: {e}")
             return None
 
+    def list_docking_assays(self) -> Optional[List[Dict[str, Any]]]:
+        """
+        Read docking_assays.db under project path in the docking/docking_registers folder
+        and display registry entries for this project.
+        """
+
+        import sqlite3
+        import json
+
+        try:
+            assays_db_path = os.path.join(os.path.dirname(self.__docking_registers_db), 'docking_assays.db')
+
+            if not os.path.exists(assays_db_path):
+                print("❌ No docking assays database found")
+                print(f"   Expected location: {assays_db_path}")
+                return None
+
+            conn = sqlite3.connect(assays_db_path)
+            cursor = conn.cursor()
+
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='docking_assays'")
+            if not cursor.fetchone():
+                print("❌ Docking assays table not found in database")
+                conn.close()
+                return None
+
+            cursor.execute(
+                """
+                SELECT assay_id, assay_name, project_name, table_name, docking_method_name,
+                       docking_engine, status, docking_status, setup_type, compound_count,
+                       prepared_molecules, created_date, last_modified, assay_folder_path,
+                       notes, receptor_info
+                FROM docking_assays
+                WHERE project_name = ?
+                ORDER BY created_date ASC
+                """,
+                (self.name,)
+            )
+
+            assays = cursor.fetchall()
+            conn.close()
+
+            if not assays:
+                print("📋 NO DOCKING ASSAYS FOUND")
+                print(f"   Database exists but contains no registries for project '{self.name}'")
+                return []
+
+            print(f"\n📋 DOCKING ASSAY REGISTRIES FOR PROJECT: {self.name}")
+            print("=" * 140)
+            print(
+                f"{'ID':<5} {'Assay Name':<22} {'Table':<18} {'Method':<18} "
+                f"{'Engine':<12} {'Status':<14} {'Compounds':<10} {'Prepared':<10} {'Created':<20}"
+            )
+            print("=" * 140)
+
+            assays_list: List[Dict[str, Any]] = []
+
+            for row in assays:
+                (
+                    assay_id,
+                    assay_name,
+                    project_name,
+                    table_name,
+                    method_name,
+                    engine,
+                    status,
+                    docking_status,
+                    setup_type,
+                    compound_count,
+                    prepared_molecules,
+                    created_date,
+                    last_modified,
+                    assay_folder_path,
+                    notes,
+                    receptor_info_json,
+                ) = row
+
+                try:
+                    receptor_info = json.loads(receptor_info_json) if receptor_info_json else {}
+                except json.JSONDecodeError:
+                    receptor_info = {}
+
+                note_preview = (notes or "").replace('\n', ' ')[:40]
+                print(
+                    f"{assay_id:<5} {assay_name[:21]:<22} {table_name[:17]:<18} {method_name[:17]:<18} "
+                    f"{engine[:11]:<12} {status or docking_status or 'unknown':<14} "
+                    f"{compound_count or 0:<10} {prepared_molecules or 0:<10} {created_date or '':<20}"
+                )
+                if note_preview:
+                    print(f"      📝 Notes: {note_preview}")
+                if assay_folder_path:
+                    folder_exists = os.path.exists(assay_folder_path)
+                    print(f"      📁 Folder: {assay_folder_path} ({'exists' if folder_exists else 'missing'})")
+                if receptor_info:
+                    receptor_model_name = receptor_info.get('receptor_model_name')
+                    receptor_charge_molde = receptor_info.get('configs').get('receptor_charge_model')
+                    print(f"      🧬 Receptor model name: {receptor_model_name or 'N/A'}")
+                    print(f"      ⚡ Receptor charge model: {receptor_charge_molde or 'N/A'}")
+
+                assays_list.append(
+                    {
+                        'assay_id': assay_id,
+                        'assay_name': assay_name,
+                        'project_name': project_name,
+                        'table_name': table_name,
+                        'docking_method_name': method_name,
+                        'docking_engine': engine,
+                        'status': status or docking_status,
+                        'setup_type': setup_type,
+                        'compound_count': compound_count,
+                        'prepared_molecules': prepared_molecules,
+                        'created_date': created_date,
+                        'last_modified': last_modified,
+                        'assay_folder_path': assay_folder_path,
+                        'notes': notes,
+                        'receptor_info': receptor_info,
+                    }
+                )
+
+            print("=" * 140)
+            print(f"Total assays: {len(assays_list)}")
+            print(f"Database: {assays_db_path}")
+
+            return assays_list
+
+        except sqlite3.Error as e:
+            print(f"❌ Database error: {e}")
+            return None
+        except Exception as e:
+            print(f"❌ Error listing docking assays: {e}")
+            return None
+
     def _get_engine_specific_parameters(self, engine_name: str) -> Optional[Dict[str, Any]]:
         """
         Get engine-specific parameters from user input.
@@ -1011,13 +1143,13 @@ class MolDock:
             receptor_info = self._select_receptor_from_db()
             
             ## Check consistency between ligands and receptor charge model
-            self.check_charges_consistency(selected_method, receptor_info)
+            self._check_charges_consistency(selected_method, receptor_info)
             
             if not receptor_info:
                 print("❌ No receptor selected. Docking cancelled.")
                 return None
             
-            print(f"✅ Selected receptor: '{receptor_info['pdb_name']}'")
+            print(f"✅ Selected receptor: '{receptor_info['template_name']}'")
 
             if selected_table:
                 print(f"\n✅ Selected table for docking: '{selected_table}'")
@@ -1762,9 +1894,6 @@ except Exception as e:
         except Exception as e:
             print(f"❌ Error listing assay folders: {e}")
             return None
-
-
-
 
     def _update_assay_registry_compound_count(self, assay_id: int, compound_count: int) -> bool:
         """
@@ -2791,7 +2920,7 @@ except Exception as e:
         except Exception as e:
             print(f"❌ Error showing table details: {e}")
     
-    def save_pdb_model(self) -> Optional[Dict[str, Any]]:
+    def create_pdb_model(self) -> Optional[Dict[str, Any]]:
         """
         The user is prompted to select a PDB file, which will be stored as a blob object in a table named pdb_files in the pdbs.db located in the 
         project_path/docking/receptors directory
@@ -2814,7 +2943,9 @@ except Exception as e:
             # Get PDB file path
             while True:
                 try:
-                    pdb_file = input(f"\n📁 Enter path to PDB file: ").strip()
+                    pdb_file_temp = input(f"\n📁 Enter path to PDB model file: ").strip()
+                    pdb_file = os.path.abspath(os.path.expanduser(pdb_file_temp))
+                    
                     
                     if not pdb_file:
                         print(f"❌ No file path provided")
@@ -2848,10 +2979,10 @@ except Exception as e:
             default_name = os.path.splitext(os.path.basename(pdb_file))[0]
             while True:
                 try:
-                    pdb_name = input(f"\n🏷️  Enter name for this PDB (default: {default_name}): ").strip()
+                    pdb_model_name = input(f"\n🏷️  Enter name for this PDB model (default: {default_name}): ").strip()
                     
-                    if not pdb_name:
-                        pdb_name = default_name
+                    if not pdb_model_name:
+                        pdb_model_name = default_name
                     
                     # Check if name already exists
                     pdbs_db_path = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
@@ -2861,11 +2992,11 @@ except Exception as e:
                         cursor = conn.cursor()
                         
                         # Check if table exists
-                        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pdb_files'")
+                        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pdb_models'")
                         if cursor.fetchone():
-                            cursor.execute("SELECT COUNT(*) FROM pdb_files WHERE pdb_name = ?", (pdb_name,))
+                            cursor.execute("SELECT COUNT(*) FROM pdb_models WHERE pdb_model_name = ?", (pdb_model_name,))
                             if cursor.fetchone()[0] > 0:
-                                print(f"⚠️  PDB name '{pdb_name}' already exists in database")
+                                print(f"⚠️  PDB name '{pdb_model_name}' already exists in database")
                                 overwrite = input(f"   Overwrite existing entry? (y/n, default: n): ").strip().lower()
                                 conn.close()
                                 if overwrite != 'y':
@@ -2915,9 +3046,9 @@ except Exception as e:
             
             # Create pdb_files table if it doesn't exist
             cursor.execute('''
-                CREATE TABLE IF NOT EXISTS pdb_files (
+                CREATE TABLE IF NOT EXISTS pdb_models (
                     file_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    pdb_name TEXT UNIQUE NOT NULL,
+                    pdb_model_name TEXT UNIQUE NOT NULL,
                     project_name TEXT,
                     pdb_blob BLOB NOT NULL,
                     original_path TEXT,
@@ -2935,12 +3066,12 @@ except Exception as e:
             print(f"\n💾 Saving to database...")
             
             cursor.execute('''
-                INSERT OR REPLACE INTO pdb_files (
-                    pdb_name, project_name, pdb_blob, original_path, filename,
+                INSERT OR REPLACE INTO pdb_models (
+                    pdb_model_name, project_name, pdb_blob, original_path, filename,
                     file_size, description, file_info, notes
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
-                pdb_name,
+                pdb_model_name,
                 self.name,
                 pdb_blob,
                 pdb_file,
@@ -2952,8 +3083,8 @@ except Exception as e:
             ))
             
             file_id = cursor.lastrowid or cursor.execute(
-                "SELECT file_id FROM pdb_files WHERE pdb_name = ?", 
-                (pdb_name,)
+                "SELECT file_id FROM pdb_models WHERE pdb_model_name = ?", 
+                (pdb_model_name,)
             ).fetchone()[0]
             
             conn.commit()
@@ -2964,7 +3095,7 @@ except Exception as e:
             print(f"✅ PDB MODEL SAVED SUCCESSFULLY")
             print(f"{'=' * 80}")
             print(f"   📋 File ID: {file_id}")
-            print(f"   🏷️  Name: {pdb_name}")
+            print(f"   🏷️  PDB model Name: {pdb_model_name}")
             print(f"   📁 Original Path: {pdb_file}")
             print(f"   📊 File Size: {file_size:,} bytes")
             print(f"   📝 Description: {description or 'None'}")
@@ -2972,20 +3103,8 @@ except Exception as e:
             print(f"   📅 Saved: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             print(f"{'=' * 80}")
             
-            print(f"\n💡 Use list_pdb_templates() to view all saved PDB files")
-            
-            return {
-                'file_id': file_id,
-                'pdb_name': pdb_name,
-                'project_name': self.name,
-                'original_path': pdb_file,
-                'filename': os.path.basename(pdb_file),
-                'file_size': file_size,
-                'description': description,
-                'database_path': pdbs_db_path,
-                'saved_date': datetime.now().isoformat()
-            }
-            
+            print(f"\n💡 Use list_pdb_models() to view all saved PDB models")
+           
         except sqlite3.Error as e:
             print(f"❌ Database error: {e}")
             return None
@@ -3048,14 +3167,88 @@ except Exception as e:
                     print(f"\n\n❌ Operation cancelled by user")
                     return None
             
+            # Check for related entries in pdb_templates and receptor_models before confirming deletion
+            try:
+                conn = sqlite3.connect(pdbs_db_path)
+                cursor = conn.cursor()
+                
+                # Check if there are related entries in pdb_templates and get their template names
+                cursor.execute("SELECT pdb_template_name FROM pdb_templates WHERE pdb_model_name = ?",(selected_model['pdb_model_name'],))
+                template_names = [row[0] for row in cursor.fetchall()]
+                template_count = len(template_names)
+                
+                conn.close()
+                
+            except sqlite3.Error as e:
+                print(f"❌ Database error while checking related templates: {e}")
+                return None
+            
+            # Check for related entries in receptor_models
+            try:
+                receptors_db_path = os.path.join(self.path, 'docking', 'receptors', 'receptors.db')
+                receptor_model_names = []
+                receptor_model_count = 0
+                
+                if os.path.exists(receptors_db_path):
+                    conn = sqlite3.connect(receptors_db_path)
+                    cursor = conn.cursor()
+                    
+                    # Check if there are related entries in receptor_models and get their names
+                    cursor.execute("SELECT receptor_model_name FROM receptor_models WHERE pdb_model_name = ?", 
+                                 (selected_model['pdb_model_name'],))
+                    receptor_model_names = [row[0] for row in cursor.fetchall() if row[0]]
+                    receptor_model_count = len(receptor_model_names)
+                    
+                    conn.close()
+                    
+            except sqlite3.Error as e:
+                print(f"❌ Database error while checking receptor models: {e}")
+                return None
+            
+            # Check for related docking assays
+            docking_assays_count = 0
+            docking_assay_names = []
+            try:
+                docking_assays_db_path = os.path.join(self.path, 'docking', 'docking_registers', 'docking_assays.db')
+                
+                if os.path.exists(docking_assays_db_path):
+                    conn_assays = sqlite3.connect(docking_assays_db_path)
+                    cursor_assays = conn_assays.cursor()
+                    
+                    # Check if there are related entries in docking_assays and get their names
+                    cursor_assays.execute(
+                        "SELECT assay_name FROM docking_assays WHERE receptor_info LIKE ?",
+                        (f'%"model_name": "{selected_model["pdb_model_name"]}"%',)
+                    )
+                    docking_assay_names = [row[0] for row in cursor_assays.fetchall() if row[0]]
+                    docking_assays_count = len(docking_assay_names)
+                    
+                    conn_assays.close()
+                    
+            except sqlite3.Error as e:
+                print(f"❌ Database error while checking docking assays: {e}")
+                return None
+            
             # Confirm deletion
             print(f"\n⚠️  CONFIRM DELETION")
             print("=" * 80)
-            print(f"   PDB Name: {selected_model['pdb_name']}")
+            print(f"   PDB Name: {selected_model['pdb_model_name']}")
             print(f"   Filename: {selected_model['filename']}")
             print(f"   File Size: {selected_model['file_size']:,} bytes" if selected_model['file_size'] else "   File Size: Unknown")
             print(f"   Created: {selected_model['created_date']}")
             print(f"   Description: {selected_model['description'] or 'None'}")
+            if template_count > 0:
+                print(f"   ⚠️  Related templates to be deleted: {template_count}")
+                for template_name in template_names:
+                    print(f"       - {template_name}")
+            if receptor_model_count > 0:
+                print(f"   ⚠️  Related receptor models to be deleted: {receptor_model_count}")
+                for receptor_name in receptor_model_names:
+                    print(f"       - {receptor_name}")
+            if docking_assays_count > 0:
+                print(f"   ⚠️  Related docking assays to be deleted: {docking_assays_count}")
+                for assay_name in docking_assay_names:
+                    print(f"       - {assay_name}")
             print("=" * 80)
             
             confirm = input(f"\n⚠️  Are you sure you want to delete this PDB model? (yes/no, default: no): ").strip().lower()
@@ -3069,25 +3262,127 @@ except Exception as e:
                 conn = sqlite3.connect(pdbs_db_path)
                 cursor = conn.cursor()
                 
-                # Delete the record
-                cursor.execute("DELETE FROM pdb_files WHERE file_id = ?", (selected_model['file_id'],))
+                # Retrieve template_folder_path values before deleting from pdb_templates
+                template_folders = []
+                if template_count > 0:
+                    cursor.execute("SELECT template_folder_path FROM pdb_templates WHERE pdb_model_name = ?", 
+                                 (selected_model['pdb_model_name'],))
+                    template_folders = [row[0] for row in cursor.fetchall() if row[0]]
+                
+                # Delete the record from pdb_models
+                cursor.execute("DELETE FROM pdb_models WHERE file_id = ?", (selected_model['file_id'],))
                 
                 if cursor.rowcount == 0:
                     print(f"❌ Failed to delete PDB model from database")
                     conn.close()
                     return None
                 
+                # Delete related entries from pdb_templates
+                if template_count > 0:
+                    cursor.execute("DELETE FROM pdb_templates WHERE pdb_model_name = ?", 
+                                 (selected_model['pdb_model_name'],))
+                    templates_deleted = cursor.rowcount
+                else:
+                    templates_deleted = 0
+                
                 conn.commit()
                 conn.close()
                 
-                print(f"\n✓ PDB model '{selected_model['pdb_name']}' successfully deleted from database")
+                # Recursively delete template folders
+                folders_deleted = 0
+                if template_folders:
+                    for folder_path in template_folders:
+                        if os.path.exists(folder_path):
+                            try:
+                                shutil.rmtree(folder_path)
+                                folders_deleted += 1
+                                print(f"   ✓ Deleted folder: {folder_path}")
+                            except Exception as e:
+                                print(f"   ⚠️  Warning: Could not delete folder {folder_path}: {e}")
+                        else:
+                            print(f"   ⚠️  Folder not found (already deleted?): {folder_path}")
+                
+                # Delete related entries from receptor_models
+                receptor_models_deleted = 0
+                if receptor_model_count > 0:
+                    try:
+                        conn_receptor = sqlite3.connect(receptors_db_path)
+                        cursor_receptor = conn_receptor.cursor()
+                        
+                        cursor_receptor.execute("DELETE FROM receptor_models WHERE pdb_model_name = ?", 
+                                              (selected_model['pdb_model_name'],))
+                        receptor_models_deleted = cursor_receptor.rowcount
+                        
+                        conn_receptor.commit()
+                        conn_receptor.close()
+                        
+                    except sqlite3.Error as e:
+                        print(f"⚠️  Warning: Error deleting receptor models: {e}")
+                
+                ## Delete all assay folder associated to the pdb_model
+                docking_assays_deleted = 0
+                assay_folders_deleted = 0
+                docking_assays_db_path = os.path.join(self.path, 'docking', 'docking_registers', 'docking_assays.db')
+                
+                if os.path.exists(docking_assays_db_path):
+                    try:
+                        conn_assays = sqlite3.connect(docking_assays_db_path)
+                        cursor_assays = conn_assays.cursor()
+                        
+                        # Retrieve assay_id and assay_folder_path for assays containing the model_name
+                        cursor_assays.execute(
+                            "SELECT assay_id, assay_folder_path FROM docking_assays WHERE receptor_info LIKE ?",
+                            (f'%"model_name": "{selected_model["pdb_model_name"]}"%',)
+                        )
+                        assays_to_delete = cursor_assays.fetchall()
+                        
+                        if assays_to_delete:
+                            # Delete the docking assays
+                            for assay_id, assay_folder_path in assays_to_delete:
+                                cursor_assays.execute("DELETE FROM docking_assays WHERE assay_id = ?", (assay_id,))
+                                docking_assays_deleted += 1
+                                
+                                # Delete assay folders if they exist
+                                if assay_folder_path and os.path.exists(assay_folder_path):
+                                    try:
+                                        shutil.rmtree(assay_folder_path)
+                                        assay_folders_deleted += 1
+                                        print(f"   ✓ Deleted assay folder: {assay_folder_path}")
+                                    except Exception as e:
+                                        print(f"   ⚠️  Warning: Could not delete assay folder {assay_folder_path}: {e}")
+                                elif assay_folder_path:
+                                    print(f"   ⚠️  Assay folder not found (already deleted?): {assay_folder_path}")
+                        
+                        conn_assays.commit()
+                        conn_assays.close()
+                        
+                    except sqlite3.Error as e:
+                        print(f"⚠️  Warning: Error deleting docking assays: {e}")
+
+                
+                print(f"\n✓ PDB model '{selected_model['pdb_model_name']}' successfully deleted from database")
                 print(f"   File ID: {selected_model['file_id']}")
                 print(f"   Database: {pdbs_db_path}")
+                if templates_deleted > 0:
+                    print(f"   Related templates deleted: {templates_deleted}")
+                if receptor_models_deleted > 0:
+                    print(f"   Related receptor models deleted: {receptor_models_deleted}")
+                if folders_deleted > 0:
+                    print(f"   Template folders deleted: {folders_deleted}")
+                if docking_assays_deleted > 0:
+                    print(f"   Related docking assays deleted: {docking_assays_deleted}")
+                if assay_folders_deleted > 0:
+                    print(f"   Assay folders deleted: {assay_folders_deleted}")
                 
                 return {
                     'status': 'deleted',
-                    'pdb_name': selected_model['pdb_name'],
+                    'pdb_model_name': selected_model['pdb_model_name'],
                     'file_id': selected_model['file_id'],
+                    'templates_deleted': templates_deleted,
+                    'receptor_models_deleted': receptor_models_deleted,
+                    'folders_deleted': folders_deleted,
+                    'docking_assays_deleted': docking_assays_deleted,
+                    'assay_folders_deleted': assay_folders_deleted,
                     'deleted_date': datetime.now().isoformat()
                 }
                 
@@ -3260,18 +3555,18 @@ except Exception as e:
             conn = sqlite3.connect(pdbs_db_path)
             cursor = conn.cursor()
             
-            # Check if pdb_files table exists
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pdb_files'")
+            # Check if pdb_models table exists
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pdb_models'")
             if not cursor.fetchone():
-                print(f"❌ PDB files table not found in database")
+                print(f"❌ PDB models table not found in database")
                 conn.close()
                 return None
             
             # Retrieve all PDB models
             cursor.execute('''
-                SELECT file_id, pdb_name, project_name, original_path, filename,
+                SELECT file_id, pdb_model_name, project_name, original_path, filename,
                     file_size, description, created_date, last_modified, notes
-                FROM pdb_files
+                FROM pdb_models
                 ORDER BY created_date ASC
             ''')
             
@@ -3294,13 +3589,13 @@ except Exception as e:
             
             models_list = []
             
-            for idx, (file_id, pdb_name, project_name, original_path, filename,
+            for idx, (file_id, pdb_model_name, project_name, original_path, filename,
                     file_size, description, created_date, last_modified, notes) in enumerate(pdb_models, 1):
                 
                 # Store model info
                 model_info = {
                     'file_id': file_id,
-                    'pdb_name': pdb_name,
+                    'pdb_model_name': pdb_model_name,
                     'project_name': project_name,
                     'original_path': original_path,
                     'filename': filename,
@@ -3313,14 +3608,11 @@ except Exception as e:
                 models_list.append(model_info)
                 
                 # Display basic model details
-                print(f"\n{idx}. 📦 {pdb_name}")
+                print(f"\n{idx}. 📦 {pdb_model_name}")
                 print(f"   {'─' * 96}")
                 print(f"   📋 ID: {file_id}")
-                print(f"   📁 Filename: {filename}")
-                print(f"   📍 Path: {original_path}")
-                print(f"   📊 File Size: {file_size:,} bytes" if file_size else "   📊 File Size: Unknown")
+                print(f"   🏷️  PDB Model Name: {pdb_model_name}")
                 print(f"   📝 Description: {description or 'None'}")
-                print(f"   📅 Created: {created_date}")
                 
                 # Display modification date if different from created date
                 if last_modified and last_modified != created_date:
@@ -3355,10 +3647,10 @@ except Exception as e:
                             # Display detailed information for selected model
                             selected_model = models_list[model_number - 1]
                             print(f"\n{'═' * 100}")
-                            print(f"🔍 DETAILED INFORMATION FOR: {selected_model['pdb_name']}")
+                            print(f"🔍 DETAILED INFORMATION FOR: {selected_model['pdb_model_name']}")
                             print(f"{'═' * 100}")
                             print(f"   📋 File ID: {selected_model['file_id']}")
-                            print(f"   🏷️  PDB Name: {selected_model['pdb_name']}")
+                            print(f"   🏷️  PDB Model Name: {selected_model['pdb_model_name']}")
                             print(f"   📁 Filename: {selected_model['filename']}")
                             print(f"   📍 Original Path: {selected_model['original_path']}")
                             print(f"   📦 Project: {selected_model['project_name']}")
@@ -3403,7 +3695,7 @@ except Exception as e:
             traceback.print_exc()
             return None
     
-    def create_pdb_template(self, pdb_name: Optional[str] = None, verbose=True) -> Optional[Dict[str, Any]]:
+    def create_pdb_template(self, pdb_template_name: Optional[str] = None, verbose=True) -> Optional[Dict[str, Any]]:
         """
         Create a PDB file template from a PDB model stored in the database using save_pdb_model.
         The user is prompted to select a PDB model from the database, after which the PDB file 
@@ -3465,7 +3757,7 @@ except Exception as e:
             cursor = conn.cursor()
             
             cursor.execute('''
-                SELECT pdb_blob FROM pdb_files WHERE file_id = ?
+                SELECT pdb_blob FROM pdb_models WHERE file_id = ?
             ''', (selected_model['file_id'],))
             
             result = cursor.fetchone()
@@ -3497,22 +3789,22 @@ except Exception as e:
                     self._display_pdb_analysis(pdb_analysis)
                 
                 # Step 5: Get PDB template name
-                if pdb_name is None:
+                if pdb_template_name is None:
                     while True:
                         try:
-                            default_name = f"{selected_model['pdb_name']}_template"
-                            pdb_name = input(f"\n🏷️  Enter PDB template name (default: {default_name}): ").strip()
+                            default_name = f"{selected_model['pdb_model_name']}_template"
+                            pdb_template_name = input(f"\n🏷️  Enter PDB template name (default: {default_name}): ").strip()
                             
-                            if not pdb_name:
-                                pdb_name = default_name
+                            if not pdb_template_name:
+                                pdb_template_name = default_name
                             
-                            if pdb_name.lower() in ['cancel', 'quit', 'exit']:
+                            if pdb_template_name.lower() in ['cancel', 'quit', 'exit']:
                                 print("❌ PDB template creation cancelled")
                                 os.unlink(temp_pdb_path)
                                 return None
                             
                             # Validate template name
-                            if not pdb_name.replace('_', '').replace('-', '').replace(' ', '').isalnum():
+                            if not pdb_template_name.replace('_', '').replace('-', '').replace(' ', '').isalnum():
                                 print("❌ Template name can only contain letters, numbers, spaces, hyphens, and underscores")
                                 continue
                             
@@ -3524,10 +3816,10 @@ except Exception as e:
                             return None
                 
                 # Step 6: Check if template name already exists
-                existing_check = self._check_pdb_name_exists(pdb_name)
+                existing_check = self._check_pdb_name_exists(pdb_template_name)
                 if existing_check:
                     while True:
-                        overwrite = input(f"\n⚠️  Template '{pdb_name}' already exists. Overwrite? (y/n): ").strip().lower()
+                        overwrite = input(f"\n⚠️  Template '{pdb_template_name}' already exists. Overwrite? (y/n): ").strip().lower()
                         if overwrite in ['y', 'yes']:
                             print("🔄 Will overwrite existing PDB template")
                             break
@@ -3543,16 +3835,16 @@ except Exception as e:
                 os.makedirs(receptors_base_dir, exist_ok=True)
                 
                 # Create template-specific directory
-                pdb_folder = self._create_receptor_folder(receptors_base_dir, pdb_name)
+                pdb_template_folder = self._create_receptor_template_folder(receptors_base_dir, pdb_template_name)
                 
-                if not pdb_folder:
+                if not pdb_template_folder:
                     print("❌ Failed to create PDB template folder")
                     os.unlink(temp_pdb_path)
                     return None
                 
                 # Step 8: Copy and process PDB file
                 print(f"📂 Processing and saving PDB template...")
-                processed_pdb_path, checked_pdb_path = self._process_pdb_file(temp_pdb_path, pdb_folder, pdb_analysis)
+                processed_pdb_path, checked_pdb_path = self._process_pdb_file(temp_pdb_path, pdb_template_folder, pdb_analysis)
                 
                 if not processed_pdb_path:
                     print("❌ Failed to process PDB file")
@@ -3560,8 +3852,8 @@ except Exception as e:
                     return None
                 
                 # Step 9: Create template registry entry
-                pdb_registry = self._create_pdb_registry_entry(
-                    pdb_name, selected_model['original_path'], processed_pdb_path, pdb_folder, pdb_analysis, checked_pdb_path
+                pdb_registry = self._create_pdb_template_registry_entry(
+                    pdb_template_name, selected_model['pdb_model_name'], selected_model['original_path'], processed_pdb_path, pdb_template_folder, pdb_analysis, checked_pdb_path
                 )
                 
                 if not pdb_registry:
@@ -3576,9 +3868,9 @@ except Exception as e:
                 print(f"\n{'=' * 80}")
                 print(f"✅ PDB TEMPLATE CREATED SUCCESSFULLY FROM DATABASE MODEL")
                 print(f"{'=' * 80}")
-                print(f"   Source Model: {selected_model['pdb_name']}")
-                print(f"   Template Name: {pdb_name}")
-                print(f"   Location: {pdb_folder}")
+                print(f"   Source Model: {selected_model['pdb_model_name']}")
+                print(f"   Template Name: {pdb_template_name}")
+                print(f"   Location: {pdb_template_folder}")
                 print(f"{'=' * 80}\n")
                 
                 return pdb_registry
@@ -4765,7 +5057,7 @@ except Exception as e:
         except Exception:
             return False
 
-    def _create_receptor_folder(self, base_dir: str, receptor_name: str) -> str:
+    def _create_receptor_template_folder(self, base_dir: str, receptor_name: str) -> str:
         """
         Create folder structure for receptor files.
         
@@ -4867,8 +5159,8 @@ except Exception as e:
             print(f"   ❌ Error extracting chain: {e}")
             return ""
 
-    def _create_pdb_registry_entry(self, pdb_name: str, original_pdb_path: str, 
-                                    processed_pdb_path: str, pdb_folder: str, 
+    def _create_pdb_template_registry_entry(self, pdb_template_name: str, pdb_model_name: str, original_pdb_path: str, 
+                                    processed_pdb_path: str, pdb_template_folder: str, 
                                     analysis: Dict[str, Any], checked_pdb_path) -> Optional[Dict[str, Any]]:
         """
         Create PDB templates registry entry in pdbs.db
@@ -4898,12 +5190,13 @@ except Exception as e:
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS pdb_templates (
                     pdb_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    pdb_name TEXT UNIQUE NOT NULL,
+                    pdb_template_name TEXT UNIQUE NOT NULL,
+                    pdb_model_name TEXT UNIQUE NOT NULL,
                     project_name TEXT,
                     original_pdb_path TEXT NOT NULL,
                     processed_pdb_path TEXT NOT NULL,
                     checked_pdb_path TEXT NOT NULL,
-                    pdb_folder_path TEXT NOT NULL,
+                    template_folder_path TEXT NOT NULL,
                     pdb_analysis TEXT,
                     chains TEXT,
                     resolution REAL,
@@ -4922,17 +5215,18 @@ except Exception as e:
 
             # Check for identical registry (excluding 'notes')
             cursor.execute('''
-                SELECT pdb_id, pdb_name, project_name, original_pdb_path, processed_pdb_path, checked_pdb_path,
-                       pdb_folder_path, pdb_analysis, chains, resolution, atom_count, has_ligands, status
+                SELECT pdb_id, pdb_template_name, pdb_model_name, project_name, original_pdb_path, processed_pdb_path, checked_pdb_path,
+                       template_folder_path, pdb_analysis, chains, resolution, atom_count, has_ligands, status
                 FROM pdb_templates
             ''')
             new_entry = (
-                pdb_name,
+                pdb_template_name,
+                pdb_model_name,
                 self.name,
                 original_pdb_path,
                 processed_pdb_path,
                 checked_pdb_path,
-                pdb_folder,
+                pdb_template_folder,
                 pdb_analysis_json,
                 chains_str,
                 analysis.get('resolution'),
@@ -4951,7 +5245,7 @@ except Exception as e:
 
             # Prompt for notes
             try:
-                notes = input("Enter a note for this model (Enter: empty note): ").strip()
+                notes = input("Enter a note for this receptor template (Enter: empty note): ").strip()
                 if not notes:
                     notes = ""
             except KeyboardInterrupt:
@@ -4961,17 +5255,18 @@ except Exception as e:
             # Insert or update receptor entry
             cursor.execute('''
                 INSERT OR REPLACE INTO pdb_templates (
-                    pdb_name, project_name, original_pdb_path, processed_pdb_path, checked_pdb_path,
-                    pdb_folder_path, pdb_analysis, chains, resolution, atom_count,
+                    pdb_template_name, pdb_model_name, project_name, original_pdb_path, processed_pdb_path, checked_pdb_path,
+                    template_folder_path, pdb_analysis, chains, resolution, atom_count,
                     has_ligands, status, notes
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
-                pdb_name,
+                pdb_template_name,
+                pdb_model_name,
                 self.name,
                 original_pdb_path,
                 processed_pdb_path,
                 checked_pdb_path,
-                pdb_folder,
+                pdb_template_folder,
                 pdb_analysis_json,
                 chains_str,
                 analysis.get('resolution'),
@@ -4982,8 +5277,8 @@ except Exception as e:
             ))
 
             pdb_id = cursor.lastrowid or cursor.execute(
-                "SELECT pdb_id FROM pdb_templates WHERE pdb_name = ?", 
-                (pdb_name,)
+                "SELECT pdb_id FROM pdb_templates WHERE pdb_template_name = ? AND pdb_model_name = ?", 
+                (pdb_template_name, pdb_model_name)
             ).fetchone()[0]
 
             conn.commit()
@@ -4991,12 +5286,13 @@ except Exception as e:
 
             return {
                 'pdb_id': pdb_id,
-                'pdb_name': pdb_name,
+                'pdb_name': pdb_template_name,
+                'pdb_model_name': pdb_model_name,
                 'project_name': self.name,
                 'original_pdb_path': original_pdb_path,
                 'processed_pdb_path': processed_pdb_path,
                 'checked_pdb_path': checked_pdb_path,
-                'pdb_folder_path': pdb_folder,
+                'template_folder_path': pdb_template_folder,
                 'database_path': pdbs_db_path,
                 'pdb_analysis': analysis,
                 'created_date': datetime.now().isoformat(),
@@ -5472,9 +5768,9 @@ quit
             conn = sqlite3.connect(pdbs_db_path)
             cursor = conn.cursor()
             cursor.execute('''
-                SELECT pdb_id, pdb_name, processed_pdb_path, checked_pdb_path, pdb_folder_path, notes
+                SELECT pdb_id, pdb_template_name, pdb_model_name, processed_pdb_path, checked_pdb_path, template_folder_path, notes
                 FROM pdb_templates
-                ORDER BY created_date ASC
+                ORDER BY pdb_id ASC
             ''')
             pdbs = cursor.fetchall()
             conn.close()
@@ -5488,8 +5784,9 @@ quit
 
         print("\n📋 Available PDB templates:")
         print("=" * 60)
-        for i, (rid, name, processed_pdb, checked_pdb, folder, notes) in enumerate(pdbs, 1):
-            print(f"{i}. {name} (ID: {rid})")
+        for i, (rid, template_name, pdb_model_name, processed_pdb, checked_pdb, folder, notes) in enumerate(pdbs, 1):
+            print(f"{i}. {template_name} - {pdb_model_name} (ID: {rid})")
+            print(f"   PDB Model: {pdb_model_name}")
             print(f"   Processed PDB: {os.path.basename(processed_pdb)}")
             print(f"   Checked PDB: {os.path.basename(checked_pdb)}")
             print(f"   Folder: {os.path.relpath(folder)}")
@@ -5524,7 +5821,7 @@ quit
                 print(f"❌ Invalid selection. Enter a number between 1 and {len(pdbs)}.")
                 return None
 
-        pdb_id, pdb_name, processed_pdb_path, checked_pdb_path, rec_main_path, notes = selected
+        pdb_id, template_name, model_name, processed_pdb_path, checked_pdb_path, folder, notes = selected
 
         # Select the pdb file to convert to .pdbqt
         pdb_to_convert = checked_pdb_path
@@ -5533,7 +5830,7 @@ quit
         pdbqt_file, configs = self._create_pdbqt_from_pdb(pdb_to_convert)
 
         # Check if pdbqt receptor file contains a Zinc ion in order to apply AutoDock4Zn parameters
-        has_ZN = self._check_ZN_presence(pdbqt_file, rec_main_path)
+        has_ZN = self._check_ZN_presence(pdbqt_file, folder)
 
         if has_ZN:
             
@@ -5542,7 +5839,7 @@ quit
                 zn_choice = input("Do you want to process with AutoDock4Zn parameters? (y/n): ").strip().lower()
                 if zn_choice in ['y', 'yes']:
                     print("✅ AutoDock4Zn parameters will be applied.")
-                    self._apply_ad4zn_params(pdbqt_file, rec_main_path)
+                    self._apply_ad4zn_params(pdbqt_file, folder)
                     break
 
                 elif zn_choice in ['n', 'no']:
@@ -5555,11 +5852,11 @@ quit
             print("✅ AutoDock4Zn parameters to be applied.")
 
         # Call helper method to create receptor grids
-        configs = self._create_receptor_grids(pdbqt_file, configs, rec_main_path, has_ZN)
+        configs = self._create_receptor_grids(pdbqt_file, configs, folder, has_ZN)
 
         if pdbqt_file:
 
-            self._create_receptor_register(pdb_id, pdb_name, pdb_to_convert, pdbqt_file, configs)
+            self._create_receptor_register(pdb_id, template_name, pdb_model_name, pdb_to_convert, pdbqt_file, configs)
             
             print(f"✅ PDBQT file created: {pdbqt_file}")
         
@@ -5889,146 +6186,15 @@ quit
             print("❌ AutoGrid4 executable not found. Please ensure it is installed and in your PATH.")
         except Exception as e:
             print(f"❌ Error running AutoGrid4: {e}") 
-
-    # def _create_receptor_register(self, 
-    #                             pdb_id: int,                 
-    #                             pdb_name: str, 
-    #                             pdb_to_convert: str,
-    #                             pdbqt_file: str,
-    #                             configs: dict,
-    #                             notes: str = None
-    #                             ) -> bool:
-    #     """
-    #     Create a receptor register entry in the database for this project.
-
-    #     This method stores metadata about a prepared receptor for docking, including:
-    #     - The originating PDB file and its database ID
-    #     - The processed PDBQT file path
-    #     - The docking box configuration (center and size)
-    #     - Optional user notes
-    #     - Timestamp of creation
-
-    #     The register is stored in the SQLite database:
-    #         project_path/docking/receptors/receptors.db
-    #     in a table called 'receptor_registers'.
-
-    #     Args:
-    #         pdb_id (int): ID for the PDB file originating the .pdbqt file (from pdbs.db)
-    #         pdb_name (str): Name of the processed PDB file originating the .pdbqt file
-    #         pdb_to_convert (str): Path to the PDB file used for conversion
-    #         pdbqt_file (str): Path to the generated .pdbqt file
-    #         configs (dict): Dictionary containing box information for docking (e.g., {'center': {...}, 'size': {...}})
-    #         notes (str, optional): Optional notes about this receptor preparation
-
-    #     Returns:
-    #         bool: True if the register was created successfully, False otherwise
-
-    #     Example:
-    #         self._create_receptor_register(
-    #             pdb_id=1,
-    #             pdb_name="1abc",
-    #             pdb_to_convert="/path/to/1abc_checked.pdb",
-    #             pdbqt_file="/path/to/1abc_checked.pdbqt",
-    #             configs={'center': {'x': 10, 'y': 20, 'z': 30}, 'size': {'x': 20, 'y': 20, 'z': 20}},
-    #             notes="Prepared for Vina docking"
-    #         )
-    #     """
-    #     try:
-    #         import sqlite3
-    #         import json
-    #         from datetime import datetime
-
-    #         receptors_db_path = os.path.join(self.path, 'docking', 'receptors', 'receptors.db')
-
-    #         # Ensure the directory exists
-    #         os.makedirs(os.path.dirname(receptors_db_path), exist_ok=True)
-
-    #         conn = sqlite3.connect(receptors_db_path)
-    #         cursor = conn.cursor()
-
-    #         # Create table if it doesn't exist
-    #         cursor.execute('''
-    #             CREATE TABLE IF NOT EXISTS receptor_registers (
-    #                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-    #                 pdb_id INTEGER NOT NULL,
-    #                 pdb_name TEXT NOT NULL,
-    #                 pdb_to_convert TEXT NOT NULL,
-    #                 pdbqt_file TEXT,
-    #                 configs TEXT,
-    #                 notes TEXT,
-    #                 created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    #             )
-    #         ''')
-
-    #         # Check for identical register (excluding 'notes')
-    #         cursor.execute('''
-    #             SELECT pdb_id, pdb_name, pdb_to_convert, pdbqt_file, configs
-    #             FROM receptor_registers
-    #         ''')
-    #         new_entry = (
-    #             pdb_id,
-    #             pdb_name,
-    #             pdb_to_convert,
-    #             pdbqt_file,
-    #             json.dumps(configs, indent=2) if configs is not None else None
-    #         )
-            
-    #         for row in cursor.fetchall():
-    #             # Compare all fields except notes and created_date
-    #             if row == new_entry:
-    #                 print(f"⚠️  An identical receptor register already exists for PDB name: {pdb_name}.")
-    #                 print(f"   Existing register details:")
-    #                 print(f"   - pdb_id: {row[0]}")
-    #                 print(f"   - pdb_name: {row[1]}")
-    #                 print(f"   - pdb_to_convert: {row[2]}")
-    #                 print(f"   - pdbqt_file: {row[3]}")
-    #                 print(f"   - configs: {row[4]}")
-    #                 print("   No new register will be created.")
-    #                 conn.close()
-    #                 return False
-
-    #         # Prompt for notes if not provided
-    #         if notes is None:
-    #             try:
-    #                 notes = input("Enter a note for this .pdbqt file (Enter: empty note): ").strip()
-    #                 if not notes:
-    #                     notes = ""
-    #             except KeyboardInterrupt:
-    #                 print("\n   ⚠️  Note entry cancelled. Using empty note.")
-    #                 notes = ""
-
-    #         # Insert register entry
-    #         cursor.execute('''
-    #             INSERT INTO receptor_registers (
-    #                 pdb_id, pdb_name, pdb_to_convert, pdbqt_file, configs, notes
-    #             ) VALUES (?, ?, ?, ?, ?, ?)
-    #         ''', (
-    #             pdb_id,
-    #             pdb_name,
-    #             pdb_to_convert,
-    #             pdbqt_file,
-    #             json.dumps(configs, indent=2) if configs is not None else None,
-    #             notes
-    #         ))
-
-    #         conn.commit()
-    #         conn.close()
-    #         print(f"   ✅ Receptor register created for PDB ID: '{pdb_id}' (PDBQT: {os.path.basename(pdbqt_file)})")
-    #         return True
-
-    #     except Exception as e:
-    #         print(f"   ❌ Error creating receptor register: {e}")
-    #         return False
-        
         
     def _create_receptor_register(self, 
                              pdb_id: int,                 
-                             pdb_name: str, 
+                             template_name: str, 
+                             pdb_model_name: str,
                              pdb_to_convert: str,
                              pdbqt_file: str,
                              configs: dict,
                              notes: str = None,
-                             model_name: Optional[str] = None
                              ) -> bool:
         """
         Create a receptor register entry in the database for this project.
@@ -6069,10 +6235,12 @@ quit
             import sqlite3
             import json
             from datetime import datetime
-
-            # Prompt for model_name if not provided
-            if model_name is None:
-                model_name = input("Enter a model name for this receptor (optional): ").strip()
+            
+            receptor_model_name = ""
+            while not receptor_model_name:
+                receptor_model_name = input("Enter a model name for this receptor (required): ").strip()
+                if not receptor_model_name:
+                    print("⚠️ Model name is required. Please enter a valid name.")
 
             receptors_db_path = os.path.join(self.path, 'docking', 'receptors', 'receptors.db')
 
@@ -6086,9 +6254,10 @@ quit
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS receptor_models (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    model_name TEXT,
                     pdb_id INTEGER,
-                    pdb_name TEXT,
+                    receptor_model_name TEXT,
+                    template_name TEXT,
+                    pdb_model_name TEXT,
                     pdb_to_convert TEXT,
                     pdbqt_file TEXT,
                     configs TEXT,
@@ -6098,13 +6267,14 @@ quit
 
             # Check for identical register (excluding 'notes')
             cursor.execute('''
-                SELECT pdb_id, model_name, pdb_name, pdb_to_convert, pdbqt_file, configs
+                SELECT pdb_id, receptor_model_name, template_name, pdb_model_name, pdb_to_convert, pdbqt_file, configs
                 FROM receptor_models
             ''')
             new_entry = (
                 pdb_id,
-                model_name,
-                pdb_name,
+                receptor_model_name,
+                template_name,
+                pdb_model_name,
                 pdb_to_convert,
                 pdbqt_file,
                 json.dumps(configs, indent=2) if configs is not None else None
@@ -6113,14 +6283,15 @@ quit
             for row in cursor.fetchall():
                 # Compare all fields except notes and created_date
                 if row == new_entry:
-                    print(f"⚠️  An identical receptor register already exists for PDB name: {pdb_name}.")
+                    print(f"⚠️  An identical receptor register already exists for PDB name: {template_name}.")
                     print(f"   Existing register details:")
                     print(f"   - pdb_id: {row[0]}")
-                    print(f"   - model_name: {row[1]}")
-                    print(f"   - pdb_name: {row[2]}")
-                    print(f"   - pdb_to_convert: {row[3]}")
-                    print(f"   - pdbqt_file: {row[4]}")
-                    print(f"   - configs: {row[5]}")
+                    print(f"   - receptor_model_name: {row[1]}")
+                    print(f"   - template_name: {row[2]}")
+                    print(f"   - pdb_model_name: {row[3]}")
+                    print(f"   - pdb_to_convert: {row[4]}")
+                    print(f"   - pdbqt_file: {row[5]}")
+                    print(f"   - configs: {row[6]}")
                     print("   No new register will be created.")
                     conn.close()
                     return False
@@ -6138,12 +6309,13 @@ quit
             # Insert register entry
             cursor.execute('''
                 INSERT INTO receptor_models (
-                    pdb_id, model_name, pdb_name, pdb_to_convert, pdbqt_file, configs, notes
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    pdb_id, receptor_model_name, template_name, pdb_model_name, pdb_to_convert, pdbqt_file, configs, notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 pdb_id,
-                model_name,
-                pdb_name,
+                receptor_model_name,
+                template_name,
+                pdb_model_name,
                 pdb_to_convert,
                 pdbqt_file,
                 json.dumps(configs, indent=2) if configs is not None else None,
@@ -6152,13 +6324,12 @@ quit
 
             conn.commit()
             conn.close()
-            print(f"   ✅ Receptor register created for PDB ID: '{pdb_id}' (Model Name: {model_name}, PDBQT: {os.path.basename(pdbqt_file)})")
+            print(f"   ✅ Receptor register created for PDB ID: '{pdb_id}' (Model Name: {receptor_model_name}, PDBQT: {os.path.basename(pdbqt_file)})")
             return True
 
         except Exception as e:
             print(f"   ❌ Error creating receptor register: {e}")
             return False
-        
         
     def _check_ZN_presence(self, pdbqt_file: str, rec_main_path: str) -> bool:
         """
@@ -6417,7 +6588,7 @@ quit
             conn = sqlite3.connect(receptors_db_path)
             cursor = conn.cursor()
             cursor.execute('''
-                SELECT id, pdb_id, pdb_name, pdbqt_file, configs, notes
+                SELECT id, pdb_id, receptor_model_name, template_name, pdb_model_name, pdbqt_file, configs, notes
                 FROM receptor_models
                 ORDER BY id ASC
             ''')
@@ -6427,12 +6598,12 @@ quit
             # Turn the 'configs' into a dictionary
             for row in raw_results:
                 configs_dict = None
-                if row[4]:  # row[4] is the configs column
+                if row[6]:  # row[6] is the configs column
                     try:
-                        configs_dict = json.loads(row[4])
+                        configs_dict = json.loads(row[6])
                     except json.JSONDecodeError:
                         configs_dict = None
-                receptors.append((row[0], row[1], row[2], row[3], configs_dict, row[5]))
+                receptors.append((row[0], row[1], row[2], row[3], row[4], row[5], configs_dict, row[7]))
             
             #receptors = cursor.fetchall()
             conn.close()
@@ -6448,8 +6619,10 @@ quit
 
         print("\n📋 Available Receptors:")
         print("=" * 70)
-        for i, (rid, pdb_id, pdb_name, pdbqt_file, configs, notes) in enumerate(receptors, 1):
-            print(f"{i}. {pdb_name} (ID: {pdb_id})")
+        for i, (rid, pdb_id, receptor_model_name, template_name, pdb_model_name, pdbqt_file, configs, notes) in enumerate(receptors, 1):
+            print(f"{i}. {receptor_model_name} (ID: {pdb_id})")
+            print(f"   Template: {template_name}")
+            print(f"   PDB Model Name: {pdb_model_name}")
             print(f"   PDBQT: {os.path.basename(pdbqt_file) if pdbqt_file else 'N/A'}")
             print(f"   Notes: {notes}")
         print("=" * 70)
@@ -6468,10 +6641,12 @@ quit
                         return {
                             'id': selected[0],
                             'pdb_id': selected[1],
-                            'pdb_name': selected[2],
-                            'pdbqt_file': selected[3],
-                            'configs': selected[4],
-                            'notes': selected[5],
+                            'receptor_model_name': selected[2],
+                            'template_name': selected[3],
+                            'pdb_model_name': selected[4],
+                            'pdbqt_file': selected[5],
+                            'configs': selected[6],
+                            'notes': selected[7],
                         }
                     else:
                         print(f"❌ Invalid selection. Enter a number between 1 and {len(receptors)}.")
@@ -6746,7 +6921,8 @@ quit
         """
         Reads the 'pdbs.db' database located in the project_path/docking/receptors folder
         and prints out the following columns from the 'pdb_templates' table:
-        - 'pdb_name'
+        - 'pdb_template_name'
+        - 'pdb_model_name'
         - 'pdb_analysis'
         - 'processed_pdb_path'
         - 'notes'
@@ -6762,9 +6938,9 @@ quit
             conn = sqlite3.connect(pdbs_db_path)
             cursor = conn.cursor()
             cursor.execute('''
-                SELECT pdb_id, pdb_name, processed_pdb_path, notes
+                SELECT pdb_id, pdb_template_name, pdb_model_name, processed_pdb_path, notes
                 FROM pdb_templates
-                ORDER BY created_date ASC
+                ORDER BY pdb_id ASC
             ''')
             rows = cursor.fetchall()
             conn.close()
@@ -6778,70 +6954,223 @@ quit
 
         print("\n📋 PDB Templates:")
         print("=" * 40)
-        for pdb_id, pdb_name, processed_pdb_path, notes in rows:
+        for pdb_id, pdb_template_name, pdb_model_name, processed_pdb_path, notes in rows:
             print(f"pdb_id: {pdb_id}")
-            print(f"Name: {pdb_name}")
+            print(f"Template Name: {pdb_template_name}")
+            print(f"Model Name: {pdb_model_name}")
             print(f"Processed PDB Path: {processed_pdb_path}")
             print(f"Notes: {notes}")
             print("-" * 40)
 
-    def remove_pdb_template(self):
+    def delete_pdb_template(self):
 
         """
         Will list entried in the pdb_templates table of the pdbs.db database located in the project_path/docking/receptors folder, and query the user which one to delete. The registry is finally deleted from the database.
         """
 
         import sqlite3
+        import shutil
+
         pdbs_db_path = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
         if not os.path.exists(pdbs_db_path):
             print(f"❌ Database not found: {pdbs_db_path}")
-            return
+            return None
 
         try:
             conn = sqlite3.connect(pdbs_db_path)
             cursor = conn.cursor()
             cursor.execute('''
-                SELECT pdb_id, pdb_name
+                SELECT pdb_id, pdb_template_name, pdb_model_name, template_folder_path, processed_pdb_path, notes
                 FROM pdb_templates
-                ORDER BY created_date ASC
+                ORDER BY pdb_id ASC
             ''')
             rows = cursor.fetchall()
         except Exception as e:
             print(f"❌ Error reading pdbs.db: {e}")
-            return
+            return None
 
         if not rows:
             print("📋 No PDB templates found in the database.")
-            return
+            return None
 
         print("\n📋 PDB Templates:")
-        print("=" * 40)
-        for i, (pdb_id, pdb_name) in enumerate(rows, 1):
-            print(f"{i}. ID: {pdb_id}, Name: {pdb_name}")
-        print("=" * 40)
+        print("=" * 60)
+        for i, (pdb_id, pdb_template_name, pdb_model_name, _, _, _) in enumerate(rows, 1):
+            print(f"{i}. ID: {pdb_id}, Template: {pdb_template_name}, Model: {pdb_model_name}")
+        print("=" * 60)
 
-        while True:
-            try:
+        try:
+            while True:
                 selection = input("Select a PDB template to delete by number (or 'cancel'): ").strip()
                 if selection.lower() in ['cancel', 'quit', 'exit']:
                     print("❌ PDB template deletion cancelled.")
-                    return
+                    conn.close()
+                    return None
                 try:
                     idx = int(selection) - 1
                     if 0 <= idx < len(rows):
-                        selected_id = rows[idx][0]
-                        cursor.execute('DELETE FROM pdb_templates WHERE pdb_id = ?', (selected_id,))
-                        conn.commit()
-                        conn.close()
-                        print(f"✅ Deleted PDB template with ID: {selected_id}")
-                        return
-                    else:
-                        print(f"❌ Invalid selection. Enter a number between 1 and {len(rows)}.")
+                        break
+                    print(f"❌ Invalid selection. Enter a number between 1 and {len(rows)}.")
                 except ValueError:
                     print("❌ Please enter a valid number.")
-            except KeyboardInterrupt:
-                print("\n❌ PDB template deletion cancelled.")
-                return
+        except KeyboardInterrupt:
+            print("\n❌ PDB template deletion cancelled.")
+            conn.close()
+            return None
+
+        selected_row = rows[idx]
+        selected_template = {
+            'pdb_id': selected_row[0],
+            'pdb_template_name': selected_row[1],
+            'pdb_model_name': selected_row[2],
+            'template_folder_path': selected_row[3],
+            'processed_pdb_path': selected_row[4],
+            'notes': selected_row[5],
+        }
+
+        # Check related receptor models
+        receptor_model_names = []
+        receptors_db_path = os.path.join(self.path, 'docking', 'receptors', 'receptors.db')
+        if os.path.exists(receptors_db_path):
+            try:
+                conn_receptors = sqlite3.connect(receptors_db_path)
+                cur_receptors = conn_receptors.cursor()
+                cur_receptors.execute(
+                    "SELECT receptor_model_name FROM receptor_models WHERE template_name = ?",
+                    (selected_template['pdb_template_name'],)
+                )
+                receptor_model_names = [row[0] for row in cur_receptors.fetchall() if row[0]]
+                conn_receptors.close()
+            except sqlite3.Error as e:
+                print(f"❌ Database error while checking receptor models: {e}")
+                conn.close()
+                return None
+
+        # Check related docking assays
+        docking_assays = []
+        docking_assays_db_path = os.path.join(self.path, 'docking', 'docking_registers', 'docking_assays.db')
+        if os.path.exists(docking_assays_db_path):
+            try:
+                conn_assays = sqlite3.connect(docking_assays_db_path)
+                cur_assays = conn_assays.cursor()
+                cur_assays.execute(
+                    "SELECT assay_id, assay_name, assay_folder_path FROM docking_assays WHERE receptor_info LIKE ?",
+                    (f'%"template_name": "{selected_template["pdb_template_name"]}"%',)
+                )
+                docking_assays = cur_assays.fetchall()
+                conn_assays.close()
+            except sqlite3.Error as e:
+                print(f"❌ Database error while checking docking assays: {e}")
+                conn.close()
+                return None
+
+        # Confirm deletion
+        print("\n⚠️  CONFIRM PDB TEMPLATE DELETION")
+        print("=" * 80)
+        print(f"   Template: {selected_template['pdb_template_name']}")
+        print(f"   PDB Model: {selected_template['pdb_model_name']}")
+        print(f"   Notes: {selected_template['notes'] or 'None'}")
+        if receptor_model_names:
+            print(f"   ⚠️  Related receptor models to be deleted: {len(receptor_model_names)}")
+            for name in receptor_model_names:
+                print(f"       - {name}")
+        if docking_assays:
+            print(f"   ⚠️  Related docking assays to be deleted: {len(docking_assays)}")
+            for _, assay_name, _ in docking_assays:
+                print(f"       - {assay_name}")
+        print("=" * 80)
+
+        confirm = input("Are you sure you want to delete this PDB template? (yes/no, default: no): ").strip().lower()
+        if confirm != 'yes':
+            print("❌ Deletion cancelled by user")
+            conn.close()
+            return None
+
+        # Delete template and related records
+        try:
+            # Delete template
+            cursor.execute("DELETE FROM pdb_templates WHERE pdb_id = ?", (selected_template['pdb_id'],))
+            template_deleted = cursor.rowcount
+            conn.commit()
+            conn.close()
+
+            # Remove template folder if present
+            folders_deleted = 0
+            if selected_template['template_folder_path'] and os.path.exists(selected_template['template_folder_path']):
+                try:
+                    shutil.rmtree(selected_template['template_folder_path'])
+                    folders_deleted = 1
+                    print(f"   ✓ Deleted template folder: {selected_template['template_folder_path']}")
+                except Exception as e:
+                    print(f"   ⚠️  Warning: Could not delete folder {selected_template['template_folder_path']}: {e}")
+
+            # Delete related receptor models
+            receptor_models_deleted = 0
+            if receptor_model_names:
+                try:
+                    conn_receptors = sqlite3.connect(receptors_db_path)
+                    cur_receptors = conn_receptors.cursor()
+                    cur_receptors.execute(
+                        "DELETE FROM receptor_models WHERE template_name = ?",
+                        (selected_template['pdb_template_name'],)
+                    )
+                    receptor_models_deleted = cur_receptors.rowcount
+                    conn_receptors.commit()
+                    conn_receptors.close()
+                except sqlite3.Error as e:
+                    print(f"⚠️  Warning: Error deleting receptor models: {e}")
+
+            # Delete related docking assays and folders
+            docking_assays_deleted = 0
+            assay_folders_deleted = 0
+            if docking_assays:
+                try:
+                    conn_assays = sqlite3.connect(docking_assays_db_path)
+                    cur_assays = conn_assays.cursor()
+                    for assay_id, _, assay_folder_path in docking_assays:
+                        cur_assays.execute("DELETE FROM docking_assays WHERE assay_id = ?", (assay_id,))
+                        docking_assays_deleted += 1
+                        if assay_folder_path and os.path.exists(assay_folder_path):
+                            try:
+                                shutil.rmtree(assay_folder_path)
+                                assay_folders_deleted += 1
+                                print(f"   ✓ Deleted assay folder: {assay_folder_path}")
+                            except Exception as e:
+                                print(f"   ⚠️  Warning: Could not delete assay folder {assay_folder_path}: {e}")
+                        elif assay_folder_path:
+                            print(f"   ⚠️  Assay folder not found (already deleted?): {assay_folder_path}")
+
+                    conn_assays.commit()
+                    conn_assays.close()
+                except sqlite3.Error as e:
+                    print(f"⚠️  Warning: Error deleting docking assays: {e}")
+
+            print(f"\n✓ PDB template '{selected_template['pdb_template_name']}' deleted")
+            print(f"   Database: {pdbs_db_path}")
+            if template_deleted:
+                print(f"   Template records deleted: {template_deleted}")
+            if folders_deleted:
+                print(f"   Template folders deleted: {folders_deleted}")
+            if receptor_models_deleted:
+                print(f"   Related receptor models deleted: {receptor_models_deleted}")
+            if docking_assays_deleted:
+                print(f"   Related docking assays deleted: {docking_assays_deleted}")
+            if assay_folders_deleted:
+                print(f"   Assay folders deleted: {assay_folders_deleted}")
+
+            return {
+                'status': 'deleted',
+                'pdb_template_name': selected_template['pdb_template_name'],
+                'pdb_id': selected_template['pdb_id'],
+                'template_folders_deleted': folders_deleted,
+                'receptor_models_deleted': receptor_models_deleted,
+                'docking_assays_deleted': docking_assays_deleted,
+                'assay_folders_deleted': assay_folders_deleted,
+            }
+
+        except sqlite3.Error as e:
+            print(f"❌ Database error while deleting PDB template: {e}")
+            return None
 
     def list_receptor_models(self):
         """
@@ -6864,7 +7193,7 @@ quit
             conn = sqlite3.connect(receptors_db_path)
             cursor = conn.cursor()
             cursor.execute('''
-                SELECT id, model_name, pdb_name, pdb_to_convert, pdbqt_file, configs, notes
+                SELECT id, receptor_model_name, template_name, pdb_model_name, pdb_to_convert, pdbqt_file, configs, notes
                 FROM receptor_models
                 ORDER BY id ASC
             ''')
@@ -6880,15 +7209,239 @@ quit
 
         print("\n📋 Receptor Models:")
         print("=" * 40)
-        for id, model_name, pdb_name, pdb_to_convert, pdbqt_file, configs, notes in rows:
+        for id, receptor_model_name, template_name, pdb_model_name, pdb_to_convert, pdbqt_file, configs, notes in rows:
             print(f"ID: {id}")
-            print(f"Model Name: {model_name}")
-            print(f"PDB Name: {pdb_name}")
+            print(f"Receptor Model Name: {receptor_model_name}")
+            print(f"Template Name: {template_name}")
+            print(f"PDB Model Name: {pdb_model_name}")
             print(f"PDB to Convert: {pdb_to_convert}")
             print(f"PDBQT File: {pdbqt_file}")
             print(f"Configs: {configs}")
             print(f"Notes: {notes}")
             print("-" * 40)
+
+    def delete_receptor_model(self):
+        """
+        List available receptor models from the receptors database and prompt the user to select one for deletion.
+        Related docking assays will also be deleted along with their associated folders.
+
+        Returns:
+            Optional[Dict]: Dictionary with deletion details or None if cancelled
+        """
+        import sqlite3
+        import shutil
+        import json
+
+        receptors_db_path = os.path.join(self.path, 'docking', 'receptors', 'receptors.db')
+        if not os.path.exists(receptors_db_path):
+            print(f"❌ Database not found: {receptors_db_path}")
+            return None
+
+        try:
+            conn = sqlite3.connect(receptors_db_path)
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT id, receptor_model_name, template_name, pdb_model_name, pdb_to_convert, pdbqt_file, configs, notes
+                FROM receptor_models
+                ORDER BY id ASC
+            ''')
+            rows = cursor.fetchall()
+        except Exception as e:
+            print(f"❌ Error reading receptors.db: {e}")
+            return None
+
+        if not rows:
+            print("📋 No receptor models found in the database.")
+            return None
+
+        print("\n🗑️  DELETE RECEPTOR MODEL FROM DATABASE")
+        print("=" * 80)
+        print("📋 Available Receptor Models:")
+        print("=" * 80)
+        for i, (rid, receptor_model_name, template_name, pdb_model_name, pdb_to_convert, pdbqt_file, configs, notes) in enumerate(rows, 1):
+            print(f"{i}. ID: {rid}, Name: {receptor_model_name}")
+            print(f"   Template: {template_name}, PDB Model: {pdb_model_name}")
+            if notes:
+                print(f"   Notes: {notes}")
+            print()
+
+        try:
+            while True:
+                selection = input("Select a receptor model to delete by number (or 'cancel'): ").strip()
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    print("❌ Deletion cancelled by user")
+                    conn.close()
+                    return None
+                try:
+                    idx = int(selection) - 1
+                    if 0 <= idx < len(rows):
+                        break
+                    print(f"❌ Invalid selection. Enter a number between 1 and {len(rows)}.")
+                except ValueError:
+                    print("❌ Please enter a valid number.")
+        except KeyboardInterrupt:
+            print("\n❌ Deletion cancelled by user")
+            conn.close()
+            return None
+
+        selected_row = rows[idx]
+
+        # Parse configs to extract grids_path
+        configs_dict = {}
+        grids_path = None
+        if selected_row[6]:
+            try:
+                configs_dict = json.loads(selected_row[6])
+                grids_path = configs_dict.get('grids_path')
+            except json.JSONDecodeError:
+                print(f"⚠️  Warning: Could not parse configs for receptor model")
+
+        selected_receptor = {
+            'id': selected_row[0],
+            'receptor_model_name': selected_row[1],
+            'template_name': selected_row[2],
+            'pdb_model_name': selected_row[3],
+            'pdb_to_convert': selected_row[4],
+            'pdbqt_file': selected_row[5],
+            'configs': configs_dict,
+            'grids_path': grids_path,
+            'notes': selected_row[7],
+        }
+
+        # Check related docking assays
+        docking_assays = []
+        docking_assays_db_path = os.path.join(self.path, 'docking', 'docking_registers', 'docking_assays.db')
+        if os.path.exists(docking_assays_db_path):
+            try:
+                conn_assays = sqlite3.connect(docking_assays_db_path)
+                cur_assays = conn_assays.cursor()
+                cur_assays.execute(
+                    "SELECT assay_id, assay_name, assay_folder_path FROM docking_assays WHERE receptor_info LIKE ?",
+                    (f'%"receptor_model_name": "{selected_receptor["receptor_model_name"]}"%',)
+                )
+                docking_assays = cur_assays.fetchall()
+                conn_assays.close()
+            except sqlite3.Error as e:
+                print(f"❌ Database error while checking docking assays: {e}")
+                conn.close()
+                return None
+
+        # Confirm deletion
+        print("\n⚠️  CONFIRM RECEPTOR MODEL DELETION")
+        print("=" * 80)
+        print(f"   Receptor Model: {selected_receptor['receptor_model_name']}")
+        print(f"   Template: {selected_receptor['template_name']}")
+        print(f"   PDB Model: {selected_receptor['pdb_model_name']}")
+        print(f"   Notes: {selected_receptor['notes'] or 'None'}")
+        if selected_receptor['pdbqt_file']:
+            print(f"   📄 PDBQT file to be deleted: {selected_receptor['pdbqt_file']}")
+        if selected_receptor['grids_path']:
+            print(f"   🗺️  Grids folder to be deleted: {selected_receptor['grids_path']}")
+        if docking_assays:
+            print(f"   ⚠️  Related docking assays to be deleted: {len(docking_assays)}")
+            for _, assay_name, _ in docking_assays:
+                print(f"       - {assay_name}")
+        print("=" * 80)
+
+        confirm = input("Are you sure you want to delete this receptor model? (yes/no, default: no): ").strip().lower()
+        if confirm != 'yes':
+            print("❌ Deletion cancelled by user")
+            conn.close()
+            return None
+
+        # Extra safeguard: require typing the receptor model name
+        name_check = input(
+            f"Type the receptor model name '{selected_receptor['receptor_model_name']}' to confirm deletion (or press Enter to cancel): "
+        ).strip()
+        if name_check != selected_receptor['receptor_model_name']:
+            print("❌ Deletion cancelled (name confirmation failed)")
+            conn.close()
+            return None
+
+        # Delete receptor model and related records
+        try:
+            # Delete receptor model
+            cursor.execute("DELETE FROM receptor_models WHERE id = ?", (selected_receptor['id'],))
+            receptor_deleted = cursor.rowcount
+            conn.commit()
+            conn.close()
+
+            # Delete grids folder if present
+            grids_folder_deleted = 0
+            if selected_receptor['grids_path'] and os.path.exists(selected_receptor['grids_path']):
+                try:
+                    shutil.rmtree(selected_receptor['grids_path'])
+                    grids_folder_deleted = 1
+                    print(f"   ✓ Deleted grids folder: {selected_receptor['grids_path']}")
+                except Exception as e:
+                    print(f"   ⚠️  Warning: Could not delete grids folder {selected_receptor['grids_path']}: {e}")
+            elif selected_receptor['grids_path']:
+                print(f"   ⚠️  Grids folder not found (already deleted?): {selected_receptor['grids_path']}")
+
+            # Delete PDBQT file if present
+            pdbqt_file_deleted = 0
+            if selected_receptor['pdbqt_file'] and os.path.exists(selected_receptor['pdbqt_file']):
+                try:
+                    os.remove(selected_receptor['pdbqt_file'])
+                    pdbqt_file_deleted = 1
+                    print(f"   ✓ Deleted PDBQT file: {selected_receptor['pdbqt_file']}")
+                except Exception as e:
+                    print(f"   ⚠️  Warning: Could not delete PDBQT file {selected_receptor['pdbqt_file']}: {e}")
+            elif selected_receptor['pdbqt_file']:
+                print(f"   ⚠️  PDBQT file not found (already deleted?): {selected_receptor['pdbqt_file']}")
+
+            # Delete related docking assays and folders
+            docking_assays_deleted = 0
+            assay_folders_deleted = 0
+            if docking_assays:
+                try:
+                    conn_assays = sqlite3.connect(docking_assays_db_path)
+                    cur_assays = conn_assays.cursor()
+                    for assay_id, _, assay_folder_path in docking_assays:
+                        cur_assays.execute("DELETE FROM docking_assays WHERE assay_id = ?", (assay_id,))
+                        docking_assays_deleted += 1
+                        if assay_folder_path and os.path.exists(assay_folder_path):
+                            try:
+                                shutil.rmtree(assay_folder_path)
+                                assay_folders_deleted += 1
+                                print(f"   ✓ Deleted assay folder: {assay_folder_path}")
+                            except Exception as e:
+                                print(f"   ⚠️  Warning: Could not delete assay folder {assay_folder_path}: {e}")
+                        elif assay_folder_path:
+                            print(f"   ⚠️  Assay folder not found (already deleted?): {assay_folder_path}")
+
+                    conn_assays.commit()
+                    conn_assays.close()
+                except sqlite3.Error as e:
+                    print(f"⚠️  Warning: Error deleting docking assays: {e}")
+
+            print(f"\n✓ Receptor model '{selected_receptor['receptor_model_name']}' deleted")
+            print(f"   Database: {receptors_db_path}")
+            if receptor_deleted:
+                print(f"   Receptor model records deleted: {receptor_deleted}")
+            if pdbqt_file_deleted:
+                print(f"   PDBQT files deleted: {pdbqt_file_deleted}")
+            if grids_folder_deleted:
+                print(f"   Grids folders deleted: {grids_folder_deleted}")
+            if docking_assays_deleted:
+                print(f"   Related docking assays deleted: {docking_assays_deleted}")
+            if assay_folders_deleted:
+                print(f"   Assay folders deleted: {assay_folders_deleted}")
+
+            return {
+                'status': 'deleted',
+                'receptor_model_name': selected_receptor['receptor_model_name'],
+                'receptor_id': selected_receptor['id'],
+                'receptor_deleted': receptor_deleted,
+                'pdbqt_file_deleted': pdbqt_file_deleted,
+                'grids_folder_deleted': grids_folder_deleted,
+                'docking_assays_deleted': docking_assays_deleted,
+                'assay_folders_deleted': assay_folders_deleted,
+            }
+
+        except sqlite3.Error as e:
+            print(f"❌ Database error while deleting receptor model: {e}")
+            return None
         
     def _get_ligand_preparation_parameters(self):
         """
@@ -8183,7 +8736,7 @@ quit
         print(assay_info)
         #print(results_db)
 
-    def check_charges_consistency(self, selected_method, receptor_info):
+    def _check_charges_consistency(self, selected_method, receptor_info):
         
         """
         Will compare the charges assigned to the receptor and ligand during preparation to ensure consistency.
@@ -8217,4 +8770,5 @@ quit
                     return False
         else:
             print("   ✅ Charge methods are consistent between receptor and ligands.")
-        
+    
+    
