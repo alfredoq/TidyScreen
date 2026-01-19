@@ -8812,10 +8812,13 @@ quit
             # Restore every docked pose
             output_dir = self._restore_single_docked_pose(results_db, ligname, pose_id)
         
-            # Create ligand .prepin and .frcmod files
+            # Create ligand .mol2 and .frcmod files
             if ligname not in processed_ligands:
-                self._prepare_ligand_prepin_frcmod_files(ligname, assay_info, output_dir)
+                mol2_file, frcmod_file = self._prepare_ligand_tleap_files(ligname, assay_info, output_dir)
         
+            # Create complex .prmtop and .inpcrd files
+            prmtop_file, inpcrd_file = self._prepare_complex_prmtop_inpcrd(mol2_file, frcmod_file, assay_info, output_dir)
+
             if prolif == True:
                 print("I will compute ProLIF FPS")
                 
@@ -8844,7 +8847,7 @@ quit
 
         return output_dir
 
-    def _prepare_ligand_prepin_frcmod_files(self, ligname, assay_info, output_dir):
+    def _prepare_ligand_tleap_files(self, ligname, assay_info, output_dir):
         
         import subprocess
         
@@ -8856,28 +8859,32 @@ quit
             sys.exit(1)
             
         # Prepare the .prepin and .frcmod files using antechamber and parmchk2
-        prepin_file = os.path.join(output_dir, f"{ligname}.prepin")
+        mol2_file = os.path.join(output_dir, f"{ligname}.mol2")
         frcmod_file = os.path.join(output_dir, f"{ligname}.frcmod")
       
         ## Compute ligand espaloma charges
         espaloma_output_file = self._compute_ligand_espaloma_charges(pdb_file)
         
         # Run antechamber
-        antechamber_command = f"antechamber -i {pdb_file} -fi pdb -o {prepin_file} -fo prepi -c rc -cf {espaloma_output_file} "
+        antechamber_command = f"antechamber -i {pdb_file} -fi pdb -o {mol2_file} -fo mol2 -c rc -cf {espaloma_output_file} "
         
         try:
             subprocess.run(antechamber_command, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        
         except Exception as e:
             print(f"[ERROR] Failed to run antechamber: {e}")
             return None
 
-        parmchk2_command = f"parmchk2 -i {prepin_file} -f prepi -o {frcmod_file}"
+        parmchk2_command = f"parmchk2 -i {mol2_file} -f mol2 -o {frcmod_file}"
         try:
             subprocess.run(parmchk2_command, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        
         except Exception as e:
             print(f"[ERROR] Failed to run parmchk2: {e}")
             return None
-        
+
+        return mol2_file, frcmod_file
+
     def _convert_ligand_sdf_into_pdb(self, ligname, assay_info, output_dir):
         """
         Convert a ligand SDF file into a PDB file using RDKit.
@@ -9004,7 +9011,6 @@ quit
         except Exception as e:
             print(f"[ERROR] Failed to load PDB file into moldf dataframe: {e}")
             return None
-    
         
     def _compute_ligand_espaloma_charges(self, pdb_file):
         
@@ -9035,3 +9041,54 @@ quit
                 f.write("\n")
 
         return espaloma_output_file
+
+
+    def _prepare_complex_prmtop_inpcrd(self, mol2_file, frcmod_file, assay_info, output_dir):
+
+        import subprocess
+
+        receptor_pdb = assay_info.get('receptor_info', None).get('pdbqt_file', None) 
+
+        print(assay_info)
+
+        # Define the raw .pdb file of the receptor
+        receptor_pdb_path = '/'.join(receptor_pdb.split('/')[:-1]) + '/receptor_checked.pdb'
+
+        # Create tleap input file to load receptor and ligand
+        tleap_in_file = os.path.join(output_dir, "complex.in")
+
+        # Defined output files
+        prmtop_file = os.path.join(output_dir, 'complex.prmtop')
+        inpcrd_file = os.path.join(output_dir, 'complex.inpcrd')
+
+        with open(tleap_in_file, 'w') as f:
+            f.write(f"""source leaprc.protein.ff14SB
+source leaprc.water.tip3p
+source leaprc.gaff2
+HOH = WAT
+
+# Load receptor
+rec = loadpdb "{receptor_pdb_path}"
+
+# Load ligand parameters
+lig = loadmol2 {mol2_file}
+loadamberparams {frcmod_file}
+
+# Create complex
+complex = combine {{rec lig}}
+
+# Save complex parameters and coordinates
+saveamberparm complex "{prmtop_file}" "{inpcrd_file}"
+
+quit
+""")
+
+        # Run tleap to generate prmtop and inpcrd files
+        tleap_command = f"tleap -f {tleap_in_file}"
+        try:
+            subprocess.run(tleap_command, shell=True, check=True, stdout=subprocess.DEVNULL , stderr=subprocess.DEVNULL)
+            print(f"✅ Generated complex prmtop and inpcrd files for ligand in {output_dir}")
+        except Exception as e:
+            print(f"[ERROR] Failed to run tleap for complex generation: {e}")
+
+        return prmtop_file, inpcrd_file
