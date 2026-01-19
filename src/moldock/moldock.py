@@ -8709,33 +8709,6 @@ quit
             print(f"   ⚠️  Error renumbering minimized PDB file: {e}")
             return None
 
-    def compute_prolif_fps(self):
-        """
-        Will compute the ProLIF fingerprints for all docked ligands in a given assay. 
-        """
-
-        import os
-        import sqlite3
-
-        ## Get the assay on which fps are to be computed
-        assays = self.list_assay_folders()
-        
-        if not assays:
-            return None
-
-        assay_by_id = {a['assay_id']: a for a in assays}
-
-        assay_id = self._prompt_assay("for ProLIF fingerprint computation", assay_by_id)
-        if assay_id is None:
-            return None
-
-        assay_info = assay_by_id[assay_id]
-        results_db = os.path
-
-        #print(assay_by_id)
-        print(assay_info)
-        #print(results_db)
-
     def _check_charges_consistency(self, selected_method, receptor_info):
         
         """
@@ -8771,4 +8744,294 @@ quit
         else:
             print("   ✅ Charge methods are consistent between receptor and ligands.")
     
+    def compute_fingerprints(self):
+        """
+        Will compute the ProLIF fingerprints for all docked ligands in a given assay. 
+        """
+
+        import os
+        import sqlite3
+        import pandas as pd
+
+        ## Get the assay on which fps are to be computed
+        assays = self.list_assay_folders()
+        
+        if not assays:
+            return None
+
+        assay_by_id = {a['assay_id']: a for a in assays}
+
+        assay_id = self._prompt_assay("for ProLIF fingerprint computation", assay_by_id)
+        
+        # Prompt user for fingerprint/computation options
+        print("\nSelect fingerprint/computation options:")
+        print("1 - ProLIF fingerprints only")
+        print("2 - MMGBSA only")
+        print("3 - BOTH ProLIF and MMGBSA")
+        while True:
+            choice = input("Enter your choice (1, 2, or 3): ").strip()
+            if choice == "1":
+                prolif = True
+                mmbgsa = False
+                break
+            elif choice == "2":
+                prolif = False
+                mmbgsa = True
+                break
+            elif choice == "3":
+                prolif = True
+                mmbgsa = True
+                break
+            else:
+                print("Invalid selection. Please enter 1, 2, or 3.")
+        
+        
+        if assay_id is None:
+            return None
+
+        assay_info = assay_by_id[assay_id]
+        
+        # Get the path to the results database for the selected assay
+        results_db = os.path.join(assay_info['assay_folder_path'], "results", f"assay_{assay_id}.db")
+        
+        try:
+            conn = sqlite3.connect(results_db)
+            query = "SELECT Pose_ID, LigName FROM Results"
+            df = pd.read_sql(query, conn)
+            conn.close()
+        except Exception as e:
+            print(f"❌ Error retrieving Pose_ID and LigName from Results table: {e}")
+        
+        ## Loop over dataframe to process each docked pose
+        processed_ligands = []
+        for idx, row in df.iterrows():
+            pose_id = row['Pose_ID']
+            ligname = row['LigName']
+            print(f"Processing Pose_ID: {pose_id}, LigName: {ligname}")
+        
+            # Restore every docked pose
+            output_dir = self._restore_single_docked_pose(results_db, ligname, pose_id)
+        
+            # Create ligand .prepin and .frcmod files
+            if ligname not in processed_ligands:
+                self._prepare_ligand_prepin_frcmod_files(ligname, assay_info, output_dir)
+        
+            if prolif == True:
+                print("I will compute ProLIF FPS")
+                
+            if mmbgsa == True:
+                print("I will compute MMGBSA FPS")
+        
+            processed_ligands.append(ligname)
+        
+    def _restore_single_docked_pose(self, results_db, ligname, pose_id):
+        """
+        Will use a similar logic than that used in the extract_docked_poses to generate a .pdb file from a single docked pose identified by Pose_ID in the Results table of the assay database
+        """
+
+        # Retrieve input_model and pose_coords_json
+        input_model, pose_coords_json = self._retrieve_pose_info(results_db, pose_id)
+        pdb_dict = self._process_input_model_for_moldf(input_model, pose_coords_json)
+
+        # Get the directory of the results_db (should be .../assay_x.db)
+        assay_dir = os.path.dirname(os.path.abspath(results_db))
+        output_dir = os.path.join(assay_dir, "temp_restored_poses")
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir, exist_ok=True)
+
+        # # Write the PDB file
+        self._write_pdb_with_moldf(pdb_dict, ligname, pose_id, output_dir)
+
+        return output_dir
+
+    def _prepare_ligand_prepin_frcmod_files(self, ligname, assay_info, output_dir):
+        
+        import subprocess
+        
+        # Retrieve original ligand in .sdf format and prepare a .pdb file
+        pdb_file = self._convert_ligand_sdf_into_pdb(ligname, assay_info, output_dir)
+        
+        if pdb_file is None:
+            print(f"[ERROR] Could not convert ligand {ligname} SDF to PDB")
+            sys.exit(1)
+            
+        # Prepare the .prepin and .frcmod files using antechamber and parmchk2
+        prepin_file = os.path.join(output_dir, f"{ligname}.prepin")
+        frcmod_file = os.path.join(output_dir, f"{ligname}.frcmod")
+      
+        ## Compute ligand espaloma charges
+        espaloma_output_file = self._compute_ligand_espaloma_charges(pdb_file)
+        
+        # Run antechamber
+        antechamber_command = f"antechamber -i {pdb_file} -fi pdb -o {prepin_file} -fo prepi -c rc -cf {espaloma_output_file} "
+        
+        try:
+            subprocess.run(antechamber_command, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            print(f"[ERROR] Failed to run antechamber: {e}")
+            return None
+
+        parmchk2_command = f"parmchk2 -i {prepin_file} -f prepi -o {frcmod_file}"
+        try:
+            subprocess.run(parmchk2_command, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            print(f"[ERROR] Failed to run parmchk2: {e}")
+            return None
+        
+    def _convert_ligand_sdf_into_pdb(self, ligname, assay_info, output_dir):
+        """
+        Convert a ligand SDF file into a PDB file using RDKit.
+
+        Args:
+            ligname (str): Name of the ligand (used for file naming).
+            assay_info (dict): Assay information dictionary containing paths and metadata.
+            output_dir (str): Directory where the output PDB file should be saved.
+
+        Returns:
+            str: Path to the generated PDB file, or None if conversion failed.
+        """
+        import os
+        from rdkit import Chem
+        from rdkit.Chem import AllChem
+        import sqlite3
+        from moldf import read_pdb
+        from moldf import write_pdb
+
+        # Construct input SDF and output PDB file paths
+        sdf_file = os.path.join(output_dir, f"{ligname}.sdf")
+        pdb_file = os.path.join(output_dir, f"{ligname}.pdb")
+
+        # Retrieve the ligand in .sdf format from the chemspace.db corresponding table
+        chemspace_table = assay_info.get('table_name', None)
+        chemspace_db = self.__chemspace_db
+        if not chemspace_table:
+            print("[ERROR] ChemSpace table name not provided in assay_info.")
+            return None
+
+        try:
+            conn = sqlite3.connect(chemspace_db)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT sdf_blob FROM {} WHERE inchi_key = ?".format(chemspace_table),
+                (ligname,)
+            )
+            row = cursor.fetchone()
+            conn.close()
+            if not row or not row[0]:
+                print(f"[ERROR] Ligand {ligname} not found in table {chemspace_table}.")
+                return None
+            with open(sdf_file, "wb") as f:
+                f.write(row[0])
+        except Exception as e:
+            print(f"[ERROR] Failed to retrieve ligand SDF from ChemSpace: {e}")
+            return None
+
+        if not os.path.isfile(sdf_file):
+            print(f"[ERROR] SDF file not found: {sdf_file}")
+            return None
+
+        # Read molecule from SDF
+        suppl = Chem.SDMolSupplier(sdf_file, removeHs=False)
+        mol = next((m for m in suppl if m is not None), None)
+        if mol is None:
+            print(f"[ERROR] Failed to read molecule from SDF: {sdf_file}")
+            return None
+
+        # Restore atom names
+        if mol.HasProp("AtomNames"):
+            atom_names = mol.GetProp("AtomNames").split("|")
+            
+            for i, atom_name in enumerate(atom_names):
+                if i < mol.GetNumAtoms():
+                    atom = mol.GetAtomWithIdx(i)
+                    atom.SetProp("_Name", atom_name)
+                    atom.SetProp("atomLabel", atom_name)
+
+        # Write to PDB
+        try:
+            Chem.MolToPDBFile(mol, pdb_file)
+        
+        except Exception as e:
+            print(f"[ERROR] Failed to write PDB file: {e}")
+            return None
+        
+        # Load the PDB file into a moldf dataframe
+        try:
+            # Insert a blank line at at the  pdb_file for moldf correct parsing
+            with open(pdb_file, 'r') as original:
+                data = original.read()
+            with open(pdb_file, 'w') as modified:
+                modified.write('\n' + data) 
+            
+            # Parse the file using moldf
+            moldf_dict = read_pdb(pdb_file)
+            moldf_df = moldf_dict['_atom_site']
+            
+            # Check if the length of 'atom_names' list is equal to the number of rows in moldf_df (number of atoms should be the same)
+            if len(atom_names) != len(moldf_df):
+                print(f"[ERROR] Number of atom names ({len(atom_names)}) does not match number of atoms in PDB ({len(moldf_df)}).")
+                sys.exit(1)
+            else:
+                # Assign atom names to the moldf dataframe
+                moldf_df['atom_name'] = atom_names
+                # Assign empty value to 'insertion' column
+                moldf_df['insertion'] = ''
+            
+            new_moldf_dict = {
+                '_atom_site': moldf_df
+            }
+            
+            # Write (overwrite) the tleap_processed_file
+            from moldf import write_pdb
+            
+            write_pdb(new_moldf_dict, pdb_file)
+            
+            # Remove one space at column 20 of pdb_file
+            with open(pdb_file, 'r') as original:
+                data = original.readlines()
+            with open(pdb_file, 'w') as modified:
+                for line in data:
+                    if line.startswith('ATOM') or line.startswith('HETATM'):
+                        # Remove one space at column 23 (index 22)
+                        new_line = line[:22] + line[23:]
+                        modified.write(new_line)
+                    else:
+                        modified.write(line)
+            
+            return pdb_file
+            
+            
+        except Exception as e:
+            print(f"[ERROR] Failed to load PDB file into moldf dataframe: {e}")
+            return None
     
+        
+    def _compute_ligand_espaloma_charges(self, pdb_file):
+        
+        from rdkit import Chem
+        from espaloma_charge import charge
+        import numpy as np
+        
+        # Read the ligand PDB file into an RDKit molecule
+        mol = Chem.MolFromPDBFile(pdb_file, removeHs=False)
+        if mol is None:
+            print(f"[ERROR] Could not read molecule from PDB: {pdb_file}")
+            return None
+        
+        espaloma_charges = charge(mol)
+        
+        # Write espaloma charges to a file with 8 columns, values separated by a single space
+        espaloma_output_file = pdb_file.replace('.pdb', '_espaloma_charges.txt')
+        with open(espaloma_output_file, 'w') as f:
+            for i, val in enumerate(espaloma_charges):
+                f.write(f"{val:.6f}")
+                # Write a space after each value except the last in a line
+                if (i + 1) % 8 == 0:
+                    f.write("\n")
+                else:
+                    f.write(" ")
+            # If the last line is not complete, add a newline
+            if len(espaloma_charges) % 8 != 0:
+                f.write("\n")
+
+        return espaloma_output_file
