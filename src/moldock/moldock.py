@@ -7953,6 +7953,8 @@ quit
         output_file = os.path.join(output_dir, f"{ligname}_{run_number}.pdb")
         write_pdb(pdb_dict, output_file)
 
+        return output_file
+
     def _dock_table_with_vina(self, selected_table, selected_method, assay_registry, clean_ligand_files, receptor_info):
         
         """
@@ -8810,18 +8812,28 @@ quit
             print(f"Processing Pose_ID: {pose_id}, LigName: {ligname}")
         
             # Restore every docked pose
-            output_dir = self._restore_single_docked_pose(results_db, ligname, pose_id)
+            output_dir, output_file = self._restore_single_docked_pose(results_db, ligname, pose_id)
         
             # Create ligand .mol2 and .frcmod files
             if ligname not in processed_ligands:
                 mol2_file, frcmod_file = self._prepare_ligand_tleap_files(ligname, assay_info, output_dir)
         
             # Create complex .prmtop and .inpcrd files
-            prmtop_file, inpcrd_file = self._prepare_complex_prmtop_inpcrd(mol2_file, frcmod_file, assay_info, output_dir)
+            prmtop_file, inpcrd_file = self._prepare_complex_prmtop_inpcrd(mol2_file, frcmod_file, assay_info, output_dir, output_file)
+
+            # Minimize complex
+            min_rst_cpptraj_file = self._minimize_complex(prmtop_file, inpcrd_file, output_dir, ligname, pose_id)
 
             if prolif == True:
                 print("I will compute ProLIF FPS")
                 
+                fps_df = self._compute_prolif_fingerprints(prmtop_file, min_rst_cpptraj_file, pose_id, results_db)
+                
+                # Temporarily save the df to a file
+                fps_output_file = os.path.join(output_dir, f"{ligname}_pose_{pose_id}_prolif_fps.csv")
+                fps_df.to_csv(fps_output_file, index=False)
+            
+
             if mmbgsa == True:
                 print("I will compute MMGBSA FPS")
         
@@ -8843,9 +8855,9 @@ quit
             os.makedirs(output_dir, exist_ok=True)
 
         # # Write the PDB file
-        self._write_pdb_with_moldf(pdb_dict, ligname, pose_id, output_dir)
+        output_file = self._write_pdb_with_moldf(pdb_dict, ligname, pose_id, output_dir)
 
-        return output_dir
+        return output_dir, output_file
 
     def _prepare_ligand_tleap_files(self, ligname, assay_info, output_dir):
         
@@ -9042,14 +9054,11 @@ quit
 
         return espaloma_output_file
 
-
-    def _prepare_complex_prmtop_inpcrd(self, mol2_file, frcmod_file, assay_info, output_dir):
+    def _prepare_complex_prmtop_inpcrd(self, mol2_file, frcmod_file, assay_info, output_dir, pdb_file):
 
         import subprocess
 
         receptor_pdb = assay_info.get('receptor_info', None).get('pdbqt_file', None) 
-
-        print(assay_info)
 
         # Define the raw .pdb file of the receptor
         receptor_pdb_path = '/'.join(receptor_pdb.split('/')[:-1]) + '/receptor_checked.pdb'
@@ -9071,8 +9080,10 @@ HOH = WAT
 rec = loadpdb "{receptor_pdb_path}"
 
 # Load ligand parameters
-lig = loadmol2 {mol2_file}
+UNL = loadmol2 {mol2_file}
 loadamberparams {frcmod_file}
+
+lig = loadpdb "{pdb_file}"
 
 # Create complex
 complex = combine {{rec lig}}
@@ -9092,3 +9103,80 @@ quit
             print(f"[ERROR] Failed to run tleap for complex generation: {e}")
 
         return prmtop_file, inpcrd_file
+
+    def _minimize_complex(self, prmtop_file, inpcrd_file, output_dir, ligname, pose_id):
+
+        """
+        Will minimize the receptor under processing using sander
+        """
+        
+        import subprocess
+        import os
+        import tempfile
+        import shutil
+
+        print("Minimizing complex")
+
+        # Create minimization input file in the same directory as tleap_processed_file
+        min_in_file = os.path.join(output_dir, "min.in")
+        min_out_file = os.path.join(output_dir, "min.out")
+        min_rst_file = os.path.join(output_dir, "min.rst")
+        cpptraj_in_file = os.path.join(output_dir, "cpptraj.in")
+        min_rst_cpptraj_file = os.path.join(output_dir, "min_cpptraj.rst")
+
+        with open(min_in_file, 'w') as f:
+            f.write("""Minimisation of the complex
+ &cntrl
+  imin=1, maxcyc=50, ncyc=25,
+  cut=16, ntb=0, igb=1,
+ &end
+        """)
+
+        # Create a tleap input file in the same directory as tleap_processed_file
+        tleap_in_file = os.path.join(os.path.dirname(output_dir), "minimize.in")
+
+        # Run sander to minimize the complex
+        sander_command = f"sander -O -i {min_in_file} -o {min_out_file} -p {prmtop_file} -c {inpcrd_file} -r {min_rst_file}"
+        subprocess.run(sander_command, shell=True, check=True)   
+
+        ## Use Cpptraj to reprocess min_rst_file to make it compatible with MDAnalysis read
+        with open(cpptraj_in_file, 'w') as f:
+            f.write(f"""parm {prmtop_file}
+trajin {min_rst_file}
+trajout {min_rst_cpptraj_file}
+go
+quit
+        """)
+
+        cpptraj_command = f"cpptraj -i {cpptraj_in_file}"
+        subprocess.run(cpptraj_command, shell=True, check=True)
+
+        return min_rst_cpptraj_file
+
+    def _compute_prolif_fingerprints(self, prmtop_file, min_rst_cpptraj_file, pose_id, results_db):
+
+        import prolif as plf
+        import MDAnalysis as mda
+
+        interactions_list = ['Anionic','CationPi','Cationic','EdgeToFace','FaceToFace','HBAcceptor','HBDonor','Hydrophobic','MetalAcceptor','MetalDonor','PiCation','PiStacking','VdWContact','XBAcceptor','XBDonor'] 
+
+        # Load the input crd file as a MDAnalysis universe object
+        u = mda.Universe(f"{prmtop_file}", f"{min_rst_cpptraj_file}", format='INPCRD')
+        # Select the protein and create the corresponding ProLIF object
+        prot = u.select_atoms("protein")
+        protein_mol = plf.Molecule.from_mda(prot)
+        # Select the ligand and create the corresponding ProLIF object
+        lig = u.select_atoms("resname UNL")
+        ligand_mol = plf.Molecule.from_mda(lig)
+        # Define all available interaction for computation
+        #fp = plf.Fingerprint(interactions_list, parameters=parameters_dict)
+        fp = plf.Fingerprint(interactions_list)
+        # Compute the fingerprints
+        print("Computing ProLIF Fingerprints")
+        fp.run_from_iterable([ligand_mol], protein_mol,progress=False)
+        # Generate the fingerprints dataframe
+        fps_df = fp.to_dataframe()
+
+        return fps_df
+
+    
