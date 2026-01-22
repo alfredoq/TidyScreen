@@ -5183,34 +5183,36 @@ except Exception as e:
             conn = sqlite3.connect(pdbs_db_path)
             cursor = conn.cursor()
 
-            # Create receptors table
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS pdb_templates (
-                    pdb_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    pdb_template_name TEXT UNIQUE NOT NULL,
-                    pdb_model_name TEXT NOT NULL,
-                    project_name TEXT,
-                    original_pdb_path TEXT NOT NULL,
-                    processed_pdb_path TEXT NOT NULL,
-                    checked_pdb_path TEXT NOT NULL,
-                    template_folder_path TEXT NOT NULL,
-                    pdb_analysis TEXT,
-                    chains TEXT,
-                    resolution REAL,
-                    atom_count INTEGER,
-                    has_ligands BOOLEAN,
-                    renumbering_dict TEXT,
-                    status TEXT DEFAULT 'created',
-                    created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_modified TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    notes TEXT
-                )
-            ''')
+            # Define dictionary to hold table structure info
+            columns_dict = {
+                'pdb_id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
+                'pdb_template_name': 'TEXT UNIQUE NOT NULL',
+                'pdb_model_name': 'TEXT NOT NULL',
+                'project_name': 'TEXT',
+                'original_pdb_path': 'TEXT NOT NULL',
+                'processed_pdb_path': 'TEXT NOT NULL',
+                'checked_pdb_path': 'TEXT NOT NULL',
+                'template_folder_path': 'TEXT NOT NULL',
+                'pdb_analysis': 'TEXT',
+                'chains': 'TEXT',
+                'resolution': 'REAL',
+                'atom_count': 'INTEGER',
+                'has_ligands': 'BOOLEAN',
+                'renumbering_dict': 'TEXT',
+                'status': "TEXT DEFAULT 'created'",
+                'created_date': "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+                'last_modified': "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+                'notes': 'TEXT',
+            }
 
-            # Ensure legacy databases get the new column
-            existing_columns = {row[1] for row in cursor.execute("PRAGMA table_info(pdb_templates)")}
-            if 'renumbering_dict' not in existing_columns:
-                cursor.execute("ALTER TABLE pdb_templates ADD COLUMN renumbering_dict TEXT")
+            # Use a dedicated method to create the table if it doesn't exist
+            self._create_table_from_columns_dict(cursor, 'pdb_templates', columns_dict)
+
+            # Update legacy databases to add missing columns
+            self._update_legacy_table_columns(cursor, 'pdb_templates', columns_dict)
+
+            # Remove deprecated columns
+            self._remove_legacy_table_columns(cursor, 'pdb_templates', columns_dict)
 
             # Prepare data for insertion
             pdb_analysis_json = json.dumps(analysis, indent=2)
@@ -10147,3 +10149,196 @@ quit
                 file_residues.append(res_key)
 
         return file_residues
+    
+    def _create_table_from_columns_dict(self, cursor: sqlite3.Cursor, table_name: str, columns_dict: dict) -> None:
+        """
+        Create a database table dynamically from a columns dictionary.
+        
+        Args:
+            cursor (sqlite3.Cursor): Database cursor for executing SQL commands
+            table_name (str): Name of the table to create
+            columns_dict (dict): Dictionary mapping column names to their SQL types
+                                Example: {'id': 'INTEGER PRIMARY KEY AUTOINCREMENT', 'name': 'TEXT NOT NULL'}
+        
+        Returns:
+            None
+        
+        Raises:
+            sqlite3.Error: If table creation fails
+        """
+        try:
+            # Build the CREATE TABLE statement from columns_dict - This works if the table does not exist
+            columns_sql = ",\n    ".join([f"{col_name} {col_type}" for col_name, col_type in columns_dict.items()])
+            
+            create_table_sql = f"""
+                CREATE TABLE IF NOT EXISTS {table_name} (
+                    {columns_sql}
+                )
+            """
+            
+            cursor.execute(create_table_sql)
+            print(f"   ✅ Table '{table_name}' created/verified with {len(columns_dict)} columns")
+            
+        except sqlite3.Error as e:
+            print(f"   ❌ Error creating table '{table_name}': {e}")
+            raise
+        
+    def _update_legacy_table_columns(self, cursor: sqlite3.Cursor, table_name: str, columns_dict: dict) -> None:
+        """
+        Update legacy database tables by adding missing columns based on columns_dict reference.
+        
+        This method compares existing table columns against the expected columns_dict schema
+        and adds any missing columns to maintain compatibility with newer database versions.
+        
+        Args:
+            cursor (sqlite3.Cursor): Database cursor for executing SQL commands
+            table_name (str): Name of the table to update
+            columns_dict (dict): Dictionary mapping column names to their SQL types
+                                Example: {'renumbering_dict': 'TEXT', 'status': "TEXT DEFAULT 'created'"}
+        
+        Returns:
+            None
+        
+        Raises:
+            sqlite3.Error: If column addition fails
+        
+        Example:
+            columns_dict = {'renumbering_dict': 'TEXT', 'notes': 'TEXT'}
+            self._update_legacy_table_columns(cursor, 'pdb_templates', columns_dict)
+        """
+        try:
+            # Get existing columns from the table
+            cursor.execute(f"PRAGMA table_info({table_name})")
+            existing_columns = {row[1] for row in cursor.fetchall()}
+            
+            # Identify missing columns
+            missing_columns = set(columns_dict.keys()) - existing_columns
+            
+            if not missing_columns:
+                print(f"   ✅ Table '{table_name}' is up to date - no missing columns")
+                return
+            
+            print(f"   🔄 Updating legacy table '{table_name}' - adding {len(missing_columns)} missing column(s)")
+            
+            # Add each missing column
+            for col_name in missing_columns:
+                col_type = columns_dict[col_name]
+                try:
+                    alter_sql = f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}"
+                    cursor.execute(alter_sql)
+                    print(f"      ✓ Added column: {col_name} ({col_type})")
+                except sqlite3.Error as e:
+                    print(f"      ⚠️  Could not add column '{col_name}': {e}")
+            
+            print(f"   ✅ Legacy table '{table_name}' updated successfully")
+            
+        except sqlite3.Error as e:
+            print(f"   ❌ Error updating legacy table '{table_name}': {e}")
+            raise
+        
+    def _remove_legacy_table_columns(self, cursor: sqlite3.Cursor, table_name: str, columns_dict: dict) -> None:
+        """
+        Remove legacy columns from database tables that are no longer in the columns_dict reference.
+        
+        This method compares existing table columns against the expected columns_dict schema
+        and removes any extra columns that are no longer needed. This is useful for cleaning up
+        deprecated columns from legacy database versions.
+        
+        **WARNING**: This operation is destructive and cannot be easily reversed. Column data
+        will be permanently deleted.
+        
+        Args:
+            cursor (sqlite3.Cursor): Database cursor for executing SQL commands
+            table_name (str): Name of the table to clean up
+            columns_dict (dict): Dictionary mapping column names to their SQL types
+                                Example: {'pdb_id': 'INTEGER PRIMARY KEY', 'pdb_name': 'TEXT'}
+        
+        Returns:
+            None
+        
+        Raises:
+            sqlite3.Error: If column removal fails
+        
+        Example:
+            columns_dict = {'pdb_id': 'INTEGER PRIMARY KEY', 'pdb_name': 'TEXT'}
+            self._remove_legacy_table_columns(cursor, 'pdb_templates', columns_dict)
+        
+        Note:
+            SQLite does not support DROP COLUMN directly in older versions (< 3.35.0).
+            This method uses the recommended approach of creating a new table and copying data.
+        """
+        try:
+            # Get existing columns from the table
+            cursor.execute(f"PRAGMA table_info({table_name})")
+            existing_columns_info = cursor.fetchall()
+            existing_columns = {row[1] for row in existing_columns_info}
+            
+            # Identify columns to remove
+            columns_to_remove = existing_columns - set(columns_dict.keys())
+            
+            if not columns_to_remove:
+                print(f"   ✅ Table '{table_name}' has no extra columns to remove")
+                return
+            
+            print(f"   🗑️  Removing {len(columns_to_remove)} legacy column(s) from '{table_name}'")
+            print(f"      Columns to remove: {', '.join(sorted(columns_to_remove))}")
+            
+            # Confirm destructive operation
+            print(f"   ⚠️  WARNING: This will permanently delete column data!")
+            confirm = input(f"   Continue with column removal? (yes/no, default: no): ").strip().lower()
+            
+            if confirm != 'yes':
+                print(f"   ❌ Column removal cancelled by user")
+                return
+            
+            # SQLite approach: Create new table with desired columns, copy data, rename
+            # Get columns to keep (in original order)
+            columns_to_keep = [
+                (row[1], row[2])  # (column_name, column_type)
+                for row in existing_columns_info 
+                if row[1] in columns_dict
+            ]
+            
+            # Build new table schema
+            new_columns_sql = ",\n    ".join([
+                f"{col_name} {columns_dict[col_name]}" 
+                for col_name, _ in columns_to_keep
+            ])
+            
+            # Column names for data transfer
+            transfer_columns = ", ".join([col_name for col_name, _ in columns_to_keep])
+            
+            # Create temporary table with new schema
+            temp_table_name = f"{table_name}_temp_migration"
+            
+            cursor.execute(f"""
+                CREATE TABLE {temp_table_name} (
+                    {new_columns_sql}
+                )
+            """)
+            
+            # Copy data from old table to new table
+            cursor.execute(f"""
+                INSERT INTO {temp_table_name} ({transfer_columns})
+                SELECT {transfer_columns}
+                FROM {table_name}
+            """)
+            
+            # Drop old table
+            cursor.execute(f"DROP TABLE {table_name}")
+            
+            # Rename new table to original name
+            cursor.execute(f"ALTER TABLE {temp_table_name} RENAME TO {table_name}")
+            
+            print(f"   ✅ Successfully removed legacy columns from '{table_name}'")
+            for col_name in sorted(columns_to_remove):
+                print(f"      ✓ Removed column: {col_name}")
+            
+        except sqlite3.Error as e:
+            print(f"   ❌ Error removing legacy columns from '{table_name}': {e}")
+            # Attempt rollback if temp table exists
+            try:
+                cursor.execute(f"DROP TABLE IF EXISTS {table_name}_temp_migration")
+            except:
+                pass
+            raise
