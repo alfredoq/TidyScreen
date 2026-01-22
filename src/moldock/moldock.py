@@ -3699,7 +3699,7 @@ except Exception as e:
         """
         Create a PDB file template from a PDB model stored in the database using save_pdb_model.
         The user is prompted to select a PDB model from the database, after which the PDB file 
-        is analyzed and a register for the receptor is created in the pdb_templates table.
+        is analyzed and a registered for the receptor is created in the pdb_templates table.
         
         Args:
             pdb_name (Optional[str]): Name for the receptor template. If None, user will be prompted.
@@ -3713,7 +3713,7 @@ except Exception as e:
         from datetime import datetime
         
         try:
-            print(f"🧬 CREATE PDB TEMPLATE FROM DATABASE")
+            print(f"🧬 CREATING PDB TEMPLATE FROM DATABASE")
             print("=" * 80)
             
             # Step 1: List and select PDB model from database
@@ -3750,6 +3750,40 @@ except Exception as e:
                     print(f"\n❌ PDB template creation cancelled")
                     return None
             
+            # Step 5: Get PDB template name
+            if pdb_template_name is None:
+                while True:
+                    try:
+                        default_name = f"{selected_model['pdb_model_name']}_template"
+                        pdb_template_name = input(f"\n🏷️  Enter PDB template name (default: {default_name}): ").strip()
+                        
+                        if not pdb_template_name:
+                            pdb_template_name = default_name
+                        
+                        if pdb_template_name.lower() in ['cancel', 'quit', 'exit']:
+                            print("❌ PDB template creation cancelled")
+                            return None
+                        
+                        # Validate template name
+                        if not pdb_template_name.replace('_', '').replace('-', '').replace(' ', '').isalnum():
+                            print("❌ Template name can only contain letters, numbers, spaces, hyphens, and underscores")
+                            continue
+                        
+                        break
+                        
+                    except KeyboardInterrupt:
+                        print("\n❌ PDB template creation cancelled")
+                        return None
+
+            # Step 6: Check if template name already exists
+            existing_check = self._check_pdb_name_exists(pdb_template_name)
+            
+            print(f"Existing check: {existing_check}")
+            
+            if existing_check:
+                print("❌ PDB template creation cancelled - name already exists")
+                sys.exit(1)
+
             # Step 2: Retrieve PDB blob from database
             print(f"\n📥 Retrieving PDB file from database...")
             pdbs_db_path = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
@@ -3788,47 +3822,8 @@ except Exception as e:
                 if verbose:
                     self._display_pdb_analysis(pdb_analysis)
                 
-                # Step 5: Get PDB template name
-                if pdb_template_name is None:
-                    while True:
-                        try:
-                            default_name = f"{selected_model['pdb_model_name']}_template"
-                            pdb_template_name = input(f"\n🏷️  Enter PDB template name (default: {default_name}): ").strip()
-                            
-                            if not pdb_template_name:
-                                pdb_template_name = default_name
-                            
-                            if pdb_template_name.lower() in ['cancel', 'quit', 'exit']:
-                                print("❌ PDB template creation cancelled")
-                                os.unlink(temp_pdb_path)
-                                return None
-                            
-                            # Validate template name
-                            if not pdb_template_name.replace('_', '').replace('-', '').replace(' ', '').isalnum():
-                                print("❌ Template name can only contain letters, numbers, spaces, hyphens, and underscores")
-                                continue
-                            
-                            break
-                            
-                        except KeyboardInterrupt:
-                            print("\n❌ PDB template creation cancelled")
-                            os.unlink(temp_pdb_path)
-                            return None
                 
-                # Step 6: Check if template name already exists
-                existing_check = self._check_pdb_name_exists(pdb_template_name)
-                if existing_check:
-                    while True:
-                        overwrite = input(f"\n⚠️  Template '{pdb_template_name}' already exists. Overwrite? (y/n): ").strip().lower()
-                        if overwrite in ['y', 'yes']:
-                            print("🔄 Will overwrite existing PDB template")
-                            break
-                        elif overwrite in ['n', 'no']:
-                            print("❌ PDB template creation cancelled - name already exists")
-                            os.unlink(temp_pdb_path)
-                            return None
-                        else:
-                            print("❌ Please answer 'y' or 'n'")
+                
                 
                 # Step 7: Create receptors directory structure
                 receptors_base_dir = os.path.join(self.path, 'docking', 'receptors')
@@ -5028,7 +5023,7 @@ except Exception as e:
         except Exception as e:
             print(f"⚠️  Error displaying PDB analysis: {e}")
 
-    def _check_pdb_name_exists(self, receptor_name: str) -> bool:
+    def _check_pdb_name_exists(self, template_name: str) -> bool:
         """
         Check if receptor name already exists in the database.
         
@@ -5039,16 +5034,16 @@ except Exception as e:
             bool: True if name exists, False otherwise
         """
         try:
-            receptors_db_path = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
+            pdbs_db_path = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
             
-            if not os.path.exists(receptors_db_path):
+            if not os.path.exists(pdbs_db_path):
                 return False
             
             import sqlite3
-            conn = sqlite3.connect(receptors_db_path)
+            conn = sqlite3.connect(pdbs_db_path)
             cursor = conn.cursor()
             
-            cursor.execute("SELECT COUNT(*) FROM receptors WHERE receptor_name = ?", (receptor_name,))
+            cursor.execute("SELECT COUNT(*) FROM pdb_templates WHERE pdb_template_name = ?", (template_name,))
             count = cursor.fetchone()[0]
             
             conn.close()
