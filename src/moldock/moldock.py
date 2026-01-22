@@ -3836,16 +3836,19 @@ except Exception as e:
                 
                 # Step 8: Copy and process PDB file
                 print(f"📂 Processing and saving PDB template...")
-                processed_pdb_path, checked_pdb_path = self._process_pdb_file(temp_pdb_path, pdb_template_folder, pdb_analysis)
+                processed_pdb_path, checked_pdb_path, renumbering_dict = self._process_pdb_file(temp_pdb_path, pdb_template_folder, pdb_analysis)
                 
                 if not processed_pdb_path:
                     print("❌ Failed to process PDB file")
                     os.unlink(temp_pdb_path)
                     return None
                 
+                print("Processed pdb path:", processed_pdb_path)
+                print("Checked pdb path:", checked_pdb_path)
+
                 # Step 9: Create template registry entry
                 pdb_registry = self._create_pdb_template_registry_entry(
-                    pdb_template_name, selected_model['pdb_model_name'], selected_model['original_path'], processed_pdb_path, pdb_template_folder, pdb_analysis, checked_pdb_path
+                    pdb_template_name, selected_model['pdb_model_name'], selected_model['original_path'], processed_pdb_path, pdb_template_folder, pdb_analysis, checked_pdb_path, renumbering_dict
                 )
                 
                 if not pdb_registry:
@@ -4189,7 +4192,7 @@ except Exception as e:
             tleap_processed_file = self._add_missing_atoms_in_pdb_tleap(processed_pdb_path, analysis)
             
             # Process tleap_processed_file to add the element name column if missing
-            receptor_moldf_dict = self._refine_receptor_model(tleap_processed_file, processed_pdb_path)
+            receptor_moldf_dict, renumbering_dict = self._refine_receptor_model(tleap_processed_file, processed_pdb_path)
 
             # Write (overwrite) the tleap_processed_file
             from moldf import write_pdb
@@ -4198,7 +4201,7 @@ except Exception as e:
             
             print(f"✅ tleap processing complete. Output: {tleap_processed_file}")
             
-            return processed_pdb_path, tleap_processed_file
+            return processed_pdb_path, tleap_processed_file, renumbering_dict
             
 
         except Exception as e:
@@ -5153,7 +5156,8 @@ except Exception as e:
 
     def _create_pdb_template_registry_entry(self, pdb_template_name: str, pdb_model_name: str, original_pdb_path: str, 
                                     processed_pdb_path: str, pdb_template_folder: str, 
-                                    analysis: Dict[str, Any], checked_pdb_path) -> Optional[Dict[str, Any]]:
+                                    analysis: Dict[str, Any], checked_pdb_path, 
+                                    renumbering_dict) -> Optional[Dict[str, Any]]:
         """
         Create PDB templates registry entry in pdbs.db
 
@@ -5163,6 +5167,7 @@ except Exception as e:
             processed_pdb_path (str): Path to processed PDB file
             pdb_folder (str): Path to PDB folder
             analysis (Dict): PDB analysis results
+            renumbering_dict (Dict): Dictionary for residue renumbering
 
         Returns:
             Optional[Dict[str, Any]]: Registry entry information or None if failed
@@ -5194,6 +5199,7 @@ except Exception as e:
                     resolution REAL,
                     atom_count INTEGER,
                     has_ligands BOOLEAN,
+                    renumbering_dict TEXT,
                     status TEXT DEFAULT 'created',
                     created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     last_modified TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -5201,9 +5207,16 @@ except Exception as e:
                 )
             ''')
 
+            # Ensure legacy databases get the new column
+            existing_columns = {row[1] for row in cursor.execute("PRAGMA table_info(pdb_templates)")}
+            if 'renumbering_dict' not in existing_columns:
+                cursor.execute("ALTER TABLE pdb_templates ADD COLUMN renumbering_dict TEXT")
+
             # Prepare data for insertion
             pdb_analysis_json = json.dumps(analysis, indent=2)
             chains_str = ','.join(analysis['chains'])
+            
+            renumbering_dict_json = json.dumps(renumbering_dict or {})
 
             # Prompt for notes
             try:
@@ -5214,37 +5227,13 @@ except Exception as e:
                 print("\n   ⚠️  Note entry cancelled. Using empty note.")
                 notes = ""
 
-            # # Insert or update receptor entry
-            # cursor.execute('''
-            #     INSERT OR REPLACE INTO pdb_templates (
-            #         pdb_template_name, pdb_model_name, project_name, original_pdb_path, processed_pdb_path, checked_pdb_path,
-            #         template_folder_path, pdb_analysis, chains, resolution, atom_count,
-            #         has_ligands, status, notes
-            #     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            # ''', (
-            #     pdb_template_name,
-            #     pdb_model_name,
-            #     self.name,
-            #     original_pdb_path,
-            #     processed_pdb_path,
-            #     checked_pdb_path,
-            #     pdb_template_folder,
-            #     pdb_analysis_json,
-            #     chains_str,
-            #     analysis.get('resolution'),
-            #     analysis['atom_count'],
-            #     analysis['has_ligands'],
-            #     'created',
-            #     notes if notes is not None else f"PDB model created from PDB file: {os.path.basename(original_pdb_path)}"
-            # ))
-
             # Insert receptor entry
             cursor.execute('''
                 INSERT INTO pdb_templates (
                     pdb_template_name, pdb_model_name, project_name, original_pdb_path, processed_pdb_path, checked_pdb_path,
                     template_folder_path, pdb_analysis, chains, resolution, atom_count,
-                    has_ligands, status, notes
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    has_ligands, renumbering_dict, status, notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 pdb_template_name,
                 pdb_model_name,
@@ -5258,6 +5247,7 @@ except Exception as e:
                 analysis.get('resolution'),
                 analysis['atom_count'],
                 analysis['has_ligands'],
+                renumbering_dict_json,
                 'created',
                 notes if notes is not None else f"PDB model created from PDB file: {os.path.basename(original_pdb_path)}"
             ))
@@ -5281,6 +5271,7 @@ except Exception as e:
                 'template_folder_path': pdb_template_folder,
                 'database_path': pdbs_db_path,
                 'pdb_analysis': analysis,
+                'renumbering_dict': renumbering_dict,
                 'created_date': datetime.now().isoformat(),
                 'notes': notes
             }
@@ -8425,7 +8416,7 @@ quit
             '_atom_site': moldf_df
         }
         
-        return receptor_moldf_dict
+        return receptor_moldf_dict, renumbering_dict
         
     def _add_element_column_to_pdb_file(self, tleap_processed_file):
         
@@ -8626,10 +8617,14 @@ quit
                 # Extract residue name and number from crystallographic file
                 cryst_res_name = line[17:20].strip()
                 cryst_res_num = int(line[22:26].strip())
-                key = f"{cryst_res_name}_{cryst_res_num}"
-                if key not in crystal_key_list:
-                    crystal_key_list.append(key)
-
+                chain_id = line[21].strip()
+                if chain_id == '': # No chain id mapping
+                    crystal_key = f"{cryst_res_name}{cryst_res_num}"
+                else: # Map chain ID since info present in pdb file   
+                    crystal_key = f"{cryst_res_name}{cryst_res_num}_{chain_id}"
+                if crystal_key not in crystal_key_list:
+                    crystal_key_list.append(crystal_key)
+                    
         # Construct a list of keys corresponding the tleap renumbered sequence
         tleap_key_list = []
         for line in minimized_lines:
@@ -8637,13 +8632,23 @@ quit
                 # Extract residue name and number from crystallographic file
                 tleap_res_name = line[17:20].strip()
                 tleap_res_num = int(line[22:26].strip())
-                key = f"{tleap_res_name}_{tleap_res_num}"
-                if key not in tleap_key_list:
-                    tleap_key_list.append(key)
+                tleap_key = f"{tleap_res_name}{tleap_res_num}"
+                
+                if tleap_key not in tleap_key_list:
+                    tleap_key_list.append(tleap_key)
 
+        
+        # Check if both lists are of the same length. They should
+        
+        if len(tleap_key_list) != len(crystal_key_list):
+            print("   ⚠️  Warning: The number of residues in the tleap processed file does not match the number of residues in the crystallographic file.")
+            print(f"       Tleap residues: {len(tleap_key_list)}, Crystallographic residues: {len(crystal_key_list)}")
+            print("       Cannot continue. Stopping.")    
+            sys.exit(1)
+        
         # Create a dictionary matching the residue numbers between both lists
         renumbering_dict = dict(zip(tleap_key_list, crystal_key_list))
-
+        
         return renumbering_dict
 
     def _renumber_minimized_pdb_file(self, minimized_pdb_file, renumbering_dict):
