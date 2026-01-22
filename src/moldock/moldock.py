@@ -3822,9 +3822,6 @@ except Exception as e:
                 if verbose:
                     self._display_pdb_analysis(pdb_analysis)
                 
-                
-                
-                
                 # Step 7: Create receptors directory structure
                 receptors_base_dir = os.path.join(self.path, 'docking', 'receptors')
                 os.makedirs(receptors_base_dir, exist_ok=True)
@@ -5186,7 +5183,7 @@ except Exception as e:
                 CREATE TABLE IF NOT EXISTS pdb_templates (
                     pdb_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     pdb_template_name TEXT UNIQUE NOT NULL,
-                    pdb_model_name TEXT UNIQUE NOT NULL,
+                    pdb_model_name TEXT NOT NULL,
                     project_name TEXT,
                     original_pdb_path TEXT NOT NULL,
                     processed_pdb_path TEXT NOT NULL,
@@ -5208,36 +5205,6 @@ except Exception as e:
             pdb_analysis_json = json.dumps(analysis, indent=2)
             chains_str = ','.join(analysis['chains'])
 
-            # Check for identical registry (excluding 'notes')
-            cursor.execute('''
-                SELECT pdb_id, pdb_template_name, pdb_model_name, project_name, original_pdb_path, processed_pdb_path, checked_pdb_path,
-                       template_folder_path, pdb_analysis, chains, resolution, atom_count, has_ligands, status
-                FROM pdb_templates
-            ''')
-            new_entry = (
-                pdb_template_name,
-                pdb_model_name,
-                self.name,
-                original_pdb_path,
-                processed_pdb_path,
-                checked_pdb_path,
-                pdb_template_folder,
-                pdb_analysis_json,
-                chains_str,
-                analysis.get('resolution'),
-                analysis['atom_count'],
-                analysis['has_ligands'],
-                'created'
-            )
-            for row in cursor.fetchall():
-                # Compare all fields except notes, created_date, last_modified, and pdb_id
-                existing_entry = row[1:13]  # skip pdb_id
-                if existing_entry == new_entry:
-                    print(f"⚠️  An identical receptor registry already exists (PDB name: {row[1]}).")
-                    print("   No new registry will be created.")
-                    conn.close()
-                    return None
-
             # Prompt for notes
             try:
                 notes = input("Enter a note for this receptor template (Enter: empty note): ").strip()
@@ -5247,9 +5214,33 @@ except Exception as e:
                 print("\n   ⚠️  Note entry cancelled. Using empty note.")
                 notes = ""
 
-            # Insert or update receptor entry
+            # # Insert or update receptor entry
+            # cursor.execute('''
+            #     INSERT OR REPLACE INTO pdb_templates (
+            #         pdb_template_name, pdb_model_name, project_name, original_pdb_path, processed_pdb_path, checked_pdb_path,
+            #         template_folder_path, pdb_analysis, chains, resolution, atom_count,
+            #         has_ligands, status, notes
+            #     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            # ''', (
+            #     pdb_template_name,
+            #     pdb_model_name,
+            #     self.name,
+            #     original_pdb_path,
+            #     processed_pdb_path,
+            #     checked_pdb_path,
+            #     pdb_template_folder,
+            #     pdb_analysis_json,
+            #     chains_str,
+            #     analysis.get('resolution'),
+            #     analysis['atom_count'],
+            #     analysis['has_ligands'],
+            #     'created',
+            #     notes if notes is not None else f"PDB model created from PDB file: {os.path.basename(original_pdb_path)}"
+            # ))
+
+            # Insert receptor entry
             cursor.execute('''
-                INSERT OR REPLACE INTO pdb_templates (
+                INSERT INTO pdb_templates (
                     pdb_template_name, pdb_model_name, project_name, original_pdb_path, processed_pdb_path, checked_pdb_path,
                     template_folder_path, pdb_analysis, chains, resolution, atom_count,
                     has_ligands, status, notes
