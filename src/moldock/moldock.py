@@ -5229,41 +5229,35 @@ except Exception as e:
                 print("\n   ⚠️  Note entry cancelled. Using empty note.")
                 notes = ""
 
-            # Insert receptor entry
-            cursor.execute('''
-                INSERT INTO pdb_templates (
-                    pdb_template_name, pdb_model_name, project_name, original_pdb_path, processed_pdb_path, checked_pdb_path,
-                    template_folder_path, pdb_analysis, chains, resolution, atom_count,
-                    has_ligands, renumbering_dict, status, notes
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                pdb_template_name,
-                pdb_model_name,
-                self.name,
-                original_pdb_path,
-                processed_pdb_path,
-                checked_pdb_path,
-                pdb_template_folder,
-                pdb_analysis_json,
-                chains_str,
-                analysis.get('resolution'),
-                analysis['atom_count'],
-                analysis['has_ligands'],
-                renumbering_dict_json,
-                'created',
-                notes if notes is not None else f"PDB model created from PDB file: {os.path.basename(original_pdb_path)}"
-            ))
+            ### Insert dynamically the correspond data into the table
+            
+            # Prepare data values dictionary (excluding auto-generated columns)
+            data_dict = {
+                'pdb_template_name': pdb_template_name,
+                'pdb_model_name': pdb_model_name,
+                'project_name': self.name,
+                'original_pdb_path': original_pdb_path,
+                'processed_pdb_path': processed_pdb_path,
+                'checked_pdb_path': checked_pdb_path,
+                'template_folder_path': pdb_template_folder,
+                'pdb_analysis': pdb_analysis_json,
+                'chains': chains_str,
+                'resolution': analysis.get('resolution'),
+                'atom_count': analysis['atom_count'],
+                'has_ligands': analysis['has_ligands'],
+                'renumbering_dict': renumbering_dict_json,
+                'status': 'created',
+                'notes': notes if notes else "No notes associated.",
+            }
 
-            pdb_id = cursor.lastrowid or cursor.execute(
-                "SELECT pdb_id FROM pdb_templates WHERE pdb_template_name = ? AND pdb_model_name = ?", 
-                (pdb_template_name, pdb_model_name)
-            ).fetchone()[0]
+            # Insert data dynamically into the corresponding table
+            template_id =self._insert_data_dinamically_into_table(cursor, "pdb_templates", data_dict) 
 
             conn.commit()
             conn.close()
 
             return {
-                'pdb_id': pdb_id,
+                'pdb_id': template_id,
                 'pdb_name': pdb_template_name,
                 'pdb_model_name': pdb_model_name,
                 'project_name': self.name,
@@ -10342,3 +10336,38 @@ quit
             except:
                 pass
             raise
+        
+        
+    def _insert_data_dinamically_into_table(self, cursor: sqlite3.Cursor, table_name: str, data_dict: Dict[str, Any]) -> None:
+        """
+        Insert data dynamically into a database table.
+        Args:
+            cursor (sqlite3.Cursor): Database cursor for executing SQL commands
+            table_name (str): Name of the table to insert data into 
+            data (Dict[str, Any]): Dictionary mapping column names to their values
+                                      Example: {'pdb_template_name': 'template1', 'pdb_model_name':
+                                        'model1', 'project_name': 'MyProject'}  
+        """
+
+        # Build dynamic INSERT statement (excluding auto-increment and timestamp columns)
+        insert_columns = [col for col in data_dict.keys()]
+        placeholders = ', '.join(['?' for _ in insert_columns])
+        columns_str = ', '.join(insert_columns)
+        values_tuple = tuple(data_dict[col] for col in insert_columns)
+
+        # Insert receptor entry using dynamic column list
+        cursor.execute(f'''
+        INSERT INTO pdb_templates ({columns_str})
+        VALUES ({placeholders})
+        ''', values_tuple)
+
+        # Retrieve the pdb_id of the newly inserted record
+        pdb_template_name = data_dict.get('pdb_template_name', None)
+        pdb_model_name = data_dict.get('pdb_model_name', None)
+
+        template_id = cursor.lastrowid or cursor.execute(
+            f"SELECT pdb_id FROM {table_name} WHERE pdb_template_name = ? AND pdb_model_name = ?", 
+            (pdb_template_name, pdb_model_name)
+        ).fetchone()[0]
+
+        return template_id
