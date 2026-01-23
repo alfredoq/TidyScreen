@@ -8838,10 +8838,11 @@ quit
                     print(f"Error retrieving renumbering_dict for template '{template_name}': {e}")
             
             # Generate a full size dataframe based on all crystal residues and requested interactions
-            full_size_df = self._create_full_size_interactions_df(prolif_params_dict, renumbering_dict)
+            if prolif:
+                full_size_df = self._create_full_size_interactions_df(prolif_params_dict, renumbering_dict)
 
-            # Store the full_size_df in the assay database for posterior processing
-            self._store_full_size_interactions_df_in_db(full_size_df, results_db)
+                # Store the full_size_df in the assay database for posterior processing
+                self._store_full_size_interactions_df_in_db(full_size_df, results_db)
 
             # Compute the requested fingerprints
             if prolif == True:
@@ -8863,7 +8864,13 @@ quit
 
             if mmbgsa == True:
                 print("I will compute MMGBSA FPS")
-        
+
+                ## Compute MMGBSA binding energy
+                complex_prmtop, receptor_prmtop, ligand_prmtop = self._prepare_mmgbsa_files(ligname, pose_id, prmtop_file, output_dir)
+
+                self._compute_mmgbsa_fingerprint(ligname, pose_id, complex_prmtop, receptor_prmtop, ligand_prmtop, min_rst_cpptraj_file, output_dir)
+            
+            # Add processed ligand to list
             processed_ligands.append(ligname)
     
         # After iterating through all ligands, reconstruct the corresponding dataframes and output a .csv file
@@ -10320,3 +10327,55 @@ quit
             conn.close()
         except Exception as e:
             print(f"\n❌ Error reconstructing ProLIF fingerprints dataframe from database: {e}")
+
+
+    def _prepare_mmgbsa_files(self, ligname, pose_id, prmtop_file, output_dir):
+
+        import subprocess
+
+        complex_prmtop = f"{output_dir}/{ligname}_{pose_id}_complex.prmtop"
+        receptor_prmtop = f"{output_dir}/{ligname}_{pose_id}_receptor.prmtop"
+        ligand_prmtop = f"{output_dir}/{ligname}_{pose_id}_ligand.prmtop"
+
+        ante_mmpbsa_command = f"ante-MMPBSA.py -p {prmtop_file} -s :NAN -c {complex_prmtop} -r {receptor_prmtop} -l {ligand_prmtop} -n :UNL"
+
+        try:
+            subprocess.run(ante_mmpbsa_command, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print(f"\n✅ MMPBSA prmtop files created successfully in '{output_dir}'")
+        except subprocess.CalledProcessError as e:  
+            print(f"\n❌ Error creating MMPBSA prmtop files: {e}")
+
+        return complex_prmtop, receptor_prmtop, ligand_prmtop
+
+    def _compute_mmgbsa_fingerprint(self, ligname, pose_id, complex_prmtop, receptor_prmtop, ligand_prmtop, min_rst_cpptraj_file, output_dir):
+        import subprocess
+
+        # Create MMPBSA input file
+        mmgbsa_in_file = os.path.join(output_dir, "mmgbsa.in")
+        with open(mmgbsa_in_file, 'w') as f:
+            f.write("""MMPBSA.py Input file for binding energy calculation
+        &general
+           startframe=1, endframe=1, interval=1,
+        /
+        &gb
+           igb=5, saltcon=0.100,
+        /
+        &decomp
+           idecomp=2, csv_format=0,
+        /
+        """)
+
+        # Execute MMPBSA.py
+
+        output_file = f"{output_dir}/{ligname}_{pose_id}_mmgbsa.out"
+        output_decomp_file = f"{output_dir}/{ligname}_{pose_id}_mmgbsa_decomp.out"
+
+        mmgbsa_command = f"MMPBSA.py -O -i {mmgbsa_in_file} -cp {complex_prmtop} -rp {receptor_prmtop} -lp {ligand_prmtop} -y {min_rst_cpptraj_file} -o {output_file} -do {output_decomp_file}"
+
+        try:
+            subprocess.run(mmgbsa_command, shell=True, check=True, cwd=output_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print(f"\n✅ MMGBSA binding energy computed successfully, results saved to '{output_file}' \n and \n '{output_decomp_file}'")
+        except subprocess.CalledProcessError as e:  
+            print(f"\n❌ Error computing MMGBSA binding energy: {e}")
+
+
