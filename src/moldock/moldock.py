@@ -10244,17 +10244,30 @@ quit
             fps_json = fps_df.to_json(orient='split')
             conn = sqlite3.connect(results_db)
             cursor = conn.cursor()
-            # Create a table if it doesn't exist
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS processed_prolif_fps_json (
-                    pose_id INTEGER PRIMARY KEY,
-                    data TEXT NOT NULL
-                )
-            ''')
-            # Insert the JSON string
-            cursor.execute('''
-                INSERT INTO processed_prolif_fps_json (pose_id, data) VALUES (?, ?)
-            ''', (pose_id, fps_json))
+            
+            
+            columns_dict = {
+                'pose_id': 'INTEGER PRIMARY KEY',
+                'data': 'TEXT NOT NULL'
+            }
+            
+            # Use a dedicated method to create the table if it doesn't exist
+            self._create_table_from_columns_dict(cursor, 'processed_prolif_fps_json', columns_dict)
+            
+            # Update legacy databases to add missing columns
+            self._update_legacy_table_columns(cursor, 'processed_prolif_fps_json', columns_dict)
+            
+            # Remove deprecated columns
+            self._remove_legacy_table_columns(cursor, 'processed_prolif_fps_json', columns_dict)
+            
+            data_dict = {
+                'pose_id': pose_id,
+                'data': fps_json
+            }
+            
+            # Insert data dynamically into the table
+            self._insert_data_dinamically_into_table(cursor, 'processed_prolif_fps_json', data_dict)
+            
             conn.commit()
             conn.close()
         
