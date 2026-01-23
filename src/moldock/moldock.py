@@ -9966,7 +9966,7 @@ quit
         
         return selection_dict
         
-    def _create_table_from_columns_dict(self, cursor: sqlite3.Cursor, table_name: str, columns_dict: dict) -> None:
+    def _create_table_from_columns_dict(self, cursor: sqlite3.Cursor, table_name: str, columns_dict: dict, verbose=True) -> None:
         """
         Create a database table dynamically from a columns dictionary.
         
@@ -9993,7 +9993,9 @@ quit
             """
             
             cursor.execute(create_table_sql)
-            print(f"   ✅ Table '{table_name}' created/verified with {len(columns_dict)} columns")
+            
+            if verbose:
+                print(f"   ✅ Table '{table_name}' created/verified with {len(columns_dict)} columns")
             
         except sqlite3.Error as e:
             print(f"   ❌ Error creating table '{table_name}': {e}")
@@ -10252,13 +10254,13 @@ quit
             }
             
             # Use a dedicated method to create the table if it doesn't exist
-            self._create_table_from_columns_dict(cursor, 'processed_prolif_fps_json', columns_dict)
+            self._create_table_from_columns_dict(cursor, 'processed_prolif_fps_json', columns_dict, verbose=False)
             
             # Update legacy databases to add missing columns
-            self._update_legacy_table_columns(cursor, 'processed_prolif_fps_json', columns_dict)
+            self._update_legacy_table_columns(cursor, 'processed_prolif_fps_json', columns_dict, verbose=False)
             
             # Remove deprecated columns
-            self._remove_legacy_table_columns(cursor, 'processed_prolif_fps_json', columns_dict)
+            self._remove_legacy_table_columns(cursor, 'processed_prolif_fps_json', columns_dict,Verbose=False)
             
             data_dict = {
                 'pose_id': pose_id,
@@ -10286,10 +10288,13 @@ quit
             ''')
             records = cursor.fetchall()
             fps_dfs = []
+            poses_ids = []
             for pose_id, fps_json in records:
                 # Reconstruct DataFrame from JSON
                 fps_df = pd.read_json(StringIO(fps_json), orient='split')
                 fps_dfs.append(fps_df)
+                poses_ids.append(pose_id)
+                
             
             # Merge all FPS DataFrames into one
             if fps_dfs:
@@ -10299,7 +10304,11 @@ quit
                 warnings.filterwarnings("ignore", message="Downcasting object dtype arrays on .fillna")
 
                 complete_fps_df = complete_fps_df.fillna(False).infer_objects(copy=False).astype(bool)
-
+                
+                ## append poses ids as first column
+                complete_fps_df.insert(0, 'pose_id', poses_ids)
+                
+                
             else:
                 complete_fps_df = pd.DataFrame()
                 print("\n❌ No FPS DataFrames to merge.")
@@ -10321,13 +10330,13 @@ quit
             # Fill NaN values with False, then convert to boolean
             merged_df = merged_df.fillna(False).astype(bool)
 
-            # Add pose_id column as the first column with incremental integers
+            # # Add pose_id column as the first column with incremental integers
 
-            complete_fps_df.insert(0, 'pose_id', range(1, len(complete_fps_df) + 1))
+            # complete_fps_df.insert(0, 'pose_id', range(1, len(complete_fps_df) + 1))
             
-            # Extract pose_id from complete_fps_df and add to merged_df as first column
-            pose_ids = complete_fps_df['pose_id'].values
-            merged_df = pd.concat([pd.DataFrame({'pose_id': pose_ids}), merged_df], axis=1)
+            # # Extract pose_id from complete_fps_df and add to merged_df as first column
+            # pose_ids = complete_fps_df['pose_id'].values
+            # merged_df = pd.concat([pd.DataFrame({'pose_id': pose_ids}), merged_df], axis=1)
 
             # Output to CSV
             assay_path = assay_info.get('assay_folder_path', None)
