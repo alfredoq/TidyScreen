@@ -8734,7 +8734,7 @@ quit
         else:
             print("   ✅ Charge methods are consistent between receptor and ligands.")
     
-    def compute_fingerprints(self):
+    def compute_fingerprints(self, minimize=True):
         """
         Will compute the ProLIF fingerprints for all docked ligands in a given assay. 
         """
@@ -8816,8 +8816,11 @@ quit
             # Create complex .prmtop and .inpcrd files
             prmtop_file, inpcrd_file = self._prepare_complex_prmtop_inpcrd(mol2_file, frcmod_file, assay_info, output_dir, output_file)
 
-            # Minimize complex
-            min_rst_cpptraj_file = self._minimize_complex(prmtop_file, inpcrd_file, output_dir, ligname, pose_id)
+
+            if minimize:
+                # Minimize complex
+                min_rst_cpptraj_file = self._minimize_complex(prmtop_file, inpcrd_file, output_dir, ligname, pose_id)
+                inpcrd_file = min_rst_cpptraj_file # Set the file to the minimized one for further processing
 
             # Retrieve renumbering_dict and rename df columns
             template_name = assay_info.get('receptor_info', None).get('template_name', None)
@@ -8848,7 +8851,7 @@ quit
             if prolif == True:
                 
                 ## Will compute and process the structure of the resulting ProLIF dataframe
-                fps_df = self._compute_prolif_fingerprints(prmtop_file, min_rst_cpptraj_file, pose_id, results_db, prolif_params_dict)
+                fps_df = self._compute_prolif_fingerprints(prmtop_file, inpcrd_file, pose_id, results_db, prolif_params_dict)
                 
                 # Flatten the MultiIndex columns by removing the first level
                 fps_df.columns = fps_df.columns.droplevel(0)
