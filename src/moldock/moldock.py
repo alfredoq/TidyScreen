@@ -8734,7 +8734,7 @@ quit
         else:
             print("   ✅ Charge methods are consistent between receptor and ligands.")
     
-    def compute_fingerprints(self, minimize=True):
+    def compute_fingerprints(self, minimize=True, clean_files=True):
         """
         Will compute the ProLIF fingerprints for all docked ligands in a given assay. 
         """
@@ -8776,7 +8776,6 @@ quit
             else:
                 print("Invalid selection. Please enter 1, 2, or 3.")
         
-        
         if assay_id is None:
             return None
 
@@ -8792,13 +8791,23 @@ quit
             conn.close()
         except Exception as e:
             print(f"❌ Error retrieving Pose_ID and LigName from Results table: {e}")
+            return None
+        
+        # If ProLIF requested, check if the final table already exists
+        if prolif:
+            print("I will compute ProLIF FPS")
+            # Check already existing fingerprints tables in the database
+            self._check_table_in_db(results_db, "processed_prolif_fps_json")
+        if mmbgsa:
+            print("I will compute MMGBSA FPS")
+            # Check already existing fingerprints tables in the database
+            self._check_table_in_db(results_db, "processed_mmgbsa_decomposition_json")
         
         ## Loop over dataframe to process each docked pose
         processed_ligands = []
         
         ## If ProLIF fingerprints are requested, retrieve the computation parameters
         if prolif == True:
-            print("I will compute ProLIF FPS")
             prolif_params_dict = self._get_prolif_params()
 
         for idx, row in df.iterrows():
@@ -8866,20 +8875,37 @@ quit
                 self._store_processed_fps_df_in_db(fps_df, pose_id, results_db)
 
             if mmbgsa == True:
-                print("I will compute MMGBSA FPS")
 
                 ## Compute MMGBSA binding energy
                 complex_prmtop, receptor_prmtop, ligand_prmtop = self._prepare_mmgbsa_files(ligname, pose_id, prmtop_file, output_dir)
 
                 self._compute_mmgbsa_fingerprint(ligname, pose_id, complex_prmtop, receptor_prmtop, ligand_prmtop, min_rst_cpptraj_file, output_dir)
             
+                # Parse MMGBSA decomposition original output
+                df = self._parse_mmgbsa_decomposition_output(ligname, pose_id, output_dir)
+            
+                # Renumber the residue numbers to match the crystal numbering
+                df['residue'] = df['residue'].apply(lambda x: renumbering_dict.get(x, x))
+            
+                # Store the processed mmgbsa df in the assay database for posterior processing
+                self._store_processed_mmgbsa_df_in_db(df, pose_id, results_db)
+                
+            
+            
             # Add processed ligand to list
             processed_ligands.append(ligname)
     
-        # After iterating through all ligands, reconstruct the corresponding dataframes and output a .csv file
+        # After iterating through all ligands, reconstruct the corresponding ProLIF dataframes and output a .csv file
         
         if prolif:
             self._reconstruct_and_output_prolif_fps_dataframe(results_db, assay_info)
+            
+        if clean_files:    
+            # Finally delte output_dir containing all temporary files
+            print(f"\n🧹 Cleaning up temporary files in {output_dir}...")
+            import shutil
+            shutil.rmtree(output_dir, ignore_errors=True)
+            print("✅ Temporary files cleaned up.")
             
     def _restore_single_docked_pose(self, results_db, ligname, pose_id):
         """
@@ -9222,6 +9248,8 @@ quit
         import prolif as plf
         import MDAnalysis as mda
 
+        print("Computing ProLIF Fingerprints")
+
         interactions_list = prolif_params_dict['interactions_list']
 
         interactions_parameters_dict = prolif_params_dict.get('interaction_parameters', {})
@@ -9237,7 +9265,7 @@ quit
         # Define all available interaction for computation
         fp = plf.Fingerprint(interactions_list, parameters=interactions_parameters_dict)
         # Compute the fingerprints
-        print("Computing ProLIF Fingerprints")
+        
         fp.run_from_iterable([ligand_mol], protein_mol,progress=False)
         # Generate the fingerprints dataframe
         fps_df = fp.to_dataframe()
@@ -10001,7 +10029,7 @@ quit
             print(f"   ❌ Error creating table '{table_name}': {e}")
             raise
         
-    def _update_legacy_table_columns(self, cursor: sqlite3.Cursor, table_name: str, columns_dict: dict) -> None:
+    def _update_legacy_table_columns(self, cursor: sqlite3.Cursor, table_name: str, columns_dict: dict, verbose=True) -> None:
         """
         Update legacy database tables by adding missing columns based on columns_dict reference.
         
@@ -10033,10 +10061,12 @@ quit
             missing_columns = set(columns_dict.keys()) - existing_columns
             
             if not missing_columns:
-                print(f"   ✅ Table '{table_name}' is up to date - no missing columns")
-                return
+                if verbose:
+                    print(f"   ✅ Table '{table_name}' is up to date - no missing columns")
+                    return
             
-            print(f"   🔄 Updating legacy table '{table_name}' - adding {len(missing_columns)} missing column(s)")
+            if verbose:
+                print(f"   🔄 Updating legacy table '{table_name}' - adding {len(missing_columns)} missing column(s)")
             
             # Add each missing column
             for col_name in missing_columns:
@@ -10048,13 +10078,14 @@ quit
                 except sqlite3.Error as e:
                     print(f"      ⚠️  Could not add column '{col_name}': {e}")
             
-            print(f"   ✅ Legacy table '{table_name}' updated successfully")
+            if verbose:
+                print(f"   ✅ Legacy table '{table_name}' updated successfully")
             
         except sqlite3.Error as e:
             print(f"   ❌ Error updating legacy table '{table_name}': {e}")
             raise
         
-    def _remove_legacy_table_columns(self, cursor: sqlite3.Cursor, table_name: str, columns_dict: dict) -> None:
+    def _remove_legacy_table_columns(self, cursor: sqlite3.Cursor, table_name: str, columns_dict: dict, verbose=True) -> None:
         """
         Remove legacy columns from database tables that are no longer in the columns_dict reference.
         
@@ -10095,11 +10126,13 @@ quit
             columns_to_remove = existing_columns - set(columns_dict.keys())
             
             if not columns_to_remove:
-                print(f"   ✅ Table '{table_name}' has no extra columns to remove")
+                if verbose:
+                    print(f"   ✅ Table '{table_name}' has no extra columns to remove")
                 return
             
-            print(f"   🗑️  Removing {len(columns_to_remove)} legacy column(s) from '{table_name}'")
-            print(f"      Columns to remove: {', '.join(sorted(columns_to_remove))}")
+            if verbose:
+                print(f"   🗑️  Removing {len(columns_to_remove)} legacy column(s) from '{table_name}'")
+                print(f"      Columns to remove: {', '.join(sorted(columns_to_remove))}")
             
             # Confirm destructive operation
             print(f"   ⚠️  WARNING: This will permanently delete column data!")
@@ -10180,7 +10213,7 @@ quit
 
         # Insert receptor entry using dynamic column list
         cursor.execute(f'''
-        INSERT INTO pdb_templates ({columns_str})
+        INSERT INTO {table_name} ({columns_str})
         VALUES ({placeholders})
         ''', values_tuple)
 
@@ -10260,7 +10293,7 @@ quit
             self._update_legacy_table_columns(cursor, 'processed_prolif_fps_json', columns_dict, verbose=False)
             
             # Remove deprecated columns
-            self._remove_legacy_table_columns(cursor, 'processed_prolif_fps_json', columns_dict,Verbose=False)
+            self._remove_legacy_table_columns(cursor, 'processed_prolif_fps_json', columns_dict,verbose=False)
             
             data_dict = {
                 'pose_id': pose_id,
@@ -10366,7 +10399,7 @@ quit
 
         try:
             subprocess.run(ante_mmpbsa_command, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            print(f"\n✅ MMPBSA prmtop files created successfully in '{output_dir}'")
+            #print(f"\n✅ MMPBSA prmtop files created successfully in '{output_dir}'")
         except subprocess.CalledProcessError as e:  
             print(f"\n❌ Error creating MMPBSA prmtop files: {e}")
 
@@ -10374,6 +10407,8 @@ quit
 
     def _compute_mmgbsa_fingerprint(self, ligname, pose_id, complex_prmtop, receptor_prmtop, ligand_prmtop, min_rst_cpptraj_file, output_dir):
         import subprocess
+
+        print("Computing MMGBSA Fingerprints")
 
         # Create MMPBSA input file
         mmgbsa_in_file = os.path.join(output_dir, "mmgbsa.in")
@@ -10399,8 +10434,149 @@ quit
 
         try:
             subprocess.run(mmgbsa_command, shell=True, check=True, cwd=output_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            print(f"\n✅ MMGBSA binding energy computed successfully, results saved to '{output_file}' \n and \n '{output_decomp_file}'")
+            #print(f"\n✅ MMGBSA binding energy computed successfully, results saved to '{output_file}' \n and \n '{output_decomp_file}'")
         except subprocess.CalledProcessError as e:  
             print(f"\n❌ Error computing MMGBSA binding energy: {e}")
 
 
+    def _parse_mmgbsa_decomposition_output(self, ligname, pose_id, output_dir): # This will work for the running workflow
+    #def parse_mmgbsa_decomposition_output(self, filename): # bypass to work with a file path
+        import pandas as pd
+        import re   
+        output_decomp_file = f"{output_dir}/{ligname}_{pose_id}_mmgbsa_decomp.out" # This will work for the running workflow
+        #output_decomp_file = filename
+        
+        try:
+            with open(output_decomp_file, 'r') as f:
+                lines = f.readlines()
+            # Find the start and end of the decomposition table
+            start_idx = None
+            end_idx = None
+            for i, line in enumerate(lines):
+                
+                starting_pattern = r"Residue\s+\|\s+Location\s+\|\s+Internal\s+\|\s+van der Waals\s+\|\s+Electrostatic\s+\|\s+Polar Solvation\s+\|\s+Non-Polar Solv\.\s+\|\s+TOTAL"
+                if re.match(starting_pattern, line):
+                    start_idx = i + 2  # Skip header lines
+                elif start_idx is not None and line.strip() == '':
+                    end_idx = i
+                    break
+            if start_idx is None or end_idx is None:
+                print(f"\n❌ Could not find decomposition table in '{output_decomp_file}'")
+                return pd.DataFrame()
+            # Parse the table into a DataFrame
+            data = []
+            for line in lines[start_idx:end_idx]:
+                parts = line.split()
+                if len(parts) >= 8:
+                    residue_id = parts[3] # This refers to either 'R' (receptor) or 'L' (ligand)
+                    resname = parts[4]
+                    resnumber = parts[5]
+                    vdw = float(parts[11])
+                    ele = float(parts[15])
+                    pol_solv = float(parts[19])
+                    nonpol_solv = float(parts[23])
+                    total = float(parts[27])
+                    reskey = f"{resname}{resnumber}"
+                    
+                    # Rename WAT residues to HOH for consistency
+                    if resname == 'WAT':
+                        reskey = f"HOH{resnumber}"
+                        
+                    # Skip data addition if corresponds to ligand residue
+                    if residue_id == 'L':
+                        continue
+                    
+                    data.append({
+                        'residue': reskey,
+                        'vdw': vdw,
+                        'ele': ele,
+                        'polar_solvation': pol_solv,
+                        'nonpolar_solvation': nonpol_solv,
+                        'total': total
+                    })
+                    
+
+            df = pd.DataFrame(data)
+            
+            return df
+        
+        except Exception as e:
+            print(f"\n❌ Error parsing MMGBSA decomposition output: {e}")
+            return pd.DataFrame()
+        
+        
+    def _store_processed_mmgbsa_df_in_db(self, df, pose_id, results_db):
+        
+        import sqlite3
+        import json
+        try:
+            # Convert DataFrame to JSON string
+            mmgbsa_json = df.to_json(orient='split')
+            conn = sqlite3.connect(results_db)
+            cursor = conn.cursor()
+            
+            # Dynamic columns dictionary
+            columns_dict = {
+                'pose_id': 'INTEGER PRIMARY KEY',
+                'data': 'TEXT NOT NULL'
+            }
+            
+            # Use a dedicated method to create the table if it doesn't exist
+            self._create_table_from_columns_dict(cursor, 'processed_mmgbsa_decomposition_json', columns_dict, verbose=False)    
+            
+            # Update legacy databases to add missing columns
+            self._update_legacy_table_columns(cursor, 'processed_mmgbsa_decomposition_json', columns_dict, verbose=False)
+            
+            # Remove deprecated columns
+            self._remove_legacy_table_columns(cursor, 'processed_mmgbsa_decomposition_json', columns_dict, verbose=False)
+            
+            data_dict = {
+                'pose_id': pose_id,
+                'data': mmgbsa_json
+            }
+            
+            #Insert data dynamically into the table
+            self._insert_data_dinamically_into_table(cursor, 'processed_mmgbsa_decomposition_json', data_dict)
+            
+            conn.commit()
+            conn.close()
+            
+            
+        except Exception as e:
+            print(f"\n❌ Error storing processed MMGBSA decomposition dataframe as JSON in database: {e}")
+            
+            
+    def _check_table_in_db(self, db, table_name):
+        
+        import sqlite3
+        
+        conn = sqlite3.connect(db)
+        cursor = conn.cursor()
+        cursor.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table_name}';")
+        table_exists = cursor.fetchone() is not None
+        
+        if table_exists:
+            print(f"   ⚠️  Warning: {table_name} table already exists in the {db}.")
+            
+            while True:
+                        try:
+                            response = input("   Do you want to overwrite it? (y/n): ").strip().lower()
+                            if response in ['y', 'yes']:
+                                print(f"   ℹ️  Proceeding to overwrite existing {table_name} table.")
+                                # Delete existing table
+                                cursor.execute(f"DROP TABLE IF EXISTS {table_name};")
+                                conn.commit()
+                                conn.close()
+                                
+                                break
+                            
+                            elif response in ['n', 'no']:
+                                raise SystemExit("   ❌ Operation cancelled to avoid overwriting existing data.")
+                            
+                            else:
+                                print("   ❌ Please answer 'y' or 'n'")
+                                continue
+                            
+                        except KeyboardInterrupt:
+                            print("\n   ❌ Operation cancelled by user.")
+                            return False
