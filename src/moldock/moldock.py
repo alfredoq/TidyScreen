@@ -6874,6 +6874,9 @@ quit
                     input_model = self._parse_pdbqt_output(out_file)
                     self._add_input_model_in_db(results_db_file, input_model, out_file)
                     
+                # Connect to the processed Results table and remove '_out' string from 'LigName' column
+                self._clean_ligand_names_in_results_db(results_db_file)
+                    
             ## Clean the .dlg files is requested
             
             if clean_ligand_files:
@@ -7809,6 +7812,9 @@ quit
 
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
+
+
+        print(f"""SELECT L.input_model, R.ligand_coordinates FROM Ligands L JOIN Results R ON L.LigName = R.LigName WHERE R.Pose_ID = {pose_id} """)
 
         # Retrieve the info required to reconstruct the ligand pose
         cursor.execute("""
@@ -8827,7 +8833,6 @@ quit
             # Create complex .prmtop and .inpcrd files
             prmtop_file, inpcrd_file = self._prepare_complex_prmtop_inpcrd(mol2_file, frcmod_file, assay_info, output_dir, output_file)
 
-
             if minimize:
                 # Minimize complex
                 min_rst_cpptraj_file = self._minimize_complex(prmtop_file, inpcrd_file, output_dir, ligname, pose_id)
@@ -8916,6 +8921,7 @@ quit
 
         # Retrieve input_model and pose_coords_json
         input_model, pose_coords_json = self._retrieve_pose_info(results_db, pose_id)
+        
         pdb_dict = self._process_input_model_for_moldf(input_model, pose_coords_json)
 
         # Get the directory of the results_db (should be .../assay_x.db)
@@ -10440,7 +10446,6 @@ quit
         except subprocess.CalledProcessError as e:  
             print(f"\n❌ Error computing MMGBSA binding energy: {e}")
 
-
     def _parse_mmgbsa_decomposition_output(self, ligname, pose_id, output_dir): # This will work for the running workflow
     #def parse_mmgbsa_decomposition_output(self, filename): # bypass to work with a file path
         import pandas as pd
@@ -10506,7 +10511,6 @@ quit
             print(f"\n❌ Error parsing MMGBSA decomposition output: {e}")
             return pd.DataFrame()
         
-        
     def _store_processed_mmgbsa_df_in_db(self, df, pose_id, results_db):
         
         import sqlite3
@@ -10547,7 +10551,6 @@ quit
         except Exception as e:
             print(f"\n❌ Error storing processed MMGBSA decomposition dataframe as JSON in database: {e}")
             
-            
     def _check_table_in_db(self, db, table_name):
         
         import sqlite3
@@ -10585,3 +10588,28 @@ quit
                         except KeyboardInterrupt:
                             print("\n   ❌ Operation cancelled by user.")
                             return False
+                        
+    def _clean_ligand_names_in_results_db(self, results_db_file):
+        import sqlite3
+        try:
+            conn = sqlite3.connect(results_db_file)
+            cursor = conn.cursor()
+            
+            # Update LigName column in 'Results' table to remove '_out' suffix
+            cursor.execute("""
+                UPDATE Results
+                SET LigName = REPLACE(LigName, '_out', '')
+                WHERE LigName LIKE '%_out'
+            """)
+            conn.commit()
+            
+            # Update LigName column in 'Ligands' table to remove '_out' suffix
+            cursor.execute("""
+                UPDATE Ligands
+                SET LigName = REPLACE(LigName, '_out', '')
+                WHERE LigName LIKE '%_out'
+            """)
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"\n❌ Error cleaning ligand names in results database: {e}")
