@@ -6682,7 +6682,7 @@ quit
             cursor = conn.cursor()
             
             cursor.execute('''
-                SELECT id, model_name, pdb_id, pdb_name, pdb_to_convert, pdbqt_file, configs, notes
+                SELECT id, receptor_model_name, pdb_id, pdb_model_name, pdb_to_convert, pdbqt_file, configs, notes
                 FROM receptor_models
                 WHERE id = ?
             ''', (receptor_id,))
@@ -8008,6 +8008,8 @@ quit
         ## If 'vina' scoring function is to be applied, compute the maps once for batch docking
         if method_params['sf_name'] == 'vina':          
             vina_rec_object = self._prepare_vina_receptor(method_params, receptor_pdbqt_file, receptor_conditions)
+        elif method_params['sf_name'] == 'ad4':
+            vina_rec_object = None
 
         # Iterate and dock each compound
         for idx, (inchi_key, sdf_blob) in enumerate(compounds, 1):
@@ -8025,9 +8027,9 @@ quit
                 ## Generate the ligand.pdbqt file
                 ligand_pdbqt_filepath = f"{docking_results_dir}/{inchi_key}.pdbqt"
                 self._pdbqt_from_mol(mol, ligand_pdbqt_filepath, inchi_key, ligand_prep_parameters)
-
-                ## Execute vina
-                self._execute_vina(ligand_pdbqt_filepath, assay_registry, method_params, receptor_pdbqt_file, receptor_conditions, vina_rec_object=None)
+                
+                ## Execute vina using ad4 scoring function
+                self._execute_vina(ligand_pdbqt_filepath, assay_registry, method_params, receptor_pdbqt_file, receptor_conditions, vina_rec_object)
                 
                 if clean_ligand_files:
                     # Remove the temporary SDF and .pdbqt files
@@ -10554,6 +10556,9 @@ quit
         cursor = conn.cursor()
         cursor.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table_name}';")
         table_exists = cursor.fetchone() is not None
+        if not table_exists:
+            conn.close()
+            return
         
         if table_exists:
             print(f"   ⚠️  Warning: {table_name} table already exists in the {db}.")
