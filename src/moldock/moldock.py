@@ -430,6 +430,64 @@ class MolDock:
             print(f"❌ Error listing docking methods: {e}")
             return None
 
+    def delete_docking_method(self):
+        """
+        Delete a docking method registry from the database as created using the create_docking_method method
+        """
+        import sqlite3
+
+        docking_registers_dir = os.path.dirname(self.__docking_registers_db)
+        methods_db_path = os.path.join(docking_registers_dir, 'docking_methods.db')
+        
+        try:
+            if not os.path.exists(methods_db_path):
+                print(f"❌ Docking methods database not found at {methods_db_path}")
+                return
+
+            conn = sqlite3.connect(methods_db_path)
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, method_name FROM docking_methods")
+            methods = cursor.fetchall()
+
+            if not methods:
+                print("❌ No docking methods found in the database.")
+                conn.close()
+                return
+
+            print("\nAvailable Docking Methods:")
+            for idx, (method_id, method_name) in enumerate(methods, 1):
+                print(f"  {idx}. {method_name} (ID: {method_id})")
+
+            while True:
+                try:
+                    selection = input("\nEnter the number of the docking method to delete (or 'q' to cancel): ").strip()
+                    if selection.lower() == 'q':
+                        print("❌ Deletion cancelled by user.")
+                        conn.close()
+                        return
+                    selection = int(selection)
+                    if 1 <= selection <= len(methods):
+                        method_id = methods[selection - 1][0]
+                        break
+                    else:
+                        print(f"❌ Invalid selection. Choose a number between 1 and {len(methods)}.")
+                except ValueError:
+                    print("❌ Please enter a valid number or 'q' to cancel.")
+
+            confirm = input(f"⚠️  Are you sure you want to delete docking method ID {method_id}? (yes/no): ").strip().lower()
+            if confirm != 'yes':
+                print("❌ Deletion cancelled by user.")
+                conn.close()
+                return
+
+            cursor.execute("DELETE FROM docking_methods WHERE id = ?", (method_id,))
+            conn.commit()
+            print(f"✅ Docking method ID {method_id} deleted successfully.")
+            conn.close()
+        except Exception as e:
+            print(f"❌ Error deleting docking method: {e}")
+
+
     def list_docking_assays(self) -> Optional[List[Dict[str, Any]]]:
         """
         Read docking_assays.db under project path in the docking/docking_registers folder
@@ -1303,6 +1361,7 @@ class MolDock:
 
             ## Dock using Vina if selected    
             elif selected_method['docking_engine'] == 'Vina':
+                print(selected_method)
                 self._dock_table_with_vina(selected_table, selected_method, assay_registry, clean_ligand_files, receptor_info)
                 docking_mode = 'vina'
             else:
@@ -8738,7 +8797,7 @@ quit
         else:
             print("   ✅ Charge methods are consistent between receptor and ligands.")
     
-    def compute_fingerprints(self, minimize=True, clean_files=True):
+    def compute_fingerprints(self, minimize=True, clean_files=True, write_prolif=False, write_mmgbsa=False):
         """
         Will compute the ProLIF fingerprints for all docked ligands in a given assay. 
         """
@@ -8893,16 +8952,18 @@ quit
                 # Store the processed mmgbsa df in the assay database for posterior processing
                 self._store_processed_mmgbsa_df_in_db(df, pose_id, results_db)
                 
-            
-            
             # Add processed ligand to list
             processed_ligands.append(ligname)
     
         # After iterating through all ligands, reconstruct the corresponding ProLIF dataframes and output a .csv file
         
-        if prolif:
-            self._reconstruct_and_output_prolif_fps_dataframe(results_db, assay_info)
-            
+        if write_prolif:
+            self._write_prolif_fps(results_db, assay_info)
+        
+        if write_mmgbsa:
+            self._write_mmgbsa_fps(results_db, assay_info)
+
+
         if clean_files:    
             # Finally delte output_dir containing all temporary files
             print(f"\n🧹 Cleaning up temporary files in {output_dir}...")
@@ -10313,7 +10374,38 @@ quit
         except Exception as e:
             print(f"\n❌ Error storing processed FPS dataframe as JSON in database: {e}")   
             
-    def _reconstruct_and_output_prolif_fps_dataframe(self, results_db, assay_info):
+    def _write_prolif_fps(self, results_db, assay_info):
+        """
+        Reconstruct and write ProLIF fingerprint DataFrames from database to CSV files.
+        This method retrieves processed ProLIF fingerprint JSON entries and full-size 
+        interaction data from the results database, merges them into a single DataFrame, 
+        and exports the results to CSV files.
+        Parameters
+        ----------
+        results_db : str
+            Path to the SQLite database containing the processed fingerprint data.
+        assay_info : dict
+            Dictionary containing assay information, including 'assay_folder_path' 
+            which specifies the base directory for output files.
+        Returns
+        -------
+        None
+            Writes two CSV files to disk:
+            - prolif_fingerprints.csv: Merged full-size interactions and fingerprints
+            - prolif_fingerprints_serie.csv: Individual pose fingerprints with pose IDs
+        Raises
+        ------
+        Exception
+            Prints error message if database connection fails, query execution fails, 
+            or DataFrame reconstruction/export encounters issues.
+        Notes
+        -----
+        - Expects tables 'processed_prolif_fps_json' and 'full_size_interactions_json' 
+          in the results database.
+        - Converts all data to boolean type after handling NaN values.
+        - Suppresses FutureWarning for downcasting behavior during fillna operations.
+        - Output directory structure: {assay_folder_path}/results/
+        """
         import sqlite3
         import pandas as pd
         try:
@@ -10367,14 +10459,6 @@ quit
             # Fill NaN values with False, then convert to boolean
             merged_df = merged_df.fillna(False).astype(bool)
 
-            # # Add pose_id column as the first column with incremental integers
-
-            # complete_fps_df.insert(0, 'pose_id', range(1, len(complete_fps_df) + 1))
-            
-            # # Extract pose_id from complete_fps_df and add to merged_df as first column
-            # pose_ids = complete_fps_df['pose_id'].values
-            # merged_df = pd.concat([pd.DataFrame({'pose_id': pose_ids}), merged_df], axis=1)
-
             # Output to CSV
             assay_path = assay_info.get('assay_folder_path', None)
             output_csv = f"{assay_path}/results/prolif_fingerprints.csv"
@@ -10389,6 +10473,66 @@ quit
             conn.close()
         except Exception as e:
             print(f"\n❌ Error reconstructing ProLIF fingerprints dataframe from database: {e}")
+
+    def _write_mmgbsa_fps(results_db, assay_info):
+        """
+        Reconstruct and write MMGBSA fingerprint DataFrames from database to CSV files.
+        This method retrieves processed MMGBSA fingerprints JSON entries and full-size 
+        interaction data from the results database and exports the results to CSV files.
+        """
+        
+        import sqlite3
+        import pandas as pd
+        from io import StringIO
+        try:
+            conn = sqlite3.connect(results_db)
+            cursor = conn.cursor()
+            # Retrieve all processed MMGBSA JSON entries
+            cursor.execute('''
+                SELECT pose_id, data FROM processed_mmgbsa_decomposition_json
+            ''')
+            records = cursor.fetchall()
+            mmgbsa_dfs = []
+            for pose_id, mmgbsa_json in records:
+                mmgbsa_df = pd.read_json(StringIO(mmgbsa_json), orient='split')
+                mmgbsa_df['pose_id'] = pose_id
+                mmgbsa_dfs.append(mmgbsa_df)
+            if mmgbsa_dfs:
+                complete_mmgbsa_df = pd.concat(mmgbsa_dfs, ignore_index=True)
+            else:
+                complete_mmgbsa_df = pd.DataFrame()
+                print("\n❌ No MMGBSA DataFrames to merge.")
+
+            # Retrieve full size interactions DataFrame if available (optional)
+            try:
+                cursor.execute('''
+                    SELECT data FROM full_size_mmgbsa_json LIMIT 1
+                ''')
+                result = cursor.fetchone()
+                if result:
+                    full_size_json = result[0]
+                    full_size_df = pd.read_json(StringIO(full_size_json), orient='split')
+                else:
+                    full_size_df = pd.DataFrame()
+            except Exception:
+                full_size_df = pd.DataFrame()
+
+            # Merge full_size_df and complete_mmgbsa_df by column name (union of columns)
+            merged_df = pd.concat([full_size_df, complete_mmgbsa_df], axis=0, ignore_index=True, sort=False)
+            merged_df = merged_df.fillna(False)
+
+            assay_path = assay_info.get('assay_folder_path', None)
+            output_csv = f"{assay_path}/results/mmgbsa_fingerprints.csv"
+            output_csv_serie = f"{assay_path}/results/mmgbsa_fingerprints_serie.csv"
+            merged_df.to_csv(output_csv, index=False)
+            complete_mmgbsa_df.to_csv(output_csv_serie, index=False)
+
+            print(f"\n✅ MMGBSA fingerprints full size dataframe reconstructed and saved to '{output_csv}'")
+            print(f"\n✅ MMGBSA fingerprints serie dataframe reconstructed and saved to '{output_csv_serie}'")
+
+            conn.close()
+        except Exception as e:
+            print(f"\n❌ Error reconstructing MMGBSA fingerprints dataframe from database: {e}")
 
 
     def _prepare_mmgbsa_files(self, ligname, pose_id, prmtop_file, output_dir):
@@ -10609,3 +10753,6 @@ quit
             conn.close()
         except Exception as e:
             print(f"\n❌ Error cleaning ligand names in results database: {e}")
+
+
+    
