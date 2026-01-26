@@ -1361,7 +1361,6 @@ class MolDock:
 
             ## Dock using Vina if selected    
             elif selected_method['docking_engine'] == 'Vina':
-                print(selected_method)
                 self._dock_table_with_vina(selected_table, selected_method, assay_registry, clean_ligand_files, receptor_info)
                 docking_mode = 'vina'
             else:
@@ -8963,10 +8962,8 @@ quit
         if write_mmgbsa:
             self._write_mmgbsa_fps(results_db, assay_info)
 
-
         if clean_files:    
             # Finally delte output_dir containing all temporary files
-            print(f"\n🧹 Cleaning up temporary files in {output_dir}...")
             import shutil
             shutil.rmtree(output_dir, ignore_errors=True)
             print("✅ Temporary files cleaned up.")
@@ -10474,7 +10471,7 @@ quit
         except Exception as e:
             print(f"\n❌ Error reconstructing ProLIF fingerprints dataframe from database: {e}")
 
-    def _write_mmgbsa_fps(results_db, assay_info):
+    def _write_mmgbsa_fps(self, results_db, assay_info):
         """
         Reconstruct and write MMGBSA fingerprint DataFrames from database to CSV files.
         This method retrieves processed MMGBSA fingerprints JSON entries and full-size 
@@ -10489,48 +10486,28 @@ quit
             cursor = conn.cursor()
             # Retrieve all processed MMGBSA JSON entries
             cursor.execute('''
-                SELECT pose_id, data FROM processed_mmgbsa_decomposition_json
+                SELECT p.pose_id, r.LigName, p.data
+                FROM processed_mmgbsa_decomposition_json p
+                JOIN Results r ON p.pose_id = r.Pose_ID
             ''')
             records = cursor.fetchall()
-            mmgbsa_dfs = []
-            for pose_id, mmgbsa_json in records:
+            
+            output_dir = f"{assay_info.get('assay_folder_path', None)}/results/mmgbsa_fingerprints"
+            os.makedirs(output_dir, exist_ok=True)
+            
+            for pose_id, ligname, mmgbsa_json in records:
+                # Reconstruct DataFrame from JSON
                 mmgbsa_df = pd.read_json(StringIO(mmgbsa_json), orient='split')
-                mmgbsa_df['pose_id'] = pose_id
-                mmgbsa_dfs.append(mmgbsa_df)
-            if mmgbsa_dfs:
-                complete_mmgbsa_df = pd.concat(mmgbsa_dfs, ignore_index=True)
-            else:
-                complete_mmgbsa_df = pd.DataFrame()
-                print("\n❌ No MMGBSA DataFrames to merge.")
-
-            # Retrieve full size interactions DataFrame if available (optional)
-            try:
-                cursor.execute('''
-                    SELECT data FROM full_size_mmgbsa_json LIMIT 1
-                ''')
-                result = cursor.fetchone()
-                if result:
-                    full_size_json = result[0]
-                    full_size_df = pd.read_json(StringIO(full_size_json), orient='split')
-                else:
-                    full_size_df = pd.DataFrame()
-            except Exception:
-                full_size_df = pd.DataFrame()
-
-            # Merge full_size_df and complete_mmgbsa_df by column name (union of columns)
-            merged_df = pd.concat([full_size_df, complete_mmgbsa_df], axis=0, ignore_index=True, sort=False)
-            merged_df = merged_df.fillna(False)
-
-            assay_path = assay_info.get('assay_folder_path', None)
-            output_csv = f"{assay_path}/results/mmgbsa_fingerprints.csv"
-            output_csv_serie = f"{assay_path}/results/mmgbsa_fingerprints_serie.csv"
-            merged_df.to_csv(output_csv, index=False)
-            complete_mmgbsa_df.to_csv(output_csv_serie, index=False)
-
-            print(f"\n✅ MMGBSA fingerprints full size dataframe reconstructed and saved to '{output_csv}'")
-            print(f"\n✅ MMGBSA fingerprints serie dataframe reconstructed and saved to '{output_csv_serie}'")
-
-            conn.close()
+                
+                # Output to CSV
+                output_csv = f"{output_dir}/{ligname}_{pose_id}_mmgbsa_fingerprint.csv"
+                
+                # Round all numeric columns to 3 decimals before saving
+                mmgbsa_df = mmgbsa_df.round(3)
+                mmgbsa_df.to_csv(output_csv, index=False)
+            
+            return output_dir
+            
         except Exception as e:
             print(f"\n❌ Error reconstructing MMGBSA fingerprints dataframe from database: {e}")
 
@@ -10622,6 +10599,7 @@ quit
                     ele = float(parts[15])
                     pol_solv = float(parts[19])
                     nonpol_solv = float(parts[23])
+                    gas = vdw + ele
                     total = float(parts[27])
                     reskey = f"{resname}{resnumber}"
                     
@@ -10635,13 +10613,13 @@ quit
                     
                     data.append({
                         'residue': reskey,
-                        'vdw': vdw,
-                        'ele': ele,
-                        'polar_solvation': pol_solv,
-                        'nonpolar_solvation': nonpol_solv,
-                        'total': total
+                        'vdw': round(vdw, 3),
+                        'ele': round(ele, 3),
+                        'polar_solvation': round(pol_solv, 3),
+                        'nonpolar_solvation': round(nonpol_solv, 3),
+                        'gas': round(gas, 3),
+                        'total': round(total, 3)
                     })
-                    
 
             df = pd.DataFrame(data)
             
@@ -10658,6 +10636,7 @@ quit
         try:
             # Convert DataFrame to JSON string
             mmgbsa_json = df.to_json(orient='split')
+            
             conn = sqlite3.connect(results_db)
             cursor = conn.cursor()
             
@@ -10753,6 +10732,78 @@ quit
             conn.close()
         except Exception as e:
             print(f"\n❌ Error cleaning ligand names in results database: {e}")
-
-
     
+    def output_fingerprints(self):
+        """
+        Prompt the user to select which fingerprint type to output (ProLIF, MMGBSA, or both),
+        then call the corresponding output method(s).
+        """
+        print("\nSelect fingerprint type to output:")
+        print("1 - ProLIF fingerprints")
+        print("2 - MMGBSA fingerprints")
+        print("3 - Both ProLIF and MMGBSA fingerprints")
+        while True:
+            choice = input("Enter your choice (1, 2, or 3): ").strip()
+            if choice == "1":
+                self._output_prolif_fps()
+                break
+            elif choice == "2":
+                self._output_mmgbsa_fps()
+                break
+            elif choice == "3":
+                assay_id, assay_info = self._output_prolif_fps()
+                
+                self._output_mmgbsa_fps(assay_id, assay_info)
+                break
+            else:
+                print("Invalid selection. Please enter 1, 2, or 3.")
+
+    def _output_prolif_fps(self):
+        import os
+        import pandas as pd
+
+        # Get the assay on which fps are to be computed
+        assays = self.list_assay_folders()
+        
+        if not assays:
+            return None
+
+        assay_by_id = {a['assay_id']: a for a in assays}
+        assay_id = self._prompt_assay("for ProLIF fingerprint retrieval", assay_by_id)
+        if assay_id is None:
+            return None
+
+        assay_info = assay_by_id[assay_id]
+        
+        # Get the path to the results database for the selected assay
+        results_db = os.path.join(assay_info['assay_folder_path'], "results", f"assay_{assay_id}.db")
+        
+        self._write_prolif_fps(results_db, assay_info)
+        
+        return assay_id, assay_info
+    
+    
+    def _output_mmgbsa_fps(self, assay_id=None, assay_info=None):
+        
+        import os
+        import pandas as pd
+
+        if assay_id is None:
+            ## Get the assay on which fps are to be computed
+            assays = self.list_assay_folders()
+            
+            if not assays:
+                return None
+
+            assay_by_id = {a['assay_id']: a for a in assays}
+
+            assay_id = self._prompt_assay("for MMGBSA fingerprint retrieval", assay_by_id)
+        
+            assay_info = assay_by_id[assay_id]
+        
+        # Get the path to the results database for the selected assay
+        results_db = os.path.join(assay_info['assay_folder_path'], "results", f"assay_{assay_id}.db")
+        
+        output_dir = self._write_mmgbsa_fps(results_db, assay_info)
+        
+        print(f"MMGBSA results saved to: {output_dir}")
