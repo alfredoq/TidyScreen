@@ -3168,43 +3168,39 @@ except Exception as e:
                     print(f"\n\n❌ Operation cancelled by user")
                     return None
             
+
             # Check for related entries in pdb_templates and receptor_models before confirming deletion
             try:
                 conn = sqlite3.connect(pdbs_db_path)
                 cursor = conn.cursor()
-                
                 # Check if there are related entries in pdb_templates and get their template names
                 cursor.execute("SELECT pdb_template_name FROM pdb_templates WHERE pdb_model_name = ?",(selected_model['pdb_model_name'],))
                 template_names = [row[0] for row in cursor.fetchall()]
                 template_count = len(template_names)
-                
                 conn.close()
-                
             except sqlite3.Error as e:
-                print(f"❌ Database error while checking related templates: {e}")
-                return None
+                print(f"⚠️  Warning: Could not check related templates in pdb_templates: {e}")
+                template_names = []
+                template_count = 0
             
             # Check for related entries in receptor_models
             try:
                 receptors_db_path = os.path.join(self.path, 'docking', 'receptors', 'receptors.db')
                 receptor_model_names = []
                 receptor_model_count = 0
-                
                 if os.path.exists(receptors_db_path):
                     conn = sqlite3.connect(receptors_db_path)
                     cursor = conn.cursor()
-                    
                     # Check if there are related entries in receptor_models and get their names
                     cursor.execute("SELECT receptor_model_name FROM receptor_models WHERE pdb_model_name = ?", 
                                  (selected_model['pdb_model_name'],))
                     receptor_model_names = [row[0] for row in cursor.fetchall() if row[0]]
                     receptor_model_count = len(receptor_model_names)
-                    
                     conn.close()
-                    
             except sqlite3.Error as e:
-                print(f"❌ Database error while checking receptor models: {e}")
-                return None
+                print(f"⚠️  Warning: Could not check related receptor models: {e}")
+                receptor_model_names = []
+                receptor_model_count = 0
             
             # Check for related docking assays
             docking_assays_count = 0
