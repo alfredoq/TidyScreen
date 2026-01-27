@@ -7867,9 +7867,6 @@ quit
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
 
-
-        print(f"""SELECT L.input_model, R.ligand_coordinates FROM Ligands L JOIN Results R ON L.LigName = R.LigName WHERE R.Pose_ID = {pose_id} """)
-
         # Retrieve the info required to reconstruct the ligand pose
         cursor.execute("""
         SELECT L.input_model, R.ligand_coordinates FROM Ligands L
