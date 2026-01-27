@@ -10428,10 +10428,6 @@ quit
 
                 complete_fps_df = complete_fps_df.fillna(False).infer_objects(copy=False).astype(bool)
                 
-                ## append poses ids as first column
-                complete_fps_df.insert(0, 'pose_id', poses_ids)
-                
-                
             else:
                 complete_fps_df = pd.DataFrame()
                 print("\n❌ No FPS DataFrames to merge.")
@@ -10444,6 +10440,7 @@ quit
             if result:
                 full_size_json = result[0]
                 full_size_df = pd.read_json(StringIO(full_size_json), orient='split')
+                
             else:
                 full_size_df = pd.DataFrame()
             
@@ -10452,6 +10449,12 @@ quit
 
             # Fill NaN values with False, then convert to boolean
             merged_df = merged_df.fillna(False).astype(bool)
+            
+            # Insert pose_id column as the first column in merged_df
+            merged_df.insert(0, 'pose_id', poses_ids)
+
+            # ## append poses ids as first column
+            complete_fps_df.insert(0, 'pose_id', poses_ids)
 
             # Output to CSV
             assay_path = assay_info.get('assay_folder_path', None)
@@ -10507,7 +10510,6 @@ quit
             
         except Exception as e:
             print(f"\n❌ Error reconstructing MMGBSA fingerprints dataframe from database: {e}")
-
 
     def _prepare_mmgbsa_files(self, ligname, pose_id, prmtop_file, output_dir):
 
@@ -10778,7 +10780,6 @@ quit
         self._write_prolif_fps(results_db, assay_info)
         
         return assay_id, assay_info
-    
     
     def _output_mmgbsa_fps(self, assay_id=None, assay_info=None):
         
