@@ -565,7 +565,6 @@ class ChemSpace:
             conn = sqlite3.connect(self.__chemspace_db)
             conn.close()
             
-            print(f"✅ ChemSpace database initialized: {self.__chemspace_db}")
             return True
             
         except Exception as e:

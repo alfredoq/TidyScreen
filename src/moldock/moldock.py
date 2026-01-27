@@ -487,7 +487,6 @@ class MolDock:
         except Exception as e:
             print(f"❌ Error deleting docking method: {e}")
 
-
     def list_docking_assays(self) -> Optional[List[Dict[str, Any]]]:
         """
         Read docking_assays.db under project path in the docking/docking_registers folder
