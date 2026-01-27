@@ -103,6 +103,9 @@ class MolDyn:
                 print(f"   📋 Requirements: {', '.join(engine['requirements'])}")
                 print("-" * 70)
             
+            # Set the params directory for the MD method
+            params = {}
+            
             # Get user selection
             while True:
                 try:
@@ -115,6 +118,8 @@ class MolDyn:
                     if selection in md_engines:
                         selected_engine = md_engines[selection]
                         print(f"\n✅ Selected: {selected_engine['name']}")
+                        params['engine'] = selected_engine['name']
+                        
                         break
                     else:
                         print("❌ Invalid selection. Please enter a valid option.")
@@ -142,6 +147,8 @@ class MolDyn:
                         print("❌ Method name can only contain letters, numbers, spaces, hyphens, and underscores")
                         continue
                     
+                    params['method_name'] = method_name
+                    
                     break
                     
                 except KeyboardInterrupt:
@@ -154,28 +161,26 @@ class MolDyn:
             if not description:
                 description = f"Molecular dynamics method using {selected_engine['name']}"
             
+            params['description'] = description
             
             # Get system preparation options
-            prep_params = self._get_system_preparation_parameters()
-            
-
+            params = self._get_system_preparation_parameters(params)
 
             # Save parameters to database 
-            self._save_parameters_to_db(prep_params)
-
+            params = self._save_parameters_to_db(params)
+            
+            # Display method summary
+            self._display_method_summary(params)
                 
         except Exception as e:
             print(f"❌ Error in create_md_method: {e}")
             return None
     
-    
-    def _get_system_preparation_parameters(self):
+    def _get_system_preparation_parameters(self, params):
         """Get system preparation parameters for MD simulations."""
         
         print(f"\n🧪 CONFIGURE SYSTEM PREPARATION PARAMETERS")
         print("-" * 70)
-        
-        params = {}
         
         # Query if implicit of explicit solvent simulation is required
         solvent_type = input("Solvent type (implicit/explicit) [default: explicit]: ").strip().lower() or 'explicit'
@@ -198,11 +203,6 @@ class MolDyn:
 
         ## Set production parameters
 
-
-
-        print(params)
-
-        
             
         print(f"✅ System preparation parameters configured")
         
@@ -244,19 +244,17 @@ class MolDyn:
         """Save system preparation parameters to the MD registers database."""
         try:
             import sqlite3
-            import json
-            import datetime
 
             conn = sqlite3.connect(self.__md_registers_db)
             cursor = conn.cursor()
             
             # Define dictionary to hold table structure info
             columns_dict = {
+                'method_id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
                 'method_name': 'TEXT',
                 'description': 'TEXT',
                 'engine': 'TEXT',
                 'parameters': 'TEXT',
-                'created_date': 'TEXT',
             }
 
             # Import from moldock.py the _create_table_from_columns_dict helper function
@@ -277,7 +275,6 @@ class MolDyn:
                 'description': params.get('description', ''),
                 'engine': params.get('engine', ''),
                 'parameters': params_json,
-                'created_date': datetime.now().isoformat(),
             }
 
             # Import from moldock.py the _insert_data_into_table helper function
@@ -286,12 +283,13 @@ class MolDyn:
             
             conn.commit()
             method_id = cursor.lastrowid
+            
+            params['method_id'] = method_id
+            
             conn.close()
             
-            # Display method summary
-            self._display_method_summary(method_id, params.get('method_name'), params.get('engine'), 
-                                         params.get('description'), params, params_json, 
-                                         self.__md_registers_db)
+            return params
+           
             
         except Exception as e:
             print(f"❌ Error saving parameters to database: {e}")
@@ -305,39 +303,88 @@ class MolDyn:
         except Exception:
             return str(parameters)
     
-    def _display_method_summary(self, method_id, method_name, engine_info, 
-                                description, parameters, system_prep_params, db_path):
+    def _display_method_summary(self, params):
         """Display summary of created MD method."""
         try:
             print(f"\n🎯 MOLECULAR DYNAMICS METHOD CREATED SUCCESSFULLY")
             print("=" * 60)
-            print(f"📋 Method ID: {method_id}")
-            print(f"🏷️  Method Name: {method_name}")
-            print(f"🧬 MD Engine: {engine_info['name']}")
-            print(f"📝 Description: {description}")
-            print(f"🗂️  Database: {db_path}")
+            print(f"\n🏷️  Method ID: {params.get('method_id', 'N/A')}")
+            print(f"🏷️  Method Name: {params.get('method_name', 'Unnamed_Method')}")
+            print(f"🧬 MD Engine: {params.get('engine', '')}")
+            print(f"📝 Description: {params.get('description', '')}")
             
-            print(f"\n⚙️  ENGINE PARAMETERS:")
-            for key, value in parameters.items():
-                print(f"   • {key.replace('_', ' ').title()}: {value}")
-
-            print(f"\n🧪 SYSTEM PREPARATION PARAMETERS:")
-            if system_prep_params:
-                for key, value in system_prep_params.items():
-                    print(f"   • {key.replace('_', ' ').title()}: {value}")
-            else:
-                print("   • None")
-
-            print(f"\n📋 REQUIREMENTS:")
-            for req in engine_info['requirements']:
-                print(f"   • {req}")
-
-            print(f"\n💡 NEXT STEPS:")
-            print("   1. Ensure all requirements are installed")
-            print("   2. Use this method for MD simulations")
-            print("   3. Prepare input structures for simulation")
+            print(f"\n⚙️  MD SPECIFIC PARAMETERS:")
+            
+            tleap_params = params.get('tleap_params', {})
+            print(f"  🔬 TLEAP PARAMETERS:")
+            for key, value in tleap_params.items():
+                print(f"    - {key}: {value}")
+            
 
             print("=" * 60)
 
         except Exception as e:
             print(f"⚠️  Error displaying method summary: {e}")
+            
+    def list_md_methods(self):
+        """List all molecular dynamics methods registered in the project and allow user to view details."""
+        try:
+            import sqlite3
+            import json
+
+            conn = sqlite3.connect(self.__md_registers_db)
+            cursor = conn.cursor()
+            
+            # Check if md_methods table exists
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='md_methods';")
+            if not cursor.fetchone():
+                print("❌ No MD methods found. The 'md_methods' table does not exist.")
+                return
+            
+            # Fetch all methods
+            cursor.execute("SELECT method_id, method_name, engine, description FROM md_methods;")
+            methods = cursor.fetchall()
+            
+            if not methods:
+                print("❌ No MD methods found in the database.")
+                return
+            
+            print(f"\n🧬 MOLECULAR DYNAMICS METHODS IN PROJECT '{self.name}':")
+            print("=" * 70)
+            for method in methods:
+                method_id, method_name, engine, description = method
+                print(f"🏷️  Method ID: {method_id}")
+                print(f"🏷️  Method Name: {method_name}")
+                print(f"🧬 MD Engine: {engine}")
+                print(f"📝 Description: {description}")
+                print("-" * 70)
+
+            # Prompt user to select a method to show details
+            method_ids = [str(m[0]) for m in methods]
+            while True:
+                selection = input("\n🔎 Enter the Method ID to view details (or 'cancel' to exit): ").strip()
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    print("❌ Operation cancelled.")
+                    conn.close()
+                    return
+                if selection in method_ids:
+                    # Fetch full parameters for the selected method
+                    cursor.execute("SELECT parameters FROM md_methods WHERE method_id = ?", (selection,))
+                    row = cursor.fetchone()
+                    if row:
+                        try:
+                            params = json.loads(row[0])
+                        except Exception:
+                            params = {}
+                        params['method_id'] = int(selection)
+                        self._display_method_summary(params)
+                    else:
+                        print("❌ Method not found.")
+                    break
+                else:
+                    print("❌ Invalid Method ID. Please try again.")
+
+            conn.close()
+            
+        except Exception as e:
+            print(f"❌ Error listing MD methods: {e}")

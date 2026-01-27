@@ -310,7 +310,7 @@ def connect_db(db):
         sys.exit(1)
 
 
-def create_table_from_columns_dict(self, cursor: sqlite3.Cursor, table_name: str, columns_dict: dict, verbose=True) -> None:
+def create_table_from_columns_dict(cursor: sqlite3.Cursor, table_name: str, columns_dict: dict, verbose=True) -> None:
     """
     Create a database table dynamically from a columns dictionary.
     
@@ -346,7 +346,7 @@ def create_table_from_columns_dict(self, cursor: sqlite3.Cursor, table_name: str
         raise
 
 
-def update_legacy_table_columns(self, cursor: sqlite3.Cursor, table_name: str, columns_dict: dict, verbose=True) -> None:
+def update_legacy_table_columns(cursor: sqlite3.Cursor, table_name: str, columns_dict: dict, verbose=True) -> None:
     """
     Update legacy database tables by adding missing columns based on columns_dict reference.
     
@@ -402,7 +402,7 @@ def update_legacy_table_columns(self, cursor: sqlite3.Cursor, table_name: str, c
         print(f"   ❌ Error updating legacy table '{table_name}': {e}")
         raise
 
-def remove_legacy_table_columns(self, cursor: sqlite3.Cursor, table_name: str, columns_dict: dict, verbose=True) -> None:
+def remove_legacy_table_columns(cursor: sqlite3.Cursor, table_name: str, columns_dict: dict, verbose=True) -> None:
     """
     Remove legacy columns from database tables that are no longer in the columns_dict reference.
     
@@ -511,7 +511,7 @@ def remove_legacy_table_columns(self, cursor: sqlite3.Cursor, table_name: str, c
             pass
         raise
     
-def insert_data_dinamically_into_table(self, cursor: sqlite3.Cursor, table_name: str, data_dict: Dict[str, Any]) -> None:
+def insert_data_dinamically_into_table(cursor: sqlite3.Cursor, table_name: str, data_dict: dict) -> None:
     """
     Insert data dynamically into a database table.
     Args:
