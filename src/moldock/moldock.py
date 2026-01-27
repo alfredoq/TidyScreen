@@ -43,7 +43,7 @@ class MolDock:
         """
         # Validate that we received a proper ActivateProject object
         if not isinstance(project_obj, ActivateProject):
-            raise TypeError("ChemSpace requires an ActivateProject object")
+            raise TypeError("MolDock requires an ActivateProject object")
         
         # Check if project exists
         if not project_obj.project_exists():
