@@ -8,6 +8,7 @@ def restore_single_docked_pose(results_db, ligname, pose_id):
     # Process input_model and pose_coords_json to create pdb_dict
     pdb_dict = _process_input_model_for_moldf(input_model, pose_coords_json)
 
+    return pdb_dict
 
 
 def _retrieve_pose_info(db_path, pose_id):
@@ -39,7 +40,7 @@ def _retrieve_pose_info(db_path, pose_id):
         WHERE R.Pose_ID = ?
         """, (pose_id,))
         row = cursor.fetchone()
-        
+
         input_model, pose_coords_json = row
         
         return input_model, pose_coords_json

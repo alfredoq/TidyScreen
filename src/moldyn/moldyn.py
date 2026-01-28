@@ -396,25 +396,35 @@ class MolDyn:
             conn = sqlite3.connect(self.__docking_registers_db)
             cursor = conn.cursor()
             # Show docking assays available
-            assay_id, assay_name, assay_folder_path = self._print_docking_assays(cursor)
+            docking_assay_id, assay_name, assay_folder_path = self._select_docking_assay(cursor)
             conn.close()
+
+            print(f"Docking Assay ID: {docking_assay_id}")
             
             # Select unique ligand molecules in the selected docking assay
-            ligname = self._select_unique_ligands_in_docking_assay(assay_id, assay_name, assay_folder_path)
+            ligname, docking_results_db = self._select_unique_ligands_in_docking_assay(docking_assay_id, assay_name, assay_folder_path)
 
             # Select pose id for the selected ligand to perform MD assay
-            pose_id = self._select_ligand_pose_for_md_assay(assay_folder_path, assay_name, ligname)
+            pose_id = self._select_ligand_pose_for_md_assay(docking_results_db, assay_name, ligname)
 
-            pdb_dict = lm.restore_single_docked_pose(assay_folder_path, pose_id)
+            # Restore the selected docked pose using ligand_management module
+            pdb_dict = lm.restore_single_docked_pose(docking_results_db, ligname, pose_id)
 
-            print(pdb_dict)
+            # Query user for MD assay description
+            assay_description = input("\n📝 Enter MD assay description (optional): ").strip()
+            if not assay_description:
+                assay_description = f"MD assay for ligand {ligname} (pose {pose_id})"
 
-            
+            # Create MD assay folder structure and prepare input files for the selected MD engine
+            new_assay_id, new_assay_folder = self._create_md_assay_folder()
+
+            # Create MD register entry in the md_assays table
+            self._create_md_assay_register_entry(new_assay_id, new_assay_folder, assay_description, docking_assay_id, ligname, pose_id)
 
         except Exception as e:
             print(f"❌ Error performing MD assay: {e}")
         
-    def _print_docking_assays(self, cursor):
+    def _select_docking_assay(self, cursor):
         
         # Check if docking_assays table exists
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='docking_assays';")
@@ -492,19 +502,18 @@ class MolDyn:
                 if selection in ligand_ids:
                     selected_ligand_name = ligands[int(selection) - 1][0]
                     print(f"✅ Selected Ligand: {selected_ligand_name}")
-                    return selected_ligand_name
+                    return selected_ligand_name, docking_results_db
                 else:
                     print("❌ Invalid Ligand ID. Please try again.")
             
         except Exception as e:
             print(f"❌ Error fetching unique ligands: {e}")
     
-    def _select_ligand_pose_for_md_assay(self, assay_folder_path, assay_name, ligname):
+    def _select_ligand_pose_for_md_assay(self, docking_results_db, assay_name, ligname):
         try:
             import sqlite3
 
             # Connect to docking results database within the assay folder
-            docking_results_db = os.path.join(assay_folder_path, 'results', f'{assay_name}.db')
             conn = sqlite3.connect(docking_results_db)
             cursor = conn.cursor()
 
@@ -548,3 +557,91 @@ class MolDyn:
             
         except Exception as e:
             print(f"❌ Error fetching ligand poses: {e}")
+
+    def _create_md_assay_folder(self):
+
+        """Create molecular dynamics assay folder structure and prepare input files."""
+        
+        last_assay_id = self._get_last_md_assay_id()
+
+        new_assay_id = last_assay_id + 1
+        new_assay_folder = os.path.join(self.__md_assays_folder, f'md_assay_{new_assay_id}')
+        try:
+            os.makedirs(new_assay_folder, exist_ok=False)
+            print(f"✅ Created MD assay folder: {new_assay_folder}")
+            # Further input file preparation can be implemented here
+            return new_assay_id, new_assay_folder
+        except Exception as e:
+            print(f"❌ Error creating MD assay folder: {e}")
+
+
+    def _get_last_md_assay_id(self):
+        """Retrieve the last MD assay ID from the MD registers database."""
+        try:
+            import sqlite3
+
+            conn = sqlite3.connect(self.__md_registers_db)
+            cursor = conn.cursor()
+
+            # Check if md_assays table exists
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='md_assays';")
+            if not cursor.fetchone():
+                print("❌ No MD assays found. The 'md_assays' table does not exist.")
+                return 0
+
+            # Fetch the last assay ID
+            cursor.execute("SELECT MAX(assay_id) FROM md_assays;")
+            row = cursor.fetchone()
+            last_assay_id = row[0] if row and row[0] is not None else 0
+
+            conn.close()
+            return last_assay_id
+        except Exception as e:
+            print(f"❌ Error retrieving last MD assay ID: {e}")
+            sys.exit(1)
+
+    def _create_md_assay_register_entry(self, new_assay_id, new_assay_folder, assay_description, docking_assay_id=None, ligname=None, pose_id=None):
+        """Create a new entry in the md_assays table for the newly created MD assay."""
+        try:
+            import sqlite3
+
+            conn = sqlite3.connect(self.__md_registers_db)
+            cursor = conn.cursor()
+
+            # Define dictionary to hold table structure info
+            columns_dict = {
+                'assay_id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
+                'md_assay': 'TEXT',
+                'description': 'TEXT',
+                'assay_folder_path': 'TEXT',
+                'docking_assay_id': 'INTEGER',
+                'ligand_name': 'TEXT',
+                'pose_id': 'INTEGER',
+            }
+            # Create md_assays table if it doesn't exist
+            dbm.create_table_from_columns_dict(cursor, 'md_assays', columns_dict)
+
+            # Update legacy table columns 
+            dbm.update_legacy_table_columns(cursor, 'md_assays', columns_dict)
+
+            # Remove legacy table columns
+            dbm.remove_legacy_table_columns(cursor, 'md_assays', columns_dict)
+
+            print(f"Docking Assay ID: {docking_assay_id}")
+
+            # Prepare data values dictionary (excluding auto-generated columns)
+            data_dict = {
+                'md_assay': f'assay_{new_assay_id}',
+                'description': assay_description,
+                'assay_folder_path': new_assay_folder,
+                'docking_assay_id': f'assay_{docking_assay_id}',
+                'ligand_name': ligname,
+                'pose_id': pose_id,
+            }
+            # Insert dinamically data into md_assays table
+            dbm.insert_data_dinamically_into_table(cursor, 'md_assays', data_dict)
+            conn.commit()
+            conn.close()
+
+        except Exception as e:
+            print(f"❌ Error creating MD assay register entry: {e}")
