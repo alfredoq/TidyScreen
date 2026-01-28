@@ -47,7 +47,7 @@ class MolDyn:
         self.__receptor_path = os.path.join(self.path, 'docking/receptors')
         
         # Set up docking assays registers database path within the project directory
-        self.__docking_registers_db = os.path.join(self.path, 'docking/docking_registers', 'registers.db')
+        self.__docking_registers_db = os.path.join(self.path, 'docking/docking_registers', 'docking_assays.db')
 
         # Set up docking params registers database path within the project directory
         self.__docking_params_db = os.path.join(self.path, 'docking/params', 'params.db')
@@ -60,7 +60,6 @@ class MolDyn:
 
         # Set up molecular dynamics params folder path within the project directory
         self.__md_params_folder = os.path.join(self.path, 'dynamics/md_params')
-
     
     def create_md_method(self):
         """
@@ -73,9 +72,6 @@ class MolDyn:
         The method will create a md_methods.db under project path in the dynamics/md_registers folder
         """
         try:
-            import sqlite3
-            import json
-            from datetime import datetime
             
             print(f"🧬 CREATE MOLECULAR DYNAMICS METHOD")
             print("=" * 50)
@@ -277,8 +273,7 @@ class MolDyn:
                 'parameters': params_json,
             }
 
-            # Import from moldock.py the _insert_data_into_table helper function
-            # _insert_data_into_table is already imported at the top
+            # Insert dinamically data into md_methods table
             dbm.insert_data_dinamically_into_table(cursor, 'md_methods', data_dict)
             
             conn.commit()
@@ -290,10 +285,8 @@ class MolDyn:
             
             return params
            
-            
         except Exception as e:
             print(f"❌ Error saving parameters to database: {e}")
-
 
     def _serialize_parameters(self, parameters):
         """Serialize parameters dictionary to JSON string for database storage."""
@@ -388,3 +381,167 @@ class MolDyn:
             
         except Exception as e:
             print(f"❌ Error listing MD methods: {e}")
+            
+    def perform_md_assay(self):
+        """
+        Will connect to the docking registers database and list available docking assays.
+        """
+        
+        try:
+            import sqlite3
+
+            # Connect to docking registers database
+            conn = sqlite3.connect(self.__docking_registers_db)
+            cursor = conn.cursor()
+            # Show docking assays available
+            assay_id, assay_name, assay_folder_path = self._print_docking_assays(cursor)
+            conn.close()
+            
+            # Select unique ligand molecules in the selected docking assay
+            ligname = self._select_unique_ligands_in_docking_assay(assay_id, assay_name, assay_folder_path)
+
+            # Select pose id for the selected ligand to perform MD assay
+            self._select_ligand_pose_for_md_assay(assay_folder_path, assay_name, ligname)
+
+            
+
+        except Exception as e:
+            print(f"❌ Error performing MD assay: {e}")
+        
+        
+    def _print_docking_assays(self, cursor):
+        
+        # Check if docking_assays table exists
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='docking_assays';")
+            if not cursor.fetchone():
+                print("❌ No docking assays found. The 'docking_assays' table does not exist.")
+                return
+
+            # Fetch all docking assays
+            cursor.execute("SELECT assay_id, assay_name, notes, assay_folder_path FROM docking_assays;")
+            assays = cursor.fetchall()
+
+            if not assays:
+                print("❌ No docking assays found in the database.")
+                return
+
+            print(f"\n🧬 DOCKING ASSAYS IN PROJECT '{self.name}':")
+            print("=" * 70)
+            for assay in assays:
+                assay_id, assay_name, notes, assay_folder_path = assay
+                print(f"🏷️  Assay ID: {assay_id}")
+                print(f"🏷️  Assay Name: {assay_name}")
+                print(f"📝 Description: {notes}")
+                print("-" * 70)
+
+            # Prompt user to select an assay for further action (optional, extend as needed)
+            assay_ids = [str(a[0]) for a in assays]
+            while True:
+                selection = input("\n🔎 Enter the Assay ID to proceed (or 'cancel' to exit): ").strip()
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    print("❌ Operation cancelled.")
+                    return
+                if selection in assay_ids:
+                    print(f"✅ Selected Assay ID: {selection}")
+                    # Further actions can be implemented here
+                    return assay_id, assay_name, assay_folder_path
+                else:
+                    print("❌ Invalid Assay ID. Please try again.")
+
+    
+    def _select_unique_ligands_in_docking_assay(self, assay_id, assay_name, assay_folder_path):
+        try:
+            import sqlite3
+
+            # Connect to docking results database within the assay folder
+            docking_results_db = os.path.join(assay_folder_path, 'results', f'{assay_name}.db')
+            conn = sqlite3.connect(docking_results_db)
+            cursor = conn.cursor()
+
+            print(f"\n🧬 UNIQUE LIGANDS IN DOCKING ASSAY '{assay_name}':")
+            print("=" * 70)
+        # Fetch unique ligands in the selected docking assay
+            cursor.execute("""
+                SELECT DISTINCT LigName
+                FROM Results;
+            """)
+            ligands = cursor.fetchall()
+
+            if not ligands:
+                print("❌ No ligands found for the selected docking assay.")
+                return
+            
+            for idx, ligand in enumerate(ligands, start=1):
+                lig_name = ligand[0]
+                print(f"🏷️  Ligand ID: {idx}")
+                print(f"🏷️  Ligand Name: {lig_name}")
+                print("-" * 70)
+            conn.close()
+            
+            # Prompt the used to select a ligand id and return the ligand name
+            ligand_ids = [str(i) for i in range(1, len(ligands) + 1)]
+            while True:
+                selection = input("\n🔎 Enter the Ligand ID to proceed (or 'cancel' to exit): ").strip()
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    print("❌ Operation cancelled.")
+                    return
+                if selection in ligand_ids:
+                    selected_ligand_name = ligands[int(selection) - 1][0]
+                    print(f"✅ Selected Ligand: {selected_ligand_name}")
+                    return selected_ligand_name
+                else:
+                    print("❌ Invalid Ligand ID. Please try again.")
+            
+        except Exception as e:
+            print(f"❌ Error fetching unique ligands: {e}")
+                
+    
+    def _select_ligand_pose_for_md_assay(self, assay_folder_path, assay_name, ligname):
+        try:
+            import sqlite3
+
+            # Connect to docking results database within the assay folder
+            docking_results_db = os.path.join(assay_folder_path, 'results', f'{assay_name}.db')
+            conn = sqlite3.connect(docking_results_db)
+            cursor = conn.cursor()
+
+            print(f"\n🧬 POSES FOR LIGAND '{ligname}':")
+            print("=" * 70)
+        # Fetch poses for the selected ligand
+            cursor.execute("""
+                SELECT Pose_ID, LigName, pose_rank, docking_score, cluster_size
+                FROM Results
+                WHERE LigName = ?;
+            """, (ligname,))
+            poses = cursor.fetchall()
+
+            if not poses:
+                print("❌ No poses found for the selected ligand.")
+                return
+            
+            for pose in poses:
+                pose_id, ligname, pose_rank, docking_score, cluster_size = pose
+                print(f"🏷️  Pose ID: {pose_id}")
+                print(f"🏷️  Ligand Name: {ligname}")
+                print(f"🏷️  Pose Rank: {pose_rank}")
+                print(f"🏷️  Docking Score: {docking_score}")
+                print(f"🏷️  Cluster Size: {cluster_size}")
+                print("-" * 70)
+            conn.close()
+            
+            # Prompt the user to select a pose id for MD assay
+            pose_ids = [str(p[0]) for p in poses]
+            while True:
+                selection = input("\n🔎 Enter the Pose ID to proceed with MD assay (or 'cancel' to exit): ").strip()
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    print("❌ Operation cancelled.")
+                    return
+                if selection in pose_ids:
+                    print(f"✅ Selected Pose ID: {selection} for MD assay")
+                    # Further actions to set up MD assay can be implemented here
+                    return
+                else:
+                    print("❌ Invalid Pose ID. Please try again.")
+            
+        except Exception as e:
+            print(f"❌ Error fetching ligand poses: {e}")

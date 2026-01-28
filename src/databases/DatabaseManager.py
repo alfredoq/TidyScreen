@@ -309,7 +309,6 @@ def connect_db(db):
         print(f"An error occurred while connecting to the database: {e}")
         sys.exit(1)
 
-
 def create_table_from_columns_dict(cursor: sqlite3.Cursor, table_name: str, columns_dict: dict, verbose=True) -> None:
     """
     Create a database table dynamically from a columns dictionary.
@@ -344,7 +343,6 @@ def create_table_from_columns_dict(cursor: sqlite3.Cursor, table_name: str, colu
     except sqlite3.Error as e:
         print(f"   ❌ Error creating table '{table_name}': {e}")
         raise
-
 
 def update_legacy_table_columns(cursor: sqlite3.Cursor, table_name: str, columns_dict: dict, verbose=True) -> None:
     """
