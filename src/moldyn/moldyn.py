@@ -2,6 +2,8 @@ from tidyscreen import tidyscreen
 import sys
 import os
 from databases import DatabaseManager as dbm
+from molecule_management import ligand_management as lm
+
 
 # Add the parent directory to path to import our local tidyscreen module
 parent_dir = os.path.dirname(os.path.dirname(__file__))
@@ -401,13 +403,16 @@ class MolDyn:
             ligname = self._select_unique_ligands_in_docking_assay(assay_id, assay_name, assay_folder_path)
 
             # Select pose id for the selected ligand to perform MD assay
-            self._select_ligand_pose_for_md_assay(assay_folder_path, assay_name, ligname)
+            pose_id = self._select_ligand_pose_for_md_assay(assay_folder_path, assay_name, ligname)
+
+            pdb_dict = lm.restore_single_docked_pose(assay_folder_path, pose_id)
+
+            print(pdb_dict)
 
             
 
         except Exception as e:
             print(f"❌ Error performing MD assay: {e}")
-        
         
     def _print_docking_assays(self, cursor):
         
@@ -447,7 +452,6 @@ class MolDyn:
                     return assay_id, assay_name, assay_folder_path
                 else:
                     print("❌ Invalid Assay ID. Please try again.")
-
     
     def _select_unique_ligands_in_docking_assay(self, assay_id, assay_name, assay_folder_path):
         try:
@@ -494,7 +498,6 @@ class MolDyn:
             
         except Exception as e:
             print(f"❌ Error fetching unique ligands: {e}")
-                
     
     def _select_ligand_pose_for_md_assay(self, assay_folder_path, assay_name, ligname):
         try:
@@ -539,7 +542,7 @@ class MolDyn:
                 if selection in pose_ids:
                     print(f"✅ Selected Pose ID: {selection} for MD assay")
                     # Further actions to set up MD assay can be implemented here
-                    return
+                    return selection
                 else:
                     print("❌ Invalid Pose ID. Please try again.")
             
