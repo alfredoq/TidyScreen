@@ -56,6 +56,9 @@ class MolDyn:
 
         # Set up molecular dynamics assays registers database path within the project directory
         self.__md_registers_db = os.path.join(self.path, 'dynamics/md_registers', 'md_registers.db')
+        
+        # Set up molecular dynamics methods registers database path within the project directory
+        self.__md_methods_db = os.path.join(self.path, 'dynamics/md_registers', 'md_methods.db')
 
         # Set up molecular dynamics assays folder path within the project directory
         self.__md_assays_folder = os.path.join(self.path, 'dynamics/md_assays')
@@ -190,16 +193,19 @@ class MolDyn:
         params['solvent_type'] = solvent_type
         
         ## Set tleap parameters for system preparation
-        tleap_params = self._set_tleap_params(params)
-        params['tleap_params'] = tleap_params
+        params = self._set_tleap_params(params)
 
         ## Set minimization parameters
+        params = self._set_minimization_params(params)
 
         ## Set heating parameters
+        params = self._set_heating_params(params)
 
         ## Set equilibration parameters
+        params = self._set_equilibration_params(params)
 
         ## Set production parameters
+        params = self._set_production_params(params)
 
             
         print(f"✅ System preparation parameters configured")
@@ -221,8 +227,11 @@ class MolDyn:
         
         # Water model only for explicit solvent
         if params['solvent_type'] == 'explicit':
-            tleap_params['water_model'] = input("Water model (e.g., TIP3P, OPC) [default: TIP3P]: ").strip() or 'TIP3P'
+            tleap_params['water_model'] = input("Water model (e.g., tip3p, opc, etc) [default: tip3p]: ").strip() or 'tip3p'
         
+        if params['solvent_type'] == 'explicit':
+            tleap_params['water_type'] = input("Water type (e.g., TIP3PBOX, TIP4PBOX, etc) [default: TIP3PBOX]: ").strip() or 'TIP3PBOX'
+
         # Ion model only for explicit solvent
         tleap_params['add_ions'] = input("Add ions? (yes/no) [default: yes]: ").strip().lower() or 'yes'
         if tleap_params['add_ions'] in ['yes', 'y']:
@@ -232,18 +241,112 @@ class MolDyn:
         
         ## Set SolvateBox parameters
         # Box shape
-        tleap_params['box_type'] = input("Box type (cubic, dodecahedron, octahedron) [default: dodecahedron]: ").strip() or 'dodecahedron'
+        tleap_params['box_type'] = input("Box type (Box, Oct) [default: Box]: ").strip() or 'Box'
         tleap_params['box_distance_nm'] = float(input("Box minimum distance from protein (nm) [default: 10.0]: ").strip() or '10.0')
         tleap_params['wat_closeness'] = float(input("Water closeness parameter (Å) [default: 1.0]: ").strip() or '1.0')
         
-        return tleap_params
+        params['tleap_params'] = tleap_params
+
+        return params
+
+
+    def _set_minimization_params(self, params):
+
+        # Set parameters for energy minimization step
+        print(f"\n🧪 ENERGY MINIMIZATION PARAMETERS CONFIGURATION")
+        print("-" * 70)
+        min1_params = {}
+        min2_params = {}
+
+        # Set parameters for first minimization step (with restraints on solute)
+        print(f"\n🔹 First Minimization Step (with restraints on solute)")
+        print("-" * 50)
+        min1_params['min1_maxcyc'] = int(input("Maximum number of minimization cycles [default: 5000]: ").strip() or '5000')
+        min1_params['min1_ncyc'] = int(input("Number of cycles for steepest descent [default: 2500]: ").strip() or '2500')
+        if 'general_params' not in params:
+            params['general_params'] = {}
+        params['general_params']['cutoff'] = int(input("Cutoff distance for nonbonded interactions (Å) [default: 10]: ").strip() or '10')
+        min1_params['min1_restraint_selector'] = input("Restraint selector for first minimization (e.g., '(@C,N,CA,O)' ; '(!:WAT & !@Na+)' ) [default: '(!:WAT & !@Na+ & !@Cl-)']: ").strip() or '(!:WAT & !@Na+ & !@Cl-)'
+        min1_params['min1_restraint_wt'] = float(input("Restraint weight on solute (kcal/mol·Å²) [default: 10.0]: ").strip() or '10.0')
+        
+        # Assign first minimization parameters to min_params
+        params['first_minimization'] = min1_params
+        
+        # Set parameters for second minimization step (without restraints)
+        print(f"\n🔹 Second Minimization Step (without restraints)")
+        print("-" * 50)
+        min2_params['min2_maxcyc'] = int(input("Maximum number of minimization cycles [default: 5000]: ").strip() or '5000')
+        min2_params['min2_ncyc'] = int(input("Number of cycles for steepest descent [default: 2500]: ").strip() or '2500')
+        min2_params['min2_restraint_selector'] = input("Restraint selector for second minimization (e.g., '@C,N,CA,O' ; '!@WAT & !@Na+' ) [default: '@C,N,CA,O']: ").strip() or '@C,N,CA,O'
+        min2_params['min2_restraint_wt'] = float(input("Restraint weight on solute (kcal/mol·Å²) [default: 1.0]: ").strip() or '1.0')
+        
+        # Assign second minimization parameters to min_params
+        params['second_minimization'] = min2_params
+
+        return params
+
+    def _set_heating_params(self, params):
+
+        # Set the parameters for the heating stage
+        print(f"\n🧪 HEATING PARAMETERS CONFIGURATION")
+        print("-" * 70)
+        heating_params = {}
+        heating_params['initial_temp'] = float(input("Initial temperature for heating (K) [default: 0]: ").strip() or '0')
+        params['general_params']['target_temp'] = float(input("Target temperature for heating (K) [default: 300]: ").strip() or '300')
+        params['general_params']['collision_freq'] = float(input("Collision frequency (ps^-1) [default: 1]: ").strip() or '1')
+        params['general_params']['thermostat'] = int(input("Thermostat selection [default: 3]: ").strip() or '3')
+        heating_params['heating_steps'] = int(input("Number of steps for heating [default: 50000]: ").strip() or '50000')
+        heating_params['heating_restraint_selector'] = input("Restraint selector during heating (e.g., '(:* & !:WAT & !:Na+ & !:Cl-)', '@C,N,CA,O' ; '(!:WAT & !@Na+)' ) [default: '(:* & !:WAT & !:Na+ & !:Cl-)']: ").strip() or '(:* & !:WAT & !:Na+ & !:Cl-)'
+        heating_params['heating_restraint_wt'] = float(input("Restraint weight during heating (kcal/mol·Å²) [default: 0.5]: ").strip() or '0.5')
+        heating_params['heating_restart_write'] = int(input("Number of frame to write restart [default: 1000]: ").strip() or '1000')
+        heating_params['heating_trajectory_write'] = int(input("Number of frame to write to trajectory [default: 1000]: ").strip() or '1000')
+        heating_params['heating_output_write'] = int(input("Number of frame to write to output [default: 1000]: ").strip() or '1000')
+        
+        params['heating_params'] = heating_params
+        
+        return params
+
+    def _set_equilibration_params(self, params):
+
+        # Set the parameters for the equilibration stage
+        print(f"\n🧪 EQUILIBRATION PARAMETERS CONFIGURATION")
+        print("-" * 70)
+        equilibration_params = {}
+        equilibration_params['equilibration_steps'] = int(input("Number of steps for equilibration [default: 500000]: ").strip() or '500000')
+        equilibration_params['equilibration_restraint_selector'] = input("Restraint selector during equilibration (e.g., '(:* & !:WAT & !:Na+ & !:Cl-)', '@C,N,CA,O' ; '(!:WAT & !@Na+)' ) [default: '@C,N,CA,O']: ").strip() or '@C,N,CA,O'
+        equilibration_params['equilibration_restraint_wt'] = float(input("Restraint weight during equilibration (kcal/mol·Å²) [default: 0.5]: ").strip() or '0.5')
+        equilibration_params['equilibration_restart_write'] = int(input("Number of frame to write restart [default: 1000]: ").strip() or '1000')
+        equilibration_params['equilibration_trajectory_write'] = int(input("Number of frame to write to trajectory [default: 1000]: ").strip() or '1000')
+        equilibration_params['equilibration_output_write'] = int(input("Number of frame to write to output [default: 1000]: ").strip() or '1000')
+        
+        params['equilibration_params'] = equilibration_params
+        
+        return params
+
+    def _set_production_params(self, params):
+
+        # Set the parameters for the production stage
+        print(f"\n🧪 PRODUCTION PARAMETERS CONFIGURATION")
+        print("-" * 70)
+        production_params = {}
+        production_params['production_steps'] = int(input("Number of steps for production [default: 5000000]: ").strip() or '5000000')
+        production_params['production_restraint_selector'] = input("Restraint selector during production (e.g., '(:* & !:WAT & !:Na+ & !:Cl-)', '@C,N,CA,O' ; '(!:WAT & !@Na+)' ) [default: '@C,N,CA,O']: ").strip() or '@C,N,CA,O'
+        production_params['production_restraint_wt'] = float(input("Restraint weight during production (kcal/mol·Å²) [default: 0.5]: ").strip() or '0.5')
+        production_params['production_restart_write'] = int(input("Number of frame to write restart [default: 1000]: ").strip() or '1000')
+        production_params['production_trajectory_write'] = int(input("Number of frame to write to trajectory [default: 1000]: ").strip() or '1000')
+        production_params['production_output_write'] = int(input("Number of frame to write to output [default: 1000]: ").strip() or '1000')
+        
+        params['production_params'] = production_params
+        
+        return params
+
 
     def _save_parameters_to_db(self, params):
         """Save system preparation parameters to the MD registers database."""
         try:
             import sqlite3
 
-            conn = sqlite3.connect(self.__md_registers_db)
+            conn = sqlite3.connect(self.__md_methods_db)
             cursor = conn.cursor()
             
             # Define dictionary to hold table structure info
@@ -314,13 +417,43 @@ class MolDyn:
             print(f"  🔬 TLEAP PARAMETERS:")
             for key, value in tleap_params.items():
                 print(f"    - {key}: {value}")
-            
+
+            min1_params = params.get('minimization_params', {}).get('first_minimization', {})
+            min2_params = params.get('minimization_params', {}).get('second_minimization', {})
+            print(f"  🧪 MINIMIZATION PARAMETERS:")
+            # Print first minimization step parameters
+            print(f"    🔹 First Minimization Step:")
+            for key, value in min1_params.items():
+                print(f"      - {key}: {value}")
+            # Print second minimization step parameters
+            print(f"    🔹 Second Minimization Step:")
+            for key, value in min2_params.items():
+                print(f"      - {key}: {value}")
+
+            # Print heating parameters
+            heating_params = params.get('heating_params', {})
+            print(f"  🔥 HEATING PARAMETERS:")
+            for key, value in heating_params.items():
+                print(f"    - {key}: {value}")
+
+            # Print equilibration parameters
+            equilibration_params = params.get('equilibration_params', {})
+            print(f"  ❄️  EQUILIBRATION PARAMETERS:")
+            for key, value in equilibration_params.items():
+                print(f"    - {key}: {value}")
+
+            # Print production parameters   
+            production_params = params.get('production_params', {})
+            print(f"  🎬 PRODUCTION PARAMETERS:")
+            for key, value in production_params.items():
+                print(f"    - {key}: {value}")
 
             print("=" * 60)
 
         except Exception as e:
             print(f"⚠️  Error displaying method summary: {e}")
-            
+        
+    
     def list_md_methods(self):
         """List all molecular dynamics methods registered in the project and allow user to view details."""
         try:
@@ -396,30 +529,43 @@ class MolDyn:
             conn = sqlite3.connect(self.__docking_registers_db)
             cursor = conn.cursor()
             # Show docking assays available
-            docking_assay_id, assay_name, assay_folder_path = self._select_docking_assay(cursor)
+            docking_assay_params_dict = self._select_docking_assay(cursor)
             conn.close()
 
-            print(f"Docking Assay ID: {docking_assay_id}")
-            
             # Select unique ligand molecules in the selected docking assay
-            ligname, docking_results_db = self._select_unique_ligands_in_docking_assay(docking_assay_id, assay_name, assay_folder_path)
+            docking_assay_params_dict = self._select_unique_ligands_in_docking_assay(docking_assay_params_dict)
 
             # Select pose id for the selected ligand to perform MD assay
-            pose_id = self._select_ligand_pose_for_md_assay(docking_results_db, assay_name, ligname)
+            docking_assay_params_dict = self._select_ligand_pose_for_md_assay(docking_assay_params_dict)
+
+            # Select a MD method to perform the MD assay
+            md_parameters_dict = self._select_md_method()
 
             # Restore the selected docked pose using ligand_management module
-            pdb_dict = lm.restore_single_docked_pose(docking_results_db, ligname, pose_id)
+            pdb_dict = lm.restore_single_docked_pose(docking_assay_params_dict.get('docking_results_db'), docking_assay_params_dict.get('selected_ligand_name'), docking_assay_params_dict.get('selected_pose_id'))
 
             # Query user for MD assay description
             assay_description = input("\n📝 Enter MD assay description (optional): ").strip()
             if not assay_description:
-                assay_description = f"MD assay for ligand {ligname} (pose {pose_id})"
+                assay_description = f"MD assay for ligand {docking_assay_params_dict.get('selected_ligand_name')} (pose {docking_assay_params_dict.get('selected_pose_id')})"
 
             # Create MD assay folder structure and prepare input files for the selected MD engine
-            new_assay_id, new_assay_folder = self._create_md_assay_folder()
+            md_assay_id, md_assay_folder = self._create_md_assay_folder()
 
+            # Save the docked pose PDB file in the MD assay folder
+            selected_pose_pdb = lm.write_pdb_with_moldf(pdb_dict, docking_assay_params_dict.get('selected_ligand_name'), docking_assay_params_dict.get('selected_pose_id'), md_assay_folder)
+
+            # Prepare the ligand tleap input file in the MD assay folder
+            mol2_file, frcmod_file = lm.prepare_ligand_tleap_input_files(self.__chemspace_db, docking_assay_params_dict.get('selected_ligand_name'), docking_assay_params_dict, md_assay_folder)
+            
+            # Create complex .prmtop and .inpcrd files
+            prmtop_file, inpcrd_file = self._prepare_complex_prmtop_inpcrd_for_md(mol2_file, frcmod_file, docking_assay_params_dict, md_assay_folder, md_assay_folder, md_parameters_dict, selected_pose_pdb)
+            
+            # Prepare md simulation input files
+            self._prepare_md_simulation_input_files(md_parameters_dict, md_assay_folder, prmtop_file, inpcrd_file)
+            
             # Create MD register entry in the md_assays table
-            self._create_md_assay_register_entry(new_assay_id, new_assay_folder, assay_description, docking_assay_id, ligname, pose_id)
+            self._create_md_assay_register_entry(md_assay_id, md_assay_folder, assay_description, docking_assay_params_dict.get('assay_id'), docking_assay_params_dict.get('selected_ligand_name'), docking_assay_params_dict.get('selected_pose_id'), md_parameters_dict)
 
         except Exception as e:
             print(f"❌ Error performing MD assay: {e}")
@@ -433,7 +579,7 @@ class MolDyn:
                 return
 
             # Fetch all docking assays
-            cursor.execute("SELECT assay_id, assay_name, notes, assay_folder_path FROM docking_assays;")
+            cursor.execute("SELECT assay_id, assay_name, table_name, receptor_info, notes, assay_folder_path FROM docking_assays;")
             assays = cursor.fetchall()
 
             if not assays:
@@ -443,7 +589,7 @@ class MolDyn:
             print(f"\n🧬 DOCKING ASSAYS IN PROJECT '{self.name}':")
             print("=" * 70)
             for assay in assays:
-                assay_id, assay_name, notes, assay_folder_path = assay
+                assay_id, assay_name, _, _, notes, _ = assay
                 print(f"🏷️  Assay ID: {assay_id}")
                 print(f"🏷️  Assay Name: {assay_name}")
                 print(f"📝 Description: {notes}")
@@ -458,15 +604,31 @@ class MolDyn:
                     return
                 if selection in assay_ids:
                     print(f"✅ Selected Assay ID: {selection}")
+                    
+                    # Find the selected assay tuple
+                    selected_assay = next((a for a in assays if str(a[0]) == selection), None)
+                    if selected_assay:
+                        # Get column names from cursor description
+                        column_names = [desc[0] for desc in cursor.description]
+                        # Create dictionary mapping column names to values
+                        docking_assay_params_dict = dict(zip(column_names, selected_assay))
+                        
+                    else:
+                        print("❌ Could not retrieve selected assay details.")
+                    
+                    
                     # Further actions can be implemented here
-                    return assay_id, assay_name, assay_folder_path
+                    return docking_assay_params_dict
                 else:
                     print("❌ Invalid Assay ID. Please try again.")
     
-    def _select_unique_ligands_in_docking_assay(self, assay_id, assay_name, assay_folder_path):
+    def _select_unique_ligands_in_docking_assay(self, docking_assay_params_dict):
         try:
             import sqlite3
 
+            # Get required parameters from docking_assay_params_dict
+            assay_folder_path = docking_assay_params_dict.get('assay_folder_path')
+            assay_name = docking_assay_params_dict.get('assay_name')
             # Connect to docking results database within the assay folder
             docking_results_db = os.path.join(assay_folder_path, 'results', f'{assay_name}.db')
             conn = sqlite3.connect(docking_results_db)
@@ -502,16 +664,24 @@ class MolDyn:
                 if selection in ligand_ids:
                     selected_ligand_name = ligands[int(selection) - 1][0]
                     print(f"✅ Selected Ligand: {selected_ligand_name}")
-                    return selected_ligand_name, docking_results_db
+                    # Add relevan info to docking_assay_params_dict
+                    docking_assay_params_dict['selected_ligand_name'] = selected_ligand_name
+                    docking_assay_params_dict['docking_results_db'] = docking_results_db
+                    
+                    return docking_assay_params_dict
                 else:
                     print("❌ Invalid Ligand ID. Please try again.")
             
         except Exception as e:
             print(f"❌ Error fetching unique ligands: {e}")
     
-    def _select_ligand_pose_for_md_assay(self, docking_results_db, assay_name, ligname):
+    def _select_ligand_pose_for_md_assay(self, docking_assay_params_dict):
         try:
             import sqlite3
+
+            docking_results_db = docking_assay_params_dict.get('docking_results_db')
+            assay_name = docking_assay_params_dict.get('assay_name')
+            ligname = docking_assay_params_dict.get('selected_ligand_name')
 
             # Connect to docking results database within the assay folder
             conn = sqlite3.connect(docking_results_db)
@@ -550,8 +720,10 @@ class MolDyn:
                     return
                 if selection in pose_ids:
                     print(f"✅ Selected Pose ID: {selection} for MD assay")
-                    # Further actions to set up MD assay can be implemented here
-                    return selection
+                    # Add the selected pose id to docking_assay_params_dict
+                    docking_assay_params_dict['selected_pose_id'] = int(selection)
+                    
+                    return docking_assay_params_dict
                 else:
                     print("❌ Invalid Pose ID. Please try again.")
             
@@ -600,7 +772,7 @@ class MolDyn:
             print(f"❌ Error retrieving last MD assay ID: {e}")
             sys.exit(1)
 
-    def _create_md_assay_register_entry(self, new_assay_id, new_assay_folder, assay_description, docking_assay_id=None, ligname=None, pose_id=None):
+    def _create_md_assay_register_entry(self, new_assay_id, new_assay_folder, assay_description, docking_assay_id=None, ligname=None, pose_id=None, md_parameters_dict=None):
         """Create a new entry in the md_assays table for the newly created MD assay."""
         try:
             import sqlite3
@@ -617,17 +789,16 @@ class MolDyn:
                 'docking_assay_id': 'INTEGER',
                 'ligand_name': 'TEXT',
                 'pose_id': 'INTEGER',
+                'md_parameters': 'TEXT',
             }
             # Create md_assays table if it doesn't exist
-            dbm.create_table_from_columns_dict(cursor, 'md_assays', columns_dict)
+            dbm.create_table_from_columns_dict(cursor, 'md_assays', columns_dict, verbose=False)
 
             # Update legacy table columns 
-            dbm.update_legacy_table_columns(cursor, 'md_assays', columns_dict)
+            dbm.update_legacy_table_columns(cursor, 'md_assays', columns_dict, verbose=False)
 
             # Remove legacy table columns
-            dbm.remove_legacy_table_columns(cursor, 'md_assays', columns_dict)
-
-            print(f"Docking Assay ID: {docking_assay_id}")
+            dbm.remove_legacy_table_columns(cursor, 'md_assays', columns_dict, verbose=False)
 
             # Prepare data values dictionary (excluding auto-generated columns)
             data_dict = {
@@ -637,6 +808,7 @@ class MolDyn:
                 'docking_assay_id': f'assay_{docking_assay_id}',
                 'ligand_name': ligname,
                 'pose_id': pose_id,
+                'md_parameters': self._serialize_parameters(md_parameters_dict),
             }
             # Insert dinamically data into md_assays table
             dbm.insert_data_dinamically_into_table(cursor, 'md_assays', data_dict)
@@ -645,3 +817,308 @@ class MolDyn:
 
         except Exception as e:
             print(f"❌ Error creating MD assay register entry: {e}")
+            
+    def _prepare_complex_prmtop_inpcrd_for_md(self, mol2_file, frcmod_file, assay_info, output_dir, output_file, md_parameters_dict, pdb_file):
+        
+        import subprocess
+        import json
+
+        # Parse receptor_info as a dictionary if it's a JSON string or already a dict
+        receptor_info = assay_info.get('receptor_info', None)
+        if isinstance(receptor_info, str):
+            try:
+                receptor_details = json.loads(receptor_info)
+            except Exception:
+                receptor_details = {}
+        elif isinstance(receptor_info, dict):
+            receptor_details = receptor_info
+        else:
+            receptor_details = {}
+
+        # get the .pdbqt used for docking
+        receptor_pdb = receptor_details.get('pdbqt_file', None)
+        
+        # Define the raw .pdb file of the receptor
+        receptor_pdb_path = '/'.join(receptor_pdb.split('/')[:-1]) + '/receptor_checked.pdb'
+
+        # # Create tleap input file to load receptor and ligand
+        tleap_in_file = os.path.join(output_dir, "complex.in")
+
+        # Defined output files
+        prmtop_file = os.path.join(output_dir, 'complex.prmtop')
+        inpcrd_file = os.path.join(output_dir, 'complex.inpcrd')
+
+        tleap_params = md_parameters_dict.get('tleap_params', {})
+        
+        protein_ff = tleap_params.get('force_field', 'ff14SB')
+        ligand_ff = tleap_params.get('small_molecule_params', 'gaff2')
+        solvent_type = md_parameters_dict.get('solvent_type', 'explicit')
+        if solvent_type == 'explicit':
+            water_model = tleap_params.get('water_model', 'tip3p')
+            water_type = tleap_params.get('water_type', 'TIP3PBOX')
+            add_ions = tleap_params.get('add_ions', 'yes')
+            ion_concentration = tleap_params.get('ion_concentration', 0.15)
+            positive_ion = tleap_params.get('positive_ion', 'Na+')
+            negative_ion = tleap_params.get('negative_ion', 'Cl-')
+            box_type = tleap_params.get('box_type', 'Box')
+            box_distance_nm = tleap_params.get('box_distance_nm', 1.0)
+            wat_closeness = tleap_params.get('wat_closeness', 1.0)
+        
+        with open(tleap_in_file, 'w') as f:
+            f.write(f"source leaprc.protein.{protein_ff}\n")
+            f.write(f"source leaprc.{ligand_ff}\n")
+            if solvent_type == 'explicit':
+                f.write(f"source leaprc.water.{water_model}\n")
+                f.write(f"HOH = WAT\n")
+            f.write(f"rec = loadpdb {receptor_pdb_path}\n")
+            f.write(f"UNL = loadmol2 {mol2_file}\n")
+            f.write(f"loadamberparams {frcmod_file}\n")
+            f.write(f"lig = loadpdb {pdb_file}\n")
+            f.write(f"COM = combine {{rec lig}}\n")
+            if solvent_type == 'explicit':
+                f.write(f"solvate{box_type} COM {water_type} {box_distance_nm} {wat_closeness}\n")
+                if add_ions in ['yes', 'y']:
+                    f.write(f"addions COM {positive_ion} 0\n")
+                    f.write(f"addions COM {negative_ion} 0\n")
+            f.write(f"saveamberparm COM {prmtop_file} {inpcrd_file}\n")
+            f.write("quit\n")
+
+        # Run tleap to generate prmtop and inpcrd files
+        tleap_command = f"tleap -f {tleap_in_file}"
+        try:
+            subprocess.run(tleap_command, shell=True, check=True, stdout=subprocess.DEVNULL , stderr=subprocess.DEVNULL)
+
+        except Exception as e:
+            print(f"[ERROR] Failed to run tleap for complex generation: {e}")
+            sys.exit(1)
+
+        return prmtop_file, inpcrd_file
+        
+        
+    def _select_md_method(self):
+        """Select a molecular dynamics method from the registered methods."""
+        try:
+            import sqlite3
+            import json
+
+            conn = sqlite3.connect(self.__md_methods_db)
+            cursor = conn.cursor()
+            
+            # Check if md_methods table exists
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='md_methods';")
+            if not cursor.fetchone():
+                print("❌ No MD methods found. The 'md_methods' table does not exist.")
+                return
+            
+            # Fetch all methods
+            cursor.execute("SELECT method_id, method_name, engine, description, parameters FROM md_methods;")
+            methods = cursor.fetchall()
+            
+            if not methods:
+                print("❌ No MD methods found in the database.")
+                return
+            
+            print(f"\n🧬 MOLECULAR DYNAMICS METHODS IN PROJECT '{self.name}':")
+            print("=" * 70)
+            for method in methods:
+                method_id, method_name, engine, description, _ = method
+                print(f"🏷️  Method ID: {method_id}")
+                print(f"🏷️  Method Name: {method_name}")
+                print(f"🧬 MD Engine: {engine}")
+                print(f"📝 Description: {description}")
+                print("-" * 70)
+
+            # Prompt user to select a method to show details
+            method_ids = [str(m[0]) for m in methods]
+            while True:
+                selection = input("\n🔎 Enter the Method ID to select for MD assay (or 'cancel' to exit): ").strip()
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    print("❌ Operation cancelled.")
+                    conn.close()
+                    return
+                if selection in method_ids:
+                    print(f"✅ Selected Method ID: {selection} for MD assay")
+                    
+                    # Fetch the parameters column for the selected method
+                    cursor.execute("SELECT parameters FROM md_methods WHERE method_id = ?", (selection,))
+                    row = cursor.fetchone()
+                    
+                    if row:
+                        try:
+                            parameters_dict = json.loads(row[0])
+                        except Exception:
+                            parameters_dict = {}
+                        print(f"\n📋 Parameters for selected MD method (as dictionary):")
+                        return parameters_dict
+                        
+                    else:
+                        print("❌ Could not retrieve parameters for the selected method.")
+                    
+                    conn.close()
+                    return int(selection)
+                else:
+                    print("❌ Invalid Method ID. Please try again.")
+
+        except Exception as e:
+            print(f"❌ Error selecting MD method: {e}")
+        
+
+    def _prepare_md_simulation_input_files(self, md_parameters_dict, md_assay_folder, prmtop_file, inpcrd_file):
+
+        """Prepare MD simulation input files based on the selected MD method and engine."""
+        try:
+            import os
+
+            engine = md_parameters_dict.get('engine', 'AMBER')
+            solvent_type = md_parameters_dict.get('solvent_type', 'explicit')
+
+            if solvent_type == 'explicit':
+                self._prepare_explicit_solvent_md_input_files(md_parameters_dict, md_assay_folder, prmtop_file, inpcrd_file)
+
+            else:
+                self._prepare_implicit_solvent_md_input_files(engine, md_parameters_dict, md_assay_folder, prmtop_file, inpcrd_file)
+
+        except Exception as e:
+            print(f"❌ Error preparing MD simulation input files: {e}")
+
+    def _prepare_explicit_solvent_md_input_files(self, md_parameters_dict, md_assay_folder, prmtop_file, inpcrd_file):
+
+        ## Prepare Min1 input file
+        # Create min1 input file
+        min1_in_file = os.path.join(md_assay_folder, "min1.in")
+
+        with open(min1_in_file, 'w') as f:
+            f.write(f"Minimization 1 stage\n")
+            f.write(f"&cntrl\n")
+            f.write(f"  imin=1,\n")
+            f.write(f"  maxcyc={md_parameters_dict.get('first_minimization').get('min1_maxcyc')},\n")
+            f.write(f"  ncyc={md_parameters_dict.get('first_minimization').get('min1_ncyc')},\n")
+            f.write(f"  ntb=1,\n")
+            f.write(f"  ntc=2,\n")
+            f.write(f"  ntf=2,\n")
+            f.write(f"  cut={md_parameters_dict.get('general_params').get('cutoff')},\n")
+            f.write(f"  ntpr=100,\n")
+            f.write(f"  iwrap=1,\n")
+            f.write(f"  ntr=1,\n")
+            f.write(f"  restraint_wt={md_parameters_dict.get('first_minimization').get('min1_restraint_wt')},\n")
+            f.write(f"  restraintmask='{md_parameters_dict.get('first_minimization').get('min1_restraint_selector')}',\n")
+            f.write(f"/\n")
+            f.write(f"END\n")
+            
+        
+        # ## Prepare Min2 input file
+        min2_in_file = os.path.join(md_assay_folder, "min2.in")
+
+        with open(min2_in_file, 'w') as f:
+            f.write(f"Minimization 2 stage\n")
+            f.write(f"&cntrl\n")
+            f.write(f"  imin=1,\n")
+            f.write(f"  maxcyc={md_parameters_dict.get('second_minimization').get('min2_maxcyc')},\n")
+            f.write(f"  ncyc={md_parameters_dict.get('second_minimization').get('min2_ncyc')},\n")
+            f.write(f"  ntb=1,\n")
+            f.write(f"  ntc=2,\n")
+            f.write(f"  ntf=2,\n")
+            f.write(f"  cut={md_parameters_dict.get('general_params').get('cutoff')},\n")
+            f.write(f"  ntpr=100,\n")
+            f.write(f"  iwrap=1,\n")
+            f.write(f"  ntr=1,\n")
+            f.write(f"  restraint_wt={md_parameters_dict.get('second_minimization').get('min2_restraint_wt')},\n")
+            f.write(f"  restraintmask='{md_parameters_dict.get('second_minimization').get('min2_restraint_selector')}',\n")
+            f.write(f"/\n")
+            f.write(f"END\n")
+
+        # Prepare heating input file
+        heating_in_file = os.path.join(md_assay_folder, "heating.in")
+        
+        with open(heating_in_file, 'w') as f:
+            f.write(f"Heating stage\n")
+            f.write(f"&cntrl\n")
+            f.write(f"  imin=0,\n")
+            f.write(f"  irest=0,\n")
+            f.write(f"  ntx=1,\n")
+            f.write(f"  ntb=2,\n")
+            f.write(f"  ntp=1,\n")
+            f.write(f"  cut={md_parameters_dict.get('general_params').get('cutoff')},\n")
+            f.write(f"  ntr=1,\n")
+            f.write(f"  ntc=2,\n")
+            f.write(f"  ntf=2,\n")
+            f.write(f"  temp0={md_parameters_dict.get('general_params').get('target_temp')},\n")
+            f.write(f"  tempi={md_parameters_dict.get('heating_params').get('initial_temp')},\n")
+            f.write(f"  ntt={md_parameters_dict.get('general_params').get('thermostat')},\n")
+            f.write(f"  gamma_ln={md_parameters_dict.get('general_params').get('collision_freq')},\n")
+            f.write(f"  nstlim={md_parameters_dict.get('heating_params').get('heating_steps')},\n")
+            f.write(f"  dt=0.002,\n")
+            f.write(f"  ntpr={md_parameters_dict.get('heating_params').get('heating_output_write')},\n")
+            f.write(f"  ntwx={md_parameters_dict.get('heating_params').get('heating_trajectory_write')},\n")
+            f.write(f"  ntwr={md_parameters_dict.get('heating_params').get('heating_restart_write')},\n")
+            f.write(f"  restraint_wt={md_parameters_dict.get('heating_params').get('heating_restraint_wt')},\n")
+            f.write(f"  restraintmask='{md_parameters_dict.get('heating_params').get('heating_restraint_selector')}',\n")
+            f.write(f"  iwrap=1,\n")
+            f.write(f"  nmropt=1,\n")
+            f.write(f"&end\n")
+            f.write(f"&wt\n")
+            f.write(f"  TYPE = 'TEMP0',\n")
+            f.write(f"  ISTEP1 = 0,\n")
+            f.write(f"  ISTEP2 = {md_parameters_dict.get('heating_params').get('heating_steps') // 2},\n")
+            f.write(f"  VALUE1 = 0,\n")
+            f.write(f"  VALUE2 = {md_parameters_dict.get('general_params').get('target_temp')},\n")
+            f.write(f"/\n")
+            f.write(f"&wt TYPE = 'END'\n")
+            f.write(f"/\n")
+            f.write(f"END\n")
+
+        # Prepare the equilibration input file
+        equilibration_in_file = os.path.join(md_assay_folder, "equilibration.in")
+        with open(equilibration_in_file, 'w') as f:
+            f.write(f"Equilibration stage\n")
+            f.write(f"&cntrl\n")
+            f.write(f"  imin=0,\n")
+            f.write(f"  irest=1,\n")
+            f.write(f"  ntx=5,\n")
+            f.write(f"  ntb=1,\n")
+            f.write(f"  ntp=0,\n")
+            f.write(f"  cut={md_parameters_dict.get('general_params').get('cutoff')},\n")
+            f.write(f"  ntr=1,\n")
+            f.write(f"  ntc=2,\n")
+            f.write(f"  ntf=2,\n")
+            f.write(f"  temp0={md_parameters_dict.get('general_params').get('target_temp')},\n")
+            f.write(f"  tempi={md_parameters_dict.get('general_params').get('target_temp')},\n")
+            f.write(f"  ntt={md_parameters_dict.get('general_params').get('thermostat')},\n")
+            f.write(f"  gamma_ln={md_parameters_dict.get('general_params').get('collision_freq')},\n")
+            f.write(f"  nstlim={md_parameters_dict.get('equilibration_params').get('equilibration_steps')},\n")
+            f.write(f"  dt=0.002,\n")
+            f.write(f"  ntpr={md_parameters_dict.get('equilibration_params').get('equilibration_output_write')},\n")
+            f.write(f"  ntwx={md_parameters_dict.get('equilibration_params').get('equilibration_trajectory_write')},\n")
+            f.write(f"  ntwr={md_parameters_dict.get('equilibration_params').get('equilibration_restart_write')},\n")
+            f.write(f"  iwrap=1,\n")
+            f.write(f"/\n")
+            f.write(f"END\n")
+
+        # Prepare the production MD input file
+        production_in_file = os.path.join(md_assay_folder, "production.in")
+        with open(production_in_file, 'w') as f:
+            f.write(f"Production MD stage\n")
+            f.write(f"&cntrl\n")
+            f.write(f"  imin=0,\n")
+            f.write(f"  irest=1,\n")
+            f.write(f"  ntx=5,\n")
+            f.write(f"  ntb=1,\n")
+            f.write(f"  ntp=0,\n")
+            f.write(f"  cut={md_parameters_dict.get('general_params').get('cutoff')},\n")
+            f.write(f"  ntc=2,\n")
+            f.write(f"  ntf=2,\n")
+            f.write(f"  temp0={md_parameters_dict.get('general_params').get('target_temp')},\n")
+            f.write(f"  ntt={md_parameters_dict.get('general_params').get('thermostat')},\n")
+            f.write(f"  gamma_ln={md_parameters_dict.get('general_params').get('collision_freq')},\n")
+            f.write(f"  nstlim={md_parameters_dict.get('production_params').get('production_steps')},\n")
+            f.write(f"  dt=0.002,\n")
+            f.write(f"  ntpr={md_parameters_dict.get('production_params').get('production_output_write')},\n")
+            f.write(f"  ntwx={md_parameters_dict.get('production_params').get('production_trajectory_write')},\n")
+            f.write(f"  ntwr={md_parameters_dict.get('production_params').get('production_restart_write')},\n")
+            f.write(f"  iwrap=1,\n")
+            f.write(f"/\n")
+            f.write(f"END\n")
+    
+
+    
+    
