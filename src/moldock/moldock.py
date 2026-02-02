@@ -6214,6 +6214,15 @@ quit
         except Exception as e:
             print(f"❌ Error running AutoGrid4: {e}") 
         
+        # Create the Waters map file in case hydrate docking is used
+
+        print(f"PDBQT file for receptor: {pdbqt_file}")
+        print(f"Grids path: {grids_path}")
+        water_map_file = pdbqt_file.split('/')[-1].replace('.pdbqt', '.W.map')
+        water_map_path = os.path.join(grids_path, water_map_file)
+        print(f"Water map file to be created: {water_map_path}")
+
+
     def _create_receptor_register(self, 
                              pdb_id: int,                 
                              template_name: str, 
@@ -8886,7 +8895,10 @@ quit
             if minimize:
                 # Minimize complex
                 min_rst_cpptraj_file = self._minimize_complex(prmtop_file, inpcrd_file, output_dir, ligname, pose_id)
+                rst_cpptraj_file = min_rst_cpptraj_file
                 inpcrd_file = min_rst_cpptraj_file # Set the file to the minimized one for further processing
+            else:
+                rst_cpptraj_file = inpcrd_file # No minimization, use the original inpcrd file for further processing
 
             # Retrieve renumbering_dict and rename df columns
             template_name = assay_info.get('receptor_info', None).get('template_name', None)
@@ -8936,7 +8948,7 @@ quit
                 ## Compute MMGBSA binding energy
                 complex_prmtop, receptor_prmtop, ligand_prmtop = self._prepare_mmgbsa_files(ligname, pose_id, prmtop_file, output_dir)
 
-                self._compute_mmgbsa_fingerprint(ligname, pose_id, complex_prmtop, receptor_prmtop, ligand_prmtop, min_rst_cpptraj_file, output_dir)
+                self._compute_mmgbsa_fingerprint(ligname, pose_id, complex_prmtop, receptor_prmtop, ligand_prmtop, rst_cpptraj_file, output_dir)
             
                 # Parse MMGBSA decomposition original output
                 df = self._parse_mmgbsa_decomposition_output(ligname, pose_id, output_dir)
@@ -10528,7 +10540,7 @@ quit
 
         return complex_prmtop, receptor_prmtop, ligand_prmtop
 
-    def _compute_mmgbsa_fingerprint(self, ligname, pose_id, complex_prmtop, receptor_prmtop, ligand_prmtop, min_rst_cpptraj_file, output_dir):
+    def _compute_mmgbsa_fingerprint(self, ligname, pose_id, complex_prmtop, receptor_prmtop, ligand_prmtop, rst_cpptraj_file, output_dir):
         import subprocess
 
         print("Computing MMGBSA Fingerprints")
@@ -10553,7 +10565,7 @@ quit
         output_file = f"{output_dir}/{ligname}_{pose_id}_mmgbsa.out"
         output_decomp_file = f"{output_dir}/{ligname}_{pose_id}_mmgbsa_decomp.out"
 
-        mmgbsa_command = f"MMPBSA.py -O -i {mmgbsa_in_file} -cp {complex_prmtop} -rp {receptor_prmtop} -lp {ligand_prmtop} -y {min_rst_cpptraj_file} -o {output_file} -do {output_decomp_file}"
+        mmgbsa_command = f"MMPBSA.py -O -i {mmgbsa_in_file} -cp {complex_prmtop} -rp {receptor_prmtop} -lp {ligand_prmtop} -y {rst_cpptraj_file} -o {output_file} -do {output_decomp_file}"
 
         try:
             subprocess.run(mmgbsa_command, shell=True, check=True, cwd=output_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
