@@ -8801,7 +8801,7 @@ quit
         else:
             print("   ✅ Charge methods are consistent between receptor and ligands.")
     
-    def compute_fingerprints(self, minimize=True, clean_files=True, write_prolif=False, write_mmgbsa=False):
+    def compute_fingerprints(self, minimize=True, clean_files=True, write_prolif=False, write_mmgbsa=False, selection_threshold=25):
         """
         Will compute the ProLIF fingerprints for all docked ligands in a given assay. 
         """
@@ -8853,12 +8853,55 @@ quit
         
         try:
             conn = sqlite3.connect(results_db)
-            query = "SELECT Pose_ID, LigName FROM Results"
+            query = "SELECT Pose_ID, LigName, docking_score, cluster_size FROM Results"
             df = pd.read_sql(query, conn)
             conn.close()
         except Exception as e:
             print(f"❌ Error retrieving Pose_ID and LigName from Results table: {e}")
             return None
+        
+        # Query the user if fingerprints are to be computer for all ligands or selected ones
+        print("\nSelect which ligands to compute fingerprints for:")
+        print("1 - All ligands")
+        print("2 - Specific ligands (provide a list)")
+        while True:
+            ligand_choice = input("Enter your choice (1 or 2): ").strip()
+            if ligand_choice == "1":
+                # All ligands, do nothing 
+                break
+            elif ligand_choice == "2":
+                # Specific ligands
+                df = self._select_ligands_for_fps_computation(df, selection_threshold)
+                break
+        
+        # Query the user if fingerprints are to be computed for all poses, the most populated pose, the lowest energy cluster of both
+        print("\nSelect which docked poses to compute fingerprints for:")
+        print("1 - All docked poses")
+        print("2 - Most populated pose per ligand")
+        print("3 - Lowest energy cluster pose per ligand")
+        print("4 - Most populated and lowest energy cluster poses per ligand")
+        while True:
+            pose_choice = input("Enter your choice (1, 2, 3, or 4): ").strip()
+            if pose_choice == "1":
+                # All docked poses, do nothing 
+                computation_mode = "All poses"
+                break 
+                break
+            elif pose_choice == "2":
+                # Most populated pose per ligand
+                df = self._subset_df_for_most_populated_poses(df)
+                computation_mode = "Most populated"
+                break
+            elif pose_choice == "3":
+                # Lowest energy cluster pose per ligand
+                df = self._subset_df_for_lowest_energy_cluster_poses(df)
+                computation_mode = "Lowest energy cluster"
+                break
+            elif pose_choice == "4":
+                # Most populated and lowest energy cluster poses per ligand
+                df = self._subset_df_for_most_populated_and_lowest_energy_poses(df)
+                computation_mode = "Lowest energy cluster AND Most populated"
+                break
         
         # If ProLIF requested, check if the final table already exists
         if prolif:
@@ -8941,7 +8984,7 @@ quit
                 fps_df.columns = [f"{first}_{second}" for first, second in fps_df.columns]
 
                 # Store the processed fps_df in the assay database for posterior processing
-                self._store_processed_fps_df_in_db(fps_df, pose_id, results_db)
+                self._store_processed_fps_df_in_db(fps_df, pose_id, results_db, computation_mode)
 
             if mmbgsa == True:
 
@@ -8957,7 +9000,7 @@ quit
                 df['residue'] = df['residue'].apply(lambda x: renumbering_dict.get(x, x))
             
                 # Store the processed mmgbsa df in the assay database for posterior processing
-                self._store_processed_mmgbsa_df_in_db(df, pose_id, results_db)
+                self._store_processed_mmgbsa_df_in_db(df, pose_id, results_db, computation_mode)
                 
             # Add processed ligand to list
             processed_ligands.append(ligname)
@@ -10340,7 +10383,7 @@ quit
         except Exception as e:
             print(f"\n❌ Error storing full size interactions dataframe as JSON in database: {e}")
     
-    def _store_processed_fps_df_in_db(self, fps_df, pose_id, results_db):
+    def _store_processed_fps_df_in_db(self, fps_df, pose_id, results_db, computation_mode):
         
         import sqlite3
         import json
@@ -10353,7 +10396,8 @@ quit
             
             columns_dict = {
                 'pose_id': 'INTEGER PRIMARY KEY',
-                'data': 'TEXT NOT NULL'
+                'data': 'TEXT NOT NULL',
+                'computation_mode': 'TEXT NOT NULL'
             }
             
             # Use a dedicated method to create the table if it doesn't exist
@@ -10368,6 +10412,7 @@ quit
             data_dict = {
                 'pose_id': pose_id,
                 'data': fps_json
+                , 'computation_mode': computation_mode
             }
             
             # Insert data dynamically into the table
@@ -10639,7 +10684,7 @@ quit
             print(f"\n❌ Error parsing MMGBSA decomposition output: {e}")
             return pd.DataFrame()
         
-    def _store_processed_mmgbsa_df_in_db(self, df, pose_id, results_db):
+    def _store_processed_mmgbsa_df_in_db(self, df, pose_id, results_db, computation_mode):
         
         import sqlite3
         import json
@@ -10653,7 +10698,8 @@ quit
             # Dynamic columns dictionary
             columns_dict = {
                 'pose_id': 'INTEGER PRIMARY KEY',
-                'data': 'TEXT NOT NULL'
+                'data': 'TEXT NOT NULL',
+                'computation_mode': 'TEXT NOT NULL'
             }
             
             # Use a dedicated method to create the table if it doesn't exist
@@ -10667,7 +10713,8 @@ quit
             
             data_dict = {
                 'pose_id': pose_id,
-                'data': mmgbsa_json
+                'data': mmgbsa_json,
+                'computation_mode': computation_mode
             }
             
             #Insert data dynamically into the table
@@ -10816,3 +10863,76 @@ quit
         output_dir = self._write_mmgbsa_fps(results_db, assay_info)
         
         print(f"MMGBSA results saved to: {output_dir}")
+        
+        
+    def _subset_df_for_most_populated_poses(self, df):
+        import pandas as pd
+        
+        # For each LigName, select the row with the highest cluster_size
+        most_populated_df = df.loc[df.groupby('LigName')['cluster_size'].idxmax()].reset_index(drop=True)
+        
+        return most_populated_df
+        
+    
+    def _subset_df_for_lowest_energy_cluster_poses(self, df):
+        import pandas as pd
+        
+        # For each LigName, select the lowest docking_score value
+        lowest_energy_df = df.loc[df.groupby('LigName')['docking_score'].idxmin()].reset_index(drop=True)
+        
+        return lowest_energy_df
+    
+    def _subset_df_for_most_populated_and_lowest_energy_poses(self, df):
+        
+        # Select rows in df in which the highest cluster_size is also the lowest docking_score value
+        import pandas as pd 
+        subset_df = pd.DataFrame()
+        ligands = df['LigName'].unique()
+        for ligname in ligands:
+            ligand_df = df[df['LigName'] == ligname]
+            max_cluster_size = ligand_df['cluster_size'].max()
+            min_docking_score = ligand_df['docking_score'].min()
+            subset = ligand_df[(ligand_df['cluster_size'] == max_cluster_size) & (ligand_df['docking_score'] == min_docking_score)]
+            subset_df = pd.concat([subset_df, subset], ignore_index=True)
+        
+        ## check if subset_df is empty and exit
+        if subset_df.empty:
+            print("No poses found that meet the criteria of highest cluster size and lowest docking score.")
+            sys.exit(1)
+        
+        return subset_df
+        
+    def _select_ligands_for_fps_computation(self, df, selection_threshold):
+        
+        import pandas as pd
+        # Query the user to select unique ligand names by providing comma separated values after printing a list of ligand names
+        
+        ligands = df['LigName'].unique()
+        
+        
+        if len(ligands) > selection_threshold:
+            print(f"\n⚠️  Warning: There are {len(ligands)} unique ligands in the results.")
+            print(f"To avoid overwhelming selection, only the first {selection_threshold} ligands will be displayed.")
+            ligands = ligands[:selection_threshold]
+        
+        print("\nAvailable ligands for fingerprint computation:")
+        for idx, ligname in enumerate(ligands, 1):
+            print(f"{idx}. {ligname}")
+        print("\nEnter the numbers of the ligands you want to select, separated by commas (e.g., 1,3,5): ")
+        selected_indices = input().split(",")
+        selected_ligands = []
+        for idx_str in selected_indices:
+            idx_str = idx_str.strip()
+            if idx_str.isdigit():
+                idx = int(idx_str) - 1
+            if 0 <= idx < len(ligands):
+                selected_ligands.append(ligands[idx])
+        if not selected_ligands:
+            print("No valid ligands selected. Returning all ligands.")
+            return df
+        # Filter the dataframe to include only the selected ligands
+        filtered_df = df[df['LigName'].isin(selected_ligands)]
+        
+        return filtered_df
+        
+        
