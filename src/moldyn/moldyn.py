@@ -249,7 +249,6 @@ class MolDyn:
 
         return params
 
-
     def _set_minimization_params(self, params):
 
         # Set parameters for energy minimization step
@@ -339,7 +338,6 @@ class MolDyn:
         params['production_params'] = production_params
         
         return params
-
 
     def _save_parameters_to_db(self, params):
         """Save system preparation parameters to the MD registers database."""
@@ -452,7 +450,6 @@ class MolDyn:
 
         except Exception as e:
             print(f"⚠️  Error displaying method summary: {e}")
-        
     
     def list_md_methods(self):
         """List all molecular dynamics methods registered in the project and allow user to view details."""
@@ -516,6 +513,62 @@ class MolDyn:
             
         except Exception as e:
             print(f"❌ Error listing MD methods: {e}")
+    
+    def delete_md_method(self):
+        """Delete a molecular dynamics method from the project database."""
+        try:
+            import sqlite3
+
+            conn = sqlite3.connect(self.__md_registers_db)
+            cursor = conn.cursor()
+            
+            # Check if md_methods table exists
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='md_methods';")
+            if not cursor.fetchone():
+                print("❌ No MD methods found. The 'md_methods' table does not exist.")
+                return
+            
+            # Fetch all methods
+            cursor.execute("SELECT method_id, method_name FROM md_methods;")
+            methods = cursor.fetchall()
+            
+            if not methods:
+                print("❌ No MD methods found in the database.")
+                return
+            
+            print(f"\n🧬 MOLECULAR DYNAMICS METHODS IN PROJECT '{self.name}':")
+            print("=" * 70)
+            for method in methods:
+                method_id, method_name = method
+                print(f"🏷️  Method ID: {method_id}")
+                print(f"🏷️  Method Name: {method_name}")
+                print("-" * 70)
+
+            # Prompt user to select a method to delete
+            method_ids = [str(m[0]) for m in methods]
+            while True:
+                selection = input("\n🗑️  Enter the Method ID to delete (or 'cancel' to exit): ").strip()
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    print("❌ Operation cancelled.")
+                    conn.close()
+                    return
+                if selection in method_ids:
+                    # Confirm deletion
+                    confirm = input(f"⚠️  Are you sure you want to delete Method ID {selection}? (yes/no): ").strip().lower()
+                    if confirm in ['yes', 'y']:
+                        cursor.execute("DELETE FROM md_methods WHERE method_id = ?", (selection,))
+                        conn.commit()
+                        print(f"✅ Method ID {selection} deleted successfully.")
+                    else:
+                        print("❌ Deletion cancelled.")
+                    break
+                else:
+                    print("❌ Invalid Method ID. Please try again.")
+
+            conn.close()
+            
+        except Exception as e:
+            print(f"❌ Error deleting MD method: {e}")
             
     def perform_md_assay(self):
         """
@@ -564,8 +617,19 @@ class MolDyn:
             # Prepare md simulation input files
             self._prepare_md_simulation_input_files(md_parameters_dict, md_assay_folder, prmtop_file, inpcrd_file)
             
+            # Prepare execution scripts for the MD assay
+            self._prepare_md_execution_script(md_assay_folder)
+            
             # Create MD register entry in the md_assays table
             self._create_md_assay_register_entry(md_assay_id, md_assay_folder, assay_description, docking_assay_params_dict.get('assay_id'), docking_assay_params_dict.get('selected_ligand_name'), docking_assay_params_dict.get('selected_pose_id'), md_parameters_dict)
+            
+            # Query if the user want to start the MD simulation now
+            start_now = input("\n▶️  Do you want to start the MD simulation now? (yes/no) [default: no]: ").strip().lower() or 'no'
+            if start_now in ['yes', 'y']:
+                self._start_md_simulation(md_assay_folder)
+            else:
+                print("❌ MD simulation not started. You can start it later by running the execution script in the assay folder.")
+                
 
         except Exception as e:
             print(f"❌ Error performing MD assay: {e}")
@@ -746,7 +810,6 @@ class MolDyn:
         except Exception as e:
             print(f"❌ Error creating MD assay folder: {e}")
 
-
     def _get_last_md_assay_id(self):
         """Retrieve the last MD assay ID from the MD registers database."""
         try:
@@ -894,7 +957,6 @@ class MolDyn:
 
         return prmtop_file, inpcrd_file
         
-        
     def _select_md_method(self):
         """Select a molecular dynamics method from the registered methods."""
         try:
@@ -961,7 +1023,6 @@ class MolDyn:
 
         except Exception as e:
             print(f"❌ Error selecting MD method: {e}")
-        
 
     def _prepare_md_simulation_input_files(self, md_parameters_dict, md_assay_folder, prmtop_file, inpcrd_file):
 
@@ -1118,7 +1179,43 @@ class MolDyn:
             f.write(f"  iwrap=1,\n")
             f.write(f"/\n")
             f.write(f"END\n")
-    
 
+    def _prepare_md_execution_script(self, md_assay_folder):
+        
+        execution_script_path = os.path.join(md_assay_folder, "run_md.sh")
+        with open(execution_script_path, 'w') as f:
+            f.write("#!/bin/bash\n")
+            f.write("echo 'Running min1'\n")
+            f.write("pmemd.cuda -O -i min1.in -o min1.out -p complex.prmtop -c complex.inpcrd -r min1.crd -ref complex.inpcrd\n")
+            f.write("echo 'Running min2'\n")
+            f.write("pmemd.cuda -O -i min2.in -o min2.out -p complex.prmtop -c complex.inpcrd -r min2.crd -ref min1.crd\n")
+            f.write("echo 'Running heating'\n")
+            f.write("pmemd.cuda -O -i heating.in -o heating.out -p complex.prmtop -c min2.crd -r heating.crd -ref min2.crd\n")
+            f.write("echo 'Running equilibration'\n")
+            f.write("pmemd.cuda -O -i equilibration.in -o equilibration.out -p complex.prmtop -c heating.crd -r equilibration.crd -ref heating.crd\n")
+            f.write("echo 'Running production'\n")
+            f.write("pmemd.cuda -O -i production.in -o production.out -p complex.prmtop -c equilibration.crd -r production.crd -ref equilibration.crd\n")
+
+        os.chmod(execution_script_path, 0o755)
     
-    
+    def _start_md_simulation(self, md_assay_folder):
+        
+        # Query if the user wants to run in the foreground or background
+        run_mode = input("\n⚙️  Do you want to run the MD simulation in the foreground or background? (fg/bg) [default: fg]: ").strip().lower() or 'fg'
+        execution_script_path = os.path.join(md_assay_folder, "run_md.sh")
+        try:
+            import subprocess
+
+            if run_mode in ['fg', 'foreground']:
+                print("\n▶️  Starting MD simulation in the foreground...")
+                subprocess.run([execution_script_path], check=True, cwd=md_assay_folder)
+
+            elif run_mode in ['bg', 'background']:
+                print("\n▶️  Starting MD simulation in the background...")
+                subprocess.Popen([execution_script_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=md_assay_folder)
+
+            else:
+                print("❌ Invalid option. Please choose 'fg' or 'bg'.")
+                return
+        except Exception as e:
+            print(f"❌ Error starting MD simulation: {e}")
