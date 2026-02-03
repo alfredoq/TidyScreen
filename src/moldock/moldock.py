@@ -6201,6 +6201,20 @@ quit
                 text=True
             )
             if result.returncode == 0:
+
+                # Create the Waters map file in case hydrate docking is used        
+                water_map_file = pdbqt_file.split('/')[-1].replace('.pdbqt', '.W.map')
+                water_map_path = os.path.join(grids_path, water_map_file)
+                mapwater_src = os.path.join(site.getsitepackages()[0], "tidyscreen/misc/mapwater.py")
+                
+                result = subprocess.run(
+                ["python", mapwater_src, "-r", pdbqt_file, "-s", water_map_path],
+                cwd=grids_path,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+                )
+
                 print(f"✅ AutoGrid4 completed successfully. Log: {grid_log_file}")
                 
                 # Return updated configs containing the corresponding grids path
@@ -6214,13 +6228,9 @@ quit
         except Exception as e:
             print(f"❌ Error running AutoGrid4: {e}") 
         
-        # Create the Waters map file in case hydrate docking is used
+        
 
-        print(f"PDBQT file for receptor: {pdbqt_file}")
-        print(f"Grids path: {grids_path}")
-        water_map_file = pdbqt_file.split('/')[-1].replace('.pdbqt', '.W.map')
-        water_map_path = os.path.join(grids_path, water_map_file)
-        print(f"Water map file to be created: {water_map_path}")
+        
 
 
     def _create_receptor_register(self, 
