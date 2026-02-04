@@ -1367,7 +1367,7 @@ class MolDock:
                 return
 
             ## After the docking run has been completed, execute the corresponding analysis
-            results_db_file = self._process_docking_assay_results(assay_registry, docking_mode, clean_ligand_files, max_poses=10)
+            results_db_file = self._process_docking_assay_results(assay_registry, docking_mode, clean_ligand_files, selected_method, max_poses=10)
             print(f"✅ Docking results saved to: {results_db_file}")
             
         except Exception as e:
@@ -6919,7 +6919,7 @@ quit
         except Exception as e:
             print(f"   ❌ Error running AutoDockGPU for {ligand_pdbqt_filepath.split("/")[-1]}: {e}")
 
-    def _process_docking_assay_results(self, assay_registry, docking_mode, clean_ligand_files, max_poses):
+    def _process_docking_assay_results(self, assay_registry, docking_mode, clean_ligand_files, selected_method, max_poses):
 
         from ringtail import RingtailCore
         import os
@@ -6930,8 +6930,14 @@ quit
             results_folder = f"{assay_folder}/results"
             results_db_file = f"{assay_folder}/results/assay_{assay_id}.db"
             rtc = RingtailCore(db_file = results_db_file, docking_mode=docking_mode )
-            rtc.add_results_from_files(file_path = f"{assay_folder}/results", recursive = True, save_receptor = False, max_poses=max_poses)
-            
+            # If Vina docking engine, add computation of fingerprints
+            if selected_method['docking_engine'] == 'Vina':
+                receptor_file = assay_registry.get('receptor_info').get('pdbqt_file')
+                rtc.add_results_from_files(file_path = f"{assay_folder}/results", recursive = True, save_receptor = True, max_poses=max_poses, add_interactions = True, receptor_file = receptor_file)
+            elif selected_method['docking_engine'] == 'AutoDockGPU':
+                rtc.add_results_from_files(file_path = f"{assay_folder}/results", recursive = True, save_receptor = False, max_poses=max_poses) # Interactions already computed
+            else:
+                rtc.add_results_from_files(file_path = f"{assay_folder}/results", recursive = True, save_receptor = False, max_poses=max_poses) # Interactions already computed
             
             ## Add ligand input model if docking with docking output is .pdqbt type
             if docking_mode == 'vina':
