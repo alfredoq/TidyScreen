@@ -6142,6 +6142,13 @@ quit
         grids_file_path = os.path.join(grids_path, 'receptor.gpf')
         grid_log_file = grids_file_path.replace(".gpf", ".glg")
 
+        # Copy the .pdbqt file to the grids path
+        try:
+            shutil.copy(pdbqt_file, grids_path)
+            pdbqt_file = os.path.basename(pdbqt_file)
+        except Exception as e:
+            print(f"⚠️  Error copying receptor PDBQT to grids folder: {e}") 
+
         # Add grid files directory to configs
         configs['grids_path'] = grids_path
 
