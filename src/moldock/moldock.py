@@ -6228,11 +6228,6 @@ quit
         except Exception as e:
             print(f"❌ Error running AutoGrid4: {e}") 
         
-        
-
-        
-
-
     def _create_receptor_register(self, 
                              pdb_id: int,                 
                              template_name: str, 
@@ -6847,6 +6842,14 @@ quit
             hydrate = ligand_prep_params.get('hydrate', '')
             add_atom_types = ligand_prep_params.get('add_atom_types', '')
             
+            # evaluate the type of add_atom_types to end with a list type as required by MoleculePreparation
+            if add_atom_types:
+                try:
+                    add_atom_types = ast.literal_eval(add_atom_types)
+                except Exception as e:
+                    print(f"   ❌ Error parsing add_atom_types for molecule {inchi_key}: {e}")
+                    add_atom_types = []
+
             mk_prep = MoleculePreparation(merge_these_atom_types=merge_atoms,
                                           charge_model=charge,
                                           hydrate=hydrate,
