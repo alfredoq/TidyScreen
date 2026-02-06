@@ -3890,7 +3890,7 @@ except Exception as e:
                 
                 # Step 8: Copy and process PDB file
                 print(f"📂 Processing and saving PDB template...")
-                processed_pdb_path, checked_pdb_path, renumbering_dict = self._process_pdb_file(temp_pdb_path, pdb_template_folder, pdb_analysis)
+                processed_pdb_path, checked_pdb_path, renumbering_dict, his_names = self._process_pdb_file(temp_pdb_path, pdb_template_folder, pdb_analysis)
                 
                 if not processed_pdb_path:
                     print("❌ Failed to process PDB file")
@@ -3902,7 +3902,7 @@ except Exception as e:
 
                 # Step 9: Create template registry entry
                 pdb_registry = self._create_pdb_template_registry_entry(
-                    pdb_template_name, selected_model['pdb_model_name'], selected_model['original_path'], processed_pdb_path, pdb_template_folder, pdb_analysis, checked_pdb_path, renumbering_dict
+                    pdb_template_name, selected_model['pdb_model_name'], selected_model['original_path'], processed_pdb_path, pdb_template_folder, pdb_analysis, checked_pdb_path, renumbering_dict, his_names
                 )
                 
                 if not pdb_registry:
@@ -4149,7 +4149,14 @@ except Exception as e:
             else:
                 selected_chains = analysis['chains']
 
-            # Process ligands if any exist
+
+            ## Parse Histidine names
+            ################################
+            his_names = self._parse_histidine_names(original_pdb_path, selected_chains)
+            his_names = self._customize_histidine_names(his_names)
+
+            ## Process ligands if any exist
+            ################################
             selected_ligands = None
             if analysis['has_ligands'] and analysis['ligand_residues']:
                 print(f"\n   💊 Ligand residues detected: {', '.join(analysis['ligand_residues'])}")
@@ -4235,6 +4242,9 @@ except Exception as e:
             else:
                 print(f"   ✅ No filtering needed - processed PDB ready")
 
+            # Manage HIS residue naming based on previous selection
+            self._fix_histine_names(his_names, processed_pdb_path) 
+
             # Create reference ligand file if ligands were kept
             if selected_ligands:
                 self._extract_reference_ligands(processed_pdb_path, pdb_folder, selected_ligands)
@@ -4255,7 +4265,7 @@ except Exception as e:
             
             print(f"✅ tleap processing complete. Output: {tleap_processed_file}")
             
-            return processed_pdb_path, tleap_processed_file, renumbering_dict
+            return processed_pdb_path, tleap_processed_file, renumbering_dict, his_names
             
 
         except Exception as e:
@@ -5211,7 +5221,7 @@ except Exception as e:
     def _create_pdb_template_registry_entry(self, pdb_template_name: str, pdb_model_name: str, original_pdb_path: str, 
                                     processed_pdb_path: str, pdb_template_folder: str, 
                                     analysis: Dict[str, Any], checked_pdb_path, 
-                                    renumbering_dict) -> Optional[Dict[str, Any]]:
+                                    renumbering_dict, his_names) -> Optional[Dict[str, Any]]:
         """
         Create PDB templates registry entry in pdbs.db
 
@@ -5248,6 +5258,7 @@ except Exception as e:
                 'checked_pdb_path': 'TEXT NOT NULL',
                 'template_folder_path': 'TEXT NOT NULL',
                 'pdb_analysis': 'TEXT',
+                'his_names': 'TEXT',
                 'chains': 'TEXT',
                 'resolution': 'REAL',
                 'atom_count': 'INTEGER',
@@ -5273,6 +5284,7 @@ except Exception as e:
             chains_str = ','.join(analysis['chains'])
             
             renumbering_dict_json = json.dumps(renumbering_dict or {})
+            his_names_dict_json = json.dumps(his_names or [])
 
             # Prompt for notes
             try:
@@ -5300,6 +5312,7 @@ except Exception as e:
                 'atom_count': analysis['atom_count'],
                 'has_ligands': analysis['has_ligands'],
                 'renumbering_dict': renumbering_dict_json,
+                'his_names': his_names_dict_json,
                 'status': 'created',
                 'notes': notes if notes else "No notes associated.",
             }
@@ -10962,3 +10975,92 @@ quit
         return filtered_df
         
         
+    def _parse_histidine_names(self, original_pdb_path, selected_chains):
+        """
+        Parses a PDB file to identify and record the names of Histidine residues (HIS, HID, HIE, HIP) 
+        within specified chains.
+        Args:
+            original_pdb_path (str): Path to the original PDB file.
+            selected_chains (Iterable[str]): Collection of chain identifiers to search for Histidine residues.
+        Returns:
+            dict: A dictionary mapping residue number and chain (formatted as "{res_num}_{chain_id}") 
+                  to the Histidine residue name found in the PDB file.
+        """
+
+        his_names = {}
+        with open(original_pdb_path, 'r') as pdb_file:
+            for line in pdb_file:
+                if line.startswith("HETATM") or line.startswith("ATOM"):
+                    chain_id = line[21].strip()
+                    res_name = line[17:20].strip()
+                    res_num = line[22:26].strip()
+                    if chain_id in selected_chains and res_name in ['HIS', 'HID', 'HIE', 'HIP']:
+                        his_names[f"{res_num}_{chain_id}"] = res_name
+        
+        return his_names
+
+    def _customize_histidine_names(self, his_names):
+
+        # Loop over the his_names and query the user if he wants to redefine the default name
+
+        # check if his_names contains items and ask if processing is required
+        if not his_names:
+            print("No Histidine residues found for customization.")
+            return his_names
+        
+        print("\nHistidine residues detected in the PDB file:")
+        # ask if processing of histidines is required
+        while True:
+            response = input("Do you want to review and potentially customize the names of these Histidine residues? (y/N): ")
+            response = response.strip().lower()
+            print(f"Response {response}")
+            if not response:
+                print("Using His names as present in template")
+                response = 'n'
+                return his_names
+            if response in ['y', 'yes', 'n', 'no']:
+                break
+            else:
+                print("Please answer 'y' or 'n'.")
+
+        print(f"Response {response}")
+
+        # Modify His names as requested by the user    
+        if response in ['y', 'yes']:
+            for res_key, default_name in his_names.items():
+                print(f"\nHistidine residue found: {res_key} with default name '{default_name}'")
+                print("Do you want to redefine the name for this residue? (y/N:)")
+                response = input().strip().lower()
+                if not response:
+                    response = 'n'
+                if response in ['y', 'yes']:
+                    new_name = input("Enter the new name for this Histidine residue (e.g., HIS, HID, HIE, HIP): ").strip().upper()
+                    if new_name in ['HIS', 'HID', 'HIE', 'HIP']:
+                        his_names[res_key] = new_name
+                        print(f"Updated name for residue {res_key} to '{new_name}'")
+                    else:
+                        print("Invalid name entered. Keeping the default name.")
+                else:
+                    print(f"Keeping default name '{default_name}' for residue {res_key}")   
+
+            return his_names
+
+    def _fix_histine_names(self, his_names, processed_pdb_path):
+
+        print(f"Processed PDB PATH {processed_pdb_path}")
+
+        # Read the processed PDB file and replace HIS residue names based on his_names dictionary
+        with open(processed_pdb_path, 'r') as pdb_file:
+            pdb_lines = pdb_file.readlines()
+        with open(processed_pdb_path, 'w') as pdb_file:
+            for line in pdb_lines:
+                if line.startswith("HETATM") or line.startswith("ATOM"):
+                    chain_id = line[21].strip()
+                    res_name = line[17:20].strip()
+                    res_num = line[22:26].strip()
+                    res_key = f"{res_num}_{chain_id}"
+                    if res_key in his_names:
+                        new_res_name = his_names[res_key]
+                        if new_res_name != res_name:
+                            line = line[:17] + new_res_name.ljust(3) + line[20:]
+                pdb_file.write(line)    
