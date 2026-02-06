@@ -5891,8 +5891,12 @@ quit
 
             print("✅ AutoDock4Zn parameters to be applied.")
 
+        # Helper method to get last receptor model id
+        last_receptor_model_id = self._get_last_receptor_model_id()
+        receptor_model_id = int(last_receptor_model_id) + 1
+
         # Call helper method to create receptor grids
-        configs = self._create_receptor_grids(pdbqt_file, configs, folder, has_ZN)
+        configs = self._create_receptor_grids(pdbqt_file, configs, folder, has_ZN, receptor_model_id)
 
         if pdbqt_file:
 
@@ -6116,7 +6120,7 @@ quit
             print(f"   ❌ Error writing PDBQT file: {e}")
             raise
 
-    def _create_receptor_grids(self, pdbqt_file, configs, rec_main_path, has_ZN):
+    def _create_receptor_grids(self, pdbqt_file, configs, rec_main_path, has_ZN, receptor_model_id):
         """
         Generate AutoGrid4 grid parameter files (.gpf) for the prepared receptor.
 
@@ -6150,7 +6154,7 @@ quit
         receptor_model_charge = configs.get('receptor_charge_model', 'unknown')
 
         # Prepare grid files directory
-        grids_path = os.path.join(rec_main_path, f'grid_files_{receptor_model_charge}')
+        grids_path = os.path.join(rec_main_path, f'RecMod_{receptor_model_id}_grid_files_{receptor_model_charge}')
         os.makedirs(grids_path, exist_ok=True)
         grids_file_path = os.path.join(grids_path, 'receptor.gpf')
         grid_log_file = grids_file_path.replace(".gpf", ".glg")
@@ -10974,7 +10978,6 @@ quit
         
         return filtered_df
         
-        
     def _parse_histidine_names(self, original_pdb_path, selected_chains):
         """
         Parses a PDB file to identify and record the names of Histidine residues (HIS, HID, HIE, HIP) 
@@ -11064,3 +11067,28 @@ quit
                         if new_res_name != res_name:
                             line = line[:17] + new_res_name.ljust(3) + line[20:]
                 pdb_file.write(line)    
+
+    def _get_last_receptor_model_id(self):
+
+        import sqlite3
+        try:
+            receptors_db_path = os.path.join(self.path, 'docking', 'receptors', 'receptors.db')
+            conn = sqlite3.connect(receptors_db_path)
+            cursor = conn.cursor()
+
+            cursor.execute("SELECT MAX(id) FROM receptor_models")
+            result = cursor.fetchone()
+            if result and result[0] is not None:
+                last_receptor_model_id = result[0]
+                return last_receptor_model_id
+            else:
+                last_receptor_model_id = 0
+                return last_receptor_model_id
+
+        except sqlite3.Error as e:
+            print(f"Error accessing receptors database: {e}")
+            last_receptor_model_id = 0
+            return last_receptor_model_id
+        finally:
+            if conn:
+                conn.close()
