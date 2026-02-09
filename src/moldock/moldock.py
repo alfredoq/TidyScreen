@@ -11047,6 +11047,11 @@ quit
                     print(f"Keeping default name '{default_name}' for residue {res_key}")   
 
             return his_names
+        
+        elif response in ['n', 'no']:
+            print("Using His names as present in template")
+            return his_names
+        
 
     def _fix_histine_names(self, his_names, processed_pdb_path):
 
