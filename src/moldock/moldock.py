@@ -6000,6 +6000,24 @@ quit
                 print("\n❌ Box size entry cancelled.")
                 return None
 
+        # Prompt for the inclusion of biases
+        while True:
+            try:
+                bias_choice = input("Do you want to include bias potentials in the grid? (y/N): ").strip().lower()
+                if not bias_choice or bias_choice in ['n', 'no']:
+                    print("ℹ️  Bias potentials will not be included in the grid.")
+                    biases = None
+                    break
+                elif bias_choice in ['y', 'yes']:
+                    bias_points = self._query_for_bias_points()
+                    biases = bias_points if bias_points else None
+                    break
+                else:
+                    print("❌ Please answer 'y' or 'n'.")
+            except KeyboardInterrupt:
+                print("\n❌ Bias potential choice cancelled.")
+                return None
+
         # Prompt for dielectric constant
         while True:
             try:
@@ -6089,7 +6107,7 @@ quit
             default="gasteiger"
             )
 
-        return {'center': coords, 'size': sizes, 'dielectric': dielectric, 'smooth': smooth, 'spacing': spacing, 'receptor_charge_model': charge_model_receptor}
+        return {'center': coords, 'size': sizes, 'dielectric': dielectric, 'smooth': smooth, 'spacing': spacing, 'receptor_charge_model': charge_model_receptor, 'biases': biases}
 
     def _write_pdbqt(self, mypol, destination_pdbqt: str) -> None:
         """
@@ -6241,17 +6259,28 @@ quit
 
                 print(f"✅ AutoGrid4 completed successfully. Log: {grid_log_file}")
                 
+                
+                # Apply biases on grids if requested
+                if configs['biases']:
+                    print("Bias file to be prepared")
+                    print(configs['biases'])
+                    pass        
+                
                 # Return updated configs containing the corresponding grids path
                 return configs
             
             else:
                 print(f"❌ AutoGrid4 failed. See log for details: {grid_log_file}")
                 print(result.stderr)
+
         except FileNotFoundError:
             print("❌ AutoGrid4 executable not found. Please ensure it is installed and in your PATH.")
         except Exception as e:
             print(f"❌ Error running AutoGrid4: {e}") 
+
         
+
+
     def _create_receptor_register(self, 
                              pdb_id: int,                 
                              template_name: str, 
@@ -11092,3 +11121,82 @@ quit
         finally:
             if conn:
                 conn.close()
+
+    def _query_for_bias_points(self):
+
+        # while loop until entering 'finish', asking for x coordinate, y coordinate and z coordinate, bias value, bias radii and bias type
+
+        bias_points = []
+        print("\nEnter bias points for docking (type 'finish' to end):")
+        counter = 1
+        while True:
+            while True:
+                x = input(f"Enter x coordinate for bias point {counter} (or 'finish' to end): ").strip()
+                if x.lower() == 'finish':
+                    print("Finished entering biases")
+                    print("\nEntered bias points:")
+                    for i, bp in enumerate(bias_points, 1):
+                        print(f"  {i}. (x={bp['x']}, y={bp['y']}, z={bp['z']}), value={bp['bias_value']}, radii={bp['bias_radii']}, type={bp['bias_type']}")
+                    return bias_points  # Exit both loops by returning immediately
+                try:
+                    x = float(x)
+                    #x = "{:.3f}".format(x)
+                    break
+                except ValueError:
+                    print("Please enter a valid number for x coordinate or 'finish' to end.")
+            
+            while True:
+                y = input(f"Enter y coordinate for bias point {counter}: ").strip()
+                try:
+                    y = float(y)
+                    #y = "{:.3f}".format(y)
+                    break
+                except ValueError:
+                    print("Please enter a valid number for y coordinate.")
+            while True:
+                z = input(f"Enter z coordinate for bias point {counter}: ").strip()
+                try:
+                    z = float(z)
+                    #z = "{:.3f}".format(z)
+                    break
+                    break
+                except ValueError:
+                    print("Please enter a valid number for z coordinate.")
+            while True:
+                bias_value = input(f"Enter bias value for bias point {counter}: ").strip()
+                try:
+                    bias_value = float(bias_value)
+                    #bias_value = "{:.2f}".format(bias_value)
+                    break
+                except ValueError:
+                    print("Please enter a valid number for bias value.")
+            while True:
+                bias_radii = input(f"Enter bias radii for bias point {counter}: ").strip()
+                try:
+                    bias_radii = float(bias_radii)
+                    #bias_radii = "{:.2f}".format(bias_radii)
+                    break
+                except ValueError:
+                    print("Please enter a valid number for bias radii.")
+
+            while True:
+                bias_type = input(f"Enter bias type for bias point {counter} ('acceptor'=1 or 'donor'=2): ").strip().lower()
+                    
+                if bias_type == '1' or 'acceptor':
+                    bias_type = 'acc'
+                    break
+                elif bias_type == '2' or 'donor':
+                    bias_type = 'don'
+                    break
+                else:
+                    print("Please enter '1' for acceptor or '2' for donor.")
+
+            bias_points.append({
+                'x': x,
+                'y': y,
+                'z': z,
+                'bias_value': bias_value,
+                'bias_radii': bias_radii,
+                'bias_type': bias_type
+            })
+            counter += 1
