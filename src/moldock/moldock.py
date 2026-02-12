@@ -6181,7 +6181,7 @@ quit
             
             if configs["receptor_charge_model"] == "espaloma":
                 print("Detected 'espaloma' charge model for receptor \n tuning 'qsap' in grid parameter file")
-                f.write("qasp 0.00679")
+                f.write("qasp 0.00679\n")
 
             # If Zn present, copy AD4Zn.dat and add Zn grid parameters
             if has_ZN:
