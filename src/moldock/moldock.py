@@ -6003,21 +6003,21 @@ quit
         # Prompt for dielectric constant
         while True:
             try:
-                dielectric = input("Enter dielectric constant to use (default: -42): ").strip()
+                dielectric = input("Enter dielectric constant to use (default: -0.1465): ").strip()
                 if not dielectric:
-                    dielectric = -42
+                    dielectric = -0.1465
                 else:
                     try:
-                        dielectric = int(dielectric)
+                        dielectric = float(dielectric)
                     except ValueError:
-                        print("❌ Please enter a valid integer for the dielectric constant")
+                        print("❌ Please enter a valid float for the dielectric constant")
                         continue
                 try:
-                    dielectric = int(dielectric)
+                    dielectric = float(dielectric)
                     misc = {'dielectric': dielectric}
                     print(f"Dielectric constant: ({dielectric})")
                 except ValueError:
-                    print("❌ Please enter valid integers for dielectric constant")
+                    print("❌ Please enter valid floats for dielectric constant")
                     continue
                 break
             except KeyboardInterrupt:
