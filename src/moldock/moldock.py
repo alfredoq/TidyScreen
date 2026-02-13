@@ -6193,14 +6193,27 @@ quit
                     print(f"⚠️  Error copying Zn parameters file: {e}")
 
                 # Write Zn-specific grid parameters
+                
+                ## Obsolete Zn parameters (to be removed in future versions, currently kept for testing purposes)
+                # zn_params = [
+                #     "nbp_r_eps 0.25 23.2135 12 6 NA TZ",
+                #     "nbp_r_eps 2.1   3.8453 12 6 OA Zn",
+                #     "nbp_r_eps 2.25  7.5914 12 6 SA Zn",
+                #     "nbp_r_eps 1.0   0.0    12 6 HD Zn",
+                #     "nbp_r_eps 2.0   0.0060 12 6 NA Zn",
+                #     "nbp_r_eps 2.0   0.2966 12 6  N Zn"
+                # ]
+                
                 zn_params = [
-                    "nbp_r_eps 0.25 23.2135 12 6 NA TZ",
-                    "nbp_r_eps 2.1   3.8453 12 6 OA Zn",
-                    "nbp_r_eps 2.25  7.5914 12 6 SA Zn",
+                    "nbp_r_eps 0.25  3.8581 12 6 NA TZ",
+                    "nbp_r_eps 2.1   0.6391 12 6 OA Zn",
+                    "nbp_r_eps 2.25  1.2617 12 6 SA Zn",
                     "nbp_r_eps 1.0   0.0    12 6 HD Zn",
-                    "nbp_r_eps 2.0   0.0060 12 6 NA Zn",
-                    "nbp_r_eps 2.0   0.2966 12 6  N Zn"
+                    "nbp_r_eps 2.0   0.0010 12 6 NA Zn",
+                    "nbp_r_eps 2.0   0.0493 12 6  N Zn"
                 ]
+                
+                
                 for line in zn_params:
                     f.write(line + "\n")
 
