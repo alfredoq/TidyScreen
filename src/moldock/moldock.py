@@ -1,5 +1,6 @@
 import ast
 import os
+import site
 import sqlite3
 from turtle import pd
 from io import StringIO
@@ -5855,7 +5856,7 @@ quit
                     return None
         else:
             idx = selection - 1
-            if 0 <= idx < len(pdbs):
+            if 0 <= idx < len>(pdbs):
                 selected = pdbs[idx]
             else:
                 print(f"❌ Invalid selection. Enter a number between 1 and {len(pdbs)}.")
@@ -6262,9 +6263,7 @@ quit
                 
                 # Apply biases on grids if requested
                 if configs['biases']:
-                    print("Bias file to be prepared")
-                    print(configs['biases'])
-                    pass        
+                    self._apply_grid_biases(configs['biases'], grids_path)
                 
                 # Return updated configs containing the corresponding grids path
                 return configs
@@ -6277,9 +6276,6 @@ quit
             print("❌ AutoGrid4 executable not found. Please ensure it is installed and in your PATH.")
         except Exception as e:
             print(f"❌ Error running AutoGrid4: {e}") 
-
-        
-
 
     def _create_receptor_register(self, 
                              pdb_id: int,                 
@@ -11181,11 +11177,11 @@ quit
 
             while True:
                 bias_type = input(f"Enter bias type for bias point {counter} ('acceptor'=1 or 'donor'=2): ").strip().lower()
-                    
-                if bias_type == '1' or 'acceptor':
+                
+                if int(bias_type) == 1 or bias_type == 'acceptor':
                     bias_type = 'acc'
                     break
-                elif bias_type == '2' or 'donor':
+                elif int(bias_type) == 2 or bias_type == 'donor':
                     bias_type = 'don'
                     break
                 else:
@@ -11200,3 +11196,46 @@ quit
                 'bias_type': bias_type
             })
             counter += 1
+
+    def _apply_grid_biases(self, biases, grids_path):
+
+        # write a .bpf file in grids_path using biases
+
+        bpf_file_path = os.path.join(grids_path, "grid_biases.bpf")
+
+        with open(bpf_file_path, 'w') as f:
+            f.write("x y x Vset r type\n")
+            for bias in biases:
+                f.write(f"{bias['x']} {bias['y']} {bias['z']} {bias['bias_value']} {bias['bias_radii']} {bias['bias_type']}\n")
+
+        # Compute the corresponding biases
+        import site
+        import subprocess
+
+        ad4_bias_script = os.path.join(site.getsitepackages()[0], "tidyscreen", "misc", "prepare_bias.py")
+        gpf_file = os.path.join(grids_path, "receptor.gpf")
+
+        try:
+            # Run the script in the 'adt' conda environment
+            result = subprocess.run(["conda", "run", "-n", "adt", "python", ad4_bias_script, "-b", bpf_file_path, "-g", gpf_file],stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=grids_path)
+
+            if result.returncode == 0:
+                print("\n✅ Grid biases computed successfully.")
+            else:
+                print(f"\n❌ Error computing grid biases: {result.stderr}")
+
+            # Replace original map files with those containing biases
+
+            import glob
+
+            for file in glob.glob(os.path.join(grids_path, "*biased*")):
+                new_name = file.replace("biased.", "")
+                try:
+                    os.replace(file, new_name)
+                except Exception as e:
+                    print(f"   ⚠️  Could not rename {file}: {e}")
+
+        except Exception as e:
+            print(f"\n❌ Exception occurred while computing grid biases: {e}")
+
+        print(f"Bias files writen to {grids_path}. It will be used in AutoGrid4 execution if biases are applied.")
