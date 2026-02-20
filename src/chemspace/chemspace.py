@@ -877,7 +877,8 @@ class ChemSpace:
                 # Process in parallel chunks
                 result = self._process_csv_parallel(
                     df, table_name, smiles_column, name_column, flag_column,
-                    name_available, flag_available, flag_description_available, skip_duplicates,
+                    name_available, flag_available, #flag_description_available, 
+                    skip_duplicates,
                     max_workers, chunk_size
                 )
             else:
