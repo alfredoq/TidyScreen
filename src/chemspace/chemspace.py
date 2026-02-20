@@ -877,7 +877,7 @@ class ChemSpace:
                 # Process in parallel chunks
                 result = self._process_csv_parallel(
                     df, table_name, smiles_column, name_column, flag_column,
-                    name_available, flag_available, #flag_description_available, 
+                    name_available, flag_available, flag_description_available, 
                     skip_duplicates,
                     max_workers, chunk_size
                 )
@@ -2429,7 +2429,7 @@ class ChemSpace:
     
     def _process_csv_parallel(self, df: pd.DataFrame, table_name: str,
                              smiles_column: str, name_column: Optional[str], flag_column: Optional[str],
-                             name_available: bool, flag_available: bool, skip_duplicates: bool,
+                             name_available: bool, flag_available: bool, flag_description_available: bool, skip_duplicates: bool,
                              max_workers: int, chunk_size: int) -> Dict[str, Any]:
         """
         Process CSV data using parallel processing with chunks and comprehensive progress tracking.
