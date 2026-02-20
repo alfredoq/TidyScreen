@@ -839,7 +839,11 @@ class ChemSpace:
             
             # Parse the df to check columns and information
             df = self._parse_df_from_csv_file(df, smiles_column, name_column, flag_column)
-            
+
+            # save the df as a csv file to /tmp
+            temp_csv_path = os.path.join('/tmp', f"{table_name}_temp.csv")
+            df.to_csv(temp_csv_path, index=False)
+
             # Validate required columns (only SMILES is mandatory)
             if smiles_column not in df.columns:
                 return {
