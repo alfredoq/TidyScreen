@@ -38,7 +38,7 @@ setup(name='tidyscreen',
         'py3Dmol',
 	'sqlite_web'
       ],
-      packages=['tidyscreen', 'tidyscreen.chemspace', 'tidyscreen.config', 'tidyscreen.databases', 'tidyscreen.projects', 'tidyscreen.moldock', 'tidyscreen.misc', 'tidyscreen.moldyn'],
+      packages=['tidyscreen', 'tidyscreen.chemspace', 'tidyscreen.config', 'tidyscreen.databases', 'tidyscreen.projects', 'tidyscreen.moldock', 'tidyscreen.misc', 'tidyscreen.moldyn', 'tidyscreen.molecule_management'],
       keywords='drug-discovery',
       classifiers=[
           "Programming Language :: Python :: 3.10",
