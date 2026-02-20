@@ -34,7 +34,7 @@ ActivateProject = tidyscreen.ActivateProject
 def _process_chunk_worker(chunk_df: pd.DataFrame, smiles_column: str, 
                          name_column: Optional[str], flag_column: Optional[str],
                          name_available: bool, flag_available: bool, 
-                         start_idx: int) -> List[Tuple[str, str, str]]:
+                         start_idx: int, flag_description_available) -> List[Tuple[str, str, str]]:
     """
     Worker function to process a chunk of DataFrame in parallel.
     This function must be at module level to be pickleable for multiprocessing.
@@ -47,6 +47,7 @@ def _process_chunk_worker(chunk_df: pd.DataFrame, smiles_column: str,
         name_available (bool): Whether name column is available
         flag_available (bool): Whether flag column is available
         start_idx (int): Starting index for compound naming
+        flag_description_available (bool): Whether flag description column is available
         
     Returns:
         List[Tuple[str, str, str]]: List of tuples (smiles, name, flag)
@@ -73,15 +74,21 @@ def _process_chunk_worker(chunk_df: pd.DataFrame, smiles_column: str,
         else:
             flag = "nd"  # Default flag if column doesn't exist
         
+        # Handle flag description - use provided column of default to "nd"
+        if flag_description_available:
+            flag_description = str(row.get("flag_description", "nd")).strip()
+        else:
+            flag_description = "nd"  # Default flag description if column doesn't exist
+
         # Skip empty SMILES rows (only SMILES is mandatory)
         if not smiles or smiles.lower() in ['nan', 'none', '']:
             continue
         
-        compounds_data.append((smiles, name, flag))
+        compounds_data.append((smiles, name, flag, flag_description))
     
     return compounds_data
 
-def _compute_inchi_keys_worker(chunk_data: List[Tuple[int, str, str]]) -> List[Tuple[int, str, str]]:
+def _compute_inchi_keys_worker(chunk_data: List[Tuple[int, str, str, str]]) -> List[Tuple[int, str, str, str]]:
     """
     Worker function to compute InChI keys for a chunk of SMILES strings in parallel.
     This function must be at module level to be pickleable for multiprocessing.
@@ -840,9 +847,9 @@ class ChemSpace:
             # Parse the df to check columns and information
             df = self._parse_df_from_csv_file(df, smiles_column, name_column, flag_column)
 
-            # save the df as a csv file to /tmp
-            temp_csv_path = os.path.join('/tmp', f"{table_name}_temp.csv")
-            df.to_csv(temp_csv_path, index=False)
+            # save the df as a csv file to /tmp # TO DELETE
+            temp_csv_path = os.path.join('/tmp', f"{table_name}_temp.csv") # TO DELETE
+            df.to_csv(temp_csv_path, index=False) # TO DELETE
 
             # Validate required columns (only SMILES is mandatory)
             if smiles_column not in df.columns:
@@ -882,8 +889,7 @@ class ChemSpace:
                 result = self._process_csv_parallel(
                     df, table_name, smiles_column, name_column, flag_column,
                     name_available, flag_available, flag_description_available, 
-                    skip_duplicates,
-                    max_workers, chunk_size
+                    skip_duplicates, max_workers, chunk_size
                 )
             else:
                 print(f"📝 Processing {len(df)} rows sequentially...")
@@ -2495,7 +2501,7 @@ class ChemSpace:
                     future = executor.submit(
                         _process_chunk_worker,
                         chunk, smiles_column, name_column, flag_column,
-                        name_available, flag_available, i * chunk_size
+                        name_available, flag_available, i * chunk_size, flag_description_available
                     )
                     future_to_chunk[future] = {
                         'index': i,
