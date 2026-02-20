@@ -1296,6 +1296,7 @@ class ChemSpace:
             
             for compound_data in compounds_data:
                 try:
+                    print(compound_data)
                     cursor.execute(insert_query, compound_data)
                     compounds_added += 1
                 except sqlite3.IntegrityError:
