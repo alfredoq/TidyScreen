@@ -1463,45 +1463,97 @@ class ChemSpace:
             print(f"❌ Error exporting compounds{table_desc}: {e}")
             return False
     
-    def filter_using_smarts(self, table_name: str, id: int):
+    def filter_using_smarts(self, table_name: Optional[str] = None, id: Optional[int] = None):
         """
         Filter compounds in a table using a SMARTS pattern retrieved by ID from the projects database.
-        
+
         Args:
-            table_name (str): Name of the table to filter
-            id (int): ID of the SMARTS filter in the projects database
+            table_name (Optional[str]): Name of the table to filter. If None, shows a list of tables for selection.
+            id (Optional[int]): ID of the SMARTS filter in the projects database. If None, shows a list for selection.
         """
-    
+
         try:
+            # If table_name is not provided, show a list of tables for user selection
+            if table_name is None:
+                tables = self.get_all_tables()
+                if not tables:
+                    print("❌ No tables found in chemspace database.")
+                    return []
+                print("\n📋 Available tables in chemspace.db:")
+                for idx, t in enumerate(tables, 1):
+                    print(f"  [{idx}] {t}")
+                while True:
+                    selection = input("Select table by number or name (or 'cancel' to abort): ").strip()
+                    if selection.lower() == 'cancel':
+                        print("❌ Operation cancelled by user.")
+                        return []
+                    if selection.isdigit():
+                        idx = int(selection) - 1
+                        if 0 <= idx < len(tables):
+                            table_name = tables[idx]
+                            break
+                        else:
+                            print("⚠️ Invalid selection. Try again.")
+                    elif selection in tables:
+                        table_name = selection
+                        break
+                    else:
+                        print("⚠️ Invalid selection. Try again.")
+
             # Check if the table exists
             tables = self.get_all_tables()
             if table_name not in tables:
-                print(f"❌ Table '{table_name}' does not exist in chemspace database")
-                return
+                print(f"❌ Table '{table_name}' not found in chemspace database.")
+                return []
 
             # Get the projects database path
             import site
             projects_db = f"{site.getsitepackages()[0]}/tidyscreen/projects_db/projects_database.db"
-            
+
             if not os.path.exists(projects_db):
-                print(f"❌ Projects database not found: {projects_db}")
-                return
-            
+                print(f"❌ Projects database not found at {projects_db}")
+                return []
+
+            # If id is not provided, show a list of available SMARTS filters for selection
+            if id is None:
+                conn = sqlite3.connect(projects_db)
+                cursor = conn.cursor()
+                cursor.execute("SELECT id, filter_name, smarts FROM chem_filters ORDER BY id")
+                filters = cursor.fetchall()
+                conn.close()
+                if not filters:
+                    print("❌ No SMARTS filters found in the projects database.")
+                    return []
+                print("\n📋 Available SMARTS filters:")
+                for idx, (fid, fname, smarts) in enumerate(filters, 1):
+                    smarts_preview = smarts[:40] + ("..." if len(smarts) > 40 else "")
+                    print(f"  [{fid}] {fname} | {smarts_preview}")
+                while True:
+                    selection = input("Select SMARTS filter by ID (or 'cancel' to abort): ").strip()
+                    if selection.lower() == 'cancel':
+                        print("❌ Operation cancelled by user.")
+                        return []
+                    if selection.isdigit():
+                        id = int(selection)
+                        if any(fid == id for fid, _, _ in filters):
+                            break
+                        else:
+                            print("⚠️ Invalid filter ID. Try again.")
+                    else:
+                        print("⚠️ Invalid selection. Try again.")
+
             # Connect to projects database and retrieve the SMARTS pattern by ID
             projects_conn = sqlite3.connect(projects_db)
             projects_cursor = projects_conn.cursor()
-            
-            # Query to get the SMARTS pattern and filter name by ID
             smarts_query = "SELECT filter_name, smarts FROM chem_filters WHERE id = ?"
             projects_cursor.execute(smarts_query, (id,))
             smarts_result = projects_cursor.fetchone()
-            
             projects_conn.close()
-            
+
             if not smarts_result:
-                print(f"❌ No SMARTS filter found with ID {id} in projects database")
-                return
-            
+                print(f"❌ No SMARTS filter found with ID {id}")
+                return []
+
             filter_name, smarts_pattern = smarts_result
             print(f"🔍 Found SMARTS filter: '{filter_name}' (ID: {id})")
             print(f"🧪 SMARTS pattern: {smarts_pattern}")
@@ -1509,75 +1561,60 @@ class ChemSpace:
             # Connect to chemspace database and retrieve the table
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
-
-            # Query to retrieve all compounds from the specified table
             query = f"SELECT id, smiles, name, flag FROM {table_name}"
             cursor.execute(query)
             compounds = cursor.fetchall()
-        
             conn.close()
 
             if not compounds:
-                print(f"⚠️  No compounds found in table '{table_name}'")
-                return
-        
+                print(f"❌ No compounds found in table '{table_name}'.")
+                return []
+
             print(f"📊 Retrieved {len(compounds)} compounds from table '{table_name}' for filtering")
             print(f"🔬 Starting SMARTS pattern matching...")
-            
+
             # Import RDKit for SMARTS pattern matching
             try:
                 from rdkit import Chem
                 from rdkit import RDLogger
-                # Suppress RDKit warnings for cleaner output
                 RDLogger.DisableLog('rdApp.*')
             except ImportError:
-                print("❌ RDKit not installed. Please install RDKit to use SMARTS filtering:")
-                print("   conda install -c conda-forge rdkit")
-                print("   or")
-                print("   pip install rdkit")
-                return
-            
+                print("❌ RDKit is required for SMARTS filtering.")
+                return []
+
             # Parse the SMARTS pattern
             smarts_mol = Chem.MolFromSmarts(smarts_pattern)
             if smarts_mol is None:
                 print(f"❌ Invalid SMARTS pattern: {smarts_pattern}")
-                return
-                
+                return []
+
             # Initialize counters
             matching_compounds = []
             invalid_smiles_count = 0
-            
+
             # Process compounds and apply SMARTS filter
-            progress_bar = None
-            if TQDM_AVAILABLE:
-                progress_bar = tqdm(total=len(compounds), desc="Filtering compounds", unit="compound")
-            
-            for compound in compounds:
-                compound_id, smiles, name, flag = compound
-                
-                # Parse SMILES
-                mol = Chem.MolFromSmiles(smiles)
-                if mol is None:
+            progress_bar = tqdm(compounds, desc="SMARTS filtering", unit="cmpd") if TQDM_AVAILABLE else compounds
+
+            for compound in progress_bar:
+                cmpd_id, smiles, name, flag = compound
+                try:
+                    mol = Chem.MolFromSmiles(smiles)
+                    if mol is None:
+                        invalid_smiles_count += 1
+                        continue
+                    if mol.HasSubstructMatch(smarts_mol):
+                        matching_compounds.append({
+                            'id': cmpd_id,
+                            'smiles': smiles,
+                            'name': name,
+                            'flag': flag
+                        })
+                except Exception:
                     invalid_smiles_count += 1
-                    if progress_bar:
-                        progress_bar.update(1)
-                    continue
-                
-                # Check if compound matches the SMARTS pattern
-                if mol.HasSubstructMatch(smarts_mol):
-                    matching_compounds.append({
-                        'id': compound_id,
-                        'smiles': smiles,
-                        'name': name,
-                        'flag': flag
-                    })
-                
-                if progress_bar:
-                    progress_bar.update(1)
-            
-            if progress_bar:
+
+            if TQDM_AVAILABLE and hasattr(progress_bar, 'close'):
                 progress_bar.close()
-            
+
             # Print results summary
             print(f"✅ SMARTS filtering completed!")
             print(f"📋 Filter applied: '{filter_name}' (ID: {id})")
@@ -1588,25 +1625,23 @@ class ChemSpace:
             print(f"   • Non-matching compounds: {len(compounds) - len(matching_compounds) - invalid_smiles_count}")
             print(f"   • Invalid SMILES: {invalid_smiles_count}")
             print(f"   • Match percentage: {len(matching_compounds)/len(compounds)*100:.1f}%")
-            
+
             # Optionally, save filtered results to a new table or file
             if matching_compounds:
-                print(f"\n💾 Found {len(matching_compounds)} compounds matching the filter.")
-                save_option = input("Do you want to save the filtered compounds to a new table? (y/n): ").strip().lower()
-                if save_option in ['y', 'yes']:
-                    new_table_name = input(f"Enter new table name (default: {table_name}_filtered_{filter_name.lower().replace(' ', '_').replace('-', '_')}): ").strip()
+                save = input("Do you want to save the filtered results to a new table? (y/N): ").strip().lower()
+                if save in ['y', 'yes']:
+                    new_table_name = input("Enter name for the new table: ").strip()
                     if not new_table_name:
-                        new_table_name = f"{table_name}_filtered_{filter_name.lower().replace(' ', '_').replace('-', '_')}"
-                    
-                    # Save matching compounds to new table
+                        new_table_name = f"{table_name}_filtered_{filter_name}_{id}"
                     self._save_filtered_compounds(matching_compounds, new_table_name)
             else:
-                print("⚠️  No compounds matched the filter criteria.")
-            
-            
+                print("No matching compounds to save.")
+
+            return matching_compounds
+
         except Exception as e:
             print(f"❌ Error retrieving SMARTS pattern or compounds for filtering: {e}")
-            return []   
+            return []
 
     def _save_filtered_compounds(self, compounds: List[Dict], table_name: str) -> bool:
         """
