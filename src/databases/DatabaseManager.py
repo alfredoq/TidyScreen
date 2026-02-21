@@ -50,7 +50,7 @@ class DatabaseManager:
             
             # Populate chem_filters table from JSON file
             config_dir = os.path.dirname(os.path.dirname(os.path.dirname(db_path)))
-            json_file_path = os.path.join(config_dir, 'src', 'config', 'chem_filters.json')
+            json_file_path = os.path.join(config_dir, 'tidyscreen', 'config', 'chem_filters.json')
             
             if os.path.exists(json_file_path):
                 with open(json_file_path, 'r') as f:
