@@ -1561,7 +1561,7 @@ class ChemSpace:
             # Connect to chemspace database and retrieve the table
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
-            query = f"SELECT id, smiles, name, flag FROM {table_name}"
+            query = f"SELECT id, smiles, name, flag, flag_description, inchi_key FROM {table_name}"
             cursor.execute(query)
             compounds = cursor.fetchall()
             conn.close()
@@ -1596,19 +1596,18 @@ class ChemSpace:
             progress_bar = tqdm(compounds, desc="SMARTS filtering", unit="cmpd") if TQDM_AVAILABLE else compounds
 
             for compound in progress_bar:
-                cmpd_id, smiles, name, flag = compound
+                # Unpack all columns from the compound tuple
+                cmpd_id, smiles, name, flag, flag_description, inchi_key = compound
+                
                 try:
                     mol = Chem.MolFromSmiles(smiles)
                     if mol is None:
                         invalid_smiles_count += 1
                         continue
                     if mol.HasSubstructMatch(smarts_mol):
-                        matching_compounds.append({
-                            'id': cmpd_id,
-                            'smiles': smiles,
-                            'name': name,
-                            'flag': flag
-                        })
+                        # Append all columns as a dictionary
+                        compound_dict = {col: compound[i] for i, col in enumerate([desc[0] for desc in cursor.description])}
+                        matching_compounds.append(compound_dict)
                 except Exception:
                     invalid_smiles_count += 1
 
@@ -1688,7 +1687,9 @@ class ChemSpace:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     smiles TEXT NOT NULL UNIQUE,
                     name TEXT,
-                    flag INTEGER DEFAULT 1
+                    flag INTEGER DEFAULT 1,
+                    flag_description TEXT,
+                    inchi_key TEXT
                 )
             ''')
             
@@ -1704,9 +1705,9 @@ class ChemSpace:
             for compound in unique_compounds:
                 try:
                     cursor.execute(f'''
-                        INSERT INTO {table_name} (smiles, name, flag)
-                        VALUES (?, ?, ?)
-                    ''', (compound['smiles'], compound['name'], compound['flag']))
+                        INSERT INTO {table_name} (smiles, name, flag, flag_description, inchi_key)
+                        VALUES (?, ?, ?, ?, ?)
+                    ''', (compound['smiles'], compound['name'], compound['flag'], compound.get('flag_description', None), compound.get('inchi_key', None)))
                     inserted_count += 1
                 except sqlite3.IntegrityError:
                     # Handle case where compound already exists in database
@@ -13594,7 +13595,6 @@ class ChemSpace:
         except Exception as e:
             print(f"❌ Error storing SDF file to table: {e}")
             return False
-        
 
     def subset_table(self):
         """
@@ -14011,5 +14011,154 @@ class ChemSpace:
 
         except Exception as e:
             print(f"❌ Error in subset_table method: {e}")
+
+    def merge_tables(self):
+        
+        """
+        Show the user a list of available tables, and select which ones to merge using comma separated indexes. Merge all the requested tables and save a to a new table whose name is queried to the user
+        """
+        
+        try:
+            # Get all available tables
+            available_tables = self.get_all_tables()
+            if not available_tables:
+                print("❌ No tables found in chemspace database")
+                return
+
+            print("\n📋 MERGE TABLES")
+            print("=" * 60)
+            print(f"Available tables ({len(available_tables)}):")
+            print("-" * 60)
+            table_info = []
+            for i, table_name in enumerate(available_tables, 1):
+                try:
+                    compound_count = self.get_compound_count(table_name=table_name)
+                    print(f"{i:2d}. {table_name:<35} ({compound_count} compounds)")
+                    table_info.append({'index': i, 'name': table_name, 'count': compound_count})
+                except Exception as e:
+                    print(f"{i:2d}. {table_name:<35} (Error: {e})")
+                    table_info.append({'index': i, 'name': table_name, 'count': 0, 'error': str(e)})
+            print("-" * 60)
+            print("Enter table numbers (comma-separated) to merge, e.g. 1,3,5")
+            print("Or enter table names (comma-separated), or 'cancel' to abort.")
+
+            # Get user selection
+            while True:
+                selection = input("Select tables to merge: ").strip()
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    print("❌ Merge operation cancelled.")
+                    return
+                selected_tables = []
+                items = [item.strip() for item in selection.split(',') if item.strip()]
+                for item in items:
+                    if item.isdigit():
+                        idx = int(item)
+                        if 1 <= idx <= len(available_tables):
+                            selected_tables.append(available_tables[idx - 1])
+                        else:
+                            print(f"⚠️  Invalid table index: {idx}")
+                    elif item in available_tables:
+                        selected_tables.append(item)
+                    else:
+                        print(f"⚠️  Table not found: {item}")
+                if selected_tables:
+                    break
+                else:
+                    print("⚠️  No valid tables selected. Try again or type 'cancel'.")
+
+            print(f"\n✅ Selected tables to merge: {selected_tables}")
+
+            # Load data from selected tables
+            dfs = []
+            for table in selected_tables:
+                df = self._get_table_as_dataframe(table)
+                if df.empty:
+                    print(f"⚠️  Table '{table}' is empty or could not be loaded.")
+                else:
+                    dfs.append(df)
+            if not dfs:
+                print("❌ No data to merge from selected tables.")
+                return
+
+            # Merge DataFrames
+            merged_df = pd.concat(dfs, ignore_index=True)
+            print(f"\n📊 Merged DataFrame shape: {merged_df.shape}")
+
+            # Remove duplicates based on SMILES and name
+            if 'smiles' in merged_df.columns and 'name' in merged_df.columns:
+                merged_df = merged_df.drop_duplicates(subset=['smiles', 'name'], keep='first')
+                print(f"🔄 After removing duplicates: {merged_df.shape[0]} rows")
+
+            # Prompt for output table name
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            default_table_name = f"merged_{'_'.join([t for t in selected_tables])}_{timestamp}"
+            user_table_name = input(f"Enter table name for merged table (default: {default_table_name}): ").strip()
+            output_table_name = user_table_name if user_table_name else default_table_name
+            output_table_name = self._sanitize_table_name(output_table_name)
+
+            # Check if output table already exists
+            while output_table_name in self.get_all_tables():
+                overwrite = input(f"⚠️  Table '{output_table_name}' already exists. Overwrite? (y/n): ").strip().lower()
+                if overwrite in ['y', 'yes']:
+                    self.drop_table(output_table_name, confirm=False)
+                    break
+                else:
+                    user_table_name = input("Enter a new table name: ").strip()
+                    output_table_name = user_table_name if user_table_name else f"merged_{timestamp}"
+                    output_table_name = self._sanitize_table_name(output_table_name)
+
+            # Save merged DataFrame to database
+            try:
+                conn = sqlite3.connect(self.__chemspace_db)
+                cursor = conn.cursor()
+                # Create table with basic schema
+                columns = merged_df.columns
+                schema_parts = []
+                for col in columns:
+                    if col == 'id':
+                        continue
+                    if col in ['smiles', 'name']:
+                        schema_parts.append(f"{col} TEXT")
+                    elif col == 'flag':
+                        schema_parts.append(f"{col} TEXT")
+                    elif col == 'inchi_key':
+                        schema_parts.append(f"{col} TEXT")
+                    else:
+                        schema_parts.append(f"{col} TEXT")
+                schema = ", ".join(schema_parts)
+                cursor.execute(f"""
+                    CREATE TABLE IF NOT EXISTS {output_table_name} (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        {schema},
+                        UNIQUE(smiles, name)
+                    )
+                """)
+                # Insert data
+                insert_cols = [col for col in columns if col != 'id']
+                placeholders = ', '.join(['?'] * len(insert_cols))
+                insert_query = f"""
+                    INSERT OR IGNORE INTO {output_table_name} ({', '.join(insert_cols)})
+                    VALUES ({placeholders})
+                """
+                inserted_count = 0
+                for _, row in merged_df.iterrows():
+                    try:
+                        values = [row[col] if col in row else None for col in insert_cols]
+                        cursor.execute(insert_query, values)
+                        inserted_count += 1
+                    except sqlite3.IntegrityError:
+                        pass
+                conn.commit()
+                conn.close()
+                print(f"\n✅ Merged table '{output_table_name}' created with {inserted_count} compounds.")
+            except Exception as e:
+                print(f"❌ Error saving merged table: {e}")
+
+        except Exception as e:
+            print(f"❌ Error in merge_tables method: {e}")     
+        
+
+
+
 
 
