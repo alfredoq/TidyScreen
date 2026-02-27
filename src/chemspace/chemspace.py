@@ -729,6 +729,53 @@ class ChemSpace:
             print(f"❌ Error renaming table '{old_name}' to '{new_name}': {e}")
             return False
     
+    
+    def load_csv_file_as_table(self, csv_file_path: str = None):
+        
+        # Will query the user for the .csv file path if not provided, and load it as a table in the chemspace database, with the table name being queried to the the user. No default is possible. Will check if the table name already exists and ask the user if they want to replace it or not. If not, the process is cancelled.        
+        
+        # Prompt for CSV file path if not provided
+        if not csv_file_path:
+            csv_file_path = input("Enter the path to the CSV file: ").strip()
+            while not csv_file_path:
+                print("❌ CSV file path cannot be empty.")
+                csv_file_path = input("Enter the path to the CSV file: ").strip()
+        
+        # Validate file exists
+        if not os.path.exists(csv_file_path):
+            print(f"❌ CSV file not found: {csv_file_path}")
+            return False
+        
+        # Prompt for table name
+        table_name = input("Enter the desired table name: ").strip()
+        while not table_name:
+            print("❌ Table name cannot be empty.")
+            table_name = input("Enter the desired table name: ").strip()
+        
+        # Check if table already exists
+        existing_tables = self.get_all_tables()
+        if table_name in existing_tables:
+            response = input(f"Table '{table_name}' already exists. Do you want to replace it? (y/N): ").strip().lower()
+            if response not in ['y', 'yes']:
+                print("❌ Process cancelled.")
+                return False
+        
+        # Load the csv as a dataframe using the first row as header
+        try:
+            df = pd.read_csv(csv_file_path)
+        except Exception as e:
+            print(f"❌ Error reading CSV file: {e}")
+            return False
+        
+        # Load the dataframe into the database table
+        try:
+            conn = sqlite3.connect(self.__chemspace_db)
+            df.to_sql(table_name, conn, if_exists='append', index=False)
+            conn.close()
+        except Exception as e:
+            print(f"❌ Error loading data into table '{table_name}': {e}")
+    
+    
     def load_csv_file(self, csv_file_path: str = None, 
                      smiles_column: str = 'smiles', 
                      name_column: str = 'name', 
