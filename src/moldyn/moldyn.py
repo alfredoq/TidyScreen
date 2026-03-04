@@ -1219,3 +1219,57 @@ class MolDyn:
                 return
         except Exception as e:
             print(f"❌ Error starting MD simulation: {e}")
+            
+    def list_md_assays(self):
+        """List all MD assays registered in the project."""
+        try:
+            import sqlite3
+
+            conn = sqlite3.connect(self.__md_registers_db)
+            cursor = conn.cursor()
+
+            # Check if md_assays table exists
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='md_assays';")
+            if not cursor.fetchone():
+                print("❌ No MD assays found. The 'md_assays' table does not exist.")
+                return
+
+            # Fetch all MD assays
+            cursor.execute("SELECT * FROM md_assays;")
+            assays = cursor.fetchall()
+
+            if not assays:
+                print("❌ No MD assays found.")
+                return
+
+            print("\n📋 MD Assays:")
+            for assay in assays:
+                print(f"  - {assay[1]} (ID: {assay[0]})")
+                print(f"    Description: {assay[2]}")
+                print(f"    Docking Assay ID: {assay[3]}")
+                print(f"    Ligand Name: {assay[4]}")
+                print(f"    Pose ID: {assay[5]}")
+                print("-" * 50)
+
+            # Select an assay to show details
+            assay_ids = [str(a[0]) for a in assays]
+            while True:
+                selection = input("\n🔎 Enter the MD Assay ID to show details (or 'cancel' to exit): ").strip()
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    print("❌ Operation cancelled.")
+                    return
+                if selection in assay_ids:
+                    selected_assay = next((a for a in assays if str(a[0]) == selection), None)
+                    if selected_assay:
+                        print(f"\n📋 Details for MD Assay '{selected_assay[1]}' (ID: {selected_assay[0]}):")
+                        print(f"  Description: {selected_assay[2]}")    
+                        print(f"  Assay folder path: {selected_assay[3]}")
+                        print(f"  Docking Assay ID: {selected_assay[4]}")
+                        print(f"  Ligand Name: {selected_assay[5]}")
+                        print(f"  Pose ID: {selected_assay[6]}")
+                        print(f"  MD Parameters: {selected_assay[7]}")
+
+        except Exception as e:
+            print(f"❌ Error listing MD assays: {e}")
+            
+            
