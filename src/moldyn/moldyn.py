@@ -457,7 +457,7 @@ class MolDyn:
             import sqlite3
             import json
 
-            conn = sqlite3.connect(self.__md_registers_db)
+            conn = sqlite3.connect(self.__md_methods_db)
             cursor = conn.cursor()
             
             # Check if md_methods table exists
