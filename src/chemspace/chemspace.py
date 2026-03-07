@@ -729,7 +729,6 @@ class ChemSpace:
             print(f"❌ Error renaming table '{old_name}' to '{new_name}': {e}")
             return False
     
-    
     def load_csv_file_as_table(self, csv_file_path: str = None):
         
         # Will query the user for the .csv file path if not provided, and load it as a table in the chemspace database, with the table name being queried to the the user. No default is possible. Will check if the table name already exists and ask the user if they want to replace it or not. If not, the process is cancelled.        
@@ -774,7 +773,6 @@ class ChemSpace:
             conn.close()
         except Exception as e:
             print(f"❌ Error loading data into table '{table_name}': {e}")
-    
     
     def load_csv_file(self, csv_file_path: str = None, 
                      smiles_column: str = 'smiles', 
@@ -2728,7 +2726,7 @@ class ChemSpace:
                     chunk_size: Optional[int] = None) -> pd.DataFrame:
         """
         Apply a chemical filtering workflow to compounds in a table with parallel processing support.
-        Shows available tables and workflows for interactive selection if not provided.
+        Shows available tables and workflows for interactive selection if not provided. The filtering will match compounds complying with ALL the filter provided
         
         Args:
             table_name (Optional[str]): Name of the table containing compounds to filter. If None, shows selection.
@@ -2829,7 +2827,7 @@ class ChemSpace:
                 save_choice = input("\n💾 Do you want to save the filtered results to a new table? (y/n): ").strip().lower()
                 save_results = save_choice in ['y', 'yes']
             
-            # Save results if requested with progress
+            # Save results if requested with progress>
             if save_results:
                 # Prompt for table name if not provided
                 if result_table_name is None:
@@ -2865,6 +2863,139 @@ class ChemSpace:
         except Exception as e:
             print(f"❌ Error in filter_using_workflow: {e}")
             return pd.DataFrame()
+
+
+    def filter_using_workflow_or(self, table_name: Optional[str] = None, workflow_name: Optional[str] = None, 
+                    save_results: Optional[bool] = None, 
+                    result_table_name: Optional[str] = None,
+                    parallel_threshold: int = 10000,
+                    max_workers: Optional[int] = None,
+                    chunk_size: Optional[int] = None) -> pd.DataFrame:
+        """
+        Apply a chemical filtering workflow to compounds in a table using OR logic.
+        Retains compounds matching ANY of the filters in the workflow.
+
+        Args:
+            table_name (Optional[str]): Name of the table containing compounds to filter. If None, shows selection.
+            workflow_name (Optional[str]): Name of the workflow to apply. If None, shows selection.
+            save_results (Optional[bool]): Whether to save filtered results to database (prompts if None)
+            result_table_name (Optional[str]): Name for the result table (prompts if save_results=True and None)
+            parallel_threshold (int): Minimum number of compounds to trigger parallel processing
+            max_workers (Optional[int]): Maximum number of worker processes (default: min(cpu_count(), 8))
+            chunk_size (Optional[int]): Size of chunks for parallel processing (auto-calculated if None)
+
+        Returns:
+            pd.DataFrame: DataFrame containing filtered compounds with match information
+        """
+        try:
+            print(f"\n🔬 Starting workflow filtering (OR logic)...")
+
+            # Interactive table selection if not provided
+            if table_name is None:
+                table_name = self._select_table_for_filtering()
+                if table_name is None:
+                    print("❌ Table selection cancelled.")
+                    return pd.DataFrame()
+
+            # Interactive workflow selection if not provided
+            if workflow_name is None:
+                workflow_name = self._select_workflow_for_filtering()
+                if workflow_name is None:
+                    print("❌ Workflow selection cancelled.")
+                    return pd.DataFrame()
+
+            print(f"   📋 Table: '{table_name}'")
+            print(f"   🧪 Workflow: '{workflow_name}'")
+
+            # Load workflow filters
+            print(f"   🔍 Loading workflow filters...")
+            workflow_filters, filters_dict = self._load_workflow_filters(workflow_name)
+            if not workflow_filters:
+                print("❌ No filters found in workflow.")
+                return pd.DataFrame()
+
+            print(filters_dict)
+
+            print(f"   ✅ Loaded {len(workflow_filters)} filters")
+
+            # Get compounds from table
+            print(f"   📊 Loading compounds from table '{table_name}'...")
+            compounds_df = self._get_table_as_dataframe(table_name)
+            if compounds_df.empty:
+                print("❌ No compounds found in table.")
+                return pd.DataFrame()
+
+            total_compounds = len(compounds_df)
+            print(f"   ✅ Loaded {total_compounds:,} compounds to filter")
+
+            # Apply filters using OR logic
+            from rdkit import Chem
+            from rdkit import RDLogger
+            RDLogger.DisableLog('rdApp.*')
+
+
+            # Track matches for each filter
+            filter_match_counts = [0 for _ in workflow_filters]
+            filtered_compounds = []
+            if TQDM_AVAILABLE:
+                progress_bar = tqdm(compounds_df.iterrows(), total=total_compounds, desc="Filtering (OR logic)", unit="cmpd")
+            else:
+                progress_bar = compounds_df.iterrows()
+
+            for idx, compound in progress_bar:
+                smiles = compound['smiles']
+                passed = False
+                for i, (filter_smarts, required_instances) in enumerate(workflow_filters):
+                    smarts_mol = Chem.MolFromSmarts(filter_smarts)
+                    mol = Chem.MolFromSmiles(smiles)
+                    if mol is not None and smarts_mol is not None:
+                        match_count = len(mol.GetSubstructMatches(smarts_mol))
+                        if match_count >= required_instances:
+                            filter_match_counts[i] += 1
+                            passed = True
+                            break  # OR logic: keep if any filter matches
+                if passed:
+                    filtered_compounds.append(compound)
+
+            filtered_df = pd.DataFrame(filtered_compounds)
+            if filtered_df.empty:
+                print("❌ No compounds passed the OR logic filtering.")
+                return filtered_df
+
+            compounds_removed = total_compounds - len(filtered_df)
+            retention_rate = (len(filtered_df) / total_compounds) * 100
+
+            print(f"\n📊 Filtering Results (OR logic):")
+            print(f"   ✅ Compounds passed: {len(filtered_df):,}")
+            print(f"   ❌ Compounds removed: {compounds_removed:,}")
+            print(f"   📈 Retention rate: {retention_rate:.2f}%")
+
+            print("\n🔎 Matches per filter:")
+            keys = list(filters_dict.keys())
+            for i, (filter_smarts, required_instances) in enumerate(workflow_filters):
+                filter_name = keys[i] if i < len(keys) else f"unknown_{i+1}"
+                print(f"   Filter {i+1}: Name='{filter_name}', Required Instances={required_instances} -> Matches: {filter_match_counts[i]:,}")
+
+            # Prompt for save_results if not provided
+            if save_results is None:
+                response = input("Do you want to save the filtered results to a new table? (y/N): ").strip().lower()
+                save_results = response in ['y', 'yes']
+
+            # Save results if requested
+            if save_results:
+                if result_table_name is None:
+                    result_table_name = input("Enter name for the result table: ").strip()
+                self._save_workflow_filtered_compounds(filtered_df, result_table_name, workflow_name, {})
+            else:
+                print("Filtered results not saved.")
+
+            return filtered_df
+
+        except Exception as e:
+            print(f"❌ Error in filter_using_workflow_or: {e}")
+            return pd.DataFrame()
+
+
 
     def _select_table_for_filtering(self) -> Optional[str]:
         """
@@ -2976,7 +3107,7 @@ class ChemSpace:
             cursor.execute("""
                 SELECT workflow_name, creation_date, description, filter_count, total_instances
                 FROM filtering_workflows 
-                ORDER BY creation_date DESC
+                ORDER BY creation_date ASC
             """)
             workflows = cursor.fetchall()
             conn.close()
@@ -10587,7 +10718,7 @@ class ChemSpace:
             cursor.execute("""
                 SELECT id, workflow_name, creation_date, description, filters_dict, filter_count, total_instances
                 FROM filtering_workflows 
-                ORDER BY creation_date DESC
+                ORDER BY creation_date ASC
             """)
             workflows = cursor.fetchall()
             
