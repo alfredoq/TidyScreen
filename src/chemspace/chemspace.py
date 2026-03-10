@@ -14335,6 +14335,186 @@ class ChemSpace:
         except Exception as e:
             print(f"❌ Error in merge_tables method: {e}")     
         
+    def substract_tables(self):
+        """
+        Show the user a list of available tables, and select which ones to substract using comma separated indexes. Substract all the requested tables from the first one and save a to a new table whose name is queried to the user
+        """
+        try:
+            # Get all available tables
+            available_tables = self.get_all_tables()
+            if not available_tables:
+                print("❌ No tables found in chemspace database")
+                return          
+            
+            # Query user for the first table (the one to substract from)
+            print("\n📋 SUBTRACT TABLES")
+            print("=" * 60)
+            print(f"Available tables ({len(available_tables)}):")
+            print("-" * 60)
+            table_info = []
+            for i, table_name in enumerate(available_tables, 1):
+                try:
+                    compound_count = self.get_compound_count(table_name=table_name)
+                    print(f"{i:2d}. {table_name:<35} ({compound_count} compounds)")
+                    table_info.append({'index': i, 'name': table_name, 'count': compound_count})
+                except Exception as e:
+                    print(f"{i:2d}. {table_name:<35} (Error: {e})")
+                    table_info.append({'index': i, 'name': table_name, 'count': 0, 'error': str(e)})
+            print("-" * 60)
+            print("Enter the number or name of the table to subtract FROM, e.g. 1")
+            print("Or enter table name, or 'cancel' to abort.")
+            while True:                
+                selection = input("Select table to subtract FROM: ").strip()
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    print("❌ Subtract operation cancelled.")
+                    return
+                if selection.isdigit():
+                    idx = int(selection)
+                    if 1 <= idx <= len(available_tables):
+                        base_table = available_tables[idx - 1]
+                        break
+                    else:                        print(f"⚠️  Invalid table index: {idx}")
+                elif selection in available_tables:
+                    base_table = selection
+                    break
+                else:                    print(f"⚠️  Table not found: {selection}")
+            print(f"\n✅ Selected base table: {base_table}")
+            
+            # Query user for tables to subtract
+            print("\nEnter table numbers (comma-separated) to subtract, e.g. 2,3")
+            print("Or enter table names (comma-separated), or 'cancel' to abort.")
+            while True:
+                selection = input("Select tables to subtract: ").strip()
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    print("❌ Subtract operation cancelled.")
+                    return
+                selected_tables = []
+                items = [item.strip() for item in selection.split(',') if item.strip()]
+                for item in items:
+                    if item.isdigit():
+                        idx = int(item)
+                        if 1 <= idx <= len(available_tables):
+                            table_name = available_tables[idx - 1]
+                            if table_name != base_table:
+                                selected_tables.append(table_name)
+                            else:
+                                print(f"⚠️  Cannot subtract the base table itself: {table_name}")
+                        else:   
+                            print(f"⚠️  Invalid table index: {idx}")
+                    elif item in available_tables:
+                        if item != base_table:
+                            selected_tables.append(item)
+                        else:                            print(f"⚠️  Cannot subtract the base table itself: {item}")
+                    else:                        print(f"⚠️  Table not found: {item}")
+                if selected_tables:
+                    break
+                else:
+                    print("⚠️  No valid tables selected. Try again or type 'cancel'.")
+            print(f"\n✅ Selected tables to subtract: {selected_tables}")
+            
+            
+            # Load data from base table
+            base_df = self._get_table_as_dataframe(base_table)
+            if base_df.empty:
+                print(f"❌ Base table '{base_table}' is empty or could not be loaded.")
+                return
+            print(f"\n📊 Base table '{base_table}' shape: {base_df.shape}")
+            # Load data from tables to subtract
+            subtract_dfs = []
+            for table in selected_tables:
+                df = self._get_table_as_dataframe(table)
+                if df.empty:
+                    print(f"⚠️  Table '{table}' is empty or could not be loaded.")
+                else:                    subtract_dfs.append(df)
+            if not subtract_dfs:
+                print("❌ No data to subtract from selected tables.")
+                return
+            # Concatenate tables to subtract
+            subtract_df = pd.concat(subtract_dfs, ignore_index=True)
+            print(f"\n📊 Combined subtract DataFrame shape: {subtract_df.shape}")
+            
+            # Remove duplicates based on inchi_key if available, otherwise inform error
+            if 'inchi_key' in base_df.columns and 'inchi_key' in subtract_df.columns:
+                base_df['inchi_key'] = base_df['inchi_key'].fillna('')
+                subtract_df['inchi_key'] = subtract_df['inchi_key'].fillna('')
+                result_df = base_df[~base_df['inchi_key'].isin(subtract_df['inchi_key'])]
+                print(f"🔄 After subtraction: {result_df.shape[0]} rows")
+            else:
+                print("❌ Cannot perform subtraction because 'inchi_key' column is missing in one of the tables.")
+                return
+            
+            # Query the user for a table name to save the result. This name is mandatory and must not exist in the database
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            default_table_name = f"{base_table}_minus_{'_'.join([t for t in selected_tables])}_{timestamp}"
+            user_table_name = input(f"Enter table name for resulting table (default: {default_table_name}): ").strip()
+            output_table_name = user_table_name if user_table_name else default_table_name
+            output_table_name = self._sanitize_table_name(output_table_name)
+            while output_table_name in self.get_all_tables():
+                overwrite = input(f"⚠️  Table '{output_table_name}' already exists. Overwrite? (y/n): ").strip().lower()
+                if overwrite in ['y', 'yes']:
+                    self.drop_table(output_table_name, confirm=False)
+                    break
+                else:                
+                    user_table_name = input("Enter a new table name: ").strip()
+                    output_table_name = user_table_name if user_table_name else f"{base_table}_minus_{timestamp}"
+                    output_table_name = self._sanitize_table_name(output_table_name)   
+            print(f"✅ Output table name: '{output_table_name}'")
+            # Save result to database
+            try:
+                conn = sqlite3.connect(self.__chemspace_db)
+                cursor = conn.cursor()
+                # Save result_df to the database
+                columns = result_df.columns
+                schema_parts = []
+                for col in columns:
+                    if col == 'id':
+                        continue
+                    if col in ['smiles', 'name']:
+                        schema_parts.append(f"{col} TEXT")
+                    elif col == 'flag':
+                        schema_parts.append(f"{col} TEXT")
+                    elif col == 'inchi_key':
+                        schema_parts.append(f"{col} TEXT")
+                    else:
+                        schema_parts.append(f"{col} TEXT")
+                schema = ", ".join(schema_parts)
+                cursor.execute(f"""
+                    CREATE TABLE IF NOT EXISTS {output_table_name} (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        {schema},
+                        UNIQUE(smiles, name)
+                    )
+                """)
+                # Insert data
+                insert_cols = [col for col in columns if col != 'id']
+                placeholders = ', '.join(['?'] * len(insert_cols))
+                insert_query = f"""
+                    INSERT OR IGNORE INTO {output_table_name} ({', '.join(insert_cols)})
+                    VALUES ({placeholders})
+                """
+                inserted_count = 0
+                for _, row in result_df.iterrows():
+                    try:
+                        values = [row[col] if col in row else None for col in insert_cols]
+                        cursor.execute(insert_query, values)
+                        inserted_count += 1
+                    except sqlite3.IntegrityError:
+                        pass
+                conn.commit()
+                conn.close()
+                print(f"\n✅ Subtracted table '{output_table_name}' created with {inserted_count} compounds.")
+            except Exception as e:
+                print(f"❌ Error saving subtracted table: {e}")
+                conn.close()
+                return
+        
+        except Exception as e:
+            print(f"❌ Error in substract_tables method: {e}")                  
+                
+                
+            
+
+
 
 
 
