@@ -4244,6 +4244,7 @@ class ChemSpace:
                         highlight_atoms_list.append(highlight_atoms)
                         
                     except Exception:
+                        print(f"Failed to depict molecule '{name}' (id: {id}) with smiles '{smiles}' - skipping")
                         failed_depictions += 1
                         continue
                 
