@@ -1192,9 +1192,9 @@ class MolDyn:
             f.write("echo 'Running heating'\n")
             f.write("pmemd.cuda -O -i heating.in -o heating.out -p complex.prmtop -c min2.crd -r heating.crd -ref min2.crd\n")
             f.write("echo 'Running equilibration'\n")
-            f.write("pmemd.cuda -O -i equilibration.in -o equilibration.out -p complex.prmtop -c heating.crd -r equilibration.crd -ref heating.crd\n")
+            f.write("pmemd.cuda -O -i equilibration.in -o equilibration.out -p complex.prmtop -c heating.crd -r equilibration.crd -ref heating.crd -x equilibration.nc\n")
             f.write("echo 'Running production'\n")
-            f.write("pmemd.cuda -O -i production.in -o production.out -p complex.prmtop -c equilibration.crd -r production.crd -ref equilibration.crd\n")
+            f.write("pmemd.cuda -O -i production.in -o production.out -p complex.prmtop -c equilibration.crd -r production.crd -ref equilibration.crd -x production.nc\n")
 
         os.chmod(execution_script_path, 0o755)
     
