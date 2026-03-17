@@ -12,7 +12,8 @@ setup(name='tidyscreen',
       package_dir={'tidyscreen': 'src'},
       include_package_data=True,
       package_data={
-          'tidyscreen.config': ['*.json'],
+          'tidyscreen.config': ['*'],
+          'tidyscreen.misc': ['*'],
       },
       install_requires=[
         'pandas==2.2.1',
