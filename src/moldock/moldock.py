@@ -8669,6 +8669,13 @@ quit
         for index, row in df.iterrows():
             if row['atom_name'].strip() in zinc_atoms:
                 df.at[index, 'element_symbol'] = 'ZN'
+        
+        # Check if there are any remaining empty element_symbol values. If so, get the atom name and take the first letter as the element symbol
+        for index, row in df.iterrows():
+            if row['element_symbol'] == '':
+                atom_name = row['atom_name'].strip()
+                if atom_name:
+                    df.at[index, 'element_symbol'] = atom_name[0].upper()   
                 
         # Return the moldf like dataframe
         return df
@@ -8696,20 +8703,14 @@ quit
  &end
         """)
 
-        # Create a tleap input file in the same directory as tleap_processed_file
+        # Create a tleap input file in the same directory as tleap_processed_file 
         tleap_in_file = os.path.join(os.path.dirname(tleap_processed_file), "minimize.in")
 
         with open(tleap_in_file, 'w') as f:
             f.write(f"""source leaprc.protein.ff14SB
 source leaprc.water.tip3p
 source leaprc.gaff2
-HOH = WAT
-    """)
-
-# rec = loadpdb "{tleap_processed_file}"
-# saveamberparm rec "{os.path.join(os.path.dirname(tleap_processed_file), 'receptor.prmtop')}" "{os.path.join(os.path.dirname(tleap_processed_file), 'receptor.inpcrd')}"
-# quit
-#         """)
+HOH = WAT\n""")
 
         # Get the presence of co-factors in the receptor and if present, add them to the tleap input file
         
@@ -8722,13 +8723,12 @@ HOH = WAT
                 # Get the mol2 and frcmod files from the lists in the analysis using the cofactor index
                 cofactor_index = analysis.get('cofactors', []).get('cofactors_names', []).index(cofactor)
                 print(f"Cofactor index: {cofactor_index}")
-                print(analysis)
                 cofactor_mol2 = analysis.get('cofactors', []).get('mol2_files', [])[cofactor_index]
                 cofactor_frcmod = analysis.get('cofactors', []).get('frcmod_files', [])[cofactor_index]
                 
                 # Open the tleap input file in append mode and add the loading commands for the cofactors
                 with open(tleap_in_file, 'a') as f: 
-                    f.write(f"loadoff {cofactor_mol2}\n")
+                    f.write(f"{cofactor} = loadmol2 {cofactor_mol2}\n")
                     f.write(f"loadamberparams {cofactor_frcmod}\n")
         
         # Finish the writting of the tleap input file with the receptor loading and saving commands
@@ -11005,7 +11005,6 @@ quit
         
         print(f"MMGBSA results saved to: {output_dir}")
         
-        
     def _subset_df_for_most_populated_poses(self, df):
         import pandas as pd
         
@@ -11013,7 +11012,6 @@ quit
         most_populated_df = df.loc[df.groupby('LigName')['cluster_size'].idxmax()].reset_index(drop=True)
         
         return most_populated_df
-        
     
     def _subset_df_for_lowest_energy_cluster_poses(self, df):
         import pandas as pd
@@ -11385,7 +11383,6 @@ quit
             analysis["cofactors"] = {"cofactors_present":1, "cofactors_names": cofactors_names, "mol2_files": mol2_files, "frcmod_files": frcmod_files} # Add the prepin and frcmod files to the analysis dictionary for later use in tleap preparation
 
         return analysis
-
                                     
     def _process_cofactor_pdb_file(self, cofactor_pdb_file_hs, ligand, processed_dir):
         
