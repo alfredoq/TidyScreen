@@ -3891,12 +3891,14 @@ except Exception as e:
                 
                 # Step 8: Copy and process PDB file
                 print(f"📂 Processing and saving PDB template...")
-                processed_pdb_path, checked_pdb_path, renumbering_dict, his_names = self._process_pdb_file(temp_pdb_path, pdb_template_folder, pdb_analysis)
+                pdb_processing_result = self._process_pdb_file(temp_pdb_path, pdb_template_folder, pdb_analysis)
                 
-                if not processed_pdb_path:
+                if not pdb_processing_result:
                     print("❌ Failed to process PDB file")
                     os.unlink(temp_pdb_path)
                     return None
+                
+                processed_pdb_path, checked_pdb_path, renumbering_dict, his_names = pdb_processing_result
                 
                 print("Processed pdb path:", processed_pdb_path)
                 print("Checked pdb path:", checked_pdb_path)
@@ -4076,10 +4078,13 @@ except Exception as e:
             print(f"❌ Error analyzing PDB file: {e}")
             return None
 
-    def _process_pdb_file(self, pdb_file: str, pdb_folder: str, analysis: Dict[str, Any]) -> str:
+    def _process_pdb_file(self, pdb_template_folder: str, pdb_folder: str, analysis: Dict[str, Any]) -> Optional[Tuple[str, str, Dict, Dict]]:
         """
         Process and copy PDB file to receptor folder with chain, ligand, and water selection options.
         Now also manages alternate locations (altlocs) and water molecules if present.
+        
+        Returns:
+            Optional[Tuple[str, str, Dict, Dict]]: Tuple of (processed_pdb_path, tleap_processed_file, renumbering_dict, his_names) or None on error
         """
         try:
             import shutil
@@ -4088,7 +4093,7 @@ except Exception as e:
             original_dir = os.path.join(pdb_folder, 'original')
             original_pdb_path = os.path.join(original_dir, 'receptor_original.pdb')
             os.makedirs(original_dir, exist_ok=True)
-            shutil.copy2(pdb_file, original_pdb_path)
+            shutil.copy2(pdb_template_folder, original_pdb_path)
             print(f"   📋 Copied original PDB file to: {os.path.relpath(original_pdb_path)}")
 
             # Create processed PDB path in processed folder
@@ -4113,7 +4118,7 @@ except Exception as e:
                 altloc_handling, altloc_map = self._query_altloc_handling(original_pdb_path, analysis)
                 if altloc_handling == "cancel":
                     print("   ❌ Altloc selection cancelled. Aborting processing.")
-                    return ""
+                    return None
 
                 # Apply altloc filtering to processed file
                 self._filter_altlocs_in_pdb(processed_pdb_path, altloc_handling, altloc_map)
@@ -4125,16 +4130,18 @@ except Exception as e:
                 print(f"   🔗 Multi-chain structure detected: {', '.join(analysis['chains'])}")
                 while True:
                     try:
-                        choice = input(f"   🧬 Keep all chains or select specific chain? (all/select): ").strip().lower()
+                        choice = input(f"   🧬 Keep all chains or select specific chain(s)? (all/select): ").strip().lower()
                         if choice in ['all', 'a']:
                             print("   ✅ Keeping all chains")
                             selected_chains = analysis['chains']
                             break
                         elif choice in ['select', 's']:
-                            selected_chain = self._select_chain_interactive(analysis['chains'])
-                            if selected_chain:
-                                selected_chains = [selected_chain]
-                                print(f"   ✅ Selected chain: {selected_chain}")
+                            selected_chains = self._select_chain_interactive(analysis['chains'])
+                            if selected_chains:
+                                if len(selected_chains) == 1:
+                                    print(f"   ✅ Selected chain: {selected_chains[0]}")
+                                else:
+                                    print(f"   ✅ Selected chains: {', '.join(selected_chains)}")
                                 break
                             else:
                                 print("   ⚠️  No chain selected, keeping all chains")
@@ -4212,6 +4219,16 @@ except Exception as e:
             else:
                 selected_ligands = []
 
+            ## If selected_ligands contains ligands information
+            if selected_ligands:
+            
+                # Check if ligand residues are present in tleap force field
+                analysis = self._process_selected_ligands(selected_ligands,original_pdb_path, selected_chains, analysis, processed_dir)
+
+            else:
+                analysis["cofactors"] ={"cofactors_present":0} # Indicate that no cofactors are present in the system
+
+
             # --- WATER MANAGEMENT ---
             selected_waters = []
             water_details = self._analyze_waters_in_pdb(original_pdb_path, selected_chains)
@@ -4238,7 +4255,7 @@ except Exception as e:
                 
                 if not filtered_pdb_path:
                     print("   ❌ Failed to create filtered PDB file")
-                    return ""
+                    return None
                 processed_pdb_path = filtered_pdb_path
             else:
                 print(f"   ✅ No filtering needed - processed PDB ready")
@@ -4257,7 +4274,7 @@ except Exception as e:
             tleap_processed_file = self._add_missing_atoms_in_pdb_tleap(processed_pdb_path, analysis)
             
             # Process tleap_processed_file to add the element name column if missing
-            receptor_moldf_dict, renumbering_dict = self._refine_receptor_model(tleap_processed_file, processed_pdb_path)
+            receptor_moldf_dict, renumbering_dict = self._refine_receptor_model(tleap_processed_file, processed_pdb_path, analysis)
 
             # Write (overwrite) the tleap_processed_file
             from moldf import write_pdb
@@ -4271,7 +4288,9 @@ except Exception as e:
 
         except Exception as e:
             print(f"❌ Error processing PDB file: {e}")
-            return ""
+            import traceback
+            traceback.print_exc()
+            return None
 
     def _analyze_waters_in_pdb(self, pdb_file: str, selected_chains: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
         """
@@ -4307,8 +4326,6 @@ except Exception as e:
                             pass
                         waters[water_id]['atoms'].append(atom_name)
             
-            print(selected_chains)
-
             # Calculate center for each water
             for wid, info in waters.items():
                 if info['coordinates']:
@@ -5154,30 +5171,44 @@ except Exception as e:
             print(f"❌ Error creating receptor folder: {e}")
             return ""
 
-    def _select_chain_interactive(self, chains: List[str]) -> Optional[str]:
+    def _select_chain_interactive(self, chains: List[str]) -> Optional[List[str]]:
         """
         Interactive chain selection for multi-chain structures.
+        Supports single chain selection or multiple comma-separated chains.
         
         Args:
             chains (List[str]): Available chain identifiers
             
         Returns:
-            Optional[str]: Selected chain ID or None if cancelled
+            Optional[List[str]]: List of selected chain IDs or None if cancelled
         """
         try:
             print(f"   📋 Available chains: {', '.join(chains)}")
+            print(f"   💡 You can select multiple chains using comma separation (e.g., 'A,B,C')")
             
             while True:
                 try:
-                    selection = input(f"   🔗 Select chain ({'/'.join(chains)}): ").strip().upper()
+                    selection = input(f"   🔗 Select chain(s) ({'/'.join(chains)} or comma-separated): ").strip().upper()
                     
-                    if selection in chains:
-                        return selection
-                    elif selection.lower() in ['cancel', 'quit', 'exit']:
+                    if selection.lower() in ['cancel', 'quit', 'exit']:
                         return None
-                    else:
-                        print(f"   ❌ Invalid chain. Please select from: {', '.join(chains)}")
+                    
+                    # Parse comma-separated chains
+                    selected = [s.strip() for s in selection.split(',')]
+                    
+                    # Validate all selected chains
+                    invalid_chains = [s for s in selected if s not in chains]
+                    if invalid_chains:
+                        print(f"   ❌ Invalid chain(s): {', '.join(invalid_chains)}. Please select from: {', '.join(chains)}")
                         continue
+                    
+                    if not selected:
+                        print(f"   ❌ Please select at least one chain")
+                        continue
+                    
+                    # Remove duplicates while preserving order
+                    selected = list(dict.fromkeys(selected))
+                    return selected
                         
                 except KeyboardInterrupt:
                     return None
@@ -8539,10 +8570,10 @@ quit
             print(f"❌ Error adding input model for {outfile_prefix}: {e}")
             return False
     
-    def _refine_receptor_model(self, tleap_processed_file, processed_pdb_path):
+    def _refine_receptor_model(self, tleap_processed_file, processed_pdb_path, analysis):
         
         # Minize the receptor model as processed with tleap
-        minimized_pdb_file = self._minimize_receptor(tleap_processed_file)
+        minimized_pdb_file = self._minimize_receptor(tleap_processed_file, analysis)
 
         ## Create residue number matching dictionary
         renumbering_dict = self._construct_resnumbers_matching_dictionary(processed_pdb_path, minimized_pdb_file)
@@ -8642,7 +8673,7 @@ quit
         # Return the moldf like dataframe
         return df
     
-    def _minimize_receptor(self, tleap_processed_file):
+    def _minimize_receptor(self, tleap_processed_file, analysis):
         """
         Will minimize the receptor under processing using sander
         """
@@ -8671,12 +8702,41 @@ quit
         with open(tleap_in_file, 'w') as f:
             f.write(f"""source leaprc.protein.ff14SB
 source leaprc.water.tip3p
+source leaprc.gaff2
 HOH = WAT
-rec = loadpdb "{tleap_processed_file}"
-saveamberparm rec "{os.path.join(os.path.dirname(tleap_processed_file), 'receptor.prmtop')}" "{os.path.join(os.path.dirname(tleap_processed_file), 'receptor.inpcrd')}"
-quit
-        """)
+    """)
 
+# rec = loadpdb "{tleap_processed_file}"
+# saveamberparm rec "{os.path.join(os.path.dirname(tleap_processed_file), 'receptor.prmtop')}" "{os.path.join(os.path.dirname(tleap_processed_file), 'receptor.inpcrd')}"
+# quit
+#         """)
+
+        # Get the presence of co-factors in the receptor and if present, add them to the tleap input file
+        
+        cofactors = analysis.get('cofactors', [])
+        print(cofactors)
+        if cofactors["cofactors_present"] == 1:
+            print("Cofactors detected in the receptor, adding them to the tleap input file")
+            for cofactor in analysis.get('cofactors', []).get('cofactors_names', []):
+                print(f"Adding cofactor {cofactor} to the tleap input file")
+                # Get the mol2 and frcmod files from the lists in the analysis using the cofactor index
+                cofactor_index = analysis.get('cofactors', []).get('cofactors_names', []).index(cofactor)
+                print(f"Cofactor index: {cofactor_index}")
+                print(analysis)
+                cofactor_mol2 = analysis.get('cofactors', []).get('mol2_files', [])[cofactor_index]
+                cofactor_frcmod = analysis.get('cofactors', []).get('frcmod_files', [])[cofactor_index]
+                
+                # Open the tleap input file in append mode and add the loading commands for the cofactors
+                with open(tleap_in_file, 'a') as f: 
+                    f.write(f"loadoff {cofactor_mol2}\n")
+                    f.write(f"loadamberparams {cofactor_frcmod}\n")
+        
+        # Finish the writting of the tleap input file with the receptor loading and saving commands
+        with open(tleap_in_file, 'a') as f:
+            f.write(f"rec = loadpdb {tleap_processed_file}\n")
+            f.write(f"saveamberparm rec {os.path.join(os.path.dirname(tleap_processed_file), 'receptor.prmtop')} {os.path.join(os.path.dirname(tleap_processed_file), 'receptor.inpcrd')}\n")
+            f.write("quit\n")
+                
         # Run tleap to generate prmtop and inpcrd files
         tleap_command = f"tleap -f {tleap_in_file}"
         subprocess.run(tleap_command, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -11089,7 +11149,6 @@ quit
         elif response in ['n', 'no']:
             print("Using His names as present in template")
             return his_names
-        
 
     def _fix_histine_names(self, his_names, processed_pdb_path):
 
@@ -11257,3 +11316,165 @@ quit
             print(f"\n❌ Exception occurred while computing grid biases: {e}")
 
         print(f"Bias files writen to {grids_path}. It will be used in AutoGrid4 execution if biases are applied.")
+        
+    def _process_selected_ligands(self, selected_ligands,original_pdb_path, selected_chains, analysis, processed_dir):
+        
+        tleap_protein_residues_list = [
+            "ACE", "ALA", "ARG", "ASH", "ASN", "ASP", "CALA", "CARG", "CASN", "CASP", "CCYS", "CCYX", "CGLN", "CGLU", "CGLY", "CHID", "CHIE", "CHIP", "CHIS", "CHYP", "CILE", "CLEU", "CLYS", "CMET", "CPHE", "CPRO", "CSER",
+            "CTHR", "CTRP", "CTYR", "CVAL", "CYM", "CYS", "CYX", "GLH", "GLN", "GLU", "GLY", "HID", "HIE", "HIP", "HIS", "HYP", "ILE", "LEU", "LYN", "LYS", "MET", "NALA", "NARG", "NASN", "NASP", "NCYS", "NCYX", "NGLN",
+            "NGLU", "NGLY", "NHE", "NHID", "NHIE", "NHIP", "NHIS", "NILE", "NLEU", "NLYS", "NME", "NMET", "NPHE", "NPRO", "NSER", "NTHR", "NTRP", "NTYR", "NVAL", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL"]
+        
+        tleap_solvent_residues_list = [
+            "AG", "AL", "Ag", "BA", "BR", "Be", "CA", "CD", "CE", "CHCL3BOX", "CL", "CO", "CR", "CS", "CU", "CU1", "Ce", "Cl-", "Cr", "DC4", "Dy", "EU", "EU3", "Er", "F", "FB3", "FB3BOX", "FB4", "FB4BOX", "FE", "FE2", "GD3", "H3O+", "HE+", "HG", "HOH", "HZ+", "Hf", "IN", "IOD", "K", "K+", "LA", "LI", "LU", "MEOHBOX", "MG", "MN", "NA", "NH4", "NI", "NMABOX", "Na+", "Nd", "O3P", "OP3", "OPC", "OPC3BOX", "OPC3POLBOX", "OPCBOX", "PB", "PD", "PL3", "POL3BOX", "PR", "PT", "Pu", "QSPCFWBOX", "RB", "Ra", "SM", "SPC",
+            "SPCBOX", "SPCFWBOX", "SPF", "SPG", "SR", "Sm", "Sn", "T4E", "TB", "TIP3PBOX", "TIP3PFBOX", "TIP4PBOX", "TIP4PEWBOX", "TIP5PBOX", "TL", "TP3", "TP4", "TP5", "TPF", "Th", "Tl", "Tm", "U4+", "V2+", "WAT","Y", "YB2", "ZN", "Zr", "WAT"]
+        
+        # Check if the selected ligands exists in the tleap residues lists and print a warning if not
+        cofactors_names = [] # list to store cofactors names
+        mol2_files = [] # list to store cofactors files
+        frcmod_files = [] # list to store cofactors files
+        
+        for ligand in selected_ligands:
+
+            if ligand not in tleap_protein_residues_list and ligand not in tleap_solvent_residues_list:
+                print(f"⚠️  Warning: Ligand {ligand} is not in the tleap residues lists.")
+                
+                # Add the cofactor flag to analysis dictionary
+                analysis["cofactors"] ={"cofactors_present":1}
+
+                # Write the ligand to a file from the original_pdb_path and corresponding to selected_chains
+                # Determine the directory of the original PDB file
+                output_dir = os.path.dirname(original_pdb_path)
+                ligand_pdb_path = os.path.join(output_dir, f"{ligand}_residue.pdb")
+                with open(original_pdb_path, 'r') as pdb_file:
+                    for line in pdb_file:
+                        if line.startswith("HETATM") or line.startswith("ATOM"):
+                            chain_id = line[21].strip()
+                            res_name = line[17:20].strip()
+                            if chain_id in selected_chains and res_name == ligand:
+                                with open(ligand_pdb_path, 'a') as ligand_file:
+                                    ligand_file.write(line) 
+                
+
+                print(f"File written to {ligand_pdb_path} for ligand {ligand}")
+
+                ## Query for already processed prepin and frcmod files for the custom ligand
+                cofactor_pdb_file_hs = input(f"Input the preprocessed PDB file for {ligand} (after Hs addition and mantaining atom names): ")
+                
+                ## Copy the cofactor_pdb_file_hs to processed_dir for storage. If file not found, inform and exit
+                try:
+                    cofactor_pdb_dest = os.path.join(processed_dir, os.path.basename(cofactor_pdb_file_hs))
+                    shutil.copy(cofactor_pdb_file_hs, cofactor_pdb_dest)
+                    print(f"Cofactor PDB file for {ligand} copied to {processed_dir}")
+                except Exception as e:
+                    print(f"Error copying cofactor PDB file for {ligand}: {e}")
+                    print("Please ensure the file exists and try again.")
+                    sys.exit(1)
+                
+                cofactor_mol2, cofactor_frcmod = self._process_cofactor_pdb_file(cofactor_pdb_file_hs, ligand, processed_dir)
+
+                # Add the prepin and frcmod files to list for final storage
+                cofactors_names.append(ligand)
+                mol2_files.append(cofactor_mol2)
+                frcmod_files.append(cofactor_frcmod)
+
+        ## if analysis dictionary contains no cofactors, set the flag to 0
+        if "cofactors" not in analysis:
+            analysis["cofactors"] = {"cofactors_present":0}
+
+        else:
+            analysis["cofactors"] = {"cofactors_present":1, "cofactors_names": cofactors_names, "mol2_files": mol2_files, "frcmod_files": frcmod_files} # Add the prepin and frcmod files to the analysis dictionary for later use in tleap preparation
+
+        return analysis
+
+                                    
+    def _process_cofactor_pdb_file(self, cofactor_pdb_file_hs, ligand, processed_dir):
+        
+        from rdkit import Chem
+        from rdkit.Chem import AllChem
+        from espaloma_charge import charge
+        import subprocess
+
+        
+        # Load the pdb file
+        mol = Chem.MolFromPDBFile(cofactor_pdb_file_hs, removeHs=False, sanitize=False)
+        
+        if mol is None:
+            print(f"Error: Could not load molecule from {cofactor_pdb_file_hs}")
+            return
+        
+        # Extract atom names from the PDB file
+        atom_names = []
+        with open(cofactor_pdb_file_hs, 'r') as f:
+            for line in f:
+                if line.startswith("ATOM") or line.startswith("HETATM"):
+                    atom_name = line[12:16].strip()
+                    atom_names.append(atom_name)
+        
+        # Apply atom names as atom properties in the RDKit molecule
+        for atom, atom_name in zip(mol.GetAtoms(), atom_names):
+            atom.SetProp("atomName", atom_name)
+        
+        # Now sanitize and add hydrogens
+        Chem.SanitizeMol(mol)   
+        mol = Chem.AddHs(mol)
+        
+        # Generate 3D coordinates for the molecule
+        AllChem.EmbedMolecule(mol, randomSeed=0xf00d)
+
+        # Compute espaloma charges
+        espaloma_charges = charge(mol)
+        
+        # Write espaloma charges to a file with 8 columns, values separated by a single space
+        espaloma_output_file = cofactor_pdb_file_hs.replace('.pdb', '_espaloma_charges.txt')
+        
+        with open(espaloma_output_file, 'w') as f:
+            for i, val in enumerate(espaloma_charges):
+                f.write(f"{val:.6f}")
+                # Write a space after each value except the last in a line
+                if (i + 1) % 8 == 0:
+                    f.write("\n")
+                else:
+                    f.write(" ")
+            # If the last line is not complete, add a newline
+            if len(espaloma_charges) % 8 != 0:
+                f.write("\n")
+        
+        # Execute antechamber to generate the mol2 file using the original cofactor pdb file with hydrogens and the espaloma charges file as input, and using the GAFF2 force field. The output mol2 file should be named as {ligand}_cofactor.mol2 and saved in processed_dir
+        mol2_output_file = os.path.join(processed_dir, f"{ligand}_cofactor.mol2")
+        try:
+            result = subprocess.run(["antechamber", "-i", cofactor_pdb_file_hs, "-fi", "pdb", "-o", mol2_output_file, "-fo", "mol2", "-c", "rc", "-cf", espaloma_output_file, "-at", "gaff2"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if result.returncode == 0:
+                print(f"Mol2 file for {ligand} generated successfully at {mol2_output_file}.")
+                
+                # Run parmchk2 to generate the frcmod file for the cofactor using the generated mol2 file as input. The output frcmod file should be named as {ligand}_cofactor.frcmod and saved in processed_dir
+                frcmod_output_file = os.path.join(processed_dir, f"{ligand}_cofactor.frcmod")
+                try:
+                    result_frcmod = subprocess.run(["parmchk2", "-i", mol2_output_file, "-f", "mol2", "-o", frcmod_output_file, "-s", "gaff2"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    if result_frcmod.returncode == 0:
+                        print(f"Frcmod file for {ligand} generated successfully at {frcmod_output_file}.")
+                        
+                        return mol2_output_file, frcmod_output_file
+                    
+                    else:
+                        print(f"Error generating frcmod file for {ligand}: {result_frcmod.stderr}")
+                except Exception as e:
+                    print(f"Exception occurred while generating frcmod file for {ligand}: {e}")
+                
+            else:
+                print(f"Error generating mol2 file for {ligand}: {result.stderr}")
+        except Exception as e:
+            print(f"Exception occurred while generating mol2 file for {ligand}: {e}")
+            
+        
+    
+        
+        
+                                    
+                            
+                            
+                            
+                            
+
+        
+        
+        
