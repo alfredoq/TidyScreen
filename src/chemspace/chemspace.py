@@ -4380,51 +4380,97 @@ class ChemSpace:
         """
         from rdkit import Chem
         from rdkit.Chem import Draw
-        
+
+        # Prompt user for legend columns (multiple allowed)
+        available_columns = list(compounds_df.columns)
+        print("\nAvailable columns for legend:")
+        for idx, col in enumerate(available_columns, 1):
+            print(f"  {idx}. {col}")
+        print("Enter the numbers or names of the columns to use for legend, separated by commas (e.g. 2,3 or name,id).\nIf left blank, defaults to 'id' if present, else first column.")
+        legend_cols = None
+        while legend_cols is None:
+            user_input = input("Legend columns: ").strip()
+            if not user_input:
+                if 'id' in available_columns:
+                    legend_cols = ['id']
+                else:
+                    legend_cols = [available_columns[0]]
+                print(f"Using default legend column(s): {legend_cols}")
+                break
+            # Split by comma and strip whitespace
+            parts = [p.strip() for p in user_input.split(',') if p.strip()]
+            selected = []
+            valid = True
+            for p in parts:
+                if p.isdigit():
+                    idx = int(p) - 1
+                    if 0 <= idx < len(available_columns):
+                        selected.append(available_columns[idx])
+                    else:
+                        print(f"Invalid column number: {p}")
+                        valid = False
+                        break
+                elif p in available_columns:
+                    selected.append(p)
+                else:
+                    print(f"Invalid column name: {p}")
+                    valid = False
+                    break
+            if valid and selected:
+                legend_cols = selected
+            elif valid:
+                print("No valid columns selected. Try again.")
+
+
         successful_depictions = 0
         failed_depictions = 0
         invalid_smiles = 0
-        
+
         # Calculate grid dimensions
         grid_cols = int(molecules_per_image ** 0.5)
         grid_rows = (molecules_per_image + grid_cols - 1) // grid_cols
-        
+
         print(f"   📐 Grid layout: {grid_rows}x{grid_cols} ({molecules_per_image} molecules per image)")
-        
+
         # Process molecules in batches
         total_molecules = len(compounds_df)
         num_grids = (total_molecules + molecules_per_image - 1) // molecules_per_image
-        
+
         if TQDM_AVAILABLE:
             progress_bar = tqdm(range(num_grids), desc="Generating grid images", unit="grids")
         else:
             progress_bar = range(num_grids)
-        
+
         for grid_idx in progress_bar:
             try:
                 start_idx = grid_idx * molecules_per_image
                 end_idx = min(start_idx + molecules_per_image, total_molecules)
                 batch_df = compounds_df.iloc[start_idx:end_idx]
-                
+
                 mols = []
                 legends = []
                 highlight_atoms_list = []
-                
+
                 # Process each molecule in the batch
+
                 for _, compound in batch_df.iterrows():
                     try:
                         smiles = compound['smiles']
-                        name = compound.get('name', f'compound_{compound.get("id", "")}')
-                        id = compound.get('id', f'compound_{compound.get("id", "")}')
-                        
+                        legend_vals = []
+                        for col in legend_cols:
+                            val = compound.get(col, f'compound_{compound.get("id", "")}')
+                            if pd.isnull(val):
+                                val = f'compound_{compound.get("id", "")}'
+                            legend_vals.append(str(val))
+                        legend_label = '_'.join(legend_vals)
                         mol = Chem.MolFromSmiles(smiles)
                         if mol is None:
                             invalid_smiles += 1
                             continue
-                        
+
                         mols.append(mol)
-                        legends.append(f"{name[:20]} \n id: {str(id)}")  # Truncate long names
-                        
+                        legends.append(legend_label[:40])  # Truncate long legends
+
                         # Prepare highlighting
                         highlight_atoms = []
                         if highlight_substructures and highlight_mol:
@@ -4434,14 +4480,14 @@ class ChemSpace:
                                     highlight_atoms = [atom for match in matches for atom in match]
                             except:
                                 pass
-                        
+
                         highlight_atoms_list.append(highlight_atoms)
-                        
+
                     except Exception:
-                        print(f"Failed to depict molecule '{name}' (id: {id}) with smiles '{smiles}' - skipping")
+                        print(f"Failed to depict molecule with smiles '{smiles}' - skipping")
                         failed_depictions += 1
                         continue
-                
+
                 if mols:
                     # Generate grid image
                     if highlight_substructures and any(highlight_atoms_list):
@@ -4459,22 +4505,22 @@ class ChemSpace:
                             subImgSize=image_size,
                             legends=legends
                         )
-                    
+
                     # Save grid image
                     filename = f"grid_{grid_idx + 1:04d}_{len(mols)}molecules.png"
                     filepath = os.path.join(output_dir, filename)
                     img.save(filepath)
-                    
+
                     successful_depictions += len(mols)
-                
+
             except Exception as e:
                 failed_depictions += molecules_per_image
                 print(f"⚠️  Error generating grid {grid_idx + 1}: {e}")
-            
+
             # Progress update for non-tqdm case
             if not TQDM_AVAILABLE and (grid_idx + 1) % max(1, num_grids // 10) == 0:
                 print(f"   📊 Generated {grid_idx + 1}/{num_grids} grid images...")
-        
+
         return successful_depictions, failed_depictions, invalid_smiles
     
     def _sanitize_filename(self, filename: str) -> str:
