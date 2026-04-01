@@ -1014,6 +1014,200 @@ class ChemSpace:
                 'errors': 1
             }
     
+    def load_csv_file_extended_columns(self, csv_file_path: str = None, skip_duplicates: bool = True) -> dict:
+        """
+        Load compounds from a CSV file into the chemspace database, allowing for additional columns.
+        Prompts the user to select which columns correspond to SMILES, name, and flag, and loads all other columns as-is, renaming those columns to 'smiles', 'name', and 'flag' in the final table.
+
+        Args:
+            csv_file_path (str): Path to the CSV file
+
+        Returns:
+            dict: Results containing success status, counts, and messages
+        """
+        try:
+            import pandas as pd
+
+            # Prompt for file path if not provided
+            if not csv_file_path:
+                csv_file_path = input("Enter the path to the CSV file: ").strip()
+                while not csv_file_path:
+                    print("❌ CSV file path cannot be empty.")
+                    csv_file_path = input("Enter the path to the CSV file: ").strip()
+            # Validate file exists
+            if not os.path.exists(csv_file_path):
+                return {
+                    'success': False,
+                    'message': f"CSV file not found: {csv_file_path}",
+                    'compounds_added': 0,
+                    'duplicates_skipped': 0,
+                    'errors': 1
+                }
+
+            # Read CSV file
+            df = pd.read_csv(csv_file_path)
+            columns = list(df.columns)
+            print("\nColumns found in CSV:")
+            for idx, col in enumerate(columns):
+                print(f"  [{idx}] {col}")
+
+            # Prompt user to select SMILES, name, and flag columns
+            def prompt_column(col_type):
+                while True:
+                    sel = input(f"Enter the number of the column to use as {col_type}: ").strip()
+                    try:
+                        idx = int(sel)
+                        if 0 <= idx < len(columns):
+                            return columns[idx]
+                        else:
+                            print("Invalid selection. Try again.")
+                    except ValueError:
+                        print("Invalid input. Please enter a valid number.")
+
+            smiles_col_orig = prompt_column("smiles")
+            name_col_orig = prompt_column("name")
+            flag_col_orig = prompt_column("flag")
+
+            # Rename selected columns in the DataFrame
+            rename_map = {smiles_col_orig: 'smiles', name_col_orig: 'name', flag_col_orig: 'flag'}
+            df = df.rename(columns=rename_map)
+
+
+            # Query user for flag_description value
+            flag_description_value = input("Enter a description for the 'flag' column to be added to all rows: ").strip()
+            df['flag_description'] = flag_description_value
+
+            # Prepare final columns order: keep all, but ensure 'smiles', 'name', 'flag', 'flag_description' are present and in correct order
+            final_columns = list(df.columns)
+            for col in ['smiles', 'name', 'flag', 'flag_description']:
+                if col in final_columns:
+                    final_columns.remove(col)
+            final_columns = ['smiles', 'name', 'flag', 'flag_description'] + final_columns
+            # Remove duplicates in case any of the original columns were already named as one of the targets
+            seen = set()
+            final_columns = [x for x in final_columns if not (x in seen or seen.add(x))]
+            df = df[final_columns]
+
+            # Prompt for table name
+            table_name = input("Enter the desired table name: ").strip()
+            while not table_name:
+                print("❌ Table name cannot be empty.")
+                table_name = input("Enter the desired table name: ").strip()
+
+            # Check if table already exists
+            existing_tables = self.get_all_tables()
+            if table_name in existing_tables:
+                response = input(f"Table '{table_name}' already exists. Do you want to replace it? (y/N): ").strip().lower()
+                if response not in ['y', 'yes']:
+                    print("❌ Process cancelled.")
+                    return {'success': False, 'message': 'Process cancelled by user.'}
+                # Drop the existing table
+                conn = sqlite3.connect(self.__chemspace_db)
+                cursor = conn.cursor()
+                cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
+                conn.commit()
+                conn.close()
+
+            # Prepare columns for SQL table
+            sql_columns = []
+            for col in final_columns:
+                if col == 'smiles':
+                    sql_columns.append(f"{col} TEXT NOT NULL")
+                else:
+                    sql_columns.append(f"{col} TEXT")
+
+            # Add id as primary key
+            create_table_query = f"""
+            CREATE TABLE IF NOT EXISTS {table_name} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                {', '.join(sql_columns)}
+            )
+            """
+
+            # Create table
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            cursor.execute(create_table_query)
+            conn.commit()
+
+
+            # Insert data with duplicate skipping if requested
+            compounds_added = 0
+            errors = 0
+            duplicates_skipped = 0
+            seen = set()
+            for _, row in df.iterrows():
+                try:
+                    values = [str(row[col]) if pd.notna(row[col]) else None for col in final_columns]
+                    # If skipping duplicates, check (smiles, name) uniqueness
+                    if skip_duplicates and 'smiles' in final_columns and 'name' in final_columns:
+                        smiles_idx = final_columns.index('smiles')
+                        name_idx = final_columns.index('name')
+                        smiles_val = values[smiles_idx]
+                        name_val = values[name_idx]
+                        key = (smiles_val, name_val)
+                        if key in seen:
+                            duplicates_skipped += 1
+                            continue
+                        seen.add(key)
+                    cursor.execute(f"INSERT INTO {table_name} ({', '.join(final_columns)}) VALUES ({', '.join(['?'] * len(final_columns))})", values)
+                    compounds_added += 1
+                except Exception as e:
+                    print(f"⚠️  Error inserting row: {e}")
+                    errors += 1
+
+            conn.commit()
+            conn.close()
+
+
+
+            print(f"✅ Loaded {compounds_added} compounds into table '{table_name}' (errors: {errors}, duplicates skipped: {duplicates_skipped})")
+
+            # Compute InChI keys for the loaded compounds, similar to load_csv_file
+            try:
+                print(f"\n🧪 Computing InChI keys for the loaded compounds...")
+                df_loaded = self._get_table_as_dataframe(table_name)
+                if 'inchi_key' not in df_loaded.columns:
+                    df_loaded['inchi_key'] = None
+                try:
+                    from rdkit import Chem
+                except ImportError:
+                    print("⚠️  Warning: RDKit not available. Skipping InChI key computation.")
+                else:
+                    for idx, row in df_loaded.iterrows():
+                        smiles = row.get('smiles', None)
+                        if smiles:
+                            try:
+                                mol = Chem.MolFromSmiles(smiles)
+                                if mol is not None:
+                                    inchi_key = Chem.inchi.MolToInchiKey(mol) if hasattr(Chem, 'inchi') else None
+                                    df_loaded.at[idx, 'inchi_key'] = inchi_key
+                            except Exception:
+                                pass
+                    # Update the table with computed InChI keys
+                    self._update_table_with_inchi_keys(table_name, df_loaded)
+            except Exception as e:
+                print(f"⚠️  Error computing InChI keys: {e}")
+
+            return {
+                'success': True,
+                'message': f"Loaded {compounds_added} compounds into table '{table_name}'",
+                'compounds_added': compounds_added,
+                'duplicates_skipped': duplicates_skipped,
+                'errors': errors,
+                'table_name': table_name
+            }
+
+        except Exception as e:
+            print(f"❌ Error loading CSV file with extended columns: {e}")
+            return {
+                'success': False,
+                'message': f"Error: {e}",
+                'compounds_added': 0,
+                'errors': 1
+            }
+    
+    
     def load_single_smiles(self) -> Dict[str, Any]:
         """
         Will prompt the user for a smiles, a name, a flag, and a table name. 
