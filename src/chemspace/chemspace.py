@@ -1026,13 +1026,10 @@ class ChemSpace:
             dict: Results containing success status, counts, and messages
         """
         try:
-            import pandas as pd
-
             # Prompt for file path if not provided
             if not csv_file_path:
                 csv_file_path = input("Enter the path to the CSV file: ").strip()
                 while not csv_file_path:
-                    print("❌ CSV file path cannot be empty.")
                     csv_file_path = input("Enter the path to the CSV file: ").strip()
             # Validate file exists
             if not os.path.exists(csv_file_path):
@@ -1054,15 +1051,13 @@ class ChemSpace:
             # Prompt user to select SMILES, name, and flag columns
             def prompt_column(col_type):
                 while True:
-                    sel = input(f"Enter the number of the column to use as {col_type}: ").strip()
-                    try:
-                        idx = int(sel)
-                        if 0 <= idx < len(columns):
-                            return columns[idx]
-                        else:
-                            print("Invalid selection. Try again.")
-                    except ValueError:
-                        print("Invalid input. Please enter a valid number.")
+                    col_input = input(f"Enter the column name or index for {col_type}: ").strip()
+                    if col_input.isdigit() and int(col_input) < len(columns):
+                        return columns[int(col_input)]
+                    elif col_input in columns:
+                        return col_input
+                    else:
+                        print("Invalid input. Please enter a valid column name or index.")
 
             smiles_col_orig = prompt_column("smiles")
             name_col_orig = prompt_column("name")
@@ -1071,7 +1066,6 @@ class ChemSpace:
             # Rename selected columns in the DataFrame
             rename_map = {smiles_col_orig: 'smiles', name_col_orig: 'name', flag_col_orig: 'flag'}
             df = df.rename(columns=rename_map)
-
 
             # Query user for flag_description value
             flag_description_value = input("Enter a description for the 'flag' column to be added to all rows: ").strip()
@@ -1100,7 +1094,13 @@ class ChemSpace:
                 response = input(f"Table '{table_name}' already exists. Do you want to replace it? (y/N): ").strip().lower()
                 if response not in ['y', 'yes']:
                     print("❌ Process cancelled.")
-                    return {'success': False, 'message': 'Process cancelled by user.'}
+                    return {
+                        'success': False,
+                        'message': 'Process cancelled by user',
+                        'compounds_added': 0,
+                        'duplicates_skipped': 0,
+                        'errors': 0
+                    }
                 # Drop the existing table
                 conn = sqlite3.connect(self.__chemspace_db)
                 cursor = conn.cursor()
@@ -1130,7 +1130,6 @@ class ChemSpace:
             cursor.execute(create_table_query)
             conn.commit()
 
-
             # Insert data with duplicate skipping if requested
             compounds_added = 0
             errors = 0
@@ -1138,28 +1137,26 @@ class ChemSpace:
             seen = set()
             for _, row in df.iterrows():
                 try:
-                    values = [str(row[col]) if pd.notna(row[col]) else None for col in final_columns]
-                    # If skipping duplicates, check (smiles, name) uniqueness
-                    if skip_duplicates and 'smiles' in final_columns and 'name' in final_columns:
-                        smiles_idx = final_columns.index('smiles')
-                        name_idx = final_columns.index('name')
-                        smiles_val = values[smiles_idx]
-                        name_val = values[name_idx]
-                        key = (smiles_val, name_val)
-                        if key in seen:
-                            duplicates_skipped += 1
-                            continue
-                        seen.add(key)
-                    cursor.execute(f"INSERT INTO {table_name} ({', '.join(final_columns)}) VALUES ({', '.join(['?'] * len(final_columns))})", values)
+                    smiles = row['smiles']
+                    name = row['name']
+                    flag = row['flag']
+                    flag_description = row['flag_description']
+                    unique_key = (smiles, name)
+                    if skip_duplicates and unique_key in seen:
+                        duplicates_skipped += 1
+                        continue
+                    seen.add(unique_key)
+                    insert_query = f"""
+                        INSERT INTO {table_name} (smiles, name, flag, flag_description{',' if len(final_columns) > 4 else ''}{', '.join(final_columns[4:])})
+                        VALUES ({', '.join(['?'] * len(final_columns))})
+                    """
+                    cursor.execute(insert_query, [row[col] for col in final_columns])
                     compounds_added += 1
                 except Exception as e:
-                    print(f"⚠️  Error inserting row: {e}")
                     errors += 1
 
             conn.commit()
             conn.close()
-
-
 
             print(f"✅ Loaded {compounds_added} compounds into table '{table_name}' (errors: {errors}, duplicates skipped: {duplicates_skipped})")
 
@@ -1168,26 +1165,26 @@ class ChemSpace:
                 print(f"\n🧪 Computing InChI keys for the loaded compounds...")
                 df_loaded = self._get_table_as_dataframe(table_name)
                 if 'inchi_key' not in df_loaded.columns:
-                    df_loaded['inchi_key'] = None
-                try:
-                    from rdkit import Chem
-                except ImportError:
-                    print("⚠️  Warning: RDKit not available. Skipping InChI key computation.")
-                else:
-                    for idx, row in df_loaded.iterrows():
-                        smiles = row.get('smiles', None)
-                        if smiles:
-                            try:
-                                mol = Chem.MolFromSmiles(smiles)
-                                if mol is not None:
-                                    inchi_key = Chem.inchi.MolToInchiKey(mol) if hasattr(Chem, 'inchi') else None
-                                    df_loaded.at[idx, 'inchi_key'] = inchi_key
-                            except Exception:
-                                pass
-                    # Update the table with computed InChI keys
-                    self._update_table_with_inchi_keys(table_name, df_loaded)
+                    try:
+                        from rdkit import Chem
+                        df_loaded['inchi_key'] = df_loaded['smiles'].apply(
+                            lambda s: Chem.MolToInchiKey(Chem.MolFromSmiles(s)) if Chem.MolFromSmiles(s) else None
+                        )
+                        # Update table with inchi_key column
+                        conn = sqlite3.connect(self.__chemspace_db)
+                        cursor = conn.cursor()
+                        cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN inchi_key TEXT")
+                        for idx, row in df_loaded.iterrows():
+                            cursor.execute(f"UPDATE {table_name} SET inchi_key = ? WHERE id = ?", (row['inchi_key'], row['id']))
+                        conn.commit()
+                        conn.close()
+                    except ImportError:
+                        print("⚠️  RDKit not available. Skipping InChI key computation.")
             except Exception as e:
                 print(f"⚠️  Error computing InChI keys: {e}")
+
+            # --- FIX COLUMN TYPES ---
+            column_types_fixed = self._evaluate_and_fix_column_types(table_name, verbose=True)
 
             return {
                 'success': True,
@@ -1195,7 +1192,8 @@ class ChemSpace:
                 'compounds_added': compounds_added,
                 'duplicates_skipped': duplicates_skipped,
                 'errors': errors,
-                'table_name': table_name
+                'table_name': table_name,
+                'column_types_fixed': column_types_fixed
             }
 
         except Exception as e:
@@ -1206,8 +1204,73 @@ class ChemSpace:
                 'compounds_added': 0,
                 'errors': 1
             }
-    
-    
+    def _evaluate_and_fix_column_types(self, table_name: str, verbose: bool = True) -> bool:
+        """
+        Evaluate the data types of columns in a SQL table and modify them to the most appropriate type.
+        This method will:
+        - Inspect all values in each column.
+        - Suggest and apply the best SQLite type: INTEGER, REAL, or TEXT.
+        - Create a new table with corrected types, copy data, and replace the old table.
+        Args:
+            table_name (str): Name of the table to analyze and fix.
+            verbose (bool): Print progress and changes.
+        Returns:
+            bool: True if operation succeeded, False otherwise.
+        """
+        try:
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+
+            # Get current schema
+            cursor.execute(f"PRAGMA table_info({table_name})")
+            columns_info = cursor.fetchall()
+            columns = [col[1] for col in columns_info]
+
+            # Analyze column types
+            type_map = {}
+            for col in columns:
+                cursor.execute(f"SELECT {col} FROM {table_name} WHERE {col} IS NOT NULL LIMIT 1000")
+                values = [row[0] for row in cursor.fetchall()]
+                col_type = "TEXT"
+                if all(isinstance(v, int) or (isinstance(v, str) and v.isdigit()) for v in values if v is not None):
+                    col_type = "INTEGER"
+                elif all(
+                    (isinstance(v, float) or
+                    (isinstance(v, str) and v.replace('.', '', 1).isdigit() and '.' in v))
+                    for v in values if v is not None
+                ):
+                    col_type = "REAL"
+                type_map[col] = col_type
+                if verbose:
+                    print(f"Column '{col}': suggested type {col_type}")
+
+            # Build new schema
+            new_table = f"{table_name}_fixedtypes"
+            col_defs = [f"{col} {type_map[col]}" for col in columns]
+            create_sql = f"CREATE TABLE {new_table} ({', '.join(col_defs)})"
+            cursor.execute(f"DROP TABLE IF EXISTS {new_table}")
+            cursor.execute(create_sql)
+
+            # Copy data with type conversion
+            insert_cols = ', '.join(columns)
+            select_cols = ', '.join([
+                f"CAST({col} AS {type_map[col]})" if type_map[col] != "TEXT" else col
+                for col in columns
+            ])
+            cursor.execute(f"INSERT INTO {new_table} ({insert_cols}) SELECT {select_cols} FROM {table_name}")
+
+            # Replace old table
+            cursor.execute(f"DROP TABLE {table_name}")
+            cursor.execute(f"ALTER TABLE {new_table} RENAME TO {table_name}")
+            conn.commit()
+            conn.close()
+            if verbose:
+                print(f"✅ Table '{table_name}' column types updated successfully.")
+            return True
+        except Exception as e:
+            print(f"❌ Error fixing column types for table '{table_name}': {e}")
+            return False
+ 
     def load_single_smiles(self) -> Dict[str, Any]:
         """
         Will prompt the user for a smiles, a name, a flag, and a table name. 
