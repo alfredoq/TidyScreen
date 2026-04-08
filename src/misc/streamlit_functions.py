@@ -223,3 +223,70 @@ def get_docking_models_info(receptors_db_path):
     
     except Exception as e:
         return None
+    
+    
+def get_electrostatic_profile_for_pose(mmpbsa_data, threshold=-1.0):
+    
+    df_electrostatic = mmpbsa_data[["residue", "ele"]].copy()
+    df_electrostatic = df_electrostatic[df_electrostatic["ele"] < threshold]
+    
+    return df_electrostatic
+    
+
+def get_vdw_profile_for_pose(mmpbsa_data, threshold=-1.0):
+    
+    df_vdw = mmpbsa_data[["residue", "vdw"]].copy()
+    df_vdw = df_vdw[df_vdw["vdw"] < threshold]
+    
+    return df_vdw
+
+def get_polsolv_profile_for_pose(mmpbsa_data, threshold=-1.0):
+    
+    df_polsolv = mmpbsa_data[["residue", "polar_solvation"]].copy()
+    df_polsolv = df_polsolv[df_polsolv["polar_solvation"] < threshold]
+    
+    return df_polsolv
+
+def get_nonpolsolv_profile_for_pose(mmpbsa_data, threshold=-1.0):
+    
+    df_nonpolsolv = mmpbsa_data[["residue", "nonpolar_solvation"]].copy()
+    df_nonpolsolv = df_nonpolsolv[df_nonpolsolv["nonpolar_solvation"] < threshold]
+    
+    return df_nonpolsolv
+
+def get_gas_profile_for_pose(mmpbsa_data, threshold=-1.0):
+    
+    df_gas = mmpbsa_data[["residue", "gas"]].copy()
+    df_gas = df_gas[df_gas["gas"] < threshold]
+    
+    return df_gas
+
+def get_total_profile_for_pose(mmpbsa_data, threshold=-1.0):
+    
+    df_total = mmpbsa_data[["residue", "total"]].copy()
+    df_total = df_total[df_total["total"] < threshold]
+    
+    return df_total
+
+def create_mmpbsa_component_plot(df, x_col, y_col, title, xlabel, ylabel):
+    """
+    Create a lollipop plot from the given DataFrame.
+    """
+    fig, ax = plt.subplots()
+    
+    # Create vertical lines (stems)
+    ax.vlines(df[x_col], 0, df[y_col], colors='skyblue', linewidth=1)
+    
+    # Create dots (lollipop heads)
+    ax.scatter(df[x_col], df[y_col], color='darkblue', s=15, zorder=3)
+    
+    ax.set_title(title, size=8)
+    ax.set_xlabel(xlabel, size=8)
+    ax.set_ylabel(ylabel, size=8)
+    # set the size of the x-axis labels to 8
+    ax.tick_params(axis='x', labelsize=4, rotation=90)
+    ax.tick_params(axis='y', labelsize=4, rotation=0)
+    ax.grid(axis='y', alpha=0.3)
+
+    fig.set_size_inches(6, 3)
+    return fig
