@@ -14,7 +14,7 @@ st.set_page_config(page_title="TidyScreen App", layout="wide")
 st.sidebar.title("Navigation")
 page = st.sidebar.radio(
     "Go to",
-    ("TidyScreen", "ChemSpace", "MolDock", "Analysis")
+    ("TidyScreen", "ChemSpace", "Receptors", "MolDock", "Analysis")
 )
 
 if page == "TidyScreen":
@@ -61,6 +61,77 @@ elif page == "ChemSpace":
     if st.button("Show ChemSpace Tables Info"):
         st.dataframe(df)
     
+elif page == "Receptors":
+    st.title("Receptors")
+    st.write(f"Welcome to the Receptors page for project: {st.session_state.get('selected_project', 'Unknown')}.")
+
+    pdbs_db_path = os.path.join(st.session_state["active_project_path"], "docking", "receptors", "pdbs.db")
+    
+    receptors_db_path = os.path.join(st.session_state["active_project_path"], "docking", "receptors", "receptors.db")
+
+    try:
+        pdbs_models = st_funcs.get_pdbs_info(pdbs_db_path)
+    except Exception:
+        pdbs_models = None
+
+    try:
+        df_templates_models = st_funcs.get_pdb_templates_info(pdbs_db_path)
+    except Exception:
+        df_templates_models = None
+        
+    try:
+        df_receptors_models = st_funcs.get_docking_models_info(receptors_db_path)
+    except Exception:
+        df_receptors_models = None
+
+    if pdbs_models is None or pdbs_models.empty:
+        st.markdown(
+            f"<span style='font-size: 24px; color: orange;'>No receptor PDBs for project: </span><span style='font-size: 30px; color: green; font-weight: bold;'><b>{st.session_state.get('selected_project', 'Unknown')}</b></span>",
+            unsafe_allow_html=True
+        )
+    else:
+        ## Create a button to show/hide the receptor PDBs DataFrame
+        if "show_pdbs" not in st.session_state:
+            st.session_state["show_pdbs"] = False
+
+        if st.button(f"{'Hide' if st.session_state['show_pdbs'] else 'Show'} Receptor PDBs Details"):
+            st.session_state["show_pdbs"] = not st.session_state["show_pdbs"]
+
+        if st.session_state["show_pdbs"]:
+            st.dataframe(pdbs_models)
+
+    if df_templates_models is None or df_templates_models.empty:
+        st.markdown(
+            f"<span style='font-size: 24px; color: orange;'>No receptor templates for project: </span><span style='font-size: 30px; color: green; font-weight: bold;'><b>{st.session_state.get('selected_project', 'Unknown')}</b></span>",
+            unsafe_allow_html=True
+        )
+    else:
+        ## Create a button to show/hide the receptor templates DataFrame
+        if "show_templates" not in st.session_state:
+            st.session_state["show_templates"] = False
+
+        if st.button(f"{'Hide' if st.session_state['show_templates'] else 'Show'} Receptor Templates Details"):
+            st.session_state["show_templates"] = not st.session_state["show_templates"]
+
+        if st.session_state["show_templates"]:
+            st.dataframe(df_templates_models)
+
+    if df_receptors_models is None or df_receptors_models.empty:
+        st.markdown(
+            f"<span style='font-size: 24px; color: orange;'>No docking receptor models for project: </span><span style='font-size: 30px; color: green; font-weight: bold;'><b>{st.session_state.get('selected_project', 'Unknown')}</b></span>",
+            unsafe_allow_html=True
+        )
+    else:
+        ## Create a button to show/hide the docking receptor models DataFrame
+        if "show_receptors_models" not in st.session_state:
+            st.session_state["show_receptors_models"] = False
+
+        if st.button(f"{'Hide' if st.session_state['show_receptors_models'] else 'Show'} Docking Receptor Models Details"):
+            st.session_state["show_receptors_models"] = not st.session_state["show_receptors_models"]
+
+        if st.session_state["show_receptors_models"]:
+            st.dataframe(df_receptors_models)
+
 
 elif page == "MolDock":
     st.title("MolDock")
@@ -82,8 +153,14 @@ elif page == "MolDock":
         )
         
     else:
-        ## Create a button to show the project tables info DataFrame
-        if st.button("Show Docking Assays Details"):
+        ## Create a button to show/hide the docking assays DataFrame
+        if "show_assays" not in st.session_state:
+            st.session_state["show_assays"] = False
+
+        if st.button(f"{'Hide' if st.session_state['show_assays'] else 'Show'} Docking Assays Details"):
+            st.session_state["show_assays"] = not st.session_state["show_assays"]
+
+        if st.session_state["show_assays"]:
             st.dataframe(df)
 
         # Selection box for assay_name
@@ -115,6 +192,8 @@ elif page == "Analysis":
 
         df_results = st_funcs.get_docking_results(results_db_path)
 
+        df_mmpbsa_poses_results = st_funcs.get_mmpbsa_results(results_db_path)
+
         if df_results is None or df_results.empty:
             st.warning("No docking results")
         else:
@@ -127,6 +206,67 @@ elif page == "Analysis":
 
             if st.session_state["show_results"]:
                 st.write(df_results)
+
+            if df_mmpbsa_poses_results is None or df_mmpbsa_poses_results.empty:
+                st.warning("No MMPBSA results")
+            else:
+                ## Button to show/hide MMPBSA results DataFrame
+                if "show_mmpbsa_results" not in st.session_state:
+                    st.session_state["show_mmpbsa_results"] = False
+
+                if st.button(f"{'Hide' if st.session_state['show_mmpbsa_results'] else 'Show'} {st.session_state['selected_assay_name']} MMPBSA Results"):
+                    st.session_state["show_mmpbsa_results"] = not st.session_state["show_mmpbsa_results"]
+
+                if st.session_state["show_mmpbsa_results"]:
+                    # Create a selection box for MMPBSA poses.
+                    poses = df_mmpbsa_poses_results['pose_id'].dropna().tolist()
+                    if poses:
+                        default_pose = st.session_state.get('selected_pose_id', poses[0])
+                        if default_pose not in poses:
+                            default_pose = poses[0]
+
+                        selected_pose = st.selectbox(
+                            f"Select a docked pose: {st.session_state['selected_assay_name']}",
+                            poses,
+                            key="select_pose_id",
+                            index=poses.index(default_pose)
+                        )
+
+                        # Always update session state and plot on selection change
+                        if selected_pose != st.session_state.get('selected_pose_id', None):
+                            st.session_state['selected_pose_id'] = selected_pose
+
+                        st.success(f"Selected Pose: {selected_pose}")
+                        
+                        # Using the selected pose, retrieve de MMPBSA data from the database
+                        
+                        mmpbsa_data = st_funcs.get_mmpbsa_data_for_pose(results_db_path, selected_pose)
+                        
+                        # Display the retrieved MMPBSA data
+                        if mmpbsa_data is not None and not mmpbsa_data.empty:
+                            st.write(mmpbsa_data)
+                        
+                        # Show sum of the energy components for the selected pose
+                        if mmpbsa_data is not None and not mmpbsa_data.empty:
+                            total_energy = mmpbsa_data['total'].sum()
+                            gas_energy = mmpbsa_data['gas'].sum()
+                            ele_energy = mmpbsa_data['ele'].sum()
+                            vdw_energy = mmpbsa_data['vdw'].sum()
+                            polar_solvation = mmpbsa_data['polar_solvation'].sum()
+                            nonpolar_solvation = mmpbsa_data['nonpolar_solvation'].sum()
+                            st.write("MMPBSA Energy Components and Total Energy:")
+                            st.write(f"Total Energy: {total_energy:.2f} kcal/mol")
+                            st.write(f"Gas Energy: {gas_energy:.2f} kcal/mol")
+                            st.write(f"Electrostatic Energy: {ele_energy:.2f} kcal/mol")
+                            st.write(f"Van der Waals Energy: {vdw_energy:.2f} kcal/mol")
+                            st.write(f"Polar Solvation Energy: {polar_solvation:.2f} kcal/mol")
+                            st.write(f"Nonpolar Solvation Energy: {nonpolar_solvation:.2f} kcal/mol")
+                        
+
+                        
+                        
+                    else:
+                        st.warning("No valid pose IDs found in MMPBSA results")
 
             # Create a selectbox for unique LigName values if present
             if 'LigName' in df_results.columns:
