@@ -451,6 +451,35 @@ def notes_management():
     # Let list_notes_actions handle all the action logic
     notes_manager.list_notes_actions()
 
+def import_existing_project():
+    """
+    Import an existing project by prompting the user for the project name and path.
+    This will create a new entry in the projects database and set up the directory structure if needed.
+    """
+    print("IMPORT EXISTING PROJECT")
+    print("="*60)
+    
+    name = input("Enter the name of the existing project: ").strip()
+    while not name:
+        print("❌ Project name cannot be empty.")
+        name = input("Enter the name of the existing project: ").strip()
+    
+    path = input("Enter the full path to the existing project directory: ").strip()
+    while not path or not os.path.exists(path):
+        print("❌ Project path cannot be empty and must exist.")
+        path = input("Enter the full path to the existing project directory: ").strip()
+    
+    # Create a new project entry in the database with the provided name and path
+    projects_manager = ProjectsManagement()
+    result = projects_manager.create_project_entry(name, path, description="Imported existing project")
+    
+    if result['success']:
+        print(f"✅ Project '{name}' imported successfully with ID {result['project_id']}.")
+        print(f"Project path: {path}")
+    else:
+        print(f"❌ Failed to import project: {result['message']}")
+
+
 class ActivateProject:
     
     def __init__(self, name):
