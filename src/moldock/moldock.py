@@ -9078,9 +9078,13 @@ HOH = WAT\n""")
 
             if minimize:
                 # Minimize complex
-                min_rst_cpptraj_file = self._minimize_complex(prmtop_file, inpcrd_file, output_dir, ligname, pose_id)
-                rst_cpptraj_file = min_rst_cpptraj_file
-                inpcrd_file = min_rst_cpptraj_file # Set the file to the minimized one for further processing
+                try: 
+                    min_rst_cpptraj_file = self._minimize_complex(prmtop_file, inpcrd_file, output_dir, ligname, pose_id)
+                    rst_cpptraj_file = min_rst_cpptraj_file
+                    inpcrd_file = min_rst_cpptraj_file # Set the file to the minimized one for further processing
+                except Exception as e:
+                    print(f"Error occurred while minimizing complex for Pose_ID: {pose_id}, LigName: {ligname}: {e} \n Skipping minimization for this pose and proceeding with original inpcrd file.")
+                    continue
             else:
                 rst_cpptraj_file = inpcrd_file # No minimization, use the original inpcrd file for further processing
 
