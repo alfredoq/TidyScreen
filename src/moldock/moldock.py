@@ -10224,6 +10224,11 @@ quit
         prolif_params_db = self.__docking_params_db
 
         try:
+            print(prolif_params_db)
+            # Check if prolif_params_db exists, if not create it
+            if not os.path.exists(prolif_params_db):
+                open(prolif_params_db, 'w').close()
+            
             conn = sqlite3.connect(prolif_params_db)
             cursor = conn.cursor()
             # Create table if it does not exist (with description column)

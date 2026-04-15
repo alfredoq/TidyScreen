@@ -483,8 +483,9 @@ def import_existing_project():
             return
         print("✅ Projects database created successfully.")
     
+    project_path = f"{path}/{name}"
     
-    result = projects_manager.create_project_entry(name, path, description="Imported existing project")
+    result = projects_manager.create_project_entry(name, project_path, description="Imported existing project")
     
     if result['success']:
         print(f"✅ Project '{name}' imported successfully with ID {result['project_id']}.")
