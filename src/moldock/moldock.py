@@ -105,6 +105,16 @@ class MolDock:
                     'name': 'Vina',
                     'description': 'AutoDock Vina - fast and accurate docking',
                     'requirements': ['AutoDock Vina installation'],
+                },
+                '4': {
+                    'name': 'UniDock_single',
+                    'description': 'UniDock - Single compound docking using GPU acceleration',
+                    'requirements': ['UniDock installation', 'GPU with CUDA support'],
+                },
+                '5': {
+                    'name': 'UniDock_batch',
+                    'description': 'UniDock - Batch compound docking using GPU acceleration',
+                    'requirements': ['UniDock installation', 'GPU with CUDA support'],
                 }
             }
             
@@ -132,7 +142,7 @@ class MolDock:
                         print(f"\n✅ Selected: {selected_engine['name']}")
                         break
                     else:
-                        print("❌ Invalid selection. Please enter 1, 2, or 3")
+                        print("❌ Invalid selection. Please enter 1, 2, 3, 4 or 5.")
                         continue
                         
                 except KeyboardInterrupt:
@@ -813,6 +823,124 @@ class MolDock:
                 
             elif engine_name == 'Vina':
                 # AutoDock Vina specific parameters
+                
+                parameters['sf_name'] = self._get_parameter_choice(
+                    "Scoring function name to use",
+                    ['vina', 'ad4'],
+                    default='vina'
+                )
+
+                parameters['cpu'] = self._get_parameter_integer(
+                    "Number of CPU to use (default: 0; use all of them)",
+                    default=0, min_val=0, max_val=64
+                )
+                
+                parameters['exhaustiveness'] = self._get_parameter_integer(
+                    "Search exhaustiveness (1-32)",
+                    default=8, min_val=1, max_val=32
+                )
+                
+                parameters['n_poses'] = self._get_parameter_integer(
+                    "Number of poses to generate in MC search (1-100)",
+                    default=20, min_val=1, max_val=100
+                )
+
+                parameters['min_rmsd'] = self._get_parameter_float(
+                    "minimum RMSD difference between poses in MC search (0.1-3)",
+                    default=1, min_val=0.1, max_val=3
+                )
+
+                parameters['num_modes'] = self._get_parameter_integer(
+                    "Number of binding modes to return",
+                    default=9, min_val=1, max_val=20
+                )
+
+                parameters['max_evals'] = self._get_parameter_integer(
+                    "Maximum number of evaluations in MC search (default: 0; use heuristics rules)",
+                    default=0, min_val=0, max_val=10000000
+                )
+                
+                parameters['energy_range'] = self._get_parameter_float(
+                    "Energy range (kcal/mol)",
+                    default=3.0, min_val=1.0, max_val=10.0
+                )
+                
+                parameters['cpu_cores'] = self._get_parameter_integer(
+                    "Number of CPU cores to use (0 = auto)",
+                    default=0, min_val=0, max_val=64
+                )
+            
+                parameters['n_poses'] = self._get_parameter_integer(
+                    "Number of poses to write in output",
+                    default=9, min_val=1, max_val=100
+                )
+
+                parameters['energy_range'] = self._get_parameter_float(
+                    "Maximum energy difference from best pose (kcal/mol)",
+                    default=3, min_val=0.1, max_val=10.0
+                )
+                
+            elif engine_name == 'UniDock_single':
+                # UniDock single specific parameters
+                
+                parameters['sf_name'] = self._get_parameter_choice(
+                    "Scoring function name to use",
+                    ['vina', 'ad4'],
+                    default='vina'
+                )
+
+                parameters['cpu'] = self._get_parameter_integer(
+                    "Number of CPU to use (default: 0; use all of them)",
+                    default=0, min_val=0, max_val=64
+                )
+                
+                parameters['exhaustiveness'] = self._get_parameter_integer(
+                    "Search exhaustiveness (1-32)",
+                    default=8, min_val=1, max_val=32
+                )
+                
+                parameters['n_poses'] = self._get_parameter_integer(
+                    "Number of poses to generate in MC search (1-100)",
+                    default=20, min_val=1, max_val=100
+                )
+
+                parameters['min_rmsd'] = self._get_parameter_float(
+                    "minimum RMSD difference between poses in MC search (0.1-3)",
+                    default=1, min_val=0.1, max_val=3
+                )
+
+                parameters['num_modes'] = self._get_parameter_integer(
+                    "Number of binding modes to return",
+                    default=9, min_val=1, max_val=20
+                )
+
+                parameters['max_evals'] = self._get_parameter_integer(
+                    "Maximum number of evaluations in MC search (default: 0; use heuristics rules)",
+                    default=0, min_val=0, max_val=10000000
+                )
+                
+                parameters['energy_range'] = self._get_parameter_float(
+                    "Energy range (kcal/mol)",
+                    default=3.0, min_val=1.0, max_val=10.0
+                )
+                
+                parameters['cpu_cores'] = self._get_parameter_integer(
+                    "Number of CPU cores to use (0 = auto)",
+                    default=0, min_val=0, max_val=64
+                )
+            
+                parameters['n_poses'] = self._get_parameter_integer(
+                    "Number of poses to write in output",
+                    default=9, min_val=1, max_val=100
+                )
+
+                parameters['energy_range'] = self._get_parameter_float(
+                    "Maximum energy difference from best pose (kcal/mol)",
+                    default=3, min_val=0.1, max_val=10.0
+                )
+                
+            elif engine_name == 'UniDock_batch':
+                # UniDock batch specific parameters
                 
                 parameters['sf_name'] = self._get_parameter_choice(
                     "Scoring function name to use",
