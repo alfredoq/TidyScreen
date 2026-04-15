@@ -471,6 +471,19 @@ def import_existing_project():
     
     # Create a new project entry in the database with the provided name and path
     projects_manager = ProjectsManagement()
+    
+    # Check if the projects database exists, create it if it doesnt
+    projects_db = f"{site.getsitepackages()[0]}/tidyscreen/projects_db/projects_database.db"
+    if not os.path.exists(projects_db):
+        print(f"Projects database does not exist at: {projects_db}")
+        print("Creating new projects database...")
+        db_manager = DatabaseManager()
+        if not db_manager.create_projects_database(projects_db):
+            print("❌ Failed to create projects database. Cannot proceed.")
+            return
+        print("✅ Projects database created successfully.")
+    
+    
     result = projects_manager.create_project_entry(name, path, description="Imported existing project")
     
     if result['success']:
