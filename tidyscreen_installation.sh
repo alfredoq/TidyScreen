@@ -69,11 +69,11 @@ echo "y" | conda create -n $ENV_NAME python=3.12
 
 echo "Installing TidyScreen"
 
-conda run -n $ENV_NAME pip install git+https://github.com/alfredoq/TidyScreen
+conda run -n $ENV_NAME pip install git+https://github.com/alfredoq/TidyScreen@develop
 
 # echo "Installing Dependencies"
 
-echo "y" | conda install -n $ENV_NAME -c conda-forge ambertools==23.6 espaloma espaloma_charge chemicalite visidata vmd-python vina pdbfixer
+echo "y" | conda install -n $ENV_NAME -c conda-forge ambertools==23.6 espaloma espaloma_charge chemicalite visidata vmd-python vina pdbfixer prolif
 
 conda run -n $ENV_NAME pip install git+https://github.com/forlilab/Meeko@develop
 
