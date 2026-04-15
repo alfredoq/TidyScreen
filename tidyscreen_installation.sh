@@ -34,6 +34,21 @@ if conda env list | grep -q "adt"; then
     fi
 fi
 
+# Check if the auxiliary unidock environment already exists
+if conda env list | grep -q "unidock"; then
+    echo "Warning: Conda environment 'unidock' already exists."
+    read -p "Do you want to replace it? (y/N): " REPLACE_ENV
+    REPLACE_ENV=${REPLACE_ENV:-n}
+    
+    if [[ "$REPLACE_ENV" =~ ^[Yy]$ ]]; then
+        echo "Removing existing environment: unidock"
+        echo "y" | conda env remove -n unidock -y
+    else
+        echo "Installation cancelled. Environment 'unidock' already exists."
+        exit 1
+    fi
+fi
+
 # Check if the auxiliary streamlit environment already exists
 if conda env list | grep -q "streamlit"; then
     echo "Warning: Conda environment 'streamlit' already exists."
@@ -96,3 +111,9 @@ echo "y" | conda install -n streamlit -c conda-forge streamlit
 
 ## Will install TidyScreen in the streamlit environment to ensure all dependencies are met for gui actions
 conda run -n streamlit pip install git+https://github.com/alfredoq/TidyScreen
+
+## Create a separate environment for UniDock to avoid conflicts with TidyScreen dependencies
+echo "y" | conda create -n unidock python=3.12
+echo "y" | conda install -n unidock -c conda-forge unidock
+
+echo "Installation complete! To activate the TidyScreen environment, run: conda activate $ENV_NAME"
