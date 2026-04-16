@@ -9090,6 +9090,9 @@ HOH = WAT\n""")
 
         assay_id = self._prompt_assay("for ProLIF fingerprint computation", assay_by_id)
         
+        # Get the receptor file used for the corresponding docking studies
+        receptor_file = ('/').join(assay_by_id[assay_id].get('receptor_info', {})["pdbqt_file"].split('/')[:-1]) + "/receptor_checked.pdb"
+        
         # Prompt user for fingerprint/computation options
         print("\nSelect fingerprint/computation options:")
         print("1 - ProLIF fingerprints only")
@@ -9176,7 +9179,7 @@ HOH = WAT\n""")
         if prolif:
             print("I will compute ProLIF FPS")
             # Check already existing fingerprints tables in the database
-            self._check_table_in_db(results_db, "processed_prolif_fps_json")
+            #self._check_table_in_db(results_db, "processed_prolif_fps_json") # Deprecated since the existence is checked at the moment of storing the results in the database.
         if mmbgsa:
             print("I will compute MMGBSA FPS")
             # Check already existing fingerprints tables in the database
@@ -9187,7 +9190,8 @@ HOH = WAT\n""")
         
         ## If ProLIF fingerprints are requested, retrieve the computation parameters
         if prolif == True:
-            prolif_params_dict = self._get_prolif_params()
+            prolif_params_dict, condition_selection = self._get_prolif_params()
+            self._check_table_in_db(results_db, f'processed_prolif_fps_json_condition_{condition_selection}')
 
         for idx, row in df.iterrows():
             pose_id = row['Pose_ID']
@@ -9202,14 +9206,17 @@ HOH = WAT\n""")
                 mol2_file, frcmod_file = self._prepare_ligand_tleap_files(ligname, assay_info, output_dir)
         
             # Create complex .prmtop and .inpcrd files
-            prmtop_file, inpcrd_file = self._prepare_complex_prmtop_inpcrd(mol2_file, frcmod_file, assay_info, output_dir, output_file)
+            prmtop_file, inpcrd_file, output_pdb_file = self._prepare_complex_prmtop_inpcrd(mol2_file, frcmod_file, assay_info, output_dir, output_file)
 
             if minimize:
                 # Minimize complex
                 try: 
-                    min_rst_cpptraj_file = self._minimize_complex(prmtop_file, inpcrd_file, output_dir, ligname, pose_id)
-                    rst_cpptraj_file = min_rst_cpptraj_file
-                    inpcrd_file = min_rst_cpptraj_file # Set the file to the minimized one for further processing
+                    min_rst_cpptraj_file, output_pdb_file = self._minimize_complex(prmtop_file, inpcrd_file, output_dir, ligname, pose_id, output_pdb_file)
+                    
+                    #rst_cpptraj_file = min_rst_cpptraj_file
+                    #inpcrd_file = min_rst_cpptraj_file # Set the file to the minimized one for further processing
+                    
+                    
                 except Exception as e:
                     print(f"Error occurred while minimizing complex for Pose_ID: {pose_id}, LigName: {ligname}: {e} \n Skipping minimization for this pose and proceeding with original inpcrd file.")
                     continue
@@ -9246,7 +9253,8 @@ HOH = WAT\n""")
                 
                 try: 
                     ## Will compute and process the structure of the resulting ProLIF dataframe
-                    fps_df = self._compute_prolif_fingerprints(prmtop_file, inpcrd_file, pose_id, results_db, prolif_params_dict)
+                    #fps_df = self._compute_prolif_fingerprints(prmtop_file, inpcrd_file, pose_id, results_db, prolif_params_dict)
+                    fps_df = self._compute_prolif_fingerprints2(prolif_params_dict, output_pdb_file, receptor_file)
                 except Exception as e:
                     print(f"Error occurred while computing ProLIF fingerprints for Pose_ID: {pose_id}, LigName: {ligname}: {e} \n Skipping ProLIF computation for this pose.")
                     continue
@@ -9261,7 +9269,7 @@ HOH = WAT\n""")
                 fps_df.columns = [f"{first}_{second}" for first, second in fps_df.columns]
 
                 # Store the processed fps_df in the assay database for posterior processing
-                self._store_processed_fps_df_in_db(fps_df, pose_id, results_db, computation_mode)
+                self._store_processed_fps_df_in_db(fps_df, pose_id, results_db, computation_mode, condition_selection)
 
             if mmbgsa == True:
 
@@ -9528,6 +9536,9 @@ HOH = WAT\n""")
         prmtop_file = os.path.join(output_dir, 'complex.prmtop')
         inpcrd_file = os.path.join(output_dir, 'complex.inpcrd')
 
+        # Write an output pdb file with Hidrogens
+        output_pdb_file = pdb_file.replace('.pdb', '_withH.pdb')
+
         with open(tleap_in_file, 'w') as f:
             f.write(f"""source leaprc.protein.ff14SB
 source leaprc.water.tip3p
@@ -9542,6 +9553,8 @@ UNL = loadmol2 {mol2_file}
 loadamberparams {frcmod_file}
 
 lig = loadpdb "{pdb_file}"
+
+savepdb lig "{output_pdb_file}"
 
 # Create complex
 complex = combine {{rec lig}}
@@ -9560,9 +9573,9 @@ quit
         except Exception as e:
             print(f"[ERROR] Failed to run tleap for complex generation: {e}")
 
-        return prmtop_file, inpcrd_file
+        return prmtop_file, inpcrd_file, output_pdb_file
 
-    def _minimize_complex(self, prmtop_file, inpcrd_file, output_dir, ligname, pose_id):
+    def _minimize_complex(self, prmtop_file, inpcrd_file, output_dir, ligname, pose_id, output_pdb_file):
 
         """
         Will minimize the receptor under processing using sander
@@ -9603,6 +9616,7 @@ quit
 
             pmemd_command = f"pmemd.cuda -O -i {min_in_file} -o {min_out_file} -p {prmtop_file} -c {inpcrd_file} -r {min_rst_file}"
             subprocess.run(pmemd_command, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            
         else:
             # Run minimization with CPU only
             print("No GPU detected. Using sander for minimization...")
@@ -9631,7 +9645,14 @@ quit
         cpptraj_command = f"cpptraj -i {cpptraj_in_file}"
         subprocess.run(cpptraj_command, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-        return min_rst_cpptraj_file
+        # Extract a minimized .pdb file from the cpptraj output in pdb format for posterior ProLIF processing. Will overwrite the output_pdb_file generated after tleap processing to keep the same file for posterior ProLIF processing and avoid having to manage multiple files.
+        ambpdb_command = f"ambpdb -p {prmtop_file} -c {min_rst_cpptraj_file} | grep 'UNL' | grep 'ATOM' > {output_pdb_file}"
+
+        subprocess.run(ambpdb_command, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+        return min_rst_cpptraj_file, output_pdb_file
+    
 
     def _compute_prolif_fingerprints(self, prmtop_file, min_rst_cpptraj_file, pose_id, results_db, prolif_params_dict):
 
@@ -9657,6 +9678,36 @@ quit
         # Compute the fingerprints
         
         fp.run_from_iterable([ligand_mol], protein_mol,progress=False)
+        # Generate the fingerprints dataframe
+        fps_df = fp.to_dataframe()
+
+        return fps_df
+    
+    
+    def _compute_prolif_fingerprints2(self, prolif_params_dict, output_pdb_file, receptor_file):
+
+        import prolif as plf
+        import MDAnalysis as mda
+        from rdkit import Chem
+        
+        print("Computing ProLIF Fingerprints")
+
+        interactions_list = prolif_params_dict['interactions_list']
+
+        interactions_parameters_dict = prolif_params_dict.get('interaction_parameters', {})
+        
+        # Load the receptor file
+        receptor = mda.Universe(receptor_file, format="PDB")
+        receptor_plf = plf.Molecule.from_mda(receptor)
+        
+        # Load the ligand file
+        ligand = Chem.MolFromPDBFile(output_pdb_file, removeHs=False)
+        ligand_plf = plf.Molecule.from_rdkit(ligand)
+        
+        fp = plf.Fingerprint(interactions_list, parameters=interactions_parameters_dict)
+        # Compute the fingerprints
+        fp.run_from_iterable([ligand_plf], receptor_plf,progress=False)
+        
         # Generate the fingerprints dataframe
         fps_df = fp.to_dataframe()
 
@@ -10349,7 +10400,7 @@ quit
                 print(f"   📌 Description: {description}")
                 print(f"   🔍 ID: {selected_id}")
 
-                return conditions_dict
+                return conditions_dict, selection
             else:
                 print("\n❌ Failed to retrieve selected conditions")
                 conn.close()
@@ -10665,7 +10716,7 @@ quit
         except Exception as e:
             print(f"\n❌ Error storing full size interactions dataframe as JSON in database: {e}")
     
-    def _store_processed_fps_df_in_db(self, fps_df, pose_id, results_db, computation_mode):
+    def _store_processed_fps_df_in_db(self, fps_df, pose_id, results_db, computation_mode, condition_selection):
         
         import sqlite3
         import json
@@ -10682,14 +10733,16 @@ quit
                 'computation_mode': 'TEXT NOT NULL'
             }
             
+            fingerprint_table_name = f'processed_prolif_fps_json_condition_{condition_selection}'
+                    
             # Use a dedicated method to create the table if it doesn't exist
-            self._create_table_from_columns_dict(cursor, 'processed_prolif_fps_json', columns_dict, verbose=False)
+            self._create_table_from_columns_dict(cursor, fingerprint_table_name, columns_dict, verbose=False)
             
             # Update legacy databases to add missing columns
-            self._update_legacy_table_columns(cursor, 'processed_prolif_fps_json', columns_dict, verbose=False)
+            self._update_legacy_table_columns(cursor, fingerprint_table_name, columns_dict, verbose=False)
             
             # Remove deprecated columns
-            self._remove_legacy_table_columns(cursor, 'processed_prolif_fps_json', columns_dict,verbose=False)
+            self._remove_legacy_table_columns(cursor, fingerprint_table_name, columns_dict,verbose=False)
             
             data_dict = {
                 'pose_id': pose_id,
@@ -10698,7 +10751,7 @@ quit
             }
             
             # Insert data dynamically into the table
-            self._insert_data_dinamically_into_table(cursor, 'processed_prolif_fps_json', data_dict)
+            self._insert_data_dinamically_into_table(cursor, fingerprint_table_name, data_dict)
             
             conn.commit()
             conn.close()
