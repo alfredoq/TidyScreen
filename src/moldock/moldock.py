@@ -9244,8 +9244,12 @@ HOH = WAT\n""")
             # Compute the requested fingerprints
             if prolif == True:
                 
-                ## Will compute and process the structure of the resulting ProLIF dataframe
-                fps_df = self._compute_prolif_fingerprints(prmtop_file, inpcrd_file, pose_id, results_db, prolif_params_dict)
+                try: 
+                    ## Will compute and process the structure of the resulting ProLIF dataframe
+                    fps_df = self._compute_prolif_fingerprints(prmtop_file, inpcrd_file, pose_id, results_db, prolif_params_dict)
+                except Exception as e:
+                    print(f"Error occurred while computing ProLIF fingerprints for Pose_ID: {pose_id}, LigName: {ligname}: {e} \n Skipping ProLIF computation for this pose.")
+                    continue
                 
                 # Flatten the MultiIndex columns by removing the first level
                 fps_df.columns = fps_df.columns.droplevel(0)
