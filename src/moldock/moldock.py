@@ -895,8 +895,8 @@ class MolDock:
                 )
                 
                 parameters['exhaustiveness'] = self._get_parameter_integer(
-                    "Search exhaustiveness (1-32)",
-                    default=8, min_val=1, max_val=32
+                    "Search exhaustiveness (1-512)",
+                    default=32, min_val=1, max_val=512
                 )
                 
                 parameters['n_poses'] = self._get_parameter_integer(
