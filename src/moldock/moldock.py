@@ -954,8 +954,8 @@ class MolDock:
                 )
                 
                 parameters['exhaustiveness'] = self._get_parameter_integer(
-                    "Search exhaustiveness (1-32)",
-                    default=8, min_val=1, max_val=32
+                    "Search exhaustiveness (1-512)",
+                    default=128, min_val=1, max_val=512
                 )
                 
                 parameters['n_poses'] = self._get_parameter_integer(
@@ -1496,17 +1496,17 @@ class MolDock:
             elif selected_method['docking_engine'] == 'UniDock_single':
                 
                 self._dock_table_with_unidock_single(selected_table, selected_method, assay_registry, clean_ligand_files, receptor_info)
+                docking_mode = 'vina' # This docking mode is afterwards required by Ringtail
                 
-                print("Docking with unidock")
-
-                sys.exit(1)
-            
             else:
                 print(f"❌ Docking engine '{selected_method['docking_engine']}' not yet implemented")
                 return
 
             ## After the docking run has been completed, execute the corresponding analysis
+            
+                 
             results_db_file = self._process_docking_assay_results(assay_registry, docking_mode, clean_ligand_files, selected_method, max_poses=10)
+            
             print(f"✅ Docking results saved to: {results_db_file}")
             
         except Exception as e:
@@ -7155,7 +7155,8 @@ quit
 
     def _process_docking_assay_results(self, assay_registry, docking_mode, clean_ligand_files, selected_method, max_poses):
 
-        from ringtail import RingtailCore
+       
+        from ringtail import RingtailCore       
         import os
 
         try:
@@ -8434,6 +8435,7 @@ quit
         ## If 'vina' scoring function is to be applied, compute the maps once for batch docking
         if method_params['sf_name'] == 'vina':          
             unidock_cmd = "unidock --scoring vina "
+        
         elif method_params['sf_name'] == 'ad4':
             unidock_cmd = "unidock --scoring ad4 "
 
@@ -8461,7 +8463,6 @@ quit
 
                 ## Execute unidock
                 self._execute_unidock(ligand_pdbqt_filepath, assay_registry, method_params, receptor_pdbqt_file, receptor_conditions, unidock_cmd)
-                
 
                 if clean_ligand_files:
                     # Remove the temporary SDF and .pdbqt files
@@ -8472,6 +8473,16 @@ quit
                 print(f"   ❌ Error docking compound {inchi_key}: {e}")
                 continue
 
+            if progress_bar:
+                progress_bar.update(1)
+            elif idx % 100 == 0:
+                print(f"   Docked {idx} compounds...")
+
+        if progress_bar:
+            progress_bar.close()
+
+        print(f"\n🎉 Docking completed for table: {selected_table}")
+        print(f"Results saved in: {docking_results_dir}")
 
     def _prepare_vina_receptor(self, method_params, receptor_pdbqt_file, receptor_conditions):
         
