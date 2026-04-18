@@ -895,8 +895,8 @@ class MolDock:
                 )
                 
                 parameters['exhaustiveness'] = self._get_parameter_integer(
-                    "Search exhaustiveness (1-32)",
-                    default=8, min_val=1, max_val=32
+                    "Search exhaustiveness (1-512)",
+                    default=32, min_val=1, max_val=512
                 )
                 
                 parameters['n_poses'] = self._get_parameter_integer(
@@ -954,8 +954,8 @@ class MolDock:
                 )
                 
                 parameters['exhaustiveness'] = self._get_parameter_integer(
-                    "Search exhaustiveness (1-32)",
-                    default=8, min_val=1, max_val=32
+                    "Search exhaustiveness (1-512)",
+                    default=128, min_val=1, max_val=512
                 )
                 
                 parameters['n_poses'] = self._get_parameter_integer(
@@ -1491,12 +1491,22 @@ class MolDock:
             elif selected_method['docking_engine'] == 'Vina':
                 self._dock_table_with_vina(selected_table, selected_method, assay_registry, clean_ligand_files, receptor_info)
                 docking_mode = 'vina'
+            
+            ## Dock using Unidock in single compound mode    
+            elif selected_method['docking_engine'] == 'UniDock_single':
+                
+                self._dock_table_with_unidock_single(selected_table, selected_method, assay_registry, clean_ligand_files, receptor_info)
+                docking_mode = 'vina' # This docking mode is afterwards required by Ringtail
+                
             else:
                 print(f"❌ Docking engine '{selected_method['docking_engine']}' not yet implemented")
                 return
 
             ## After the docking run has been completed, execute the corresponding analysis
+            
+                 
             results_db_file = self._process_docking_assay_results(assay_registry, docking_mode, clean_ligand_files, selected_method, max_poses=10)
+            
             print(f"✅ Docking results saved to: {results_db_file}")
             
         except Exception as e:
@@ -7145,7 +7155,8 @@ quit
 
     def _process_docking_assay_results(self, assay_registry, docking_mode, clean_ligand_files, selected_method, max_poses):
 
-        from ringtail import RingtailCore
+       
+        from ringtail import RingtailCore       
         import os
 
         try:
@@ -8356,6 +8367,123 @@ quit
         print(f"\n🎉 Docking completed for table: {selected_table}")
         print(f"Results saved in: {docking_results_dir}")
     
+    def _dock_table_with_unidock_single(self, selected_table, selected_method, assay_registry, clean_ligand_files, receptor_info):
+        import sqlite3
+        import tempfile
+        import os
+        import subprocess
+        from meeko import MoleculePreparation
+        from rdkit import Chem
+
+        # Try to import tqdm for progress bar
+        try:
+            from tqdm import tqdm
+            TQDM_AVAILABLE = True
+        except ImportError:
+            TQDM_AVAILABLE = False
+
+        print(f"\n🚀 Starting docking with Vina for table: {selected_table}")
+
+        # Retrieve docking method parameters
+        method_params = selected_method.get('parameters', {})
+        
+        # Retrieve ligand preparation params
+        ligand_prep_parameters = selected_method.get('ligand_prep_parameters', {})
+
+        # Select the receptor to be used for docking
+        receptor_conditions = self._get_receptor_conditions(receptor_info.get('id', None))
+        
+        receptor_pdbqt_file = receptor_info.get('pdbqt_file', None)
+        charge_model = receptor_info.get('configs', None).get('receptor_charge_model', None)
+        grids_path = receptor_info.get('grids_path', None)
+        fld_file = f"{grids_path}/receptor_checked_{charge_model}.maps.fld"
+        assay_folder = assay_registry['assay_folder_path']
+
+        if not receptor_pdbqt_file:
+            print("❌ No receptor .pdbqt file found.")
+            return
+        
+        if not fld_file:
+            print("❌ No receptor .maps.fld file found.")
+            return
+            
+        # Connect to chemspace database and get compounds
+        try:
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            cursor.execute(f"SELECT inchi_key, sdf_blob FROM {selected_table} WHERE sdf_blob IS NOT NULL")
+            compounds = cursor.fetchall()
+            conn.close()
+        except Exception as e:
+            print(f"❌ Error retrieving compounds from table: {e}")
+            return
+
+        if not compounds:
+            print("❌ No compounds with SDF blobs found in the selected table.")
+            return
+
+        print(f"🧪 {len(compounds)} compounds to dock.")
+
+        # Prepare output directory for docking results
+        docking_results_dir = f"{assay_folder}/results"
+
+        # Progress bar setup
+        progress_bar = None
+        if TQDM_AVAILABLE:
+            progress_bar = tqdm(total=len(compounds), desc="Docking compounds", unit="ligand")
+
+        ## If 'vina' scoring function is to be applied, compute the maps once for batch docking
+        if method_params['sf_name'] == 'vina':          
+            unidock_cmd = "unidock --scoring vina "
+        
+        elif method_params['sf_name'] == 'ad4':
+            unidock_cmd = "unidock --scoring ad4 "
+
+            # Append the maps prefix to the command
+            maps_path = receptor_info["configs"]["grids_path"]
+            maps_prefix = f"{maps_path}/receptor_checked_{charge_model} "
+            unidock_cmd += f"--maps {maps_prefix} " 
+
+        # Iterate and dock each compound
+        for idx, (inchi_key, sdf_blob) in enumerate(compounds, 1):
+            try:
+                # Write SDF blob to temp file
+                # Use inchi_key as the temporary file name for the SDF
+                sdf_filepath = f"{assay_folder}/results/{inchi_key}.sdf"
+                
+                with open(sdf_filepath, "wb") as sdf_temp:
+                    sdf_temp.write(sdf_blob)
+                
+                # Create an RDKit mol object from a sdf file
+                mol = self._mol_from_sdf(sdf_filepath)
+                
+                ## Generate the ligand.pdbqt file
+                ligand_pdbqt_filepath = f"{docking_results_dir}/{inchi_key}.pdbqt"
+                self._pdbqt_from_mol(mol, ligand_pdbqt_filepath, inchi_key, ligand_prep_parameters)
+
+                ## Execute unidock
+                self._execute_unidock(ligand_pdbqt_filepath, assay_registry, method_params, receptor_pdbqt_file, receptor_conditions, unidock_cmd)
+
+                if clean_ligand_files:
+                    # Remove the temporary SDF and .pdbqt files
+                    os.remove(sdf_filepath)
+                    os.remove(ligand_pdbqt_filepath)
+
+            except Exception as e:
+                print(f"   ❌ Error docking compound {inchi_key}: {e}")
+                continue
+
+            if progress_bar:
+                progress_bar.update(1)
+            elif idx % 100 == 0:
+                print(f"   Docked {idx} compounds...")
+
+        if progress_bar:
+            progress_bar.close()
+
+        print(f"\n🎉 Docking completed for table: {selected_table}")
+        print(f"Results saved in: {docking_results_dir}")
+
     def _prepare_vina_receptor(self, method_params, receptor_pdbqt_file, receptor_conditions):
         
         from vina import Vina
@@ -8454,6 +8582,41 @@ quit
         
         except Exception as e:
             print(f"Error executing Vina: {e}")
+
+    def _execute_unidock(self, ligand_pdbqt_filepath, assay_registry, method_params, receptor_pdbqt_file, receptor_conditions, unidock_cmd):
+
+        import subprocess
+
+        ## Append ligand path to unidock command
+        unidock_cmd += f"--ligand {ligand_pdbqt_filepath} "
+
+        ## Append the grid position parameters to the command
+        x_pos = receptor_conditions["configs"]["center"]["x"]
+        y_pos = receptor_conditions["configs"]["center"]["y"]
+        z_pos = receptor_conditions["configs"]["center"]["z"]
+        ## Add the info
+        unidock_cmd += f"--center_x {x_pos} --center_y {y_pos} --center_z {z_pos} "
+
+        # Append the grid size parameters to the command
+        x_size = receptor_conditions["configs"]["size"]["x"]
+        y_size = receptor_conditions["configs"]["size"]["y"]
+        z_size = receptor_conditions["configs"]["size"]["z"]
+        ## Add the info
+        unidock_cmd += f"--size_x {x_size} --size_y {y_size} --size_z {z_size} "
+        
+        ## Add execution from unidock environment
+        unidock_execution_cmd = f"conda run -n unidock {unidock_cmd}"
+
+        ## run unidock command from the unidock conda environment
+        result = subprocess.run(unidock_execution_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+        results_file = ligand_pdbqt_filepath.replace('.pdbqt', '_out.pdbqt')
+        ligand_name = ligand_pdbqt_filepath.split('/')[-1]
+        if result.returncode == 0:
+            
+            print(f"\n✅ Succesfully docked {ligand_name} successfully.")
+        else:
+            print(f"\n❌ Error docking compound: {ligand_name}")
 
     def compute_roc_curve(self):
         
