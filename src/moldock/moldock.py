@@ -1509,7 +1509,6 @@ class MolDock:
                 return
 
             ## After the docking run has been completed, execute the corresponding analysis
-            
                  
             results_db_file = self._process_docking_assay_results(assay_registry, docking_mode, clean_ligand_files, selected_method, max_poses=10)
             
@@ -1556,10 +1555,13 @@ class MolDock:
             python_script = f"""
 import sys
 import os
+import time
 sys.path.insert(0, '{self.path}')
 
 from tidyscreen import tidyscreen
 from tidyscreen.moldock.moldock import MolDock
+
+start_time = time.time()
 
 try:
     # Recreate the project and MolDock objects
@@ -1579,11 +1581,15 @@ try:
     # Run docking
     moldock._run_docking_foreground(selected_table, selected_method, assay_registry, clean_ligand_files, receptor_info)
     
+    elapsed = time.time() - start_time
     print(f'✅ Background docking process completed successfully')
+    print(f'⏱️  Elapsed time: {{elapsed:.2f}} seconds')
     sys.exit(0)
     
 except Exception as e:
+    elapsed = time.time() - start_time
     print(f'❌ Error in background docking process: {{e}}')
+    print(f'⏱️  Elapsed time (with error): {{elapsed:.2f}} seconds')
     import traceback
     traceback.print_exc()
     sys.exit(1)
@@ -7160,7 +7166,6 @@ quit
             print(f"   ❌ Error running AutoDockGPU for {ligand_pdbqt_filepath.split("/")[-1]}: {e}")
 
     def _process_docking_assay_results(self, assay_registry, docking_mode, clean_ligand_files, selected_method, max_poses):
-
        
         from ringtail import RingtailCore       
         import os
@@ -7201,9 +7206,16 @@ quit
             if clean_ligand_files:
                 if os.path.exists(results_db_file) and os.path.getsize(results_db_file) > 0:
                     for fname in os.listdir(results_folder):
+                        ## Clean .dlg files if exists
                         if fname.endswith('.dlg'):
                             try:
                                 os.remove(os.path.join(results_folder, fname))
+                            except Exception as e:
+                                print(f"Warning: could not delete {fname}: {e}")
+                        ## Clean .dlg files if exists
+                        if fname.endswith('out.pdbqt'):
+                            try:
+                                oes.remove(os.path.join(results_folder, fname))
                             except Exception as e:
                                 print(f"Warning: could not delete {fname}: {e}")
 
@@ -8599,6 +8611,15 @@ quit
         ## Execute unidock in single compound mode
         self._execute_unidock_batch(ligand_pdbqt_filepath, assay_registry, method_params, receptor_pdbqt_file, receptor_conditions, unidock_cmd, ligands_index_file)
 
+        ## Remove the ligand .pdbqt input files if required
+        if clean_ligand_files:
+            # Loop over the pdbqt_files_list and remove each file
+            for pdbqt_file in pdqbt_files_list:
+                os.remove(pdbqt_file)
+                    
+        print(f"\n🎉 Docking completed for table: {selected_table}")
+        print(f"Results saved in: {docking_results_dir}")
+
 
     def _prepare_vina_receptor(self, method_params, receptor_pdbqt_file, receptor_conditions):
         
@@ -8764,13 +8785,8 @@ quit
         ## Add execution from unidock environment
         unidock_execution_cmd = f"conda run -n unidock {unidock_cmd}"
 
-        print(unidock_execution_cmd)
-
         ## run unidock command from the unidock conda environment
-        result = subprocess.run(unidock_execution_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        print(result.stdout)
-        print(result.stderr)
-
+        result = subprocess.run(unidock_execution_cmd, shell=True, text=True, stdout=None, stderr=None)
 
         if result.returncode == 0:
             
