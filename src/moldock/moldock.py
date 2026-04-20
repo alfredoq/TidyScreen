@@ -1,4 +1,5 @@
 import ast
+from asyncio import subprocess
 import os
 import site
 import sqlite3
@@ -9550,11 +9551,14 @@ HOH = WAT\n""")
             if minimize:
                 # Minimize complex
                 try: 
+                    print("MINIMIZING COMPLEX...")
+                    
                     min_rst_cpptraj_file, output_pdb_file = self._minimize_complex(prmtop_file, inpcrd_file, output_dir, ligname, pose_id, output_pdb_file)
+                    
+                    rst_cpptraj_file = min_rst_cpptraj_file # Set the file to the minimized one for further processing
                     
                     #rst_cpptraj_file = min_rst_cpptraj_file
                     #inpcrd_file = min_rst_cpptraj_file # Set the file to the minimized one for further processing
-                    
                     
                 except Exception as e:
                     print(f"Error occurred while minimizing complex for Pose_ID: {pose_id}, LigName: {ligname}: {e} \n Skipping minimization for this pose and proceeding with original inpcrd file.")
@@ -9593,7 +9597,11 @@ HOH = WAT\n""")
                 try: 
                     ## Will compute and process the structure of the resulting ProLIF dataframe
                     #fps_df = self._compute_prolif_fingerprints(prmtop_file, inpcrd_file, pose_id, results_db, prolif_params_dict)
-                    fps_df = self._compute_prolif_fingerprints2(prolif_params_dict, output_pdb_file, receptor_file)
+                    #fps_df = self._compute_prolif_fingerprints2(prolif_params_dict, output_pdb_file, receptor_file)
+                    
+                    ## This fingerprint computation mode is based on generating the .pdb file containing records from the .prmtop and .inpcrd files
+                    fps_df = self._compute_prolif_fingerprints3(prolif_params_dict, output_pdb_file, receptor_file, prmtop_file, inpcrd_file, ligname, pose_id)
+                    
                 except Exception as e:
                     print(f"Error occurred while computing ProLIF fingerprints for Pose_ID: {pose_id}, LigName: {ligname}: {e} \n Skipping ProLIF computation for this pose.")
                     continue
@@ -9991,7 +9999,6 @@ quit
 
 
         return min_rst_cpptraj_file, output_pdb_file
-    
 
     def _compute_prolif_fingerprints(self, prmtop_file, min_rst_cpptraj_file, pose_id, results_db, prolif_params_dict):
 
@@ -10022,7 +10029,6 @@ quit
 
         return fps_df
     
-    
     def _compute_prolif_fingerprints2(self, prolif_params_dict, output_pdb_file, receptor_file):
 
         import prolif as plf
@@ -10050,6 +10056,40 @@ quit
         # Generate the fingerprints dataframe
         fps_df = fp.to_dataframe()
 
+        return fps_df
+    
+    def _compute_prolif_fingerprints3(self, prolif_params_dict, output_pdb_file, receptor_file, prmtop_file, inpcrd_file, ligname, pose_id):
+
+        import prolif as plf
+        import MDAnalysis as mda
+        from rdkit import Chem
+        import subprocess
+        
+        print(f"COMPUTING for {ligname}, pose {pose_id}")
+        
+        interactions_list = prolif_params_dict['interactions_list']
+        interactions_parameters_dict = prolif_params_dict.get('interaction_parameters', {})
+                        
+        # Use ambpdb to generate a .pdb file from the prmtop and inpcrd files to be used for ProLIF processing. Will overwrite the output_pdb_file generated after tleap processing to keep the same file for posterior ProLIF processing and avoid having to manage multiple files.
+        ambpdb_command = f"ambpdb -p {prmtop_file} -c {inpcrd_file} -conect > {output_pdb_file}"
+        subprocess.run(ambpdb_command, shell=True)
+                     
+        # # # Load the receptor file
+        u = mda.Universe(f"{output_pdb_file}")
+        
+        receptor = u.select_atoms(f"{prolif_params_dict['selection_dict']['receptor']}")
+        receptor_plf = plf.Molecule.from_mda(receptor)
+        ligand = u.select_atoms(f"{prolif_params_dict['selection_dict']['ligand']}")
+        ligand_plf = plf.Molecule.from_mda(ligand)
+        
+        #fp = plf.Fingerprint(interactions_list, parameters=interactions_parameters_dict)
+        fp = plf.Fingerprint(interactions=interactions_list, parameters=interactions_parameters_dict)
+        # # Compute the fingerprints
+        fp.run_from_iterable([ligand_plf], receptor_plf,progress=False)
+        
+        ## Generate the fingerprints dataframe
+        fps_df = fp.to_dataframe()
+        
         return fps_df
 
     def _check_gpu_available(self):
@@ -10124,16 +10164,10 @@ quit
                 
             elif interaction == 'HBDonor':
                 
-                # Will pass since the behavior is hard coded in ProLIF to invert respect to HBAcceptor
-                print("Inverting HBAcceptor parameters for HBDonor interaction.")
+                hbdonor_dict =self._define_hbdonor_interaction(interaction)
                 
-                # Check if HBDonor exists in interactions list. If not, inform and exit
-                if "HBDonor" not in interactions_list:
-                    print("❌ HBAcceptor interaction must be defined to set parameters for HBDonor.")
-                    sys.exit(1)
+                interaction_parameters['HBDonor'] = hbdonor_dict
                 
-                pass
-
             elif interaction == 'Hydrophobic':
 
                 hydrophobic_dict =self._define_hydrophobic_interaction(interaction)
@@ -10142,16 +10176,10 @@ quit
                 
             elif interaction == 'MetalAcceptor':
                 
-                # Will pass since the behavior is hard coded in ProLIF to invert respect to MetalDonor
+                metalacceptor_dict =self._define_metalacceptor_interaction(interaction)
                 
-                print("Inverting MetalDonor parameters for MetalAcceptor interaction.")
+                interaction_parameters['MetalAcceptor'] = metalacceptor_dict
                 
-                # Check if MetalDonor exists in interaction list. If not inform and exist
-                if "MetalDonor" not in interactions_list:
-                    print("❌ MetalDonor interaction must be defined to set parameters for MetalAcceptor.")
-                    sys.exit(1)
-                
-                pass
                 
             elif interaction == 'MetalDonor':
                 
@@ -10161,17 +10189,10 @@ quit
                 
             elif interaction == 'PiCation':
                 
-                # Will pass since the behavior is hard coded in ProLIF to invert respect to CationPi
-                
-                print("Inverting CationPi parameters for PiCation interaction.")
-                
-                # Check if CationPi exists in interaction list. If not inform and exit
-                if "CationPi" not in interactions_list:
-                    print("❌ CationPi interaction must be defined to set parameters for PiCation.")
-                    sys.exit(1)
-                
-                pass
-                
+                pication_dict =self._define_pication_interaction(interaction)
+
+                interaction_parameters['PiCation'] = pication_dict
+                                
             elif interaction == 'PiStacking':
                 
                 # Will pass since the behavior is hard coded in ProLIF to invert respect to FaceToFace and EdgeToFace interactions
@@ -10199,17 +10220,10 @@ quit
                 
             elif interaction == 'XBDonor':
                 
-                # Will pass since the behavior is hard coded in ProLIF to invert respect to XBAcceptor
+                xbdonor_dict =self._define_xbdonor_interaction(interaction)
                 
-                print("Inverting XBAcceptor parameters for XBDonor interaction.")
-                
-                # Check if XBAcceptor exists in list, otherwise inform and stop
-                if "XBAcceptor" not in interactions_list:
-                    print("❌ XBAcceptor interaction must be defined to set parameters for XBDonor.")
-                    sys.exit(1)
-                
-                pass
-                
+                interaction_parameters['XBDonor'] = xbdonor_dict
+                                
         # Store interaction conditions
         prolif_conditions['interaction_parameters'] = interaction_parameters
 
@@ -10437,6 +10451,35 @@ quit
 
         return cationpi_dict
     
+    def _define_pication_interaction(self, interaction):
+        
+        pication_dict = {}
+
+        # Define cations
+        pication_dict['cation'] = self._get_prolif_parameter_string(f"{interaction} cations list", default='[+{1-},$([NX3&!$([NX3]-O)]-[C]=[NX3+])]', description="SMARTS pattern for cations")
+
+        # Define rings
+
+        cation_pi_ring_1 = self._get_prolif_parameter_string(f"{interaction} pi_ring_1 string", default='[a;r6]1:[a;r6]:[a;r6]:[a;r6]:[a;r6]:[a;r6]:1', description="SMARTS pattern for pi ring 1") # Will return a tuple as required by ProLIF
+
+        cation_pi_ring_2 = self._get_prolif_parameter_string(f"{interaction} pi_ring_2 string", default="[a;r5]1:[a;r5]:[a;r5]:[a;r5]:[a;r5]:1", description="SMARTS pattern for pi ring 2") # Will return a tuple as required by ProLIF 
+
+        pication_dict['pi_ring'] = (cation_pi_ring_1, cation_pi_ring_2)
+
+        # Define distance cutoff
+
+        pication_dict['distance'] = self._get_prolif_parameter_float(f"{interaction} distance", default=4.5, description="Distance cutoff PiCation for interaction")
+        # Define angle cutoff
+
+        angle_1 = self._get_prolif_parameter_float(f"{interaction} angle1", default=0.0, description="Minimum angle cutoff PiCation for interaction")
+
+        angle_2 = self._get_prolif_parameter_float(f"{interaction} angle2", default=30.0, description="Maximum angle cutoff PiCation for interaction")
+
+        pication_dict['angle'] =  (angle_1, angle_2)
+
+        return pication_dict
+    
+    
     def _define_edge_to_face_interaction(self, interaction):
         
         edge_to_face_dict = {}
@@ -10526,6 +10569,33 @@ quit
         
         return hbacceptor_dict
 
+    def _define_hbdonor_interaction(self, interaction):
+        
+        hbdonor_dict = {}
+
+        # Define the Acceptor SMARTS pattern
+        acceptor = self._get_prolif_parameter_string(f"{interaction} HB acceptor atoms", default="[#7&!$([nX3])&!$([NX3]-*=[O,N,P,S])&!$([NX3]-[a])&!$([Nv4&+1]),O&!$([OX2](C)C=O)&!$(O(~a)~a)&!$(O=N-*)&!$([O-]-N=O),o+0,F&$(F-[#6])&!$(F-[#6][F,Cl,Br,I])]", description="List of SMARTS for HB acceptor atoms")
+        
+        hbdonor_dict['acceptor'] =  acceptor
+        
+        # Define the Donor SMARTS pattern
+        donor = self._get_prolif_parameter_string(f"{interaction} HB donor atoms", default="[$([O,S;+0]),$([N;v3,v4&+1]),n+0]-[H]", description="List of SMARTS for HB donor atoms")
+        
+        hbdonor_dict['donor'] =  donor
+        
+        # Define the distance cutoff for the interaction
+        hbdonor_dict['distance'] = self._get_prolif_parameter_float(f"{interaction} distance", default=3.5, description="Distance cutoff for hydrogen bond interaction")
+        
+        # Define the Donor-Acceptor angle threshold min-max values
+        angle_1 = self._get_prolif_parameter_float(f"{interaction} min angle", default=130.0, description="Min value for the angle between hydrogen bonding groups")
+
+        angle_2 = self._get_prolif_parameter_float(f"{interaction} max angle", default=180.0, description="Max value for the angle between hydrogen bonding groups")
+
+        hbdonor_dict['DHA_angle'] =  (angle_1, angle_2) 
+        
+        return hbdonor_dict
+
+
     def _define_hydrophobic_interaction(self, interaction):
 
         hydrophobic_dict = {}
@@ -10556,6 +10626,27 @@ quit
         metal_donor_dict["distance"] = distance
 
         return metal_donor_dict
+
+    def _define_metalacceptor_interaction(self, interaction):
+
+        metal_acceptor_dict = {}
+        
+        # Define metal atoms
+        metal = self._get_prolif_parameter_string(f"{interaction} metal atoms", default="[Ca,Cd,Co,Cu,Fe,Mg,Mn,Ni,Zn]", description="List of SMARTS for metal atoms")
+        
+        metal_acceptor_dict['metal'] =  metal
+        
+        # Define ligand atoms coordinating metals
+        ligand = self._get_prolif_parameter_string(f"{interaction} metal coordinating ligand atoms", default="[O,#7&!$([nX3])&!$([NX3]-*=[!#6])&!$([NX3]-[a])&!$([NX4]),-{1-};!+{1-}]", description="List of SMARTS for ligand atoms able to coordinate metal atoms")
+        
+        metal_acceptor_dict['ligand'] =  ligand
+    
+        # Define distance threshold for assuming interaction distance
+        distance = self._get_prolif_parameter_float(f"{interaction} distance", default=2.8, description="Distance cutoff quelation with metals")
+        
+        metal_acceptor_dict["distance"] = distance
+
+        return metal_acceptor_dict
 
     def _define_vdwcontact_interaction(self, interaction):
         
@@ -10603,6 +10694,41 @@ quit
         xbacceptor_interaction_dict['XAR_angle'] =  (angle_1, angle_2)
         
         return xbacceptor_interaction_dict
+
+    def _define_xbdonor_interaction(self, interaction):
+        
+        xbdonor_interaction_dict = {}
+
+        # Define ligand acceptor atoms involved in halogen bonding
+        acceptor = self._get_prolif_parameter_string(f"{interaction} SMARTS for ``[Acceptor]-[R]``", default="[#7,#8,P,S,Se,Te,a;!+{1-}]!#[*]", description="Acceptor atoms: Halogen bonding between a ligand (acceptor) and a residue (donor)")
+
+        xbdonor_interaction_dict['acceptor'] =  acceptor
+
+        # Define ligand donor atoms involved in halogen bonding
+        donor = self._get_prolif_parameter_string(f"{interaction} SMARTS for ``[Donor]-[R]``", default="[#6,#7,Si,F,Cl,Br,I]-[Cl,Br,I,At]", description="Donor atoms: Halogen bonding between a ligand (acceptor) and a residue (donor)")
+
+        xbdonor_interaction_dict['donor'] =  donor
+
+        # Define distance threshold for assuming interaction distance
+        distance = self._get_prolif_parameter_float(f"{interaction} distance", default=3.5, description="Distance cutoff for halogen bonding")
+
+        xbdonor_interaction_dict["distance"] = distance
+
+        # Define the angle for halogen bonding - A-X-D
+        angle_1 = self._get_prolif_parameter_float(f"{interaction} minimun angle", default=130.0, description="Min value for the angle between interacting atoms - A-X-D")
+
+        angle_2 = self._get_prolif_parameter_float(f"{interaction} maximum angle", default=180.0, description="Max value for the angle between interacting atoms - A-X-D")
+
+        xbdonor_interaction_dict['AXD_angle'] =  (angle_1, angle_2)
+
+        # Define the angle for halogen bonding - Angle X-A-R
+        angle_1 = self._get_prolif_parameter_float(f"{interaction} minimum angle", default=80.0, description="Min value for the angle between interacting atoms - X-A-R")
+
+        angle_2 = self._get_prolif_parameter_float(f"{interaction} maximum angle", default=140.0, description="Max value for the angle between interacting atoms - X-A-R")
+
+        xbdonor_interaction_dict['XAR_angle'] =  (angle_1, angle_2)
+        
+        return xbdonor_interaction_dict
 
     def _register_prolif_conditions(self, prolif_conditions):
 
