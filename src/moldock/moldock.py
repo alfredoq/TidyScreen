@@ -9609,7 +9609,7 @@ HOH = WAT\n""")
 
                 # Store the processed fps_df in the assay database for posterior processing
                 self._store_processed_fps_df_in_db(fps_df, pose_id, results_db, computation_mode, condition_selection)
-
+                
             if mmbgsa == True:
 
                 ## Compute MMGBSA binding energy
