@@ -4161,7 +4161,8 @@ except Exception as e:
                             altlocs_per_residue.setdefault(res_uid, set()).add(altloc)
                             altloc_counts[altloc] = altloc_counts.get(altloc, 0) + 1
 
-                    # Parse HETATM records
+                    ## Parse HETATM records
+                    ## Here the presence of ligands in the pdb file will occurr. In order to detect a ligand, it needs to be flaged with the 'HETATM' record. Otherwise the processing will fail since it is recognized as a valid protein residue.
                     elif line.startswith('HETATM'):
                         analysis['hetero_count'] += 1
                         residue_name = line[17:20].strip()
