@@ -4423,15 +4423,18 @@ except Exception as e:
             self._create_processing_summary(pdb_folder, original_pdb_path, processed_pdb_path, selected_chains, selected_ligands, analysis)
             
             # --- Add missing atoms using tleap ---
-            tleap_processed_file = self._add_missing_atoms_in_pdb_tleap(processed_pdb_path, analysis)
-            
+            #tleap_processed_file = self._add_missing_atoms_in_pdb_tleap(processed_pdb_path, analysis)
+            # Modified to process receptors containing cobound ligands
+            tleap_processed_file = self._add_missing_atoms_in_pdb_tleap2(processed_pdb_path, analysis, processed_dir)
+                                  
             # Process tleap_processed_file to add the element name column if missing
             receptor_moldf_dict, renumbering_dict = self._refine_receptor_model(tleap_processed_file, processed_pdb_path, analysis)
-
+            
             # Write (overwrite) the tleap_processed_file
             from moldf import write_pdb
             
             write_pdb(receptor_moldf_dict, tleap_processed_file)
+            
             
             print(f"✅ tleap processing complete. Output: {tleap_processed_file}")
             
@@ -5716,6 +5719,11 @@ quit
                 print("❌ tleap not found in PATH. Please install AmberTools and ensure tleap is available.")
                 return None
         
+        
+
+        
+        
+        
             # Process with tleap
             tleap_processed_file = receptor_file.replace(".pdb", "_checked.pdb")
             tleap_script = f"""
@@ -5726,10 +5734,18 @@ mol = loadpdb {receptor_file}
 savepdb mol {tleap_processed_file}
 quit
 """
+
+            print(receptor_file)
+            print(tleap_processed_file)
+
             # Write tleap script to a temp file
             with tempfile.NamedTemporaryFile("w", delete=False, suffix=".in") as tf:
                 tf.write(tleap_script)
                 tleap_input_path = tf.name
+                print("RUNNING TLEAP")
+                # make a copy of tleap_input_path file
+                shutil.copy(tleap_input_path, "/tmp/tleap_input_copy.in")
+                print(tleap_input_path)
 
             ## Run tleap to process the receptor
             print(f"🛠️  Running tleap to process receptor...")
@@ -5769,7 +5785,100 @@ quit
             print(f"Failed processing: {receptor_file} with tleap")
             print(e)
             return None
+    
+    def _add_missing_atoms_in_pdb_tleap2(self, receptor_file, receptor_info, processed_dir):
         
+        ## Modified to treat cobound ligands in receptor
+        
+        import tempfile
+        import subprocess
+        
+        print(f"Processing pdb: \n {receptor_file} \n with tleap")
+        
+        ## Write a tleap input to load receptor_file
+        try:
+            tleap_path = shutil.which("tleap")
+
+            # Fail is tleap is not available
+            if tleap_path is None:
+                print("❌ tleap not found in PATH. Please install AmberTools and ensure tleap is available.")
+                return None
+
+            tleap_file = f"{processed_dir}/add_missing_atoms_in_pdb.in"
+            tleap_processed_file = receptor_file.replace(".pdb", "_checked.pdb")
+            with open(tleap_file, "w") as f:
+                f.write(f"#Adding missing atoms\n")
+                f.write(f"source leaprc.protein.ff14SB\n")
+                f.write(f"source leaprc.water.tip3p\n")
+                f.write(f"source leaprc.gaff2\n")
+                f.write(f"HOH = WAT\n")
+            f.close()
+            
+            
+            ligands_in_template = receptor_info.get('has_ligands', []) # Will return either True or False
+            if ligands_in_template:
+                cofactors_names = receptor_info.get('cofactors', {}).get('cofactors_names', [])
+                mol2_files_names = receptor_info.get('cofactors', {}).get('mol2_files', [])
+                frcmod_files_names = receptor_info.get('cofactors', {}).get('frcmod_files', [])
+                
+                for index, cofactor_name in enumerate(cofactors_names):
+                    name = cofactor_name
+                    mol2_file = mol2_files_names[index]
+                    frcmod_file = frcmod_files_names[index]
+                
+                    # Append each cofactor information to the file
+                    with open(tleap_file, 'a') as f:
+                        f.write(f"""# Load cofactor {name}
+{name} = loadmol2 {mol2_file}
+loadamberparams {frcmod_file}
+
+""")    
+            
+            with open(tleap_file, "a") as f:
+                f.write(f"mol = loadpdb {receptor_file}\n")
+                f.write(f"savepdb mol {tleap_processed_file}\n")
+                f.write(f"quit")
+            f.close()
+                
+            print(f"""Run: {tleap_file}""")
+
+            ## Run tleap to process the receptor
+            print(f"🛠️  Running tleap to process receptor...")
+            result = subprocess.run(
+                ["tleap", "-f", tleap_file],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+           
+
+            ## Rename 'WAT' residues to 'HOH' in the tleap_processed_file
+            with open(tleap_file, 'r') as file:
+                filedata = file.read()
+
+            filedata = filedata.replace(' WAT ', ' HOH ')
+
+            with open(tleap_file, 'w') as file:
+                file.write(filedata)
+        
+            # Check for errors
+            if result.returncode != 0:
+                print("❌ tleap failed to process the receptor file.")
+                print(result.stderr)
+                return None
+
+            # Check if output file was created
+            if not os.path.exists(tleap_processed_file):
+                print("❌ tleap did not produce the expected output file.")
+                return None
+
+            return tleap_processed_file
+                    
+        except Exception as e:
+            print(f"Failed processing: {receptor_file} with tleap")
+            print(e)
+            return None
+    
     def _reassign_chain_and_resnums(self, reference_pdb, target_pdb):
         """
         Create a dictionary in which the key is formed by residue name, the chain and the residue number in the reference pdb_file, and the value is formed by the residue name and residue number in the target pdb file.
@@ -9872,6 +9981,7 @@ HOH = WAT\n""")
 
         import subprocess
 
+        
         receptor_pdb = assay_info.get('receptor_info', None).get('pdbqt_file', None) 
 
         # Define the raw .pdb file of the receptor
@@ -9887,13 +9997,43 @@ HOH = WAT\n""")
         # Write an output pdb file with Hidrogens
         output_pdb_file = pdb_file.replace('.pdb', '_withH.pdb')
 
+        ### Determine if ligands are bound as cofactors
+        ## Get the pdb template n>ame
+        pdb_template_name = assay_info.get('receptor_info', None).get('template_name', None)
+        ligands_in_template, cofactors_names, mol2_files_names, frcmod_files_names = self._check_ligands_in_template(pdb_template_name)
+        
+        # Will write the header of the tleap input file
         with open(tleap_in_file, 'w') as f:
             f.write(f"""source leaprc.protein.ff14SB
 source leaprc.water.tip3p
 source leaprc.gaff2
 HOH = WAT
 
-# Load receptor
+""")
+    
+        ## Evaluate if ligands/cofactors are required to be loaded with the receptor
+        if ligands_in_template:
+            # loop over cofactors_name and get the index and item
+            for index, cofactor_name in enumerate(cofactors_names):
+                name = cofactor_name
+                mol2_file = mol2_files_names[index]
+                frcmod_file = frcmod_files_names[index]
+                
+                print(name)
+                print(mol2_file)
+                print(frcmod_file)
+                
+                # Append each cofactor information to the file
+                with open(tleap_in_file, 'a') as f:
+                    f.write(f"""# Load cofactor {name}
+{name} = loadmol2 {mol2_file}
+loadamberparams {frcmod_file}
+
+""")
+
+        # Will write the rest of the tleap input file
+        with open(tleap_in_file, 'a') as f:
+            f.write(f"""# Load receptor
 rec = loadpdb "{receptor_pdb_path}"
 
 # Load ligand parameters
@@ -12122,7 +12262,40 @@ quit
         except Exception as e:
             print(f"Exception occurred while generating mol2 file for {ligand}: {e}")
             
+    def _check_ligands_in_template(self, pdb_template_name):
         
+        # Connect to pdb templates database
+        import sqlite3
+        try:
+            pdb_templates_db_path = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
+            conn = sqlite3.connect(pdb_templates_db_path)
+            cursor = conn.cursor()
+            
+            # Check if the pdb template exists in the database
+            cursor.execute("SELECT pdb_analysis FROM pdb_templates WHERE pdb_template_name = ?", (pdb_template_name,))
+            result = cursor.fetchone()
+            
+            if result is None:
+                print(f"Error: PDB template '{pdb_template_name}' not found in the database.")
+                return
+            else:
+                pdb_analysis_json = result[0]
+                import json
+                pdb_analysis = json.loads(pdb_analysis_json)
+                ligands_in_template = pdb_analysis.get('has_ligands', []) # Will return either True or False
+                if ligands_in_template:
+                    cofactors_names = pdb_analysis.get('cofactors', {}).get('cofactors_names', [])
+                    mol2_files_names = pdb_analysis.get('cofactors', {}).get('mol2_files', [])
+                    frcmod_files_names = pdb_analysis.get('cofactors', {}).get('frcmod_files', [])
+                    
+                    # Return the corresponding information
+                    return ligands_in_template, cofactors_names, mol2_files_names, frcmod_files_names
+                else:
+                    return ligands_in_template, [], [], []
+                
+        except Exception as e:
+            print(f"Error accessing PDB templates database: {e}. Stopping")
+            sys.exit(1)
     
         
         
