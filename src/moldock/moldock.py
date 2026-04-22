@@ -10016,18 +10016,14 @@ HOH = WAT
             # loop over cofactors_name and get the index and item
             for index, cofactor_name in enumerate(cofactors_names):
                 name = cofactor_name
-                mol2_file = mol2_files_names[index]
-                frcmod_file = frcmod_files_names[index]
-                
-                print(name)
-                print(mol2_file)
-                print(frcmod_file)
+                mol2_file_lig = mol2_files_names[index]
+                frcmod_file_lig = frcmod_files_names[index]
                 
                 # Append each cofactor information to the file
                 with open(tleap_in_file, 'a') as f:
                     f.write(f"""# Load cofactor {name}
-{name} = loadmol2 {mol2_file}
-loadamberparams {frcmod_file}
+{name} = loadmol2 {mol2_file_lig}
+loadamberparams {frcmod_file_lig}
 
 """)
 
