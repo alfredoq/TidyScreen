@@ -9672,7 +9672,9 @@ HOH = WAT\n""")
                     
                 except Exception as e:
                     print(f"Error occurred while minimizing complex for Pose_ID: {pose_id}, LigName: {ligname}: {e} \n Skipping minimization for this pose and proceeding with original inpcrd file.")
-                    continue
+                    
+                    rst_cpptraj_file = inpcrd_file    
+                    
             else:
                 rst_cpptraj_file = inpcrd_file # No minimization, use the original inpcrd file for further processing
 
@@ -9998,6 +10000,7 @@ HOH = WAT\n""")
         # Write an output pdb file with Hidrogens
         output_pdb_file = pdb_file.replace('.pdb', '_withH.pdb')
 
+
         ### Determine if ligands are bound as cofactors
         ## Get the pdb template n>ame
         pdb_template_name = assay_info.get('receptor_info', None).get('template_name', None)
@@ -10207,11 +10210,13 @@ quit
         
         interactions_list = prolif_params_dict['interactions_list']
         interactions_parameters_dict = prolif_params_dict.get('interaction_parameters', {})
-                        
+        
+                               
         # Use ambpdb to generate a .pdb file from the prmtop and inpcrd files to be used for ProLIF processing. Will overwrite the output_pdb_file generated after tleap processing to keep the same file for posterior ProLIF processing and avoid having to manage multiple files.
         ambpdb_command = f"ambpdb -p {prmtop_file} -c {inpcrd_file} -conect > {output_pdb_file}"
+        print(ambpdb_command)
         subprocess.run(ambpdb_command, shell=True)
-                     
+
         # # # Load the receptor file
         u = mda.Universe(f"{output_pdb_file}")
         
