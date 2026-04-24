@@ -9653,10 +9653,10 @@ HOH = WAT\n""")
         
             # Create ligand .mol2 and .frcmod files
             if ligname not in processed_ligands:
-                mol2_file, frcmod_file = self._prepare_ligand_tleap_files(ligname, assay_info, output_dir)
+                prepin_file, frcmod_file  = self._prepare_ligand_tleap_files(ligname, assay_info, output_dir)
         
             # Create complex .prmtop and .inpcrd files
-            prmtop_file, inpcrd_file, output_pdb_file = self._prepare_complex_prmtop_inpcrd(mol2_file, frcmod_file, assay_info, output_dir, output_file, pose_id)
+            prmtop_file, inpcrd_file, output_pdb_file = self._prepare_complex_prmtop_inpcrd(prepin_file, frcmod_file, assay_info, output_dir, output_file, pose_id)
             
             if minimize:
                 # Minimize complex
@@ -9794,14 +9794,15 @@ HOH = WAT\n""")
             sys.exit(1)
             
         # Prepare the .prepin and .frcmod files using antechamber and parmchk2
-        mol2_file = os.path.join(output_dir, f"{ligname}.mol2")
+        prepin_file = os.path.join(output_dir, f"{ligname}.prepin")
         frcmod_file = os.path.join(output_dir, f"{ligname}.frcmod")
       
         ## Compute ligand espaloma charges
         espaloma_output_file = self._compute_ligand_espaloma_charges(pdb_file)
         
         # Run antechamber
-        antechamber_command = f"antechamber -i {pdb_file} -fi pdb -o {mol2_file} -fo mol2 -c rc -cf {espaloma_output_file} "
+        
+        antechamber_command = f"antechamber -i {pdb_file} -fi pdb -o {prepin_file} -fo prepc -c rc -cf {espaloma_output_file} "
         
         try:
             subprocess.run(antechamber_command, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -9810,7 +9811,7 @@ HOH = WAT\n""")
             print(f"[ERROR] Failed to run antechamber: {e}")
             return None
 
-        parmchk2_command = f"parmchk2 -i {mol2_file} -f mol2 -o {frcmod_file}"
+        parmchk2_command = f"parmchk2 -i {prepin_file} -f prepc -o {frcmod_file}"
         try:
             subprocess.run(parmchk2_command, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
@@ -9818,7 +9819,7 @@ HOH = WAT\n""")
             print(f"[ERROR] Failed to run parmchk2: {e}")
             return None
 
-        return mol2_file, frcmod_file
+        return prepin_file, frcmod_file
 
     def _convert_ligand_sdf_into_pdb(self, ligname, assay_info, output_dir):
         """
@@ -9977,7 +9978,7 @@ HOH = WAT\n""")
 
         return espaloma_output_file
 
-    def _prepare_complex_prmtop_inpcrd(self, mol2_file, frcmod_file, assay_info, output_dir, pdb_file, pose_id):
+    def _prepare_complex_prmtop_inpcrd(self, prepin_file, frcmod_file, assay_info, output_dir, pdb_file, pose_id):
 
         import subprocess
 
@@ -10033,7 +10034,7 @@ loadamberparams {frcmod_file_lig}
 rec = loadpdb "{receptor_pdb_path}"
 
 # Load ligand parameters
-UNL = loadmol2 {mol2_file}
+loadamberprep {prepin_file}
 loadamberparams {frcmod_file}
 
 lig = loadpdb "{pdb_file}"
@@ -10616,7 +10617,6 @@ quit
 
         return pication_dict
     
-    
     def _define_edge_to_face_interaction(self, interaction):
         
         edge_to_face_dict = {}
@@ -10731,7 +10731,6 @@ quit
         hbdonor_dict['DHA_angle'] =  (angle_1, angle_2) 
         
         return hbdonor_dict
-
 
     def _define_hydrophobic_interaction(self, interaction):
 
@@ -11396,8 +11395,10 @@ quit
         import sqlite3
         import pandas as pd
         try:
+            
             conn = sqlite3.connect(results_db)
             cursor = conn.cursor()
+            
             # Retrieve all processed FPS JSON entries
             cursor.execute('''
                 SELECT pose_id, data FROM processed_prolif_fps_json
@@ -11405,13 +11406,14 @@ quit
             records = cursor.fetchall()
             fps_dfs = []
             poses_ids = []
+            
+                       
             for pose_id, fps_json in records:
                 # Reconstruct DataFrame from JSON
                 fps_df = pd.read_json(StringIO(fps_json), orient='split')
                 fps_dfs.append(fps_df)
-                poses_ids.append(pose_id)
-                
-            
+                poses_ids.append(pose_id)   
+                        
             # Merge all FPS DataFrames into one
             if fps_dfs:
                 complete_fps_df = pd.concat(fps_dfs, ignore_index=True)
@@ -11475,6 +11477,7 @@ quit
         import pandas as pd
         from io import StringIO
         try:
+            
             conn = sqlite3.connect(results_db)
             cursor = conn.cursor()
             # Retrieve all processed MMGBSA JSON entries
