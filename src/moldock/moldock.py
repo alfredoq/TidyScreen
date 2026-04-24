@@ -7326,7 +7326,7 @@ loadamberparams {frcmod_file}
                         ## Clean .dlg files if exists
                         if fname.endswith('out.pdbqt'):
                             try:
-                                oes.remove(os.path.join(results_folder, fname))
+                                os.remove(os.path.join(results_folder, fname))
                             except Exception as e:
                                 print(f"Warning: could not delete {fname}: {e}")
 
