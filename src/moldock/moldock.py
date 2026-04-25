@@ -8011,6 +8011,8 @@ loadamberparams {frcmod_file}
             print(f"❌ Results directory not found: {results_dir}")
             return None
 
+        print(docking_engine)
+
         # Create the path were the database to be analyzed lives
         db_path = os.path.join(results_dir, f"assay_{assay_id}.db")
 
@@ -8018,7 +8020,7 @@ loadamberparams {frcmod_file}
         if docking_engine == "AutoDockGPU":
             self._extract_docked_poses_autodockgpu(db_path)
             
-        elif docking_engine == "Vina":
+        else:
             self._extract_docked_poses_autodockvina(db_path)
     
     def _extract_docked_poses_autodockgpu(self, db_path):
