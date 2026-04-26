@@ -3121,7 +3121,6 @@ class ChemSpace:
             print(f"❌ Error in filter_using_workflow: {e}")
             return pd.DataFrame()
 
-
     def filter_using_workflow_or(self, table_name: Optional[str] = None, workflow_name: Optional[str] = None, 
                     save_results: Optional[bool] = None, 
                     result_table_name: Optional[str] = None,
@@ -3251,8 +3250,6 @@ class ChemSpace:
         except Exception as e:
             print(f"❌ Error in filter_using_workflow_or: {e}")
             return pd.DataFrame()
-
-
 
     def _select_table_for_filtering(self) -> Optional[str]:
         """
@@ -13155,7 +13152,8 @@ class ChemSpace:
     def generate_mols_in_table(self, max_molecules: Optional[int] = None,
                             generate_conformers: bool = True,
                             nbr_confs: int = 10,
-                            conf_percentile: float = 0.25) -> Optional[List[Dict[str, Any]]]:
+                            conf_percentile: float = 0.25,
+                            mmff: str ='MMFF94') -> Optional[List[Dict[str, Any]]]:
         """
         Generate RDKit molecule objects from SMILES in a selected table.
         Uses existing helper methods for table selection and follows established patterns.
@@ -13299,7 +13297,7 @@ class ChemSpace:
                         try:
 
                             mol, molecule_datamol = self._generate_molecule_conformer(
-                                mol_hs, nbr_confs, compound_name, conf_percentile
+                                mol_hs, nbr_confs, compound_name, conf_percentile, mmff
                             )
                         
                             self._store_mol(mol, molecule_data)
@@ -13428,7 +13426,8 @@ class ChemSpace:
             return None
 
     def _generate_molecule_conformer(self, mol_hs, nbr_confs: int, 
-                                    compound_name: str, conf_percentile) -> List[Dict[str, Any]]:
+                                    compound_name: str, conf_percentile,
+                                    mmff) -> List[Dict[str, Any]]:
         """
         Generate 3D conformers for a molecule.
         Reuses existing conformer generation patterns from _generate_conformers.
@@ -13445,16 +13444,16 @@ class ChemSpace:
             from rdkit.Chem import AllChem
             
             # Use existing conformer generation method
-            mol_hs, confs, ps = self._generate_conformers(
-                mol_hs, nbr_confs=nbr_confs, mmff='MMFF94s'
+            mol_hs, confs_id, ps = self._generate_conformers(
+                mol_hs, nbr_confs, mmff
             )
 
-            if not confs:
+            if not confs_id:
                 return []
             
             # Create conformer data
             conformers_data = []
-            for i, conf_id in enumerate(confs):
+            for i, conf_id in enumerate(confs_id):
                 try:
                     # Get conformer energy if MMFF properties (ps) available
                     energy = None
@@ -13462,8 +13461,10 @@ class ChemSpace:
                         try:
                             # Use the molecule with hydrogens returned by _generate_conformers (mol_hs)
                             ff = AllChem.MMFFGetMoleculeForceField(mol_hs, ps, confId=int(conf_id))
+                            
                             if ff is not None:
                                 energy = float(ff.CalcEnergy())
+                        
                         except Exception:
                             energy = None
                     
@@ -13568,48 +13569,43 @@ class ChemSpace:
                 # older signature
                 try:
                     conf_ids = list(AllChem.EmbedMultipleConfs(mol_hs, nbr_confs, params))
-                except Exception:
-                    conf_ids = []
-            except Exception:
-                conf_ids = []
-
-            if not conf_ids:
-                return mol_hs, [], None
+                except Exception as e:
+                    print(f"Error generating conformer ids: {e}.")
+                    confs_ids = []
 
             # Prepare MMFF properties
             try:
                 ps = AllChem.MMFFGetMoleculeProperties(mol_hs, mmffVariant='MMFF94s')
-            except Exception:
-                try:
-                    ps = AllChem.MMFFGetMoleculeProperties(mol_hs)
-                except Exception:
-                    ps = None
+            except Exception as e:
+                print(f"Error preparing forcefield properties: {e}.")
+                ps = []
 
             # Try bulk optimization; fall back to per-conformer optimize if signature differs
             try:
-                # modern RDKit: MMFFOptimizeMoleculeConfs returns list of (confId, status)
-                try:
-                    AllChem.MMFFOptimizeMoleculeConfs(mol_hs, confIds=conf_ids, maxIters=100, mmffVariant='MMFF94s')
-                except TypeError:
-                    # older signature without keyword args
-                    AllChem.MMFFOptimizeMoleculeConfs(mol_hs, conf_ids, 100)
-            except Exception:
-                # best-effort per-conformer optimization
-                for cid in conf_ids:
-                    try:
-                        ff = AllChem.MMFFGetMoleculeForceField(mol_hs, ps, confId=int(cid))
-                        if ff is not None:
-                            ff.Minimize(maxIts=100)
-                    except Exception:
-                        continue
+                #AllChem.MMFFOptimizeMoleculeConfs(mol_hs, confIds=conf_ids, maxIters=100, mmffVariant='MMFF94s')
+                #AllChem.MMFFOptimizeMoleculeConfs(mol_hs, maxIters=100, mmffVariant='MMFF94s')
+                
+                ## Try a per-conformer optimization
+                for conf_id in conf_ids:
+                    conf = mol_hs.GetConformer(conf_id)
+                    # Minimize the conformer
+                    #AllChem.UFFOptimizeMolecule(mol_hs, confId=conf_id, maxIters=200)
+                    AllChem.MMFFOptimizeMolecule(mol_hs, confId=conf_id, maxIters=200, mmffVariant=mmff)
+
+
+            except TypeError as e:
+                # older signature without keyword args
+                #AllChem.MMFFOptimizeMoleculeConfs(mol_hs, conf_ids, 100)
+
+                print("Error minimizing the conformers in bulk... Error:", e)
+                
+                mol_hs = []
 
             return mol_hs, conf_ids, ps
 
-        except Exception as error:
-            
-            print(f"Exiting conformer generation with failure... Error: {error}")
-            
-            return None, [], None
+        except Exception as e:
+            print("Error generating conformers: {e}. Stopping")
+            sys.exit(1)
 
     def _sort_conf_by_energy(self, conformers_data, mol_hs, ps, conf_percentile):
         """
@@ -14815,7 +14811,121 @@ class ChemSpace:
         except Exception as e:
             print(f"❌ Error in substract_tables method: {e}")                  
                 
-                
+    def export_table_as_pdb(self):
+
+        """
+        Will query the user which table to export as .pdb file from the existing .sdf objects present in the table
+        """
+        try:
+            # List available tables
+            available_tables = self.get_all_tables()
+            if not available_tables:
+                print("❌ No tables available in the chemspace database.")
+                return False
+
+            print("\n📋 EXPORT TABLE AS PDB")
+            print("=" * 60)
+            print("Available tables with SDF blobs:")
+            tables_with_sdf = []
+            for i, table in enumerate(available_tables, 1):
+                # Check if table has 'sdf_blob' column
+                conn = sqlite3.connect(self.__chemspace_db)
+                cursor = conn.cursor()
+                cursor.execute(f"PRAGMA table_info({table})")
+                columns = [row[1] for row in cursor.fetchall()]
+                conn.close()
+                if 'sdf_blob' in columns:
+                    tables_with_sdf.append(table)
+                    print(f"  {i}. {table}")
+            if not tables_with_sdf:
+                print("❌ No tables with 'sdf_blob' column found. Generate molecules with SDF first.")
+                return False
+
+            # Prompt user to select table
+            while True:
+                table_input = input("Enter table number or name to export as PDB (or 'cancel' to abort): ").strip()
+                if table_input.lower() in ['cancel', 'exit', 'quit']:
+                    print("Operation cancelled.")
+                    return False
+                if table_input.isdigit():
+                    idx = int(table_input) - 1
+                    if 0 <= idx < len(tables_with_sdf):
+                        selected_table = tables_with_sdf[idx]
+                        break
+                    else:
+                        print("Invalid table number. Try again.")
+                elif table_input in tables_with_sdf:
+                    selected_table = table_input
+                    break
+                else:
+                    print("Invalid input. Try again.")
+
+            ## Output directory is set to the /misc folder and creating a subfolder named after the selected table containing the suffix '_pdbs'
+
+            output_dir = os.path.join(self.path, 'chemspace', 'misc', f'{selected_table}_pdbs')
+
+            print(output_dir)
+
+            try:
+                os.makedirs(output_dir, exist_ok=True)
+            except Exception as e:
+                print("Problem creating the pdbs output directory")
+                sys.exit(1)
+
+            # Query all rows with sdf_blob
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            cursor.execute(f"SELECT id, name, inchi_key, sdf_blob FROM {selected_table} WHERE sdf_blob IS NOT NULL")
+            rows = cursor.fetchall()
+            conn.close()
+
+            if not rows:
+                print(f"❌ No SDF blobs found in table '{selected_table}'.")
+                return False
+
+            # Export each SDF blob as PDB
+            from rdkit import Chem
+            from rdkit.Chem import AllChem
+
+            exported = 0
+            failed = 0
+            for row in rows:
+                cmpd_id, name, inchi_key, sdf_blob = row
+                try:
+                    # Write SDF blob to temp file
+                    temp_sdf = f"/tmp/{inchi_key or cmpd_id}.sdf"
+                    with open(temp_sdf, "wb") as f:
+                        f.write(sdf_blob)
+                    # Read molecule from SDF
+                    suppl = Chem.SDMolSupplier(temp_sdf, removeHs=False)
+                    mols = [m for m in suppl if m is not None]
+                    if not mols:
+                        failed += 1
+                        continue
+                    mol = mols[0]
+                    # Generate 3D coordinates if not present
+                    if mol.GetNumConformers() == 0:
+                        AllChem.EmbedMolecule(mol, AllChem.ETKDG())
+                    # Write as PDB
+                    safe_name = self._sanitize_filename(name or f"mol_{cmpd_id}")
+                    pdb_path = os.path.join(output_dir, f"{safe_name}.pdb")
+                    with Chem.rdmolfiles.PDBWriter(pdb_path) as writer:
+                        writer.write(mol)
+                    exported += 1
+                except Exception as e:
+                    failed += 1
+                    continue
+
+            print(f"\n✅ Exported {exported} molecules as PDB to: {output_dir}")
+            if failed > 0:
+                print(f"⚠️  {failed} molecules failed to export.")
+            return exported > 0
+
+        except Exception as e:
+            print(f"❌ Error exporting table as PDB: {e}")
+            return False    
+
+
             
 
 
