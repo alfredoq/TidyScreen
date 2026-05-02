@@ -3324,6 +3324,194 @@ except Exception as e:
             traceback.print_exc()
             return None
     
+    
+    
+    def create_pdb_models_in_batch(self) -> Optional[Dict[str, Any]]:
+        """
+        The user is prompted to select a PDB file, which will be stored as a blob object in a table named pdb_files in the pdbs.db located in the 
+        project_path/docking/receptors directory
+        
+        Returns:
+            Optional[Dict[str, Any]]: Information about the saved PDB file or None if failed
+        """
+        import sqlite3
+        import json
+        from datetime import datetime
+        
+        
+        # Query the user the directory from which to retrieve the .pdb batch files
+        directory = input("Enter the full path to the directory containing the .pdb files: ")
+        files_pattern = input("Enter the pattern to match pdb files to process: ")
+        
+        # Create a list of files in 'directory' containining the file_pattern
+        
+        pdb_files = []
+        
+        for filename in os.listdir(directory):
+            if files_pattern in filename and filename.endswith('.pdb'):
+                print(f"Processing {filename}")
+                pdb_files.append(os.path.join(directory, filename))
+
+        print(pdb_files)
+
+        ## Loop through the list of files and process them one by one, with the same logic as in create_pdb_model, but without asking for the file path and name, since they are already defined in the list. The description will be set to "Model loaded in batch mode." and the notes will include the original file path. The rest of the logic will be the same, including checking for existing names in the database and adding an increasing index if needed.
+        for pdb_file in pdb_files:
+            try:
+                # Prompt for PDB file path
+                print(f"\n💾 SAVE PDB MODEL TO DATABASE")
+                print("=" * 80)
+                print(f"   This will store a PDB file as a blob in the database")
+                print(f"   Location: {self.path}/docking/receptors/pdbs.db")
+                print("=" * 80)
+                        
+                print(f"Processing {pdb_file}")
+            
+                if not pdb_file:
+                    print(f"❌ No file path provided")
+                    return None
+            
+                # Check if it's a PDB file
+                if not pdb_file.lower().endswith('.pdb'):
+                    print(f"⚠️  Warning: File doesn't have .pdb extension")
+                    proceed = input(f"   Proceed anyway? (y/n, default: n): ").strip().lower()
+                    if proceed != 'y':
+                        continue
+                    else:
+                        break
+            
+                # Get PDB name/identifier
+                pdb_model_name = pdb_file.split('/')[-1].split('.')[0]
+                
+                # Check if name already exists
+                pdbs_db_path = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
+                
+                # This will creck the pdb_model_name existence, and in case it exists, will add an incresing subindex to the name. Will loop until the resulting name is not found
+                
+                if os.path.exists(pdbs_db_path):
+                    conn = sqlite3.connect(pdbs_db_path)
+                    cursor = conn.cursor()
+            
+                counter = 0
+                while True:
+                    # Check if table exists
+                    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pdb_models'")
+                    if cursor.fetchone():
+                        if counter == 0:
+                            cursor.execute("SELECT COUNT(*) FROM pdb_models WHERE pdb_model_name = ?", (pdb_model_name,))
+                        else:
+                            print(new_pdb_model_name)
+                            cursor.execute("SELECT COUNT(*) FROM pdb_models WHERE pdb_model_name = ?", (new_pdb_model_name,))
+                        
+                        if cursor.fetchone()[0] > 0:
+                            print(f"⚠️  PDB name '{pdb_model_name}' already exists in database - adding +1 index")
+                            counter += 1
+                            new_pdb_model_name = f"{pdb_model_name}_{counter}"
+                            continue
+                        else:
+                            # Assign the corresponding variable before exiting the loop in case a model previously existed
+                            if counter > 0:
+                                pdb_model_name = new_pdb_model_name
+                                break
+                            break
+                            
+                conn.close()
+        
+                print(f"PDB Model Name: {pdb_model_name}")
+        
+                description = "Model loaded in batch mode."
+                
+                # Read PDB file content
+                print(f"\n📖 Reading PDB file...")
+                try:
+                    with open(pdb_file, 'rb') as f:
+                        pdb_blob = f.read()
+                    
+                    file_size = len(pdb_blob)
+                    print(f"   ✓ File read successfully ({file_size:,} bytes)")
+                    
+                except Exception as e:
+                    print(f"❌ Error reading PDB file: {e}")
+                    return None
+        
+                # Get basic file information
+                file_info = {
+                    'original_path': pdb_file,
+                    'filename': os.path.basename(pdb_file),
+                    'file_size': file_size,
+                    'modified_date': datetime.fromtimestamp(os.path.getmtime(pdb_file)).isoformat()
+                }
+        
+                # Create database and table if not existing
+                os.makedirs(os.path.dirname(pdbs_db_path), exist_ok=True)
+        
+                conn = sqlite3.connect(pdbs_db_path)
+                cursor = conn.cursor()
+        
+                # Create pdb_files table if it doesn't exist
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS pdb_models (
+                        file_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        pdb_model_name TEXT UNIQUE NOT NULL,
+                        project_name TEXT,
+                        pdb_blob BLOB NOT NULL,
+                        original_path TEXT,
+                        filename TEXT,
+                        file_size INTEGER,
+                        description TEXT,
+                        file_info TEXT,
+                        created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        last_modified TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        notes TEXT
+                    )
+                ''')
+        
+                # Insert or replace PDB file
+                print(f"\n💾 Saving to database...")
+                
+                cursor.execute('''
+                    INSERT OR REPLACE INTO pdb_models (
+                        pdb_model_name, project_name, pdb_blob, original_path, filename,
+                        file_size, description, file_info, notes
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    pdb_model_name,
+                    self.name,
+                    pdb_blob,
+                    pdb_file,
+                    os.path.basename(pdb_file),
+                    file_size,
+                    description,
+                    json.dumps(file_info, indent=2),
+                    f"PDB file saved from: {pdb_file}"
+                ))
+        
+                file_id = cursor.lastrowid or cursor.execute(
+                    "SELECT file_id FROM pdb_models WHERE pdb_model_name = ?", 
+                    (pdb_model_name,)
+                ).fetchone()[0]
+                
+                conn.commit()
+                conn.close()
+        
+                # Display summary
+                print(f"\n{'=' * 80}")
+                print(f"✅ PDB MODEL SAVED SUCCESSFULLY")
+                print(f"{'=' * 80}")
+                print(f"   📋 File ID: {file_id}")
+                print(f"   🏷️  PDB model Name: {pdb_model_name}")
+                print(f"   📁 Original Path: {pdb_file}")
+                print(f"   📊 File Size: {file_size:,} bytes")
+                print(f"   📝 Description: {description or 'None'}")
+                print(f"   💾 Database: {pdbs_db_path}")
+                print(f"   📅 Saved: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                print(f"{'=' * 80}")
+                
+                print(f"\n💡 Use list_pdb_models() to view all saved PDB models")
+            
+            
+            except sqlite3.Error as e:
+                print(e)
+    
     def delete_pdb_model(self):
         """
         Will list the available pdb models in the database and prompt the user to select one to delete.
