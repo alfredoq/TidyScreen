@@ -1,5 +1,6 @@
 import ast
 from asyncio import subprocess
+import json
 import os
 import site
 import sqlite3
@@ -3324,8 +3325,6 @@ except Exception as e:
             traceback.print_exc()
             return None
     
-    
-    
     def create_pdb_models_in_batch(self) -> Optional[Dict[str, Any]]:
         """
         The user is prompted to select a PDB file, which will be stored as a blob object in a table named pdb_files in the pdbs.db located in the 
@@ -3922,7 +3921,7 @@ except Exception as e:
             traceback.print_exc()
             return None
     
-    def list_pdb_models(self) -> Optional[List[Dict[str, Any]]]:
+    def list_pdb_models(self, print_models: bool = True) -> Optional[List[Dict[str, Any]]]:
         """
         List the PDB models saved in the pdbs.db located in the 
         project_path/docking/receptors directory.
@@ -3974,12 +3973,13 @@ except Exception as e:
                 print(f"\n💡 Save a PDB model using save_pdb_model()")
                 return None
             
-            # Display models
-            print(f"\n📦 SAVED PDB MODELS")
-            print("=" * 100)
-            print(f"   Found {len(pdb_models)} PDB model(s) in database")
-            print(f"   Database: {pdbs_db_path}")
-            print("=" * 100)
+            if print_models:
+                # Display models
+                print(f"\n📦 SAVED PDB MODELS")
+                print("=" * 100)
+                print(f"   Found {len(pdb_models)} PDB model(s) in database")
+                print(f"   Database: {pdbs_db_path}")
+                print("=" * 100)
             
             models_list = []
             
@@ -4001,82 +4001,90 @@ except Exception as e:
                 }
                 models_list.append(model_info)
                 
-                # Display basic model details
-                print(f"\n{idx}. 📦 {pdb_model_name}")
-                print(f"   {'─' * 96}")
-                print(f"   📋 ID: {file_id}")
-                print(f"   🏷️  PDB Model Name: {pdb_model_name}")
-                print(f"   📝 Description: {description or 'None'}")
+                if print_models:
                 
-                # Display modification date if different from created date
-                if last_modified and last_modified != created_date:
-                    print(f"   🔄 Modified: {last_modified}")
+                    # Display basic model details
+                    print(f"\n{idx}. 📦 {pdb_model_name}")
+                    print(f"   {'─' * 96}")
+                    print(f"   📋 ID: {file_id}")
+                    print(f"   🏷️  PDB Model Name: {pdb_model_name}")
+                    print(f"   📝 Description: {description or 'None'}")
                 
-                print(f"   {'─' * 96}")
-            
-            print("=" * 100)
-            print(f"💡 Type 'details <number>' to view full information about a model")
-            
-            # Interactive details viewing
-            while True:
-                try:
-                    user_input = input(f"\nEnter command (or press Enter to exit): ").strip()
+                if print_models:
+                
+                    # Display modification date if different from created date
+                    if last_modified and last_modified != created_date:
+                        print(f"   🔄 Modified: {last_modified}")
                     
-                    if not user_input:
-                        break
-                    
-                    # Check if user wants details
-                    if user_input.lower().startswith('details'):
-                        parts = user_input.split()
-                        if len(parts) < 2:
-                            print(f"❌ Please specify a model number. Example: details 1")
-                            continue
+                    print(f"   {'─' * 96}")
+            
+            if print_models:
+                print("=" * 100)
+                print(f"💡 Type 'details <number>' to view full information about a model")
+            
+            
+            if print_models:
+            
+                # Interactive details viewing
+                while True:
+                    try:
+                        user_input = input(f"\nEnter command (or press Enter to exit): ").strip()
                         
-                        try:
-                            model_number = int(parts[1])
-                            if model_number < 1 or model_number > len(models_list):
-                                print(f"❌ Invalid model number. Choose between 1 and {len(models_list)}")
+                        if not user_input:
+                            break
+                        
+                        # Check if user wants details
+                        if user_input.lower().startswith('details'):
+                            parts = user_input.split()
+                            if len(parts) < 2:
+                                print(f"❌ Please specify a model number. Example: details 1")
                                 continue
                             
-                            # Display detailed information for selected model
-                            selected_model = models_list[model_number - 1]
-                            print(f"\n{'═' * 100}")
-                            print(f"🔍 DETAILED INFORMATION FOR: {selected_model['pdb_model_name']}")
-                            print(f"{'═' * 100}")
-                            print(f"   📋 File ID: {selected_model['file_id']}")
-                            print(f"   🏷️  PDB Model Name: {selected_model['pdb_model_name']}")
-                            print(f"   📁 Filename: {selected_model['filename']}")
-                            print(f"   📍 Original Path: {selected_model['original_path']}")
-                            print(f"   📦 Project: {selected_model['project_name']}")
-                            
-                            if selected_model['file_size']:
-                                print(f"\n   📊 SIZE INFORMATION:")
-                                print(f"      • File Size: {selected_model['file_size']:,} bytes")
-                            
-                            if selected_model['description']:
-                                print(f"\n   📝 DESCRIPTION:")
-                                print(f"      {selected_model['description']}")
-                            
-                            print(f"\n   📅 TIMESTAMPS:")
-                            print(f"      • Created: {selected_model['created_date']}")
-                            if selected_model['last_modified'] and selected_model['last_modified'] != selected_model['created_date']:
-                                print(f"      • Last Modified: {selected_model['last_modified']}")
-                            
-                            if selected_model['notes']:
-                                print(f"\n   📋 NOTES:")
-                                print(f"      {selected_model['notes']}")
-                            
-                            print(f"{'═' * 100}")
-                            
-                        except ValueError:
-                            print(f"❌ Invalid number format. Please use: details <number>")
-                            continue
-                    else:
-                        print(f"❌ Unknown command. Use 'details <number>' to view full information")
-                
-                except KeyboardInterrupt:
-                    print(f"\n\n👋 Exiting PDB models list")
-                    break
+                            try:
+                                model_number = int(parts[1])
+                                if model_number < 1 or model_number > len(models_list):
+                                    print(f"❌ Invalid model number. Choose between 1 and {len(models_list)}")
+                                    continue
+                                
+                                # Display detailed information for selected model
+                                selected_model = models_list[model_number - 1]
+                                print(f"\n{'═' * 100}")
+                                print(f"🔍 DETAILED INFORMATION FOR: {selected_model['pdb_model_name']}")
+                                print(f"{'═' * 100}")
+                                print(f"   📋 File ID: {selected_model['file_id']}")
+                                print(f"   🏷️  PDB Model Name: {selected_model['pdb_model_name']}")
+                                print(f"   📁 Filename: {selected_model['filename']}")
+                                print(f"   📍 Original Path: {selected_model['original_path']}")
+                                print(f"   📦 Project: {selected_model['project_name']}")
+                                
+                                if selected_model['file_size']:
+                                    print(f"\n   📊 SIZE INFORMATION:")
+                                    print(f"      • File Size: {selected_model['file_size']:,} bytes")
+                                
+                                if selected_model['description']:
+                                    print(f"\n   📝 DESCRIPTION:")
+                                    print(f"      {selected_model['description']}")
+                                
+                                print(f"\n   📅 TIMESTAMPS:")
+                                print(f"      • Created: {selected_model['created_date']}")
+                                if selected_model['last_modified'] and selected_model['last_modified'] != selected_model['created_date']:
+                                    print(f"      • Last Modified: {selected_model['last_modified']}")
+                                
+                                if selected_model['notes']:
+                                    print(f"\n   📋 NOTES:")
+                                    print(f"      {selected_model['notes']}")
+                                
+                                print(f"{'═' * 100}")
+                                
+                            except ValueError:
+                                print(f"❌ Invalid number format. Please use: details <number>")
+                                continue
+                        else:
+                            print(f"❌ Unknown command. Use 'details <number>' to view full information")
+                    
+                    except KeyboardInterrupt:
+                        print(f"\n\n👋 Exiting PDB models list")
+                        break
             
             return models_list
             
@@ -4271,6 +4279,202 @@ except Exception as e:
                 if os.path.exists(temp_pdb_path):
                     os.unlink(temp_pdb_path)
                 
+        except Exception as e:
+            print(f"❌ Error creating PDB template: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+        
+    def create_pdb_template_in_batch(self, pdb_template_name: Optional[str] = None, verbose=True) -> Optional[Dict[str, Any]]:
+        """
+        Create a PDB file template from a PDB model stored in the database using save_pdb_model.
+        The user is prompted to select a PDB model from the database, after which the PDB file 
+        is analyzed and a registered for the receptor is created in the pdb_templates table.
+        
+        Args:
+            pdb_name (Optional[str]): Name for the receptor template. If None, user will be prompted.
+            verbose (bool): Whether to display detailed output during processing.
+            
+        Returns:
+            Optional[Dict[str, Any]]: PDB template registry information or None if failed
+        """
+        import sqlite3
+        import tempfile
+        from datetime import datetime
+        
+        try:
+            
+            print(f"🧬 CREATING PDB TEMPLATE FROM DATABASE IN BATCH MODE")
+            print("=" * 80)
+            
+            # Create a list of PDB models number to process as batch as integers separated by commas (e.g. 1,3,5) or by ranges (e.g. 1-5) or a combination of both (e.g. 1,3,5-7)
+            pdb_model_numbers = []
+            while True:
+                try:
+                    model_input = input(f"\nEnter PDB model numbers for batch processing (e.g. 1,3,5 or 1-5 or 1,3-5): ").strip()
+                    if not model_input:
+                        print("❌ Invalid input. Please enter a valid list of PDB model numbers.")
+                        continue
+                    # Parse the input into individual numbers or ranges
+                    for part in model_input.split(','):
+                        part = part.strip()
+                        if '-' in part:
+                            start, end = map(int, part.split('-'))
+                            pdb_model_numbers.extend(range(start, end + 1))
+                        else:
+                            pdb_model_numbers.append(int(part))
+                    break
+                except ValueError:
+                    print("❌ Invalid input. Please enter valid integers or ranges.")
+                    continue
+            
+             # Step 1: List and select PDB model from database
+            print(f"\n📂 Retrieving PDB models from database...")
+            models_list = self.list_pdb_models(print_models=False)
+            
+            # Loop through the selected model numbers and process each one
+            
+            processing_index = 0 # This is set to 1 to keep track of the processing order in batch mode
+            
+            for selection_input in pdb_model_numbers:
+                
+                processing_index += 1 # Increase the counter for each model processed in batch mode
+                
+                # Prompt user to select a model
+                while True:
+                        
+                    try:
+                        model_number = int(selection_input)
+                        if model_number < 1 or model_number > len(models_list):
+                            print(f"❌ Invalid model number. Choose between 1 and {len(models_list)}")
+                            continue
+                        
+                        selected_model = models_list[model_number - 1]
+                        break
+                        
+                    except ValueError:
+                        print(f"❌ Invalid input. Please enter a number or 'q' to quit")
+                        continue
+            
+            # Step 5: Get PDB template name
+                #default_name = f"{selected_model['pdb_model_name']}_template"
+                pdb_template_name = f"{selected_model['pdb_model_name']}_template"
+                        
+                # Validate template name
+                if not pdb_template_name.replace('_', '').replace('-', '').replace(' ', '').isalnum():
+                    print("❌ Template name can only contain letters, numbers, spaces, hyphens, and underscores")
+                    continue
+
+                print(pdb_template_name)
+                        
+                        
+                        
+        # except Exception as e:
+        #     print(f"\n❌ PDB template batch processing failed: {e}")
+        #     return None
+
+                # Step 6: Check if template name already exists
+                existing_check = self._check_pdb_name_exists(pdb_template_name)
+        
+
+                print(f"Existing check: {existing_check}")
+                
+                if existing_check:
+                    print(f"❌ PDB template {pdb_template_name} creation cancelled - name already exists")
+                    continue
+
+                # Step 2: Retrieve PDB blob from database
+                print(f"\n📥 Retrieving PDB file from database...")
+                pdbs_db_path = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
+                conn = sqlite3.connect(pdbs_db_path)
+                cursor = conn.cursor()
+        
+                cursor.execute('''
+                    SELECT pdb_blob FROM pdb_models WHERE file_id = ?
+                ''', (selected_model['file_id'],))
+        
+                result = cursor.fetchone()
+                conn.close()
+        
+                if not result or not result[0]:
+                    print(f"❌ Failed to retrieve PDB blob from database")
+                    return None
+        
+                pdb_blob = result[0]
+        
+                # Step 3: Write blob to temporary file for analysis
+                print(f"📝 Processing PDB file...")
+                with tempfile.NamedTemporaryFile(mode='wb', suffix='.pdb', delete=False) as tmp_file:
+                    tmp_file.write(pdb_blob)
+                    temp_pdb_path = tmp_file.name
+        
+                # Step 4: Analyze PDB file
+                print(f"🔬 Analyzing PDB structure...")
+                pdb_analysis = self._analyze_pdb_file(temp_pdb_path)
+            
+                if not pdb_analysis:
+                    print(f"❌ Failed to analyze PDB file")
+                    os.unlink(temp_pdb_path)
+                    return None
+            
+                if verbose:
+                    self._display_pdb_analysis(pdb_analysis)
+            
+                # Step 7: Create receptors directory structure
+                receptors_base_dir = os.path.join(self.path, 'docking', 'receptors')
+                os.makedirs(receptors_base_dir, exist_ok=True)
+            
+                # Create template-specific directory
+                pdb_template_folder = self._create_receptor_template_folder(receptors_base_dir, pdb_template_name)
+            
+                if not pdb_template_folder:
+                    print("❌ Failed to create PDB template folder")
+                    os.unlink(temp_pdb_path)
+                    return None
+            
+                # Step 8: Copy and process PDB file
+                print(f"📂 Processing and saving PDB template...")
+                pdb_processing_result = self._process_pdb_file_in_batch(temp_pdb_path, pdb_template_folder, pdb_analysis, processing_index)
+                
+                # if not pdb_processing_result:
+                #     print("❌ Failed to process PDB file")
+                #     os.unlink(temp_pdb_path)
+                #     return None
+            
+                # processed_pdb_path, checked_pdb_path, renumbering_dict, his_names = pdb_processing_result
+                
+                # print("Processed pdb path:", processed_pdb_path)
+                # print("Checked pdb path:", checked_pdb_path)
+
+        #     # Step 9: Create template registry entry
+        #     pdb_registry = self._create_pdb_template_registry_entry(
+        #         pdb_template_name, selected_model['pdb_model_name'], selected_model['original_path'], processed_pdb_path, pdb_template_folder, pdb_analysis, checked_pdb_path, renumbering_dict, his_names
+        #     )
+            
+        #     if not pdb_registry:
+        #         print("❌ Failed to create PDB template registry")
+        #         os.unlink(temp_pdb_path)
+        #         return None
+            
+        #     if verbose:
+        #         # Step 10: Display success summary
+        #         self._display_pdb_creation_summary(pdb_registry)
+            
+        #     print(f"\n{'=' * 80}")
+        #     print(f"✅ PDB TEMPLATE CREATED SUCCESSFULLY FROM DATABASE MODEL")
+        #     print(f"{'=' * 80}")
+        #     print(f"   Source Model: {selected_model['pdb_model_name']}")
+        #     print(f"   Template Name: {pdb_template_name}")
+        #     print(f"   Location: {pdb_template_folder}")
+        #     print(f"{'=' * 80}\n")
+            
+        #     return pdb_registry
+            
+        # finally:
+        #     # Clean up temporary file
+        #     if os.path.exists(temp_pdb_path):
+        #         os.unlink(temp_pdb_path)
+            
         except Exception as e:
             print(f"❌ Error creating PDB template: {e}")
             import traceback
@@ -4634,6 +4838,232 @@ except Exception as e:
             import traceback
             traceback.print_exc()
             return None
+        
+    def _process_pdb_file_in_batch(self, pdb_template_folder: str, pdb_folder: str, analysis: Dict[str, Any], processing_index: int) -> Optional[Tuple[str, str, Dict, Dict]]:
+        """
+        Process and copy PDB file to receptor folder with chain, ligand, and water selection options.
+        Now also manages alternate locations (altlocs) and water molecules if present.
+        
+        Returns:
+            Optional[Tuple[str, str, Dict, Dict]]: Tuple of (processed_pdb_path, tleap_processed_file, renumbering_dict, his_names) or None on error
+        """
+        try:
+            import shutil
+
+            # Copy original PDB to original folder
+            original_dir = os.path.join(pdb_folder, 'original')
+            original_pdb_path = os.path.join(original_dir, 'receptor_original.pdb')
+            os.makedirs(original_dir, exist_ok=True)
+            shutil.copy2(pdb_template_folder, original_pdb_path)
+            print(f"   📋 Copied original PDB file to: {os.path.relpath(original_pdb_path)}")
+
+            # Create processed PDB path in processed folder
+            processed_dir = os.path.join(pdb_folder, 'processed')
+            os.makedirs(processed_dir, exist_ok=True)
+            processed_pdb_path = os.path.join(processed_dir, 'receptor.pdb')
+            shutil.copy2(original_pdb_path, processed_pdb_path)
+            print(f"   🔄 Created working copy for processing: {os.path.relpath(processed_pdb_path)}")
+
+            # --- ALTLOC MANAGEMENT ---
+            altloc_handling = None
+            altloc_map = {}
+            if analysis.get('has_altlocs', False):
+                # altlocs = analysis.get('altlocs', {})
+                # print(f"\n⚠️  Alternate locations (altlocs) detected in structure.")
+                # print(f"   • Residues with altlocs: {altlocs.get('residues_with_altlocs', 0)}")
+                # print(f"   • Unique altloc IDs: {', '.join(altlocs.get('unique_altloc_ids', [])) or 'None'}")
+                # print(f"   • Total altloc atoms: {altlocs.get('total_altlocs', 0)}")
+                # print("   ⚠️  You must select which altlocs to keep in the processed file.")
+
+                # Query user for altloc handling strategy
+                altloc_handling, altloc_map = self._query_altloc_handling_in_batch(original_pdb_path, analysis)
+                if altloc_handling == "cancel":
+                    print("   ❌ Altloc selection cancelled. Aborting processing.")
+                    return None
+
+                # Apply altloc filtering to processed file
+                self._filter_altlocs_in_pdb(processed_pdb_path, altloc_handling, altloc_map)
+                print(f"   ✅ Applied altloc filtering: {altloc_handling}")
+
+            # Process chains if multiple chains exist
+            selected_chains = None
+            if len(analysis['chains']) > 1:
+                print(f"   🔗 Multi-chain structure detected: {', '.join(analysis['chains'])}")
+                
+                # In batch mode, the selection of defaulted to 'all chains'
+                choice = 'all'
+                while True:
+                    try:
+                        #choice = input(f"   🧬 Keep all chains or select specific chain(s)? (all/select): ").strip().lower()
+                        if choice in ['all', 'a']:
+                            print("   ✅ Keeping all chains")
+                            selected_chains = analysis['chains']
+                            break
+                        elif choice in ['select', 's']:
+                            selected_chains = self._select_chain_interactive(analysis['chains'])
+                            if selected_chains:
+                                if len(selected_chains) == 1:
+                                    print(f"   ✅ Selected chain: {selected_chains[0]}")
+                                else:
+                                    print(f"   ✅ Selected chains: {', '.join(selected_chains)}")
+                                break
+                            else:
+                                print("   ⚠️  No chain selected, keeping all chains")
+                                selected_chains = analysis['chains']
+                                break
+                        else:
+                            print("   ❌ Please enter 'all' or 'select'")
+                            continue
+                    except KeyboardInterrupt:
+                        print("\n   ⚠️  Using all chains by default")
+                        selected_chains = analysis['chains']
+                        break
+            else:
+                selected_chains = analysis['chains']
+
+
+            ## Parse Histidine names
+            ################################
+            # In batch mode, the parsing of histidine names is performed only for the first template and applied consitently afterwards.
+            his_names = self._parse_histidine_names_batch_mode(original_pdb_path, selected_chains, processing_index)
+            his_names = self._customize_histidine_names(his_names)
+
+
+            ## Process ligands if any exist
+            ################################
+            selected_ligands = None
+            
+            ## In batch mode the selection of ligands is only performed for the first template and applied consitently afterwards.
+            if processing_index == 1:
+                if analysis['has_ligands'] and analysis['ligand_residues']:
+                    print(f"\n   💊 Ligand residues detected: {', '.join(analysis['ligand_residues'])}")
+                    ligand_details = self._analyze_ligands_in_pdb(original_pdb_path, analysis['ligand_residues'], selected_chains)
+                    if ligand_details:
+                        self._display_ligand_analysis(ligand_details)
+                        while True:
+                            try:
+                                print("\n   🧪 LIGAND OPTIONS:")
+                                print("   1. Remove all ligands (clean receptor)")
+                                print("   2. Keep all ligands")
+                                print("   3. Select specific ligands to keep")
+                                print("   4. Keep only co-crystallized ligands (exclude waters)")
+                                ligand_choice = input("   💊 Select ligand handling (1-4): ").strip()
+                                if ligand_choice == '1':
+                                    print("   🧹 Will remove all ligands from processed PDB")
+                                    selected_ligands = []
+                                    break
+                                elif ligand_choice == '2':
+                                    print("   ✅ Will keep all ligands")
+                                    selected_ligands = list(analysis['ligand_residues'])
+                                    break
+                                elif ligand_choice == '3':
+                                    selected_ligands = self._select_ligands_interactive(ligand_details)
+                                    if selected_ligands is not None:
+                                        if selected_ligands:
+                                            print(f"   ✅ Selected ligands: {', '.join(selected_ligands)}")
+                                        else:
+                                            print("   🧹 No ligands selected - will create clean receptor")
+                                        break
+                                    else:
+                                        print("   ⚠️  Ligand selection cancelled, keeping all ligands")
+                                        selected_ligands = list(analysis['ligand_residues'])
+                                        break
+                                elif ligand_choice == '4':
+                                    non_water_ligands = [lig for lig in analysis['ligand_residues'] if lig != 'HOH']
+                                    selected_ligands = non_water_ligands
+                                    if non_water_ligands:
+                                        print(f"   ✅ Will keep co-crystallized ligands: {', '.join(non_water_ligands)}")
+                                    else:
+                                        print("   🧹 No co-crystallized ligands found - will create clean receptor")
+                                    break
+                                else:
+                                    print("   ❌ Invalid choice. Please enter 1, 2, 3, or 4")
+                                    continue
+                            except KeyboardInterrupt:
+                                print("\n   ⚠️  Keeping all ligands by default")
+                                selected_ligands = list(analysis['ligand_residues'])
+                                break
+                    else:
+                        selected_ligands = list(analysis['ligand_residues'])
+                else:
+                    selected_ligands = []
+
+            ## If selected_ligands contains ligands information
+            if selected_ligands:
+            
+                # Check if ligand residues are present in tleap force field
+                analysis = self._process_selected_ligands(selected_ligands,original_pdb_path, selected_chains, analysis, processed_dir)
+
+            else:
+                analysis["cofactors"] ={"cofactors_present":0} # Indicate that no cofactors are present in the system
+
+
+            ## --- WATER MANAGEMENT ---
+            ## In batch mode all waters are removed from the receptor templates, sin they are not expected to be reproduce among different structures.
+            selected_waters = []
+            water_details = self._analyze_waters_in_pdb(original_pdb_path, selected_chains)
+            
+            if water_details:
+                print(f"\n   💧 Water molecules detected: {len(water_details)}")
+                #selected_waters = self._select_waters_interactive(water_details)
+                selected_waters = [] # This will again default to None selected water molecules
+                if selected_waters is None:
+                    print("   ⚠️  Water selection cancelled, will remove all waters.")
+                    selected_waters = []
+                elif selected_waters:
+                    print(f"   ✅ Will keep {len(selected_waters)} water(s): {', '.join(selected_waters)}")
+                else:
+                    print("   🧹 Will remove all water molecules.")
+
+            # Create processed PDB file with selected chains, ligands, and waters
+            if (selected_chains != analysis['chains'] or
+                selected_ligands != list(analysis['ligand_residues']) or
+                (water_details and selected_waters != list(water_details.keys()))):
+                print(f"   🔄 Applying filters to processed PDB (chains, ligands, waters)...")
+                
+                filtered_pdb_path = self._create_filtered_pdb(
+                    processed_pdb_path, selected_chains, selected_ligands, selected_waters, analysis
+                )
+                
+                if not filtered_pdb_path:
+                    print("   ❌ Failed to create filtered PDB file")
+                    return None
+                processed_pdb_path = filtered_pdb_path
+            else:
+                print(f"   ✅ No filtering needed - processed PDB ready")
+
+            # Manage HIS residue naming based on previous selection
+            self._fix_histine_names(his_names, processed_pdb_path) 
+
+            # Create reference ligand file if ligands were kept
+            if selected_ligands:
+                self._extract_reference_ligands(processed_pdb_path, pdb_folder, selected_ligands)
+
+            # Create processing summary file
+            self._create_processing_summary(pdb_folder, original_pdb_path, processed_pdb_path, selected_chains, selected_ligands, analysis)
+            
+            # --- Add missing atoms using tleap ---
+            #tleap_processed_file = self._add_missing_atoms_in_pdb_tleap(processed_pdb_path, analysis)
+            # Modified to process receptors containing cobound ligands
+            tleap_processed_file = self._add_missing_atoms_in_pdb_tleap2(processed_pdb_path, analysis, processed_dir)
+                                  
+            # Process tleap_processed_file to add the element name column if missing
+            receptor_moldf_dict, renumbering_dict = self._refine_receptor_model(tleap_processed_file, processed_pdb_path, analysis)
+            
+            # Write (overwrite) the tleap_processed_file
+            from moldf import write_pdb
+            
+            write_pdb(receptor_moldf_dict, tleap_processed_file)
+            
+            print(f"✅ tleap processing complete. Output: {tleap_processed_file}")
+            
+            return processed_pdb_path, tleap_processed_file, renumbering_dict, his_names
+            
+        except Exception as e:
+            print(f"❌ Error processing PDB file: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
 
     def _analyze_waters_in_pdb(self, pdb_file: str, selected_chains: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
         """
@@ -4858,6 +5288,36 @@ except Exception as e:
                 altloc_map = self._manual_select_altlocs(pdb_file, analysis)
                 return "manual", altloc_map
             elif choice == '4' or choice.lower() in ['cancel', 'quit', 'exit']:
+                return "cancel", {}
+            else:
+                print("   ❌ Invalid choice. Please enter 1, 2, 3, or 4.")
+                
+    def _query_altloc_handling_in_batch(self, pdb_file: str, analysis: Dict[str, Any]) -> Tuple[str, dict]:
+        """
+        Query the user for how to handle altlocs: keep first, keep highest occupancy, or select manually.
+        Returns the chosen strategy and a mapping if manual selection.
+        """
+        altlocs = analysis.get('altlocs', {})
+        # unique_altlocs = altlocs.get('unique_altloc_ids', [])
+        # print("\n   ALTLOC HANDLING OPTIONS:")
+        # print("   1. Keep only the first altloc (A/B/C...) for each residue")
+        # print("   2. Keep altloc with highest occupancy (if available)")
+        # print("   3. Select altloc manually for each residue with altlocs")
+        # print("   4. Cancel processing")
+        
+        # For batch processing default to highest occupancy if altlocs are present, otherwise no handling needed
+        choice = 2
+        while True:
+            #choice = input("   Select altloc handling (1-4): ").strip()
+            if choice == 1:
+                return "first", {}
+            elif choice == 2:
+                return "highest_occupancy", {}
+            elif choice == 3:
+                # Manual selection per residue
+                altloc_map = self._manual_select_altlocs(pdb_file, analysis)
+                return "manual", altloc_map
+            elif choice == 4 or choice.lower() in ['cancel', 'quit', 'exit']:
                 return "cancel", {}
             else:
                 print("   ❌ Invalid choice. Please enter 1, 2, 3, or 4.")
@@ -12092,6 +12552,48 @@ quit
                         his_names[f"{res_num}_{chain_id}"] = res_name
         
         return his_names
+    
+    def _parse_histidine_names_batch_mode(self, original_pdb_path, selected_chains, procesing_index):
+        """
+        Parses a PDB file to identify and record the names of Histidine residues (HIS, HID, HIE, HIP) 
+        within specified chains.
+        Args:
+            original_pdb_path (str): Path to the original PDB file.
+            selected_chains (Iterable[str]): Collection of chain identifiers to search for Histidine residues.
+        Returns:
+            dict: A dictionary mapping residue number and chain (formatted as "{res_num}_{chain_id}") 
+                  to the Histidine residue name found in the PDB file.
+        """
+
+        # If the dictionary is not empty:
+        if procesing_index > 1:
+            print("\nExisting Histidine names found in batch mode. Skipping parsing of Histidine names from PDB file.")
+            
+            # Read the dictionary from the temp file in /tmp directory
+            import json
+            temp_file_path = "/tmp/his_names_batch_mode.json"
+            with open(temp_file_path, 'r') as temp_file:
+                his_names = json.load(temp_file)
+            return his_names
+        
+        else:
+            his_names = {}
+            with open(original_pdb_path, 'r') as pdb_file:
+                for line in pdb_file:
+                    if line.startswith("HETATM") or line.startswith("ATOM"):
+                        chain_id = line[21].strip()
+                        res_name = line[17:20].strip()
+                        res_num = line[22:26].strip()
+                        if chain_id in selected_chains and res_name in ['HIS', 'HID', 'HIE', 'HIP']:
+                            his_names[f"{res_num}_{chain_id}"] = res_name
+            
+            # Write the dictionary to a temp file for subsequent retrieval in batch mode to the /tmp directory
+            import json
+            temp_file_path = "/tmp/his_names_batch_mode.json"
+            with open(temp_file_path, 'w') as temp_file:
+                json.dump(his_names, temp_file)
+            
+            return his_names
 
     def _customize_histidine_names(self, his_names):
 
