@@ -1540,6 +1540,7 @@ class MolDock:
         """
         import subprocess
         import sys
+        import textwrap
         from datetime import datetime
         
         try:
@@ -1554,48 +1555,48 @@ class MolDock:
             os.makedirs(os.path.dirname(log_file), exist_ok=True)
             
             # Build Python command to run docking
-            python_script = f"""
-import sys
-import os
-import time
-sys.path.insert(0, '{self.path}')
+            python_script = textwrap.dedent(f"""
+                import sys
+                import os
+                import time
+                sys.path.insert(0, '{self.path}')
 
-from tidyscreen import tidyscreen
-from tidyscreen.moldock.moldock import MolDock
+                from tidyscreen import tidyscreen
+                from tidyscreen.moldock.moldock import MolDock
 
-start_time = time.time()
+                start_time = time.time()
 
-try:
-    # Recreate the project and MolDock objects
-    project = tidyscreen.ActivateProject('{self.name}')
-    moldock = MolDock(project)
-    
-    # Retrieve method info from assay registry
-    assay_id = {assay_registry['assay_id']}
-    
-    # Prepare parameters
-    selected_table = '{selected_table}'
-    selected_method = {selected_method}
-    assay_registry = {assay_registry}
-    clean_ligand_files = {clean_ligand_files}
-    receptor_info = {receptor_info}
-    
-    # Run docking
-    moldock._run_docking_foreground(selected_table, selected_method, assay_registry, clean_ligand_files, receptor_info)
-    
-    elapsed = time.time() - start_time
-    print(f'✅ Background docking process completed successfully')
-    print(f'⏱️  Elapsed time: {{elapsed:.2f}} seconds')
-    sys.exit(0)
-    
-except Exception as e:
-    elapsed = time.time() - start_time
-    print(f'❌ Error in background docking process: {{e}}')
-    print(f'⏱️  Elapsed time (with error): {{elapsed:.2f}} seconds')
-    import traceback
-    traceback.print_exc()
-    sys.exit(1)
-    """
+                try:
+                    # Recreate the project and MolDock objects
+                    project = tidyscreen.ActivateProject('{self.name}')
+                    moldock = MolDock(project)
+
+                    # Retrieve method info from assay registry
+                    assay_id = {assay_registry['assay_id']}
+
+                    # Prepare parameters
+                    selected_table = '{selected_table}'
+                    selected_method = {selected_method}
+                    assay_registry = {assay_registry}
+                    clean_ligand_files = {clean_ligand_files}
+                    receptor_info = {receptor_info}
+
+                    # Run docking
+                    moldock._run_docking_foreground(selected_table, selected_method, assay_registry, clean_ligand_files, receptor_info)
+
+                    elapsed = time.time() - start_time
+                    print(f'✅ Background docking process completed successfully')
+                    print(f'⏱️  Elapsed time: {{elapsed:.2f}} seconds')
+                    sys.exit(0)
+
+                except Exception as e:
+                    elapsed = time.time() - start_time
+                    print(f'❌ Error in background docking process: {{e}}')
+                    print(f'⏱️  Elapsed time (with error): {{elapsed:.2f}} seconds')
+                    import traceback
+                    traceback.print_exc()
+                    sys.exit(1)
+                """)
             
             # Write script to temporary file
             script_file = os.path.join(
@@ -1870,37 +1871,39 @@ except Exception as e:
             assay_name (str): Name of the assay
         """
         try:
+            import textwrap
             from datetime import datetime
             
-            readme_content = f"""# Docking Assay: {assay_name}
+            readme_content = textwrap.dedent(f"""
+                # Docking Assay: {assay_name}
 
-    Created: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-    Project: {self.name}
+                Created: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+                Project: {self.name}
 
-    ## Folder Structure
+                ## Folder Structure
 
-    - **ligands/**: Prepared ligand files (PDBQT, SDF formats)
-    - **receptors/**: Receptor structure files (PDB, PDBQT formats)  
-    - **grid_files/**: Grid and map files for docking
-    - **results/**: Docking output files and poses
-    - **logs/**: Log files and error reports
-    - **analysis/**: Analysis results, plots, and summaries
-    - **configurations/**: Docking configuration files (DPF, config files)
+                - **ligands/**: Prepared ligand files (PDBQT, SDF formats)
+                - **receptors/**: Receptor structure files (PDB, PDBQT formats)
+                - **grid_files/**: Grid and map files for docking
+                - **results/**: Docking output files and poses
+                - **logs/**: Log files and error reports
+                - **analysis/**: Analysis results, plots, and summaries
+                - **configurations/**: Docking configuration files (DPF, config files)
 
-    ## Usage Notes
+                ## Usage Notes
 
-    This folder structure is designed to organize all files related to this docking assay.
-    Place input files in the appropriate directories and docking results will be saved
-    to the results/ directory.
+                This folder structure is designed to organize all files related to this docking assay.
+                Place input files in the appropriate directories and docking results will be saved
+                to the results/ directory.
 
-    ## File Naming Convention
+                ## File Naming Convention
 
-    - Use consistent naming with assay ID prefix
-    - Keep original compound identifiers where possible
-    - Use standard file extensions (.pdbqt, .sdf, .pdb, .dlg, etc.)
+                - Use consistent naming with assay ID prefix
+                - Keep original compound identifiers where possible
+                - Use standard file extensions (.pdbqt, .sdf, .pdb, .dlg, etc.)
 
-    Generated by TidyScreen MolDock module.
-    """
+                Generated by TidyScreen MolDock module.
+                """)
             
             readme_path = os.path.join(assay_folder_path, 'README.md')
             with open(readme_path, 'w') as f:
@@ -6222,6 +6225,7 @@ except Exception as e:
         """
         import subprocess
         import tempfile
+        import textwrap
         import os
         import shutil
 
@@ -6237,12 +6241,12 @@ except Exception as e:
             output_pdb = os.path.join(receptor_dir, "receptor_checked.pdb")
 
             # Prepare tleap input script
-            tleap_script = f"""
-source leaprc.protein.ff14SB
-mol = loadpdb "{receptor_file}"
-savepdb mol "{output_pdb}"
-quit
-"""
+            tleap_script = textwrap.dedent(f"""
+                source leaprc.protein.ff14SB
+                mol = loadpdb "{receptor_file}"
+                savepdb mol "{output_pdb}"
+                quit
+                """)
             # Write tleap script to a temp file
             with tempfile.NamedTemporaryFile("w", delete=False, suffix=".in") as tf:
                 tf.write(tleap_script)
@@ -6286,43 +6290,6 @@ quit
             # Move the intermediate file (without hydrogens) to the final output path
             shutil.move(output_receptor_file_intermediate, output_pdb)
 
-#             # A second round of tleap processing will be performed on the receptor containing all heavy atoms
-
-#             # Prepare tleap input script. The original output_pdb will be overwritten.
-#             tleap_script = f"""
-# source leaprc.protein.ff14SB
-# mol = loadpdb "{output_receptor_file_intermediate}"
-# savepdb mol "{output_pdb}"
-# quit
-# """
-
-#             # Write tleap script to a temp file
-#             with tempfile.NamedTemporaryFile("w", delete=False, suffix=".in") as tf:
-#                 tf.write(tleap_script)
-#                 tleap_input_path = tf.name
-
-#             ## This second tleap run will ensure addition of hydrogens on all added heavy atoms
-#             result = subprocess.run(
-#                 ["tleap", "-f", tleap_input_path],
-#                 stdout=subprocess.PIPE,
-#                 stderr=subprocess.PIPE,
-#                 text=True
-#             )
-
-#             # Clean up temp file
-#             os.remove(tleap_input_path)
-
-#             # Check for errors
-#             if result.returncode != 0:
-#                 print("❌ tleap failed to process the receptor file.")
-#                 print(result.stderr)
-#                 return None
-
-#             # Check if output file was created
-#             if not os.path.exists(output_pdb):
-#                 print("❌ tleap did not produce the expected output file.")
-#                 return None
-
             # Reassign chain IDs and residue numbers
             self._reassign_chain_and_resnums(receptor_file, output_pdb)
 
@@ -6355,6 +6322,7 @@ quit
         
         import tempfile
         import subprocess
+        import textwrap
         
         print(f"Processing pdb: \n {receptor_file} \n with tleap")
         
@@ -6374,14 +6342,14 @@ quit
         
             # Process with tleap
             tleap_processed_file = receptor_file.replace(".pdb", "_checked.pdb")
-            tleap_script = f"""
-source leaprc.protein.ff14SB
-source leaprc.water.tip3p
-HOH = WAT
-mol = loadpdb {receptor_file}
-savepdb mol {tleap_processed_file}
-quit
-"""
+            tleap_script = textwrap.dedent(f"""
+                source leaprc.protein.ff14SB
+                source leaprc.water.tip3p
+                HOH = WAT
+                mol = loadpdb {receptor_file}
+                savepdb mol {tleap_processed_file}
+                quit
+                """)
 
             print(receptor_file)
             print(tleap_processed_file)
@@ -6434,12 +6402,9 @@ quit
             print(e)
             return None
     
-    def _add_missing_atoms_in_pdb_tleap2(self, receptor_file, receptor_info, processed_dir):
-        
-        ## Modified to treat cobound ligands in receptor
-        
         import tempfile
         import subprocess
+        import textwrap
         
         print(f"Processing pdb: \n {receptor_file} \n with tleap")
         
@@ -6476,11 +6441,12 @@ quit
                 
                     # Append each cofactor information to the file
                     with open(tleap_file, 'a') as f:
-                        f.write(f"""# Load cofactor {name}
-{name} = loadmol2 {mol2_file}
-loadamberparams {frcmod_file}
+                        f.write(textwrap.dedent(f"""
+                            # Load cofactor {name}
+                            {name} = loadmol2 {mol2_file}
+                            loadamberparams {frcmod_file}
 
-""")    
+                            """))    
             
             with open(tleap_file, "a") as f:
                 f.write(f"mol = loadpdb {receptor_file}\n")
@@ -9388,7 +9354,6 @@ loadamberparams {frcmod_file}
         print(f"\n🎉 Docking completed for table: {selected_table}")
         print(f"Results saved in: {docking_results_dir}")
 
-
     def _prepare_vina_receptor(self, method_params, receptor_pdbqt_file, receptor_conditions):
         
         from vina import Vina
@@ -9924,28 +9889,30 @@ loadamberparams {frcmod_file}
         import os
         import tempfile
         import shutil
-
-        print("Minimizing receptor")
+        import textwrap
 
         # Create minimization input file in the same directory as tleap_processed_file
         min_in_file = os.path.join(os.path.dirname(tleap_processed_file), "min.in")
 
         with open(min_in_file, 'w') as f:
-            f.write("""Initial minimisation of the receptor
- &cntrl
-  imin=1, maxcyc=50, ncyc=25,
-  cut=16, ntb=0, igb=1,
- &end
-        """)
+            f.write(textwrap.dedent("""\
+                Initial minimisation of the receptor
+                 &cntrl
+                  imin=1, maxcyc=50, ncyc=25,
+                  cut=16, ntb=0, igb=1,
+                 &end
+                """))
 
         # Create a tleap input file in the same directory as tleap_processed_file 
         tleap_in_file = os.path.join(os.path.dirname(tleap_processed_file), "minimize.in")
 
         with open(tleap_in_file, 'w') as f:
-            f.write(f"""source leaprc.protein.ff14SB
-source leaprc.water.tip3p
-source leaprc.gaff2
-HOH = WAT\n""")
+            f.write(textwrap.dedent(f"""\
+                source leaprc.protein.ff14SB
+                source leaprc.water.tip3p
+                source leaprc.gaff2
+                HOH = WAT
+                """))
 
         # Get the presence of co-factors in the receptor and if present, add them to the tleap input file
         
@@ -10640,9 +10607,9 @@ HOH = WAT\n""")
     def _prepare_complex_prmtop_inpcrd(self, prepin_file, frcmod_file, assay_info, output_dir, pdb_file, pose_id):
 
         import subprocess
+        import textwrap
 
-        
-        receptor_pdb = assay_info.get('receptor_info', None).get('pdbqt_file', None) 
+        receptor_pdb = assay_info.get('receptor_info', None).get('pdbqt_file', None)
 
         # Define the raw .pdb file of the receptor
         receptor_pdb_path = '/'.join(receptor_pdb.split('/')[:-1]) + '/receptor_checked.pdb'
@@ -10665,12 +10632,13 @@ HOH = WAT\n""")
         
         # Will write the header of the tleap input file
         with open(tleap_in_file, 'w') as f:
-            f.write(f"""source leaprc.protein.ff14SB
-source leaprc.water.tip3p
-source leaprc.gaff2
-HOH = WAT
+            f.write(textwrap.dedent("""\
+                source leaprc.protein.ff14SB
+                source leaprc.water.tip3p
+                source leaprc.gaff2
+                HOH = WAT
 
-""")
+                """))
     
         ## Evaluate if ligands/cofactors are required to be loaded with the receptor
         if ligands_in_template:
@@ -10682,33 +10650,35 @@ HOH = WAT
                 
                 # Append each cofactor information to the file
                 with open(tleap_in_file, 'a') as f:
-                    f.write(f"""# Load cofactor {name}
-{name} = loadmol2 {mol2_file_lig}
-loadamberparams {frcmod_file_lig}
+                    f.write(textwrap.dedent(f"""\
+                        # Load cofactor {name}
+                        {name} = loadmol2 {mol2_file_lig}
+                        loadamberparams {frcmod_file_lig}
 
-""")
+                        """))
 
         # Will write the rest of the tleap input file
         with open(tleap_in_file, 'a') as f:
-            f.write(f"""# Load receptor
-rec = loadpdb "{receptor_pdb_path}"
+            f.write(textwrap.dedent(f"""\
+                # Load receptor
+                rec = loadpdb "{receptor_pdb_path}"
 
-# Load ligand parameters
-loadamberprep {prepin_file}
-loadamberparams {frcmod_file}
+                # Load ligand parameters
+                loadamberprep {prepin_file}
+                loadamberparams {frcmod_file}
 
-lig = loadpdb "{pdb_file}"
+                lig = loadpdb "{pdb_file}"
 
-savepdb lig "{output_pdb_file}"
+                savepdb lig "{output_pdb_file}"
 
-# Create complex
-complex = combine {{rec lig}}
+                # Create complex
+                complex = combine {{rec lig}}
 
-# Save complex parameters and coordinates
-saveamberparm complex "{prmtop_file}" "{inpcrd_file}"
+                # Save complex parameters and coordinates
+                saveamberparm complex "{prmtop_file}" "{inpcrd_file}"
 
-quit
-""")
+                quit
+                """))
 
         # Run tleap to generate prmtop and inpcrd files
         tleap_command = f"tleap -f {tleap_in_file}"
@@ -10730,6 +10700,7 @@ quit
         import os
         import tempfile
         import shutil
+        import textwrap
 
         print("Minimizing complex")
 
@@ -10752,12 +10723,13 @@ quit
 
             # Write a GPU compatible minimization script
             with open(min_in_file, 'w') as f:
-                f.write("""Minimisation of the complex
- &cntrl
-  imin=1, maxcyc=50, ncyc=25,
-  cut=999, ntb=0, igb=1,
- &end
-        """)
+                f.write(textwrap.dedent("""\
+                    Minimisation of the complex
+                     &cntrl
+                      imin=1, maxcyc=50, ncyc=25,
+                      cut=999, ntb=0, igb=1,
+                     &end
+                    """))
 
             pmemd_command = f"pmemd.cuda -O -i {min_in_file} -o {min_out_file} -p {prmtop_file} -c {inpcrd_file} -r {min_rst_file}"
             subprocess.run(pmemd_command, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -10768,24 +10740,26 @@ quit
 
             # Write a sander compatible minimization script
             with open(min_in_file, 'w') as f:
-                f.write("""Minimisation of the complex
- &cntrl
-  imin=1, maxcyc=50, ncyc=25,
-  cut=16, ntb=0, igb=1,
- &end
-        """)
+                f.write(textwrap.dedent("""\
+                    Minimisation of the complex
+                     &cntrl
+                      imin=1, maxcyc=50, ncyc=25,
+                      cut=16, ntb=0, igb=1,
+                     &end
+                    """))
             
             sander_command = f"sander -O -i {min_in_file} -o {min_out_file} -p {prmtop_file} -c {inpcrd_file} -r {min_rst_file}"
             subprocess.run(sander_command, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         ## Use Cpptraj to reprocess min_rst_file to make it compatible with MDAnalysis read
         with open(cpptraj_in_file, 'w') as f:
-            f.write(f"""parm {prmtop_file}
-trajin {min_rst_file}
-trajout {min_rst_cpptraj_file}
-go
-quit
-        """)
+            f.write(textwrap.dedent(f"""\
+                parm {prmtop_file}
+                trajin {min_rst_file}
+                trajout {min_rst_cpptraj_file}
+                go
+                quit
+                """))
 
         cpptraj_command = f"cpptraj -i {cpptraj_in_file}"
         subprocess.run(cpptraj_command, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -12220,8 +12194,7 @@ quit
         except subprocess.CalledProcessError as e:  
             print(f"\n❌ Error computing MMGBSA binding energy: {e}")
 
-    def _parse_mmgbsa_decomposition_output(self, ligname, pose_id, output_dir): # This will work for the running workflow
-    #def parse_mmgbsa_decomposition_output(self, filename): # bypass to work with a file path
+    def _parse_mmgbsa_decomposition_output(self, ligname, pose_id, output_dir): 
         import pandas as pd
         import re   
         output_decomp_file = f"{output_dir}/{ligname}_{pose_id}_mmgbsa_decomp.out" # This will work for the running workflow
