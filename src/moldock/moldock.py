@@ -6699,6 +6699,25 @@ class MolDock:
             print(f"   ⚠️  Error in residue mapping: {e}")
             return {}
     
+    def _rebase_project_path(self, stored_path: str) -> str:
+        """
+        Rebase a stored absolute path to the current project root (self.path).
+
+        Paths are stored as absolute values at creation time. If the project is
+        moved, the stored root becomes stale. This method recovers the relative
+        portion of the path starting from the 'docking' directory and rebuilds
+        it under the current self.path.
+        """
+        if not stored_path:
+            return stored_path
+        normalized = stored_path.replace('\\', '/')
+        marker = '/docking/'
+        idx = normalized.find(marker)
+        if idx != -1:
+            relative = normalized[idx + 1:]  # 'docking/...'
+            return os.path.join(self.path, relative)
+        return stored_path
+
     def create_receptor_for_docking(self, selection: int = None):
         """
         Will load the pdbs.db database from project_path/docking/receptors and prompt the user to select one of the PBD models available to create a pdbqt file for docking purposes using helper function to be created.
@@ -6769,6 +6788,11 @@ class MolDock:
                 return None
 
         pdb_id, template_name, model_name, processed_pdb_path, checked_pdb_path, folder, notes = selected
+
+        # Rebase stored paths in case the project was moved
+        processed_pdb_path = self._rebase_project_path(processed_pdb_path)
+        checked_pdb_path   = self._rebase_project_path(checked_pdb_path)
+        folder             = self._rebase_project_path(folder)
 
         # Select the pdb file to convert to .pdbqt
         pdb_to_convert = checked_pdb_path
