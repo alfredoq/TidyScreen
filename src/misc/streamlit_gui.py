@@ -14,7 +14,7 @@ st.set_page_config(page_title="TidyScreen App", layout="wide")
 st.sidebar.title("Navigation")
 page = st.sidebar.radio(
     "Go to",
-    ("TidyScreen", "ChemSpace", "Receptors", "MolDock", "Analysis")
+    ("TidyScreen", "ChemSpace", "Receptors", "Docking Methods", "MolDock", "Analysis")
 )
 
 if page == "TidyScreen":
@@ -132,6 +132,64 @@ elif page == "Receptors":
         if st.session_state["show_receptors_models"]:
             st.dataframe(df_receptors_models)
 
+
+elif page == "Docking Methods":
+    st.title("Docking Methods")
+    st.write(f"Docking methods registered for project: {st.session_state.get('selected_project', 'Unknown')}.")
+
+    docking_methods_db_path = os.path.join(
+        st.session_state["active_project_path"], "docking", "docking_registers", "docking_methods.db"
+    )
+
+    try:
+        df_methods = st_funcs.get_docking_methods(docking_methods_db_path)
+    except Exception:
+        df_methods = None
+
+    if df_methods is None or df_methods.empty:
+        st.markdown(
+            f"<span style='font-size: 24px; color: orange;'>No docking methods registered for project: </span>"
+            f"<span style='font-size: 30px; color: green; font-weight: bold;'><b>{st.session_state.get('selected_project', 'Unknown')}</b></span>",
+            unsafe_allow_html=True
+        )
+    else:
+        ## Show/hide summary table
+        if "show_docking_methods" not in st.session_state:
+            st.session_state["show_docking_methods"] = False
+
+        if st.button(f"{'Hide' if st.session_state['show_docking_methods'] else 'Show'} Docking Methods Table"):
+            st.session_state["show_docking_methods"] = not st.session_state["show_docking_methods"]
+
+        if st.session_state["show_docking_methods"]:
+            st.dataframe(df_methods[["id", "method_name", "docking_engine", "description", "created_date"]])
+
+        ## Select a method to inspect details
+        method_names = df_methods["method_name"].dropna().unique().tolist()
+        if "selected_docking_method" not in st.session_state and method_names:
+            st.session_state["selected_docking_method"] = method_names[0]
+
+        selected_method = st.selectbox(
+            "Select a docking method to inspect:",
+            method_names,
+            key="select_docking_method",
+            index=method_names.index(st.session_state.get("selected_docking_method", method_names[0])) if method_names else 0
+        )
+        if selected_method != st.session_state.get("selected_docking_method"):
+            st.session_state["selected_docking_method"] = selected_method
+
+        method_row = df_methods[df_methods["method_name"] == selected_method].iloc[0]
+
+        st.markdown(f"### Method: `{method_row['method_name']}`")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown(f"**Docking Engine:** {method_row['docking_engine']}")
+            st.markdown(f"**Description:** {method_row['description'] or 'N/A'}")
+            st.markdown(f"**Created:** {method_row['created_date']}")
+        with col2:
+            st.markdown("**Docking Parameters:**")
+            st.code(method_row["parameters"] or "N/A", language="json")
+            st.markdown("**Ligand Preparation Parameters:**")
+            st.code(method_row["ligand_prep_params"] or "N/A", language="json")
 
 elif page == "MolDock":
     st.title("MolDock")

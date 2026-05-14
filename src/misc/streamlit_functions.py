@@ -49,6 +49,26 @@ def get_tables_info(db_path):
     except Exception as e:
         return pd.DataFrame([{'table': 'Error', 'rows': str(e)}])
     
+def get_docking_methods(db_path):
+    """
+    Retrieve all entries from the 'docking_methods' table.
+
+    Args:
+        db_path (str): Path to the docking_methods.db SQLite database.
+
+    Returns:
+        pd.DataFrame: DataFrame with all docking method records, or None on error.
+    """
+    columns = ['id', 'method_name', 'docking_engine', 'description', 'parameters', 'ligand_prep_params', 'created_date']
+    try:
+        conn = sqlite3.connect(db_path)
+        query = f"SELECT {', '.join(columns)} FROM docking_methods"
+        df = pd.read_sql_query(query, conn)
+        conn.close()
+        return df
+    except Exception as e:
+        return None
+
 def get_docking_assay_registers(db_path):
     """
     Retrieve columns 'assay_name', 'table_name', 'docking_method_name', 'compound_count', and 'notes'
