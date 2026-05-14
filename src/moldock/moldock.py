@@ -8653,13 +8653,20 @@ loadamberparams {frcmod_file}
 
         assay_id, assay_name, docking_engine, assay_folder, status = selected_assay
 
+        # Reconstruct assay folder path from self.path to handle project relocations.
+        reconstructed_folder = os.path.join(self.path, 'docking', 'docking_assays', assay_name)
+        if os.path.exists(reconstructed_folder):
+            assay_folder = reconstructed_folder
+        elif not os.path.exists(assay_folder):
+            print(f"❌ Assay folder not found at reconstructed path: {reconstructed_folder}")
+            print(f"   Also not found at stored path: {assay_folder}")
+            return None
+
         # Locate results directory
         results_dir = os.path.join(assay_folder, "results")
         if not os.path.exists(results_dir):
             print(f"❌ Results directory not found: {results_dir}")
             return None
-
-        print(docking_engine)
 
         # Create the path were the database to be analyzed lives
         db_path = os.path.join(results_dir, f"assay_{assay_id}.db")
