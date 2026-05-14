@@ -8253,6 +8253,90 @@ class MolDock:
             print(f"Notes: {notes}")
             print("-" * 40)
 
+    def export_receptor_config(self) -> Optional[str]:
+        """
+        List available receptor models and export the 'configs' of the selected
+        one to a JSON file placed alongside its PDBQT file.
+
+        Returns:
+            str: Path to the written JSON file, or None on failure/cancellation.
+        """
+        import sqlite3
+        import json
+
+        receptors_db_path = os.path.join(self.path, 'docking', 'receptors', 'receptors.db')
+        if not os.path.exists(receptors_db_path):
+            print(f"❌ Database not found: {receptors_db_path}")
+            return None
+
+        try:
+            conn = sqlite3.connect(receptors_db_path)
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT id, receptor_model_name, template_name, pdb_model_name, pdbqt_file, configs
+                FROM receptor_models
+                ORDER BY id ASC
+            ''')
+            rows = cursor.fetchall()
+            conn.close()
+        except Exception as e:
+            print(f"❌ Error reading receptors.db: {e}")
+            return None
+
+        if not rows:
+            print("📋 No receptor models found in the database.")
+            return None
+
+        print("\n📋 Available Receptor Models:")
+        print("=" * 70)
+        for i, (rid, receptor_model_name, template_name, pdb_model_name, pdbqt_file, configs) in enumerate(rows, 1):
+            print(f"{i}. {receptor_model_name}  (ID: {rid})")
+            print(f"   Template: {template_name}")
+            print(f"   PDB Model: {pdb_model_name}")
+            print(f"   PDBQT: {os.path.basename(pdbqt_file) if pdbqt_file else 'N/A'}")
+        print("=" * 70)
+
+        while True:
+            try:
+                selection = input("Select a receptor by number (or 'cancel'): ").strip()
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    print("❌ Export cancelled.")
+                    return None
+                idx = int(selection) - 1
+                if 0 <= idx < len(rows):
+                    break
+                print(f"❌ Enter a number between 1 and {len(rows)}.")
+            except ValueError:
+                print("❌ Please enter a valid number.")
+            except KeyboardInterrupt:
+                print("\n❌ Export cancelled.")
+                return None
+
+        rid, receptor_model_name, template_name, pdb_model_name, pdbqt_file, configs_raw = rows[idx]
+
+        if not configs_raw:
+            print("❌ No configs data found for the selected receptor model.")
+            return None
+
+        try:
+            configs_dict = json.loads(configs_raw)
+            configs_dict.pop('grids_path', None)
+        except json.JSONDecodeError as e:
+            print(f"❌ Failed to parse configs JSON: {e}")
+            return None
+
+        output_dir = os.path.dirname(pdbqt_file) if pdbqt_file else os.path.join(self.path, 'docking', 'receptors')
+        output_path = os.path.join(output_dir, f"{receptor_model_name}_config.json")
+
+        try:
+            with open(output_path, 'w') as f:
+                json.dump(configs_dict, f, indent=4)
+            print(f"✅ Receptor config exported to: {output_path}")
+            return output_path
+        except Exception as e:
+            print(f"❌ Failed to write config file: {e}")
+            return None
+
     def delete_receptor_model(self):
         """
         List available receptor models from the receptors database and prompt the user to select one for deletion.
