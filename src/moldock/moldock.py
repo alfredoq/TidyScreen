@@ -3836,7 +3836,7 @@ except Exception as e:
             
             # Display selected model info
             print(f"\n{'=' * 80}")
-            print(f"✓ Selected Model: {selected_model['pdb_name']}")
+            print(f"✓ Selected Model: {selected_model['pdb_model_name']}")
             print(f"  Original name: {selected_model['filename']}")
             print(f"  File size: {selected_model['file_size']:,} bytes" if selected_model['file_size'] else "  File size: Unknown")
             print(f"{'=' * 80}")
@@ -3849,7 +3849,7 @@ except Exception as e:
             cursor = conn.cursor()
             
             cursor.execute('''
-                SELECT pdb_blob FROM pdb_files WHERE file_id = ?
+                SELECT pdb_blob FROM pdb_models WHERE file_id = ?
             ''', (selected_model['file_id'],))
             
             result = cursor.fetchone()
@@ -3894,7 +3894,7 @@ except Exception as e:
             print(f"✅ PDB FILE RETRIEVED AND WRITTEN SUCCESSFULLY")
             print(f"{'=' * 80}")
             print(f"   📋 Model ID: {selected_model['file_id']}")
-            print(f"   🏷️  Model Name: {selected_model['pdb_name']}")
+            print(f"   🏷️  Model Name: {selected_model['pdb_model_name']}")
             print(f"   📁 Output Filename: {output_filename}")
             print(f"   📍 Output Path: {output_path}")
             print(f"   📊 File Size: {written_size:,} bytes")
@@ -3905,7 +3905,7 @@ except Exception as e:
             
             return {
                 'file_id': selected_model['file_id'],
-                'model_name': selected_model['pdb_name'],
+                'model_name': selected_model['pdb_model_name'],
                 'filename': output_filename,
                 'output_path': output_path,
                 'file_size': written_size,
