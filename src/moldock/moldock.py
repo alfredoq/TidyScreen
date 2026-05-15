@@ -6838,7 +6838,170 @@ class MolDock:
         else:
             print("❌ Failed to create PDBQT file.")
             return None
-        
+
+    def create_receptor_for_docking_from_config(self, config_file: str = None, selection: int = None):
+        """
+        Duplicate of create_receptor_for_docking() that reads docking parameters from a JSON config
+        file (as written by export_receptor_config()) instead of prompting the user interactively.
+
+        The config file must contain the following keys:
+            - center          : dict with 'x', 'y', 'z' (float) – box center coordinates
+            - size            : dict with 'x', 'y', 'z' (int)   – box dimensions
+            - biases          : list of bias point dicts or null  – ANSED bias potentials
+            - dielectric      : float – dielectric constant
+            - smooth          : float – smooth constant
+            - spacing         : float – spacing
+            - receptor_charge_model : str – charge model ('gasteiger', 'espaloma')
+
+        Args:
+            config_file (str): Path to the JSON config file. If None, the user will be prompted.
+            selection   (int): 1-based index of the PDB entry to use. If None, the user is prompted.
+        """
+        import sqlite3
+        import json
+
+        # ── Load config file ──────────────────────────────────────────────────
+        if config_file is None:
+            try:
+                config_file = input("Enter path to receptor config JSON file: ").strip()
+            except KeyboardInterrupt:
+                print("\n❌ Config file entry cancelled.")
+                return None
+
+        if not os.path.exists(config_file):
+            print(f"❌ Config file not found: {config_file}")
+            return None
+
+        try:
+            with open(config_file, 'r') as f:
+                configs = json.load(f)
+        except Exception as e:
+            print(f"❌ Failed to read config file: {e}")
+            return None
+
+        required_keys = ['center', 'size', 'dielectric', 'smooth', 'spacing', 'receptor_charge_model']
+        missing = [k for k in required_keys if k not in configs]
+        if missing:
+            print(f"❌ Config file is missing required keys: {missing}")
+            return None
+
+        # Ensure 'biases' key exists (may be absent in older exports)
+        configs.setdefault('biases', None)
+
+        print("\n📄 Loaded receptor config:")
+        print(f"   Center   : {configs['center']}")
+        print(f"   Size     : {configs['size']}")
+        print(f"   Dielectric : {configs['dielectric']}")
+        print(f"   Smooth   : {configs['smooth']}")
+        print(f"   Spacing  : {configs['spacing']}")
+        print(f"   Charge model : {configs['receptor_charge_model']}")
+        print(f"   Biases   : {'yes' if configs['biases'] else 'none'}")
+
+        # ── Select PDB ────────────────────────────────────────────────────────
+        pdbs_db_path = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
+        if not os.path.exists(pdbs_db_path):
+            print(f"❌ No pdbs database found at {pdbs_db_path}")
+            return None
+
+        try:
+            conn = sqlite3.connect(pdbs_db_path)
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT pdb_id, pdb_template_name, pdb_model_name, processed_pdb_path, checked_pdb_path, template_folder_path, notes
+                FROM pdb_templates
+                ORDER BY pdb_id ASC
+            ''')
+            pdbs = cursor.fetchall()
+            conn.close()
+        except Exception as e:
+            print(f"❌ Error loading PDB files database: {e}")
+            return None
+
+        if not pdbs:
+            print("❌ No PDB files found in the database.")
+            return None
+
+        print("\n📋 Available PDB templates:")
+        print("=" * 60)
+        for i, (rid, template_name, pdb_model_name, processed_pdb, checked_pdb, folder, notes) in enumerate(pdbs, 1):
+            print(f"{i}. {template_name} - {pdb_model_name} (ID: {rid})")
+            print(f"   PDB Model: {pdb_model_name}")
+            print(f"   Processed PDB: {os.path.basename(processed_pdb)}")
+            print(f"   Checked PDB: {os.path.basename(checked_pdb)}")
+            print(f"   Folder: {os.path.relpath(folder)}")
+            print(f"   Notes: {notes}")
+        print("=" * 60)
+
+        if selection is None:
+            while True:
+                try:
+                    selection_input = input("Select the pdb file by number (or 'cancel'): ").strip()
+                    if selection_input.lower() in ['cancel', 'quit', 'exit']:
+                        print("❌ PDB file selection cancelled.")
+                        return None
+                    try:
+                        idx = int(selection_input) - 1
+                        if 0 <= idx < len(pdbs):
+                            selected = pdbs[idx]
+                            break
+                        else:
+                            print(f"❌ Invalid selection. Enter a number between 1 and {len(pdbs)}.")
+                    except ValueError:
+                        print("❌ Please enter a valid number.")
+                except KeyboardInterrupt:
+                    print("\n❌ PDB selection cancelled.")
+                    return None
+        else:
+            idx = selection - 1
+            if 0 <= idx < len(pdbs):
+                selected = pdbs[idx]
+            else:
+                print(f"❌ Invalid selection. Enter a number between 1 and {len(pdbs)}.")
+                return None
+
+        pdb_id, template_name, pdb_model_name, processed_pdb_path, checked_pdb_path, folder, notes = selected
+
+        processed_pdb_path = self._rebase_project_path(processed_pdb_path)
+        checked_pdb_path   = self._rebase_project_path(checked_pdb_path)
+        folder             = self._rebase_project_path(folder)
+
+        pdb_to_convert = checked_pdb_path
+
+        # ── Create PDBQT using the configs loaded from the file ───────────────
+        pdbqt_file = self._create_pdbqt_from_pdb_with_config(pdb_to_convert, configs)
+
+        # ── Zn check ──────────────────────────────────────────────────────────
+        has_ZN = self._check_ZN_presence(pdbqt_file, folder)
+
+        if has_ZN:
+            print("⚠️  Zn atom(s) detected in the receptor structure.")
+            while True:
+                zn_choice = input("Do you want to process with AutoDock4Zn parameters? (y/n): ").strip().lower()
+                if zn_choice in ['y', 'yes']:
+                    print("✅ AutoDock4Zn parameters will be applied.")
+                    self._apply_ad4zn_params(pdbqt_file, folder)
+                    break
+                elif zn_choice in ['n', 'no']:
+                    print("ℹ️  Skipping AutoDock4Zn processing.")
+                    has_ZN = False
+                    break
+                else:
+                    print("❌ Please answer 'y' or 'n'.")
+
+            print("✅ AutoDock4Zn parameters to be applied.")
+
+        last_receptor_model_id = self._get_last_receptor_model_id()
+        receptor_model_id = int(last_receptor_model_id) + 1
+
+        configs = self._create_receptor_grids(pdbqt_file, configs, folder, has_ZN, receptor_model_id)
+
+        if pdbqt_file:
+            self._create_receptor_register(pdb_id, template_name, pdb_model_name, pdb_to_convert, pdbqt_file, configs)
+            print(f"✅ PDBQT file created: {pdbqt_file}")
+        else:
+            print("❌ Failed to create PDBQT file.")
+            return None
+
     def _create_pdbqt_from_pdb(self, pdb_to_convert):
         
         from meeko import MoleculePreparation, ResidueChemTemplates
@@ -6863,6 +7026,41 @@ class MolDock:
         
         if os.path.exists(destination_pdbqt):
             return destination_pdbqt, configs
+        else:
+            print(f"❌ Failed to create PDBQT file at {destination_pdbqt}")
+            return False
+
+    def _create_pdbqt_from_pdb_with_config(self, pdb_to_convert: str, configs: dict):
+        """
+        Convert a PDB file to PDBQT using a pre-built configs dict (no interactive prompts).
+
+        This is the counterpart of _create_pdbqt_from_pdb() used by
+        create_receptor_for_docking_from_config() when parameters are loaded from a JSON file.
+
+        Args:
+            pdb_to_convert (str): Path to the checked PDB file.
+            configs        (dict): Config dict with at least 'receptor_charge_model'.
+
+        Returns:
+            str : Path to the created PDBQT file, or False on failure.
+        """
+        from meeko import MoleculePreparation, ResidueChemTemplates
+        from meeko import Polymer
+
+        structure = self._create_prody_selection(pdb_to_convert)
+
+        receptor_charge_model = configs.get('receptor_charge_model', 'gasteiger')
+        destination_pdbqt = pdb_to_convert.replace(".pdb", f"_{receptor_charge_model}.pdbqt")
+
+        mk_prep = MoleculePreparation(charge_model=receptor_charge_model)
+        print(f"Creating receptor .pdbqt file applying charge model: {receptor_charge_model}")
+        chem_templates = ResidueChemTemplates.create_from_defaults()
+        mypol = Polymer.from_prody(structure, chem_templates, mk_prep)
+
+        self._write_pdbqt(mypol, destination_pdbqt)
+
+        if os.path.exists(destination_pdbqt):
+            return destination_pdbqt
         else:
             print(f"❌ Failed to create PDBQT file at {destination_pdbqt}")
             return False
