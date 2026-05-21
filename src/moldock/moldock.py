@@ -6335,11 +6335,6 @@ class MolDock:
                 print("❌ tleap not found in PATH. Please install AmberTools and ensure tleap is available.")
                 return None
         
-        
-
-        
-        
-        
             # Process with tleap
             tleap_processed_file = receptor_file.replace(".pdb", "_checked.pdb")
             tleap_script = textwrap.dedent(f"""
@@ -6402,6 +6397,10 @@ class MolDock:
             print(e)
             return None
     
+
+    def _add_missing_atoms_in_pdb_tleap2(self, receptor_file, receptor_info, processed_dir):
+
+
         import tempfile
         import subprocess
         import textwrap
@@ -6426,7 +6425,6 @@ class MolDock:
                 f.write(f"source leaprc.gaff2\n")
                 f.write(f"HOH = WAT\n")
             f.close()
-            
             
             ligands_in_template = receptor_info.get('has_ligands', []) # Will return either True or False
             if ligands_in_template:
