@@ -1,7 +1,9 @@
 from io import StringIO
 import sqlite3
+import os
 import pandas as pd
 import matplotlib.pyplot as plt
+from datetime import datetime
 
 def read_database_as_dataframe(db_path, table_name):
     """
@@ -424,4 +426,119 @@ def create_mmpbsa_component_plot(df, x_col, y_col, title, xlabel, ylabel):
     ax.grid(axis='y', alpha=0.3)
 
     fig.set_size_inches(6, 3)
-    return fig
+
+
+def save_positive_binder(project_path: str, assay_name: str, pose_file: str, directory: str, pose_full_path: str) -> str:
+    """
+    Save a pose flagged as a positive binder to the positive_binders.db database.
+
+    The database is created at <project_path>/ml/training_sets/positive_binders.db.
+    Returns a status string: 'saved', 'duplicate', or 'error:<message>'.
+
+    Args:
+        project_path (str): Root path of the active project.
+        assay_name (str): Name of the docking assay.
+        pose_file (str): PDB filename of the pose.
+        directory (str): Pose folder name (e.g. 'most_stable_poses').
+        pose_full_path (str): Absolute path to the PDB file.
+    """
+    try:
+        db_dir = os.path.join(project_path, "ml", "training_sets")
+        os.makedirs(db_dir, exist_ok=True)
+        db_path = os.path.join(db_dir, "positive_binders.db")
+        conn = sqlite3.connect(db_path)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS positive_binders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                assay_name TEXT NOT NULL,
+                pose_file TEXT NOT NULL,
+                directory TEXT NOT NULL,
+                pose_full_path TEXT NOT NULL,
+                flagged_at TEXT NOT NULL,
+                UNIQUE(assay_name, pose_file, directory)
+            )
+        """)
+        conn.commit()
+        try:
+            conn.execute(
+                "INSERT INTO positive_binders (assay_name, pose_file, directory, pose_full_path, flagged_at) VALUES (?, ?, ?, ?, ?)",
+                (assay_name, pose_file, directory, pose_full_path, datetime.now().isoformat())
+            )
+            conn.commit()
+            status = "saved"
+        except sqlite3.IntegrityError:
+            status = "duplicate"
+        conn.close()
+        return status
+    except Exception as e:
+        return f"error:{e}"
+
+
+def save_negative_binder(project_path: str, assay_name: str, pose_file: str, directory: str, pose_full_path: str) -> str:
+    """
+    Save a pose flagged as a negative binder to the negative_binders.db database.
+
+    The database is created at <project_path>/ml/training_sets/negative_binders.db.
+    Returns a status string: 'saved', 'duplicate', or 'error:<message>'.
+
+    Args:
+        project_path (str): Root path of the active project.
+        assay_name (str): Name of the docking assay.
+        pose_file (str): PDB filename of the pose.
+        directory (str): Pose folder name (e.g. 'most_stable_poses').
+        pose_full_path (str): Absolute path to the PDB file.
+    """
+    try:
+        db_dir = os.path.join(project_path, "ml", "training_sets")
+        os.makedirs(db_dir, exist_ok=True)
+        db_path = os.path.join(db_dir, "negative_binders.db")
+        conn = sqlite3.connect(db_path)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS negative_binders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                assay_name TEXT NOT NULL,
+                pose_file TEXT NOT NULL,
+                directory TEXT NOT NULL,
+                pose_full_path TEXT NOT NULL,
+                flagged_at TEXT NOT NULL,
+                UNIQUE(assay_name, pose_file, directory)
+            )
+        """)
+        conn.commit()
+        try:
+            conn.execute(
+                "INSERT INTO negative_binders (assay_name, pose_file, directory, pose_full_path, flagged_at) VALUES (?, ?, ?, ?, ?)",
+                (assay_name, pose_file, directory, pose_full_path, datetime.now().isoformat())
+            )
+            conn.commit()
+            status = "saved"
+        except sqlite3.IntegrityError:
+            status = "duplicate"
+        conn.close()
+        return status
+    except Exception as e:
+        return f"error:{e}"
+
+
+def get_binders_registry(project_path: str, binder_type: str) -> "pd.DataFrame":
+    """
+    Load the positive or negative binders registry from the ml/training_sets database.
+
+    Args:
+        project_path (str): Root path of the active project.
+        binder_type (str): Either 'positive' or 'negative'.
+
+    Returns:
+        pd.DataFrame or None if the database/table does not exist.
+    """
+    db_path = os.path.join(project_path, "ml", "training_sets", f"{binder_type}_binders.db")
+    table = f"{binder_type}_binders"
+    if not os.path.exists(db_path):
+        return None
+    try:
+        conn = sqlite3.connect(db_path)
+        df = pd.read_sql_query(f"SELECT * FROM {table} ORDER BY flagged_at DESC", conn)
+        conn.close()
+        return df
+    except Exception:
+        return None

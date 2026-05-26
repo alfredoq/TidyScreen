@@ -16,7 +16,7 @@ st.set_page_config(page_title="TidyScreen App", layout="wide")
 st.sidebar.title("Navigation")
 page = st.sidebar.radio(
     "Go to",
-    ("TidyScreen", "ChemSpace", "Receptors", "Docking Methods", "MolDock", "Analysis")
+    ("TidyScreen", "ChemSpace", "Receptors", "Docking Methods", "MolDock", "Analysis", "ML")
 )
 
 ## Persistent sidebar info: active project and assay
@@ -313,15 +313,24 @@ elif page == "Analysis":
                             if st.session_state[key]:
                                 pdb_files = sorted(glob.glob(os.path.join(entry["path"], "*.pdb")))
                                 pdb_names = [os.path.basename(f) for f in pdb_files]
-                                sel_key = f"selected_pose_file_{entry['directory']}"
+                                idx_key = f"pose_idx_{entry['directory']}"
+                                if idx_key not in st.session_state:
+                                    st.session_state[idx_key] = 0
+                                ## Clamp index to valid range (e.g. folder contents changed)
+                                st.session_state[idx_key] = max(0, min(st.session_state[idx_key], len(pdb_names) - 1))
+
+                                ## Selectbox with NO key — driven entirely by idx_key via index param
                                 selected_file = st.selectbox(
                                     f"Select a pose file from {entry['directory']}:",
                                     pdb_names,
-                                    key=sel_key
+                                    index=st.session_state[idx_key],
                                 )
+                                ## Keep index in sync when user picks from the selectbox directly
+                                if selected_file:
+                                    st.session_state[idx_key] = pdb_names.index(selected_file)
+
                                 if selected_file:
                                     full_path = os.path.join(entry["path"], selected_file)
-                                    st.info(f"Selected: `{full_path}`")
                                     with open(full_path, "r") as f:
                                         pdb_data = f.read()
                                     view = py3Dmol.view(width=800, height=500)
@@ -334,15 +343,61 @@ elif page == "Analysis":
                                         view.setStyle({"model": 1}, {"sphere": {"colorscheme": "elementColors", "scale": 0.3, "opacity": 0.6}, "stick": {"colorscheme": "elementColors", "opacity": 0.6}})
                                     view.zoomTo()
 
-                                    if st.session_state.get("reference_pdb_data"):
-                                        viewer_col, btn_col = st.columns([4, 1])
-                                        with viewer_col:
-                                            st.components.v1.html(view.write_html(), height=520)
-                                        with btn_col:
-                                            st.button("✅ Flag positive binding pose", key=f"flag_pos_{entry['directory']}_{selected_file}")
-                                            st.button("❌ Flag negative binding pose", key=f"flag_neg_{entry['directory']}_{selected_file}")
-                                    else:
+                                    ## Navigation prev/next arrow buttons flanking the viewer
+                                    current_idx = st.session_state[idx_key]
+                                    has_ref = st.session_state.get("reference_pdb_data")
+                                    prev_col, viewer_col, next_col = st.columns([0.5, 8, 0.5 if not has_ref else 1])
+                                    with prev_col:
+                                        st.write("")  ## vertical alignment spacer
+                                        st.write("")
+                                        st.write("")
+                                        if st.button("◀", key=f"prev_pose_{entry['directory']}", disabled=(current_idx == 0)):
+                                            st.session_state[idx_key] = current_idx - 1
+                                            st.rerun()
+                                    with viewer_col:
                                         st.components.v1.html(view.write_html(), height=520)
+                                    with next_col:
+                                        st.write("")
+                                        st.write("")
+                                        st.write("")
+                                        if st.button("▶", key=f"next_pose_{entry['directory']}", disabled=(current_idx >= len(pdb_names) - 1)):
+                                            st.session_state[idx_key] = current_idx + 1
+                                            st.rerun()
+                                        if has_ref:
+                                            st.write("")
+                                            flag_pos_key = f"flag_pos_{entry['directory']}_{selected_file}"
+                                            if st.button("✅ Flag positive binding pose", key=flag_pos_key):
+                                                result = st_funcs.save_positive_binder(
+                                                    project_path=st.session_state["active_project_path"],
+                                                    assay_name=st.session_state.get("selected_assay_name", "unknown"),
+                                                    pose_file=selected_file,
+                                                    directory=entry["directory"],
+                                                    pose_full_path=full_path,
+                                                )
+                                                if result == "saved":
+                                                    st.success(f"Saved: {selected_file}")
+                                                elif result == "duplicate":
+                                                    st.warning("Already flagged.")
+                                                else:
+                                                    st.error(result)
+                                            flag_neg_key = f"flag_neg_{entry['directory']}_{selected_file}"
+                                            if st.button("❌ Flag negative binding pose", key=flag_neg_key):
+                                                result = st_funcs.save_negative_binder(
+                                                    project_path=st.session_state["active_project_path"],
+                                                    assay_name=st.session_state.get("selected_assay_name", "unknown"),
+                                                    pose_file=selected_file,
+                                                    directory=entry["directory"],
+                                                    pose_full_path=full_path,
+                                                )
+                                                if result == "saved":
+                                                    st.success(f"Saved: {selected_file}")
+                                                elif result == "duplicate":
+                                                    st.warning("Already flagged.")
+                                                else:
+                                                    st.error(result)
+
+                                    ## pose counter label
+                                    st.caption(f"Pose {current_idx + 1} of {len(pdb_names)}")
                         else:
                             st.button(label, disabled=True, key=key + "_btn")
 
@@ -753,3 +808,32 @@ elif page == "Analysis":
                 
                 
     
+elif page == "ML":
+    st.title("Machine Learning")
+
+    if "active_project_path" not in st.session_state:
+        st.warning("No active project. Please select a project first.")
+    else:
+        project_path = st.session_state["active_project_path"]
+
+        st.subheader("Training Set Registries")
+
+        ## --- Positive binders ---
+        st.markdown("### ✅ Positive Binders")
+        df_pos = st_funcs.get_binders_registry(project_path, "positive")
+        if df_pos is None or df_pos.empty:
+            st.info("No positive binders registered yet.")
+        else:
+            st.success(f"{len(df_pos)} positive binder(s) registered.")
+            st.dataframe(df_pos, use_container_width=True)
+
+        st.divider()
+
+        ## --- Negative binders ---
+        st.markdown("### ❌ Negative Binders")
+        df_neg = st_funcs.get_binders_registry(project_path, "negative")
+        if df_neg is None or df_neg.empty:
+            st.info("No negative binders registered yet.")
+        else:
+            st.success(f"{len(df_neg)} negative binder(s) registered.")
+            st.dataframe(df_neg, use_container_width=True)
