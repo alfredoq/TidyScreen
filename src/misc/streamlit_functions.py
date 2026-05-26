@@ -112,6 +112,121 @@ def get_docking_results(db_path):
         
         return None
 
+def get_extracted_poses_info(results_db_path):
+    """
+    Check for extracted docked poses in the four known output subdirectories adjacent to the results DB.
+
+    Always returns all four entries. Each entry has:
+      - 'directory': folder name
+      - 'count': number of PDB files (0 if folder absent or empty)
+      - 'path': full path to the folder
+      - 'active': True if the folder exists and contains at least one PDB file
+    """
+    import os
+    import glob
+
+    results_dir = os.path.dirname(os.path.abspath(results_db_path))
+    pose_dirs = ["most_stable_poses", "most_populated_poses", "most_populated_and_stable_poses", "all_poses"]
+    entries = []
+    for name in pose_dirs:
+        full_path = os.path.join(results_dir, name)
+        if os.path.isdir(full_path):
+            pdb_files = glob.glob(os.path.join(full_path, "*.pdb"))
+            count = len(pdb_files)
+            active = count > 0
+        else:
+            count = 0
+            active = False
+        entries.append({"directory": name, "count": count, "path": full_path, "active": active})
+    return entries
+
+def get_prolif_all_column_names(db_path, table_name):
+    """
+    Return the sorted union of all column names across every pose stored in table_name.
+    This ensures filter checkboxes cover interaction types that may be absent in a single pose.
+    """
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute(f"SELECT data FROM {table_name}")
+        rows = cursor.fetchall()
+        conn.close()
+        all_cols = set()
+        for (data_json,) in rows:
+            df = pd.read_json(data_json, orient='split')
+            all_cols.update(df.columns.tolist())
+        return sorted(all_cols)
+    except Exception:
+        return []
+
+def get_all_prolif_fingerprints(db_path, table_name):
+    """
+    Retrieve and concatenate ProLIF fingerprint DataFrames for all poses in the given table.
+    A 'pose_id' column is prepended to identify each row's origin.
+    Returns a combined DataFrame or None if the table is empty / on error.
+    """
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute(f"SELECT pose_id, data FROM {table_name} ORDER BY pose_id")
+        rows = cursor.fetchall()
+        conn.close()
+        if not rows:
+            return None
+        frames = []
+        for pose_id, data_json in rows:
+            df = pd.read_json(data_json, orient='split')
+            df.insert(0, 'pose_id', pose_id)
+            frames.append(df)
+        return pd.concat(frames, ignore_index=True)
+    except Exception:
+        return None
+
+def get_prolif_tables(db_path):
+    """
+    Return a list of ProLIF fingerprint table names present in the results database.
+    Tables follow the pattern 'processed_prolif_fps_json_condition_<N>'.
+    Returns an empty list if none are found.
+    """
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'processed_prolif_fps_json_condition_%';")
+        tables = [row[0] for row in cursor.fetchall()]
+        conn.close()
+        return tables
+    except Exception:
+        return []
+
+def get_prolif_poses(db_path, table_name):
+    """
+    Return a DataFrame with pose_id and computation_mode for all entries in the given ProLIF table.
+    """
+    try:
+        conn = sqlite3.connect(db_path)
+        df = pd.read_sql_query(f"SELECT pose_id, computation_mode FROM {table_name} ORDER BY pose_id", conn)
+        conn.close()
+        return df
+    except Exception:
+        return None
+
+def get_prolif_fingerprint_for_pose(db_path, table_name, pose_id):
+    """
+    Retrieve and reconstruct the ProLIF fingerprint DataFrame for a given pose_id.
+    Returns a DataFrame or None if not found.
+    """
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute(f"SELECT data FROM {table_name} WHERE pose_id = ?", (pose_id,))
+        row = cursor.fetchone()
+        conn.close()
+        if row is None:
+            return None
+        return pd.read_json(row[0], orient='split')
+    except Exception:
+        return None
+
 def get_mmpbsa_results(db_path):
     
     # check if the MMPBSA_results table exists

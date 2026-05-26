@@ -3,6 +3,8 @@ from tidyscreen import tidyscreen
 import io
 import sys
 import os
+import glob
+import py3Dmol
 import streamlit_functions as st_funcs
 
 tidyscreen_package_path = sys.argv[1]
@@ -16,6 +18,15 @@ page = st.sidebar.radio(
     "Go to",
     ("TidyScreen", "ChemSpace", "Receptors", "Docking Methods", "MolDock", "Analysis")
 )
+
+## Persistent sidebar info: active project and assay
+st.sidebar.divider()
+active_project = st.session_state.get("activate_project_selectbox") or st.session_state.get("selected_project")
+active_assay = st.session_state.get("select_assay_name") or st.session_state.get("selected_assay_name")
+st.sidebar.markdown("**Active project:**")
+st.sidebar.info(active_project if active_project else "None selected")
+st.sidebar.markdown("**Active docking assay:**")
+st.sidebar.info(active_assay if active_assay else "None selected")
 
 if page == "TidyScreen":
     st.title("TidyScreen")
@@ -265,8 +276,78 @@ elif page == "Analysis":
             if st.session_state["show_results"]:
                 st.write(df_results)
 
+            ## Single "View Poses" button that expands to show the four folder buttons
+            extracted_poses = st_funcs.get_extracted_poses_info(results_db_path)
+            any_active = any(e["active"] for e in extracted_poses)
+
+            if not any_active:
+                st.button("View Poses", disabled=True)
+            else:
+                if "show_view_poses" not in st.session_state:
+                    st.session_state["show_view_poses"] = False
+
+                if st.button(f"{'Hide' if st.session_state['show_view_poses'] else 'View'} Poses"):
+                    st.session_state["show_view_poses"] = not st.session_state["show_view_poses"]
+
+                if st.session_state["show_view_poses"]:
+                    ## Reference PDB uploader (shared across all pose folders)
+                    ref_file = st.file_uploader(
+                        "Load a reference PDB for superimposition (optional):",
+                        type=["pdb"],
+                        key="reference_pdb_uploader"
+                    )
+                    if ref_file is not None:
+                        st.session_state["reference_pdb_data"] = ref_file.read().decode("utf-8")
+                        st.success(f"Reference loaded: {ref_file.name}")
+                    elif "reference_pdb_data" not in st.session_state:
+                        st.session_state["reference_pdb_data"] = None
+
+                    for entry in extracted_poses:
+                        label = f"{entry['directory']} ({entry['count']} PDB files)" if entry["active"] else entry["directory"]
+                        key = f"btn_poses_{entry['directory']}"
+                        if entry["active"]:
+                            if key not in st.session_state:
+                                st.session_state[key] = False
+                            if st.button(f"{'Hide' if st.session_state[key] else 'Show'} {label}", key=key + "_btn"):
+                                st.session_state[key] = not st.session_state[key]
+                            if st.session_state[key]:
+                                pdb_files = sorted(glob.glob(os.path.join(entry["path"], "*.pdb")))
+                                pdb_names = [os.path.basename(f) for f in pdb_files]
+                                sel_key = f"selected_pose_file_{entry['directory']}"
+                                selected_file = st.selectbox(
+                                    f"Select a pose file from {entry['directory']}:",
+                                    pdb_names,
+                                    key=sel_key
+                                )
+                                if selected_file:
+                                    full_path = os.path.join(entry["path"], selected_file)
+                                    st.info(f"Selected: `{full_path}`")
+                                    with open(full_path, "r") as f:
+                                        pdb_data = f.read()
+                                    view = py3Dmol.view(width=800, height=500)
+                                    ## Add selected pose (model 0) — stick + spectrum cartoon
+                                    view.addModel(pdb_data, "pdb")
+                                    view.setStyle({"model": 0}, {"stick": {}, "cartoon": {"color": "spectrum"}})
+                                    ## Add reference structure (model 1) if loaded — CPK spheres
+                                    if st.session_state.get("reference_pdb_data"):
+                                        view.addModel(st.session_state["reference_pdb_data"], "pdb")
+                                        view.setStyle({"model": 1}, {"sphere": {"colorscheme": "elementColors", "scale": 0.3, "opacity": 0.6}, "stick": {"colorscheme": "elementColors", "opacity": 0.6}})
+                                    view.zoomTo()
+
+                                    if st.session_state.get("reference_pdb_data"):
+                                        viewer_col, btn_col = st.columns([4, 1])
+                                        with viewer_col:
+                                            st.components.v1.html(view.write_html(), height=520)
+                                        with btn_col:
+                                            st.button("✅ Flag positive binding pose", key=f"flag_pos_{entry['directory']}_{selected_file}")
+                                            st.button("❌ Flag negative binding pose", key=f"flag_neg_{entry['directory']}_{selected_file}")
+                                    else:
+                                        st.components.v1.html(view.write_html(), height=520)
+                        else:
+                            st.button(label, disabled=True, key=key + "_btn")
+
             if df_mmpbsa_poses_results is None or df_mmpbsa_poses_results.empty:
-                st.warning("No MMPBSA results")
+                st.button(f"No MMPBSA results available for {st.session_state['selected_assay_name']}", disabled=True)
             else:
                 ## Button to show/hide MMPBSA results DataFrame
                 if "show_mmpbsa_results" not in st.session_state:
@@ -576,6 +657,76 @@ elif page == "Analysis":
                         
                     else:
                         st.warning("No valid pose IDs found in MMPBSA results")
+
+            # ProLIF fingerprints button
+            prolif_tables = st_funcs.get_prolif_tables(results_db_path)
+            if not prolif_tables:
+                st.button("Show ProLIF Fingerprints", disabled=True)
+            else:
+                if "show_prolif" not in st.session_state:
+                    st.session_state["show_prolif"] = False
+
+                if st.button(f"{'Hide' if st.session_state['show_prolif'] else 'Show'} ProLIF Fingerprints"):
+                    st.session_state["show_prolif"] = not st.session_state["show_prolif"]
+
+                if st.session_state["show_prolif"]:
+                    selected_table = st.selectbox(
+                        "Select a ProLIF condition table:",
+                        prolif_tables,
+                        key="select_prolif_table"
+                    )
+                    prolif_poses_df = st_funcs.get_prolif_poses(results_db_path, selected_table)
+                    if prolif_poses_df is not None and not prolif_poses_df.empty:
+                        pose_options = prolif_poses_df["pose_id"].tolist()
+                        selected_prolif_pose = st.selectbox(
+                            "Select a pose to display fingerprints:",
+                            pose_options,
+                            key="select_prolif_pose"
+                        )
+                        fps_df = st_funcs.get_prolif_fingerprint_for_pose(results_db_path, selected_table, selected_prolif_pose)
+
+                        if fps_df is not None and not fps_df.empty:
+                            ## Build interaction-type filter checkboxes from the union of ALL poses' columns
+                            reserved = {"pose_id"}
+                            all_columns = st_funcs.get_prolif_all_column_names(results_db_path, selected_table)
+                            all_interaction_types = sorted(set(
+                                col.split("_")[-1] for col in all_columns if col not in reserved
+                            ))
+                            st.markdown("**Filter by interaction type:**")
+                            filter_cols = st.columns(min(len(all_interaction_types), 6))
+                            selected_types = []
+                            for i, itype in enumerate(all_interaction_types):
+                                ck_key = f"prolif_filter_{itype}"
+                                if ck_key not in st.session_state:
+                                    st.session_state[ck_key] = True
+                                checked = filter_cols[i % len(filter_cols)].checkbox(itype, key=ck_key)
+                                if checked:
+                                    selected_types.append(itype)
+
+                            def filter_fps(df):
+                                keep = [c for c in df.columns
+                                        if c in reserved or c.split("_")[-1] in selected_types]
+                                return df[keep]
+
+                            st.dataframe(filter_fps(fps_df), use_container_width=True)
+                        else:
+                            st.warning(f"No fingerprint data found for pose {selected_prolif_pose}.")
+
+                        ## Button to concatenate and display all poses for the selected condition
+                        if "show_all_prolif" not in st.session_state:
+                            st.session_state["show_all_prolif"] = False
+
+                        if st.button(f"{'Hide' if st.session_state['show_all_prolif'] else 'Show'} all fingerprints for {selected_table}"):
+                            st.session_state["show_all_prolif"] = not st.session_state["show_all_prolif"]
+
+                        if st.session_state["show_all_prolif"]:
+                            all_fps_df = st_funcs.get_all_prolif_fingerprints(results_db_path, selected_table)
+                            if all_fps_df is not None and not all_fps_df.empty:
+                                st.dataframe(filter_fps(all_fps_df), use_container_width=True)
+                            else:
+                                st.warning("Could not retrieve fingerprints for all poses.")
+                    else:
+                        st.warning("No poses found in the selected ProLIF table.")
 
             # Create a button to show/hide the histogram of docking scores for the selected ligand in the selected assay
             if st.button("Show/Hide Histogram"):
