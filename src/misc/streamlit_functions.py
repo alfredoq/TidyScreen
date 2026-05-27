@@ -1,4 +1,4 @@
-from io import StringIO
+from io import StringIO, BytesIO
 import sqlite3
 import os
 import pandas as pd
@@ -542,3 +542,119 @@ def get_binders_registry(project_path: str, binder_type: str) -> "pd.DataFrame":
         return df
     except Exception:
         return None
+
+
+def get_table_columns(db_path: str, table_name: str) -> list:
+    """
+    Return the list of column names for a given table in a SQLite database.
+
+    Args:
+        db_path (str): Path to the SQLite database.
+        table_name (str): Name of the table.
+
+    Returns:
+        list[str]: Column names, or empty list on error.
+    """
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute(f"SELECT * FROM [{table_name}] LIMIT 0")
+        columns = [desc[0] for desc in cursor.description]
+        conn.close()
+        return columns
+    except Exception:
+        return []
+
+
+def depict_table_to_images(db_path: str, table_name: str,
+                           max_molecules: int = 25,
+                           molecules_per_image: int = 25,
+                           mol_image_size: tuple = (300, 300),
+                           legend_col: str = None) -> list:
+    """
+    Generate in-memory molecule grid images from a chemspace table for Streamlit display.
+
+    Mirrors the logic of ChemSpace.depict_table but returns PIL Images instead of
+    saving files to disk, so they can be rendered inline with st.image().
+
+    Args:
+        db_path (str): Path to the chemspace SQLite database.
+        table_name (str): Name of the table to depict.
+        max_molecules (int): Maximum number of molecules to render (-1 for all).
+        molecules_per_image (int): Number of molecules per grid image.
+        mol_image_size (tuple): (width, height) of each molecule cell in the grid.
+        legend_col (str): Column to use as molecule label. Defaults to 'id' if present,
+                          otherwise the first column.
+
+    Returns:
+        list[PIL.Image.Image]: List of grid images ready for st.image(). Empty on error.
+    """
+    try:
+        from rdkit import Chem
+        from rdkit.Chem import Draw
+    except ImportError:
+        raise ImportError("RDKit is required for depiction. Install with: conda install -c conda-forge rdkit")
+
+    try:
+        conn = sqlite3.connect(db_path)
+        df = pd.read_sql_query(f"SELECT * FROM [{table_name}]", conn)
+        conn.close()
+    except Exception as e:
+        raise RuntimeError(f"Could not read table '{table_name}': {e}")
+
+    if df.empty:
+        return []
+
+    if 'smiles' not in df.columns:
+        raise ValueError(f"Table '{table_name}' has no 'smiles' column.")
+
+    total = len(df)
+    if max_molecules == -1 or max_molecules >= total:
+        subset = df
+    else:
+        subset = df.head(max_molecules)
+
+    # Determine legend column: use caller's choice, else 'id', else first column
+    if legend_col and legend_col in subset.columns:
+        effective_legend_col = legend_col
+    elif 'id' in subset.columns:
+        effective_legend_col = 'id'
+    else:
+        effective_legend_col = subset.columns[0]
+
+    # Calculate grid column count from molecules_per_image
+    grid_cols = max(1, int(molecules_per_image ** 0.5))
+
+    images = []
+    batch_size = molecules_per_image
+    rows_list = list(subset.itertuples(index=False))
+
+    for batch_start in range(0, len(rows_list), batch_size):
+        batch = rows_list[batch_start:batch_start + batch_size]
+        mols = []
+        legends = []
+
+        for row in batch:
+            smiles = getattr(row, 'smiles', None)
+            if not smiles:
+                continue
+            mol = Chem.MolFromSmiles(str(smiles))
+            if mol is None:
+                continue
+            mols.append(mol)
+            legend_val = str(getattr(row, effective_legend_col, ''))[:40]
+            legends.append(legend_val)
+
+        if not mols:
+            continue
+
+        img = Draw.MolsToGridImage(
+            mols,
+            molsPerRow=grid_cols,
+            subImgSize=mol_image_size,
+            legends=legends,
+            returnPNG=False
+        )
+        images.append(img)
+
+    return images

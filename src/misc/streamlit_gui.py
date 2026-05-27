@@ -71,6 +71,71 @@ elif page == "ChemSpace":
     ## Create a button to show the project tables info DataFrame
     if st.button("Show ChemSpace Tables Info"):
         st.dataframe(df)
+
+    ## Depict a selected table inline
+    st.divider()
+    st.subheader("Depict Table")
+
+    if "show_depiction" not in st.session_state:
+        st.session_state["show_depiction"] = False
+    if "depiction_images" not in st.session_state:
+        st.session_state["depiction_images"] = []
+
+    if df is not None and not df.empty:
+        table_names = df["table"].tolist()
+        selected_table = st.selectbox("Select a table to depict:", table_names, key="depict_table_select")
+
+        ## Load columns for the selected table to let the user pick the label
+        table_columns = st_funcs.get_table_columns(db_path, selected_table)
+        default_label = "id" if "id" in table_columns else (table_columns[0] if table_columns else None)
+        default_idx = table_columns.index(default_label) if default_label in table_columns else 0
+
+        label_col = st.selectbox(
+            "Column to use as molecule label:",
+            table_columns,
+            index=default_idx,
+            key="depict_label_col"
+        ) if table_columns else None
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            max_mols = st.number_input("Max molecules (-1 for all):", min_value=-1, value=25, step=1, key="depict_max_mols")
+        with col2:
+            mols_per_image = st.number_input("Molecules per grid image:", min_value=1, max_value=100, value=25, step=1, key="depict_mols_per_image")
+        with col3:
+            mol_size = st.number_input("Molecule cell size (px):", min_value=100, max_value=600, value=300, step=50, key="depict_mol_size")
+
+        button_label = "Hide Depictions" if st.session_state["show_depiction"] else "Depict Selected Table"
+        if st.button(button_label):
+            if st.session_state["show_depiction"]:
+                st.session_state["show_depiction"] = False
+                st.session_state["depiction_images"] = []
+            else:
+                with st.spinner(f"Generating depictions for table '{selected_table}'…"):
+                    try:
+                        images = st_funcs.depict_table_to_images(
+                            db_path=db_path,
+                            table_name=selected_table,
+                            max_molecules=int(max_mols),
+                            molecules_per_image=int(mols_per_image),
+                            mol_image_size=(int(mol_size), int(mol_size)),
+                            legend_col=label_col
+                        )
+                        if images:
+                            st.session_state["depiction_images"] = images
+                            st.session_state["show_depiction"] = True
+                        else:
+                            st.warning(f"No valid molecules found in table '{selected_table}'.")
+                    except Exception as e:
+                        st.error(f"Depiction failed: {e}")
+
+        if st.session_state["show_depiction"] and st.session_state["depiction_images"]:
+            images = st.session_state["depiction_images"]
+            st.success(f"Showing {len(images)} grid image(s) for '{selected_table}'.")
+            for i, img in enumerate(images):
+                st.image(img, caption=f"Grid {i + 1}", use_container_width=True)
+    else:
+        st.info("No tables found in the ChemSpace database for the active project.")
     
 elif page == "Receptors":
     st.title("Receptors")
