@@ -11170,7 +11170,6 @@ class MolDock:
         
         interactions_list = prolif_params_dict['interactions_list']
         interactions_parameters_dict = prolif_params_dict.get('interaction_parameters', {})
-        
                                
         # Use ambpdb to generate a .pdb file from the prmtop and inpcrd files to be used for ProLIF processing. Will overwrite the output_pdb_file generated after tleap processing to keep the same file for posterior ProLIF processing and avoid having to manage multiple files.
         ambpdb_command = f"ambpdb -p {prmtop_file} -c {inpcrd_file} -conect > {output_pdb_file}"
@@ -11180,6 +11179,7 @@ class MolDock:
         # # # Load the receptor file
         u = mda.Universe(f"{output_pdb_file}")
         
+
         receptor = u.select_atoms(f"{prolif_params_dict['selection_dict']['receptor']}")
         receptor_plf = plf.Molecule.from_mda(receptor)
         ligand = u.select_atoms(f"{prolif_params_dict['selection_dict']['ligand']}")
