@@ -508,6 +508,7 @@ elif page == "Analysis":
                             if st.button(f"{'Hide' if st.session_state[key] else 'Show'} {label}", key=key + "_btn"):
                                 st.session_state[key] = not st.session_state[key]
                             if st.session_state[key]:
+                                st.divider()
                                 pdb_files = sorted(glob.glob(os.path.join(entry["path"], "*.pdb")))
                                 pdb_names = [os.path.basename(f) for f in pdb_files]
                                 idx_key = f"pose_idx_{entry['directory']}"
@@ -595,6 +596,91 @@ elif page == "Analysis":
 
                                     ## pose counter label
                                     st.caption(f"Pose {current_idx + 1} of {len(pdb_names)}")
+
+                                ## ProLIF Fingerprints for this pose directory
+                                dir_name = entry['directory']
+                                dir_pose_ids = st_funcs.get_pose_ids_for_directory(results_db_path, dir_name)
+                                prolif_tables_dir = st_funcs.get_prolif_tables_by_pose_ids(results_db_path, dir_pose_ids)
+                                prolif_dir_key = f"show_prolif_{dir_name}"
+                                if not prolif_tables_dir:
+                                    st.button("Show ProLIF Fingerprints", disabled=True, key=f"btn_prolif_disabled_{dir_name}")
+                                else:
+                                    if prolif_dir_key not in st.session_state:
+                                        st.session_state[prolif_dir_key] = False
+                                    _dir_label = {
+                                        "most_stable_poses": "most_stable",
+                                        "most_populated_poses": "most_populated",
+                                        "most_populated_and_stable_poses": "most_populated_and_stable",
+                                        "all_poses": "all_poses",
+                                    }.get(dir_name, dir_name)
+                                    if st.button(
+                                        f"{'Hide' if st.session_state[prolif_dir_key] else 'Show'} ProLIF FPS - {_dir_label}",
+                                        key=f"btn_prolif_{dir_name}"
+                                    ):
+                                        st.session_state[prolif_dir_key] = not st.session_state[prolif_dir_key]
+                                        st.rerun()
+                                    if st.session_state[prolif_dir_key]:
+                                        selected_table_dir = st.selectbox(
+                                            "Select a ProLIF condition table:",
+                                            prolif_tables_dir,
+                                            key=f"select_prolif_table_{dir_name}"
+                                        )
+                                        prolif_poses_dir_df = st_funcs.get_prolif_poses_by_pose_ids(results_db_path, selected_table_dir, dir_pose_ids)
+                                        if prolif_poses_dir_df is not None and not prolif_poses_dir_df.empty:
+                                            pose_options_dir = prolif_poses_dir_df["pose_id"].tolist()
+                                            pose_label_map = st_funcs.get_pose_labels_for_pose_ids(results_db_path, pose_options_dir)
+                                            pose_options_dir = sorted(pose_options_dir, key=lambda pid: pose_label_map.get(pid, str(pid)))
+                                            selected_prolif_pose_dir = st.selectbox(
+                                                "Select a pose to display fingerprints:",
+                                                pose_options_dir,
+                                                format_func=lambda pid: pose_label_map.get(pid, str(pid)),
+                                                key=f"select_prolif_pose_{dir_name}"
+                                            )
+                                            fps_dir_df = st_funcs.get_prolif_fingerprint_for_pose(results_db_path, selected_table_dir, selected_prolif_pose_dir)
+                                            reserved_dir = {"pose_id"}
+                                            all_columns_dir = st_funcs.get_prolif_all_column_names_by_pose_ids(results_db_path, selected_table_dir, dir_pose_ids)
+                                            all_itypes_dir = sorted(set(
+                                                col.split("_")[-1] for col in all_columns_dir if col not in reserved_dir
+                                            ))
+                                            if fps_dir_df is not None and not fps_dir_df.empty:
+                                                st.markdown("**Filter by interaction type:**")
+                                                filter_cols_dir = st.columns(min(len(all_itypes_dir), 6))
+                                                selected_types_dir = []
+                                                for i, itype in enumerate(all_itypes_dir):
+                                                    ck_key = f"prolif_filter_{dir_name}_{itype}"
+                                                    if ck_key not in st.session_state:
+                                                        st.session_state[ck_key] = True
+                                                    if filter_cols_dir[i % len(filter_cols_dir)].checkbox(itype, key=ck_key):
+                                                        selected_types_dir.append(itype)
+                                                keep_dir = [c for c in fps_dir_df.columns
+                                                            if c in reserved_dir or c.split("_")[-1] in selected_types_dir]
+                                                st.dataframe(fps_dir_df[keep_dir], use_container_width=True)
+                                            else:
+                                                st.warning(f"No fingerprint data found for pose {selected_prolif_pose_dir}.")
+                                                selected_types_dir = []
+
+                                            show_all_dir_key = f"show_all_prolif_{dir_name}"
+                                            if show_all_dir_key not in st.session_state:
+                                                st.session_state[show_all_dir_key] = False
+                                            if st.button(
+                                                f"{'Hide' if st.session_state[show_all_dir_key] else 'Show'} all fingerprints for {selected_table_dir}",
+                                                key=f"btn_all_prolif_{dir_name}"
+                                            ):
+                                                st.session_state[show_all_dir_key] = not st.session_state[show_all_dir_key]
+                                                st.rerun()
+                                            if st.session_state[show_all_dir_key]:
+                                                all_fps_dir_df = st_funcs.get_all_prolif_fingerprints_by_pose_ids(results_db_path, selected_table_dir, dir_pose_ids)
+                                                if all_fps_dir_df is not None and not all_fps_dir_df.empty:
+                                                    all_fps_dir_df.insert(1, "pose_name", all_fps_dir_df["pose_id"].map(lambda pid: pose_label_map.get(pid, str(pid))))
+                                                    all_fps_dir_df = all_fps_dir_df.sort_values("pose_name").reset_index(drop=True)
+                                                    keep_all_dir = [c for c in all_fps_dir_df.columns
+                                                                    if c in reserved_dir | {"pose_name"} or c.split("_")[-1] in selected_types_dir]
+                                                    st.dataframe(all_fps_dir_df[keep_all_dir], use_container_width=True)
+                                                else:
+                                                    st.warning("Could not retrieve fingerprints for all poses.")
+                                        else:
+                                            st.warning(f"No ProLIF poses found for {dir_name}.")
+                                st.divider()
                         else:
                             st.button(label, disabled=True, key=key + "_btn")
 

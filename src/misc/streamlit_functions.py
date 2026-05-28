@@ -229,6 +229,166 @@ def get_prolif_fingerprint_for_pose(db_path, table_name, pose_id):
     except Exception:
         return None
 
+def get_pose_ids_for_directory(db_path, directory_name):
+    """
+    Return the list of Pose_IDs from the Results table that correspond to the given
+    extracted-poses directory (mirrors the logic used when extracting PDB files).
+    """
+    _queries = {
+        "most_stable_poses": """
+            SELECT Pose_ID FROM Results AS R1
+            WHERE docking_score = (
+                SELECT MIN(docking_score) FROM Results AS R2
+                WHERE R1.LigName = R2.LigName
+            )
+        """,
+        "most_populated_poses": """
+            SELECT Pose_ID FROM Results AS R1
+            WHERE cluster_size = (
+                SELECT MAX(cluster_size) FROM Results AS R2
+                WHERE R1.LigName = R2.LigName
+            )
+        """,
+        "most_populated_and_stable_poses": """
+            SELECT Pose_ID FROM Results AS R1
+            WHERE cluster_size = (
+                SELECT MAX(cluster_size) FROM Results AS R2
+                WHERE R1.LigName = R2.LigName
+            ) AND docking_score = (
+                SELECT MIN(docking_score) FROM Results AS R3
+                WHERE R1.LigName = R3.LigName
+            )
+        """,
+        "all_poses": "SELECT Pose_ID FROM Results",
+    }
+    query = _queries.get(directory_name)
+    if query is None:
+        return []
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute(query)
+        ids = [row[0] for row in cursor.fetchall()]
+        conn.close()
+        return ids
+    except Exception:
+        return []
+
+def get_pose_labels_for_pose_ids(db_path, pose_ids):
+    """
+    Return a dict mapping pose_id -> 'LigName_poserank' for the given pose_ids,
+    looked up from the Results table.
+    Falls back to str(pose_id) for any pose_id not found.
+    """
+    if not pose_ids:
+        return {}
+    try:
+        placeholders = ",".join("?" * len(pose_ids))
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            f"SELECT Pose_ID, LigName, pose_rank FROM Results WHERE Pose_ID IN ({placeholders})",
+            pose_ids
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        label_map = {pid: str(pid) for pid in pose_ids}
+        for pose_id, ligname, pose_rank in rows:
+            label_map[pose_id] = f"{ligname}_{pose_rank}"
+        return label_map
+    except Exception:
+        return {pid: str(pid) for pid in pose_ids}
+
+def get_prolif_tables_by_pose_ids(db_path, pose_ids):
+    """
+    Return ProLIF table names that contain at least one entry whose pose_id is in pose_ids.
+    """
+    if not pose_ids:
+        return []
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'processed_prolif_fps_json_condition_%';")
+        all_tables = [row[0] for row in cursor.fetchall()]
+        placeholders = ",".join("?" * len(pose_ids))
+        matching = []
+        for table in all_tables:
+            cursor.execute(f"SELECT COUNT(*) FROM {table} WHERE pose_id IN ({placeholders})", pose_ids)
+            if cursor.fetchone()[0] > 0:
+                matching.append(table)
+        conn.close()
+        return matching
+    except Exception:
+        return []
+
+def get_prolif_poses_by_pose_ids(db_path, table_name, pose_ids):
+    """
+    Return a DataFrame with pose_id for entries in table_name whose pose_id is in pose_ids.
+    """
+    if not pose_ids:
+        return None
+    try:
+        placeholders = ",".join("?" * len(pose_ids))
+        conn = sqlite3.connect(db_path)
+        df = pd.read_sql_query(
+            f"SELECT pose_id FROM {table_name} WHERE pose_id IN ({placeholders}) ORDER BY pose_id",
+            conn, params=pose_ids
+        )
+        conn.close()
+        return df
+    except Exception:
+        return None
+
+def get_prolif_all_column_names_by_pose_ids(db_path, table_name, pose_ids):
+    """
+    Return the sorted union of all column names for entries matching the given pose_ids.
+    """
+    if not pose_ids:
+        return []
+    try:
+        placeholders = ",".join("?" * len(pose_ids))
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute(f"SELECT data FROM {table_name} WHERE pose_id IN ({placeholders})", pose_ids)
+        rows = cursor.fetchall()
+        conn.close()
+        all_cols = set()
+        for (data_json,) in rows:
+            df = pd.read_json(data_json, orient='split')
+            all_cols.update(df.columns.tolist())
+        return sorted(all_cols)
+    except Exception:
+        return []
+
+def get_all_prolif_fingerprints_by_pose_ids(db_path, table_name, pose_ids):
+    """
+    Retrieve and concatenate ProLIF fingerprint DataFrames for the given pose_ids.
+    A 'pose_id' column is prepended to identify each row's origin.
+    Returns a combined DataFrame or None if no matching entries / on error.
+    """
+    if not pose_ids:
+        return None
+    try:
+        placeholders = ",".join("?" * len(pose_ids))
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            f"SELECT pose_id, data FROM {table_name} WHERE pose_id IN ({placeholders}) ORDER BY pose_id",
+            pose_ids
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        if not rows:
+            return None
+        frames = []
+        for pose_id, data_json in rows:
+            df = pd.read_json(data_json, orient='split')
+            df.insert(0, 'pose_id', pose_id)
+            frames.append(df)
+        return pd.concat(frames, ignore_index=True)
+    except Exception:
+        return None
+
 def get_mmpbsa_results(db_path):
     
     # check if the MMPBSA_results table exists
