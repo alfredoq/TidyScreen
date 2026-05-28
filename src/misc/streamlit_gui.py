@@ -72,6 +72,41 @@ elif page == "ChemSpace":
     if st.button("Show ChemSpace Tables Info"):
         st.dataframe(df)
 
+    ## Display full content of a selected table
+    st.divider()
+    st.subheader("Display Table")
+
+    if "show_display_table" not in st.session_state:
+        st.session_state["show_display_table"] = False
+
+    if df is not None and not df.empty:
+        if st.button("Display Table"):
+            st.session_state["show_display_table"] = not st.session_state["show_display_table"]
+
+        if st.session_state["show_display_table"]:
+            display_table_names = df["table"].tolist()
+            display_selected_table = st.selectbox(
+                "Select a table to display:",
+                display_table_names,
+                key="display_table_select"
+            )
+            display_columns = st_funcs.get_table_columns(db_path, display_selected_table)
+            if display_columns:
+                st.markdown("**Select columns to display:**")
+                selected_display_cols = [col for col in display_columns if st.checkbox(col, value=True, key=f"display_col_{display_selected_table}_{col}")]
+                if selected_display_cols:
+                    display_df = st_funcs.read_table_columns_as_dataframe(db_path, display_selected_table, selected_display_cols)
+                    if display_df is not None and not display_df.empty:
+                        st.dataframe(display_df, use_container_width=True)
+                    else:
+                        st.info(f"Table '{display_selected_table}' is empty or could not be read.")
+                else:
+                    st.warning("Please select at least one column.")
+            else:
+                st.info(f"Table '{display_selected_table}' is empty or could not be read.")
+    else:
+        st.info("No tables found in the ChemSpace database for the active project.")
+
     ## Depict a selected table inline
     st.divider()
     st.subheader("Depict Table")
@@ -80,63 +115,130 @@ elif page == "ChemSpace":
         st.session_state["show_depiction"] = False
     if "depiction_images" not in st.session_state:
         st.session_state["depiction_images"] = []
+    if "show_depict_options" not in st.session_state:
+        st.session_state["show_depict_options"] = False
 
     if df is not None and not df.empty:
-        table_names = df["table"].tolist()
-        selected_table = st.selectbox("Select a table to depict:", table_names, key="depict_table_select")
-
-        ## Load columns for the selected table to let the user pick the label
-        table_columns = st_funcs.get_table_columns(db_path, selected_table)
-        default_label = "id" if "id" in table_columns else (table_columns[0] if table_columns else None)
-        default_idx = table_columns.index(default_label) if default_label in table_columns else 0
-
-        label_col = st.selectbox(
-            "Column to use as molecule label:",
-            table_columns,
-            index=default_idx,
-            key="depict_label_col"
-        ) if table_columns else None
-
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            max_mols = st.number_input("Max molecules (-1 for all):", min_value=-1, value=25, step=1, key="depict_max_mols")
-        with col2:
-            mols_per_image = st.number_input("Molecules per grid image:", min_value=1, max_value=100, value=25, step=1, key="depict_mols_per_image")
-        with col3:
-            mol_size = st.number_input("Molecule cell size (px):", min_value=100, max_value=600, value=300, step=50, key="depict_mol_size")
-
-        button_label = "Hide Depictions" if st.session_state["show_depiction"] else "Depict Selected Table"
-        if st.button(button_label):
-            if st.session_state["show_depiction"]:
+        if st.button("Depict Table"):
+            st.session_state["show_depict_options"] = not st.session_state["show_depict_options"]
+            if not st.session_state["show_depict_options"]:
                 st.session_state["show_depiction"] = False
                 st.session_state["depiction_images"] = []
-            else:
-                with st.spinner(f"Generating depictions for table '{selected_table}'…"):
-                    try:
-                        images = st_funcs.depict_table_to_images(
-                            db_path=db_path,
-                            table_name=selected_table,
-                            max_molecules=int(max_mols),
-                            molecules_per_image=int(mols_per_image),
-                            mol_image_size=(int(mol_size), int(mol_size)),
-                            legend_col=label_col
-                        )
-                        if images:
-                            st.session_state["depiction_images"] = images
-                            st.session_state["show_depiction"] = True
-                        else:
-                            st.warning(f"No valid molecules found in table '{selected_table}'.")
-                    except Exception as e:
-                        st.error(f"Depiction failed: {e}")
 
-        if st.session_state["show_depiction"] and st.session_state["depiction_images"]:
-            images = st.session_state["depiction_images"]
-            st.success(f"Showing {len(images)} grid image(s) for '{selected_table}'.")
-            for i, img in enumerate(images):
-                st.image(img, caption=f"Grid {i + 1}", use_container_width=True)
+        if st.session_state["show_depict_options"]:
+            table_names = df["table"].tolist()
+            selected_table = st.selectbox("Select a table to depict:", table_names, key="depict_table_select")
+
+            ## Load columns for the selected table to let the user pick the label
+            table_columns = st_funcs.get_table_columns(db_path, selected_table)
+            default_label = "id" if "id" in table_columns else (table_columns[0] if table_columns else None)
+            default_idx = table_columns.index(default_label) if default_label in table_columns else 0
+
+            label_col = st.selectbox(
+                "Column to use as molecule label:",
+                table_columns,
+                index=default_idx,
+                key="depict_label_col"
+            ) if table_columns else None
+
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                max_mols = st.number_input("Max molecules (-1 for all):", min_value=-1, value=25, step=1, key="depict_max_mols")
+            with col2:
+                mols_per_image = st.number_input("Molecules per grid image:", min_value=1, max_value=100, value=25, step=1, key="depict_mols_per_image")
+            with col3:
+                mol_size = st.number_input("Molecule cell size (px):", min_value=100, max_value=600, value=300, step=50, key="depict_mol_size")
+
+            button_label = "Hide Depictions" if st.session_state["show_depiction"] else "Depict Selected Table"
+            if st.button(button_label):
+                if st.session_state["show_depiction"]:
+                    st.session_state["show_depiction"] = False
+                    st.session_state["depiction_images"] = []
+                else:
+                    with st.spinner(f"Generating depictions for table '{selected_table}'…"):
+                        try:
+                            images = st_funcs.depict_table_to_images(
+                                db_path=db_path,
+                                table_name=selected_table,
+                                max_molecules=int(max_mols),
+                                molecules_per_image=int(mols_per_image),
+                                mol_image_size=(int(mol_size), int(mol_size)),
+                                legend_col=label_col
+                            )
+                            if images:
+                                st.session_state["depiction_images"] = images
+                                st.session_state["show_depiction"] = True
+                            else:
+                                st.warning(f"No valid molecules found in table '{selected_table}'.")
+                        except Exception as e:
+                            st.error(f"Depiction failed: {e}")
+
+            if st.session_state["show_depiction"] and st.session_state["depiction_images"]:
+                images = st.session_state["depiction_images"]
+                st.success(f"Showing {len(images)} grid image(s) for '{selected_table}'.")
+                for i, img in enumerate(images):
+                    st.image(img, caption=f"Grid {i + 1}", use_container_width=True)
     else:
         st.info("No tables found in the ChemSpace database for the active project.")
-    
+
+    ## Export a selected table to CSV
+    st.divider()
+    st.subheader("Export Table")
+
+    if "show_export_options" not in st.session_state:
+        st.session_state["show_export_options"] = False
+    if "export_save_path" not in st.session_state:
+        st.session_state["export_save_path"] = ""
+
+    if df is not None and not df.empty:
+        if st.button("Export Table"):
+            st.session_state["show_export_options"] = not st.session_state["show_export_options"]
+            if not st.session_state["show_export_options"]:
+                st.session_state["export_save_path"] = ""
+
+        if st.session_state["show_export_options"]:
+            export_table_names = df["table"].tolist()
+            export_selected_table = st.selectbox(
+                "Select a table to export:",
+                export_table_names,
+                key="export_table_select"
+            )
+
+            export_columns = st_funcs.get_table_columns(db_path, export_selected_table)
+            if export_columns:
+                st.markdown("**Select columns to export:**")
+                selected_cols = [col for col in export_columns if st.checkbox(col, value=True, key=f"export_col_{export_selected_table}_{col}")]
+
+                if st.button("Save Table"):
+                    if not selected_cols:
+                        st.warning("Please select at least one column.")
+                    else:
+                        st.session_state["export_save_path"] = st.session_state.get("export_save_path", "")
+                        st.session_state["show_export_path_input"] = True
+
+                if st.session_state.get("show_export_path_input"):
+                    save_path = st.text_input(
+                        "Enter full path for the CSV file (e.g. /home/user/output.csv):",
+                        value=st.session_state["export_save_path"],
+                        key="export_path_input"
+                    )
+                    if st.button("Confirm Save"):
+                        if not save_path.strip():
+                            st.warning("Please enter a valid file path.")
+                        else:
+                            try:
+                                export_df = st_funcs.read_table_columns_as_dataframe(db_path, export_selected_table, selected_cols)
+                                export_df.to_csv(save_path.strip(), index=False)
+                                st.success(f"Table '{export_selected_table}' saved to: {save_path.strip()}")
+                                st.session_state["show_export_path_input"] = False
+                                st.session_state["export_save_path"] = ""
+                            except Exception as e:
+                                st.error(f"Export failed: {e}")
+            else:
+                st.warning(f"No columns found for table '{export_selected_table}'.")
+    else:
+        st.info("No tables found in the ChemSpace database for the active project.")
+
 elif page == "Receptors":
     st.title("Receptors")
     st.write(f"Welcome to the Receptors page for project: {st.session_state.get('selected_project', 'Unknown')}.")

@@ -566,6 +566,28 @@ def get_table_columns(db_path: str, table_name: str) -> list:
         return []
 
 
+def read_table_columns_as_dataframe(db_path: str, table_name: str, columns: list) -> "pd.DataFrame":
+    """
+    Read selected columns from a SQLite table and return as a pandas DataFrame.
+
+    Args:
+        db_path (str): Path to the SQLite database.
+        table_name (str): Name of the table.
+        columns (list): List of column names to include.
+
+    Returns:
+        pd.DataFrame: DataFrame with the selected columns, or empty DataFrame on error.
+    """
+    try:
+        col_expr = ", ".join(f"[{c}]" for c in columns)
+        conn = sqlite3.connect(db_path)
+        df = pd.read_sql_query(f"SELECT {col_expr} FROM [{table_name}]", conn)
+        conn.close()
+        return df
+    except Exception as e:
+        return pd.DataFrame()
+
+
 def depict_table_to_images(db_path: str, table_name: str,
                            max_molecules: int = 25,
                            molecules_per_image: int = 25,
