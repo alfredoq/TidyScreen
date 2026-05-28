@@ -278,6 +278,37 @@ elif page == "Receptors":
         if st.session_state["show_pdbs"]:
             st.dataframe(pdbs_models)
 
+        ## Export PDB Model toggle button
+        if "show_export_pdb" not in st.session_state:
+            st.session_state["show_export_pdb"] = False
+
+        if st.button("Export PDB Model", key="toggle_export_pdb"):
+            st.session_state["show_export_pdb"] = not st.session_state["show_export_pdb"]
+
+        if st.session_state["show_export_pdb"]:
+            model_options = pdbs_models["pdb_model_name"].tolist()
+            selected_model_name = st.selectbox(
+                "Select PDB model to export:",
+                model_options,
+                key="export_pdb_model_select"
+            )
+            default_output_dir = os.path.join(
+                st.session_state["active_project_path"], "docking", "receptors"
+            )
+            export_output_dir = st.text_input(
+                "Output directory:",
+                value=default_output_dir,
+                key="export_pdb_output_dir"
+            )
+            if st.button("Export PDB", key="export_pdb_button"):
+                selected_row = pdbs_models[pdbs_models["pdb_model_name"] == selected_model_name].iloc[0]
+                file_id = selected_row["file_id"]
+                success, result = st_funcs.export_pdb_model(pdbs_db_path, file_id, export_output_dir.strip())
+                if success:
+                    st.success(f"PDB exported to: {result}")
+                else:
+                    st.error(f"Export failed: {result}")
+
     if df_templates_models is None or df_templates_models.empty:
         st.markdown(
             f"<span style='font-size: 24px; color: orange;'>No receptor templates for project: </span><span style='font-size: 30px; color: green; font-weight: bold;'><b>{st.session_state.get('selected_project', 'Unknown')}</b></span>",
@@ -309,7 +340,6 @@ elif page == "Receptors":
 
         if st.session_state["show_receptors_models"]:
             st.dataframe(df_receptors_models)
-
 
 elif page == "Docking Methods":
     st.title("Docking Methods")

@@ -680,3 +680,42 @@ def depict_table_to_images(db_path: str, table_name: str,
         images.append(img)
 
     return images
+
+
+def export_pdb_model(pdbs_db_path, file_id, output_dir):
+    """
+    Export a PDB model blob from the database to a file on disk.
+
+    Args:
+        pdbs_db_path (str): Path to the pdbs.db SQLite database.
+        file_id (str): The file_id of the PDB model to export.
+        output_dir (str): Directory where the PDB file will be written.
+
+    Returns:
+        tuple[bool, str]: (success, message) where message is the output path on success
+                          or an error description on failure.
+    """
+    try:
+        conn = sqlite3.connect(pdbs_db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT filename, pdb_blob FROM pdb_models WHERE file_id = ?",
+            (int(file_id),)
+        )
+        row = cursor.fetchone()
+        conn.close()
+
+        if row is None or row[1] is None:
+            return False, f"No PDB blob found for file_id '{file_id}'"
+
+        filename, pdb_blob = row
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, filename)
+
+        with open(output_path, "wb") as f:
+            f.write(pdb_blob)
+
+        return True, output_path
+
+    except Exception as e:
+        return False, str(e)
