@@ -11170,7 +11170,37 @@ class MolDock:
         
         interactions_list = prolif_params_dict['interactions_list']
         interactions_parameters_dict = prolif_params_dict.get('interaction_parameters', {})
-                               
+
+        ### Starting section of hard coding interaction classes for Mate Project
+
+        class Metal_O_Amine_Benzamide(plf.interactions.MetalAcceptor):
+            def __init__(
+                self,
+                metal: str = "[Ca,Cd,Co,Cu,Fe,Mg,Mn,Ni,Zn]",
+                ligand: str = ("[NX3;H2;$(N-ccNC=O)]"),
+                distance: float = 3.0):
+
+                super().__init__(
+                    ligand=ligand, metal=metal, distance=distance
+                )
+
+        class Metal_Benzamide_O_amine(plf.interactions.MetalAcceptor):
+            def __init__(
+                self,
+                metal: str = "[Ca,Cd,Co,Cu,Fe,Mg,Mn,Ni,Zn]",
+                ligand: str = ("[OX1;H0;$(O=CNccN)]"),
+                distance: float = 3.0):
+
+                super().__init__(
+                    ligand=ligand, metal=metal, distance=distance
+                )
+
+        # Add the custom interaction classes to the interactions list and parameters dictionary
+        interactions_list.append("Metal_O_Amine_Benzamide")
+        interactions_list.append("Metal_Benzamide_O_amine")
+
+        ### Ending section of hard coding interaction classes for Mate Project
+
         # Use ambpdb to generate a .pdb file from the prmtop and inpcrd files to be used for ProLIF processing. Will overwrite the output_pdb_file generated after tleap processing to keep the same file for posterior ProLIF processing and avoid having to manage multiple files.
         ambpdb_command = f"ambpdb -p {prmtop_file} -c {inpcrd_file} -conect > {output_pdb_file}"
         print(ambpdb_command)
