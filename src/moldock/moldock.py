@@ -12090,6 +12090,165 @@ class MolDock:
             print(f"\n❌ Unexpected error retrieving ProLIF conditions: {e}")
             return None
 
+    def export_prolif_conditions(self):
+        """
+        Exports a ProLIF conditions record from the database to a portable JSON file.
+        The user selects the record to export and provides an output file path.
+        The exported file can later be re-imported with import_prolif_conditions().
+        """
+
+        import sqlite3
+        import json
+
+        prolif_params_db = self.__docking_params_db
+
+        try:
+            conn = sqlite3.connect(prolif_params_db)
+            cursor = conn.cursor()
+
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='ProLIF_Conditions'")
+            if not cursor.fetchone():
+                print("\n❌ No ProLIF_Conditions table found in database")
+                conn.close()
+                return
+
+            cursor.execute("SELECT id, description FROM ProLIF_Conditions ORDER BY id ASC")
+            records = cursor.fetchall()
+
+            if not records:
+                print("\n❌ No ProLIF conditions registered in database")
+                conn.close()
+                return
+
+            print(f"\n📤 EXPORT PROLIF CONDITIONS")
+            print("=" * 70)
+            for idx, (record_id, description) in enumerate(records, 1):
+                print(f"   {idx}. ID {record_id}: {description}")
+            print("=" * 70)
+
+            while True:
+                try:
+                    selection = input("\nSelect conditions to export (enter number or 'c' to cancel): ").strip()
+                    if selection.lower() == 'c':
+                        conn.close()
+                        return
+                    selection_idx = int(selection) - 1
+                    if 0 <= selection_idx < len(records):
+                        selected_id, selected_description = records[selection_idx]
+                        break
+                    print(f"❌ Please enter a valid number (1-{len(records)})")
+                except ValueError:
+                    print("❌ Please enter a valid number")
+
+            cursor.execute("SELECT description, conditions FROM ProLIF_Conditions WHERE id = ?", (selected_id,))
+            result = cursor.fetchone()
+            conn.close()
+
+            if not result:
+                print("\n❌ Failed to retrieve selected conditions")
+                return
+
+            description, conditions_json = result
+            conditions_dict = json.loads(conditions_json)
+
+            export_payload = {
+                "description": description,
+                "conditions": conditions_dict
+            }
+
+            output_path = input("\nEnter output file path (e.g. prolif_conditions.json): ").strip()
+            if not output_path:
+                print("❌ No output path provided. Export cancelled.")
+                return
+
+            with open(output_path, 'w') as f:
+                json.dump(export_payload, f, indent=2)
+
+            print(f"\n✅ ProLIF conditions exported successfully to: {output_path}")
+            print(f"   📌 Description: {description}")
+
+        except sqlite3.Error as e:
+            print(f"\n❌ Database error: {e}")
+        except Exception as e:
+            print(f"\n❌ Unexpected error exporting ProLIF conditions: {e}")
+
+    def import_prolif_conditions(self):
+        """
+        Imports a ProLIF conditions record from a JSON file previously created by
+        export_prolif_conditions() and inserts it as a new record in the database.
+        The user may override the description before inserting.
+        """
+
+        import os
+        import sqlite3
+        import json
+
+        file_path = input("\nEnter path to the ProLIF conditions JSON file: ").strip()
+        if not file_path or not os.path.isfile(file_path):
+            print(f"❌ File not found: {file_path}")
+            return
+
+        try:
+            with open(file_path, 'r') as f:
+                export_payload = json.load(f)
+        except json.JSONDecodeError as e:
+            print(f"❌ Failed to parse JSON file: {e}")
+            return
+
+        if "description" not in export_payload or "conditions" not in export_payload:
+            print("❌ Invalid export file: missing 'description' or 'conditions' keys.")
+            return
+
+        original_description = export_payload["description"]
+        conditions_dict = export_payload["conditions"]
+
+        print(f"\n📥 IMPORT PROLIF CONDITIONS")
+        print("=" * 70)
+        print(f"   📌 Original description: {original_description}")
+
+        override = input("\nKeep original description? (y/n, default: y): ").strip().lower()
+        if override == 'n':
+            while True:
+                new_description = input("Enter new description: ").strip()
+                if new_description:
+                    original_description = new_description
+                    break
+                print("❌ Description cannot be empty. Please enter a valid description.")
+
+        prolif_params_db = self.__docking_params_db
+
+        try:
+            if not os.path.exists(prolif_params_db):
+                open(prolif_params_db, 'w').close()
+
+            conn = sqlite3.connect(prolif_params_db)
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS ProLIF_Conditions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    description TEXT,
+                    conditions TEXT
+                )
+            """)
+
+            conditions_json = json.dumps(conditions_dict, indent=2)
+            cursor.execute("""
+                INSERT INTO ProLIF_Conditions (description, conditions)
+                VALUES (?, ?)
+            """, (original_description, conditions_json))
+            conn.commit()
+            new_id = cursor.lastrowid
+            conn.close()
+
+            print(f"\n✅ ProLIF conditions imported successfully into {prolif_params_db}")
+            print(f"   📌 Description: {original_description}")
+            print(f"   🔍 New record ID: {new_id}")
+
+        except sqlite3.Error as e:
+            print(f"\n❌ Database error: {e}")
+        except Exception as e:
+            print(f"\n❌ Unexpected error importing ProLIF conditions: {e}")
+
     def _create_selection_commands(self):
         
         """
