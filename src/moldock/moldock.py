@@ -11120,6 +11120,20 @@ class MolDock:
         # Select the ligand and create the corresponding ProLIF object
         lig = u.select_atoms(prolif_params_dict['selection_dict']['ligand'])
         ligand_mol = plf.Molecule.from_mda(lig)
+        # Exec any custom interaction class definitions so they are registered in ProLIF
+        custom_interactions = prolif_params_dict.get('custom_interactions', {})
+        if custom_interactions:
+            from prolif.interactions.base import Interaction, Distance, SingleAngle, DoubleAngle
+            exec_namespace = {
+                'Interaction': Interaction,
+                'Distance': Distance,
+                'SingleAngle': SingleAngle,
+                'DoubleAngle': DoubleAngle,
+            }
+            for script_code in set(custom_interactions.values()):
+                exec(script_code, exec_namespace)
+            print(f"✅ Custom interactions registered: {list(custom_interactions.keys())}")
+
         # Define all available interaction for computation
         fp = plf.Fingerprint(interactions_list, parameters=interactions_parameters_dict)
         # Compute the fingerprints
@@ -11149,7 +11163,21 @@ class MolDock:
         # Load the ligand file
         ligand = Chem.MolFromPDBFile(output_pdb_file, removeHs=False)
         ligand_plf = plf.Molecule.from_rdkit(ligand)
-        
+
+        # Exec any custom interaction class definitions so they are registered in ProLIF
+        custom_interactions = prolif_params_dict.get('custom_interactions', {})
+        if custom_interactions:
+            from prolif.interactions.base import Interaction, Distance, SingleAngle, DoubleAngle
+            exec_namespace = {
+                'Interaction': Interaction,
+                'Distance': Distance,
+                'SingleAngle': SingleAngle,
+                'DoubleAngle': DoubleAngle,
+            }
+            for script_code in set(custom_interactions.values()):
+                exec(script_code, exec_namespace)
+            print(f"✅ Custom interactions registered: {list(custom_interactions.keys())}")
+
         fp = plf.Fingerprint(interactions_list, parameters=interactions_parameters_dict)
         # Compute the fingerprints
         fp.run_from_iterable([ligand_plf], receptor_plf,progress=False)
@@ -11170,37 +11198,7 @@ class MolDock:
         
         interactions_list = prolif_params_dict['interactions_list']
         interactions_parameters_dict = prolif_params_dict.get('interaction_parameters', {})
-
-        ### Starting section of hard coding interaction classes for Mate Project
-
-        class Metal_O_Amine_Benzamide(plf.interactions.MetalAcceptor):
-            def __init__(
-                self,
-                metal: str = "[Ca,Cd,Co,Cu,Fe,Mg,Mn,Ni,Zn]",
-                ligand: str = ("[NX3;H2;$(N-ccNC=O)]"),
-                distance: float = 3.0):
-
-                super().__init__(
-                    ligand=ligand, metal=metal, distance=distance
-                )
-
-        class Metal_Benzamide_O_amine(plf.interactions.MetalAcceptor):
-            def __init__(
-                self,
-                metal: str = "[Ca,Cd,Co,Cu,Fe,Mg,Mn,Ni,Zn]",
-                ligand: str = ("[OX1;H0;$(O=CNccN)]"),
-                distance: float = 3.0):
-
-                super().__init__(
-                    ligand=ligand, metal=metal, distance=distance
-                )
-
-        # Add the custom interaction classes to the interactions list and parameters dictionary
-        interactions_list.append("Metal_O_Amine_Benzamide")
-        interactions_list.append("Metal_Benzamide_O_amine")
-
-        ### Ending section of hard coding interaction classes for Mate Project
-
+        
         # Use ambpdb to generate a .pdb file from the prmtop and inpcrd files to be used for ProLIF processing. Will overwrite the output_pdb_file generated after tleap processing to keep the same file for posterior ProLIF processing and avoid having to manage multiple files.
         ambpdb_command = f"ambpdb -p {prmtop_file} -c {inpcrd_file} -conect > {output_pdb_file}"
         print(ambpdb_command)
@@ -11214,7 +11212,21 @@ class MolDock:
         receptor_plf = plf.Molecule.from_mda(receptor)
         ligand = u.select_atoms(f"{prolif_params_dict['selection_dict']['ligand']}")
         ligand_plf = plf.Molecule.from_mda(ligand)
-        
+
+        # Exec any custom interaction class definitions so they are registered in ProLIF
+        custom_interactions = prolif_params_dict.get('custom_interactions', {})
+        if custom_interactions:
+            from prolif.interactions.base import Interaction, Distance, SingleAngle, DoubleAngle
+            exec_namespace = {
+                'Interaction': Interaction,
+                'Distance': Distance,
+                'SingleAngle': SingleAngle,
+                'DoubleAngle': DoubleAngle,
+            }
+            for script_code in set(custom_interactions.values()):
+                exec(script_code, exec_namespace)
+            print(f"✅ Custom interactions registered: {list(custom_interactions.keys())}")
+
         #fp = plf.Fingerprint(interactions_list, parameters=interactions_parameters_dict)
         fp = plf.Fingerprint(interactions=interactions_list, parameters=interactions_parameters_dict)
         # # Compute the fingerprints
@@ -11360,12 +11372,78 @@ class MolDock:
         # Store interaction conditions
         prolif_conditions['interaction_parameters'] = interaction_parameters
 
+        # Query user for custom interaction class definitions
+        print(f"\n🧩 CUSTOM INTERACTION TYPES")
+        print("=" * 70)
+        add_custom = input("Do you want to add custom interaction class definitions? (y/n, default: n): ").strip().lower()
+        if add_custom == 'y':
+            custom_interactions = self._collect_custom_interactions()
+            if custom_interactions:
+                prolif_conditions['custom_interactions'] = custom_interactions
+                prolif_conditions['interactions_list'].extend(custom_interactions.keys())
+
         print(prolif_conditions)
 
         # Create a register of the conditions dictionary
 
         self._register_prolif_conditions(prolif_conditions)
         
+    def _collect_custom_interactions(self) -> dict:
+        """
+        Collects custom ProLIF interaction class definitions from a user-supplied Python script.
+        The script is validated with compile() and all class names are extracted via AST.
+        Returns {class_name: script_source_code}.
+        """
+        import ast
+
+        custom_interactions = {}
+
+        print("\nProvide the path to a Python script containing custom interaction class definitions.")
+        print("  - The script must define classes that inherit from ProLIF's Interaction base class.")
+        print("  - Type 'DONE' to finish.\n")
+
+        while True:
+            script_path = input("Enter script path (or DONE to finish): ").strip()
+
+            if script_path.upper() == 'DONE':
+                break
+
+            if not os.path.isfile(script_path):
+                print(f"❌ File not found: {script_path}")
+                continue
+
+            with open(script_path, 'r') as f:
+                code = f.read()
+
+            # Validate the code compiles
+            try:
+                compile(code, script_path, "exec")
+            except SyntaxError as e:
+                print(f"❌ Syntax error in script: {e}")
+                continue
+
+            # Extract class names via AST
+            try:
+                parsed = ast.parse(code)
+                class_nodes = [node for node in ast.walk(parsed) if isinstance(node, ast.ClassDef)]
+                if not class_nodes:
+                    print("❌ No class definitions found in the script. Please check the file.")
+                    continue
+                class_names = [node.name for node in class_nodes]
+            except Exception as e:
+                print(f"❌ Could not parse script: {e}")
+                continue
+
+            for class_name in class_names:
+                custom_interactions[class_name] = code
+                print(f"✅ Class '{class_name}' found and registered.")
+
+            another = input("Add another script? (y/n, default: n): ").strip().lower()
+            if another != 'y':
+                break
+
+        return custom_interactions
+
     def _get_prolif_parameter_string(self, param_name: str, default: str, description: str = None) -> str:
         """
         Get string parameter for ProLIF conditions with validation.
