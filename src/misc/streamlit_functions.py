@@ -704,6 +704,175 @@ def get_binders_registry(project_path: str, binder_type: str) -> "pd.DataFrame":
         return None
 
 
+def remove_binder(project_path: str, binder_type: str, assay_name: str, pose_file: str, directory: str) -> str:
+    """
+    Remove a single entry from the positive or negative binders registry.
+
+    Deletes the row matching (assay_name, pose_file, directory) from the corresponding table.
+    Returns 'removed', 'not_found', or 'error:<message>'.
+
+    Args:
+        project_path (str): Root path of the active project.
+        binder_type (str): Either 'positive' or 'negative'.
+        assay_name (str): Name of the docking assay.
+        pose_file (str): PDB filename of the pose.
+        directory (str): Pose folder name.
+    """
+    try:
+        db_path = os.path.join(project_path, "ml", "training_sets", f"{binder_type}_binders.db")
+        table = f"{binder_type}_binders"
+        if not os.path.exists(db_path):
+            return "not_found"
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            f"DELETE FROM {table} WHERE assay_name = ? AND pose_file = ? AND directory = ?",
+            (assay_name, pose_file, directory)
+        )
+        conn.commit()
+        removed = cursor.rowcount > 0
+        conn.close()
+        return "removed" if removed else "not_found"
+    except Exception as e:
+        return f"error:{e}"
+
+
+def consolidate_training_set(project_path: str, training_set_id: str, notes: str = "") -> str:
+    """
+    Snapshot the current positive and negative binders registries into a named training set.
+
+    The snapshot is stored in <project_path>/ml/training_sets/training_sets_snapshots.db
+    using two tables:
+      - training_set_snapshots: one row per snapshot (id, counts, notes, timestamp)
+      - training_set_entries:   one row per binder entry, tagged with training_set_id and binder_type
+
+    Returns a status string: 'saved', 'duplicate', or 'error:<message>'.
+
+    Args:
+        project_path (str): Root path of the active project.
+        training_set_id (str): Unique identifier for this training set snapshot.
+        notes (str): Optional free-text notes to attach to the snapshot.
+    """
+    try:
+        df_pos = get_binders_registry(project_path, "positive")
+        df_neg = get_binders_registry(project_path, "negative")
+        n_pos = len(df_pos) if df_pos is not None and not df_pos.empty else 0
+        n_neg = len(df_neg) if df_neg is not None and not df_neg.empty else 0
+
+        if n_pos == 0 and n_neg == 0:
+            return "error:No binders registered in either registry"
+
+        db_dir = os.path.join(project_path, "ml", "training_sets")
+        os.makedirs(db_dir, exist_ok=True)
+        db_path = os.path.join(db_dir, "training_sets_snapshots.db")
+        conn = sqlite3.connect(db_path)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS training_set_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                training_set_id TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                n_positives INTEGER NOT NULL,
+                n_negatives INTEGER NOT NULL,
+                notes TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS training_set_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                training_set_id TEXT NOT NULL,
+                binder_type TEXT NOT NULL,
+                assay_name TEXT NOT NULL,
+                pose_file TEXT NOT NULL,
+                directory TEXT NOT NULL,
+                pose_full_path TEXT NOT NULL,
+                flagged_at TEXT NOT NULL
+            )
+        """)
+        conn.commit()
+
+        try:
+            conn.execute(
+                "INSERT INTO training_set_snapshots (training_set_id, created_at, n_positives, n_negatives, notes) VALUES (?, ?, ?, ?, ?)",
+                (training_set_id, datetime.now().isoformat(), n_pos, n_neg, notes)
+            )
+            conn.commit()
+        except sqlite3.IntegrityError:
+            conn.close()
+            return "duplicate"
+
+        for binder_type, df in [("positive", df_pos), ("negative", df_neg)]:
+            if df is not None and not df.empty:
+                for _, row in df.iterrows():
+                    conn.execute(
+                        "INSERT INTO training_set_entries (training_set_id, binder_type, assay_name, pose_file, directory, pose_full_path, flagged_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (training_set_id, binder_type, row["assay_name"], row["pose_file"],
+                         row["directory"], row["pose_full_path"], row["flagged_at"])
+                    )
+        conn.commit()
+        conn.close()
+        return "saved"
+    except Exception as e:
+        return f"error:{e}"
+
+
+def get_training_set_entries(project_path: str, training_set_id: str) -> "pd.DataFrame":
+    """
+    Load all binder entries for a given consolidated training set.
+
+    Args:
+        project_path (str): Root path of the active project.
+        training_set_id (str): ID of the training set snapshot to load.
+
+    Returns:
+        pd.DataFrame with columns (binder_type, assay_name, pose_file, directory,
+        pose_full_path, flagged_at), ordered positive-first then negative,
+        or None on error.
+    """
+    db_path = os.path.join(project_path, "ml", "training_sets", "training_sets_snapshots.db")
+    if not os.path.exists(db_path):
+        return None
+    try:
+        conn = sqlite3.connect(db_path)
+        df = pd.read_sql_query(
+            """SELECT binder_type, assay_name, pose_file, directory, pose_full_path, flagged_at
+               FROM training_set_entries
+               WHERE training_set_id = ?
+               ORDER BY binder_type DESC, assay_name, pose_file""",
+            conn,
+            params=(training_set_id,)
+        )
+        conn.close()
+        return df if not df.empty else None
+    except Exception:
+        return None
+
+
+def get_training_set_snapshots(project_path: str) -> "pd.DataFrame":
+    """
+    Load the list of all consolidated training set snapshots.
+
+    Args:
+        project_path (str): Root path of the active project.
+
+    Returns:
+        pd.DataFrame with snapshot metadata, or None if none exist yet.
+    """
+    db_path = os.path.join(project_path, "ml", "training_sets", "training_sets_snapshots.db")
+    if not os.path.exists(db_path):
+        return None
+    try:
+        conn = sqlite3.connect(db_path)
+        df = pd.read_sql_query(
+            "SELECT training_set_id, created_at, n_positives, n_negatives, notes FROM training_set_snapshots ORDER BY created_at ASC",
+            conn
+        )
+        conn.close()
+        return df
+    except Exception:
+        return None
+
+
 def get_table_columns(db_path: str, table_name: str) -> list:
     """
     Return the list of column names for a given table in a SQLite database.

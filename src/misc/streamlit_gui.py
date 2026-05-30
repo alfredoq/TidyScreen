@@ -10,6 +10,26 @@ import streamlit_functions as st_funcs
 tidyscreen_package_path = sys.argv[1]
 
 
+def _toggle_ml_positive_viewer():
+    key = "show_ml_positive_poses"
+    st.session_state[key] = not st.session_state.get(key, False)
+
+
+def _toggle_ml_negative_viewer():
+    key = "show_ml_negative_poses"
+    st.session_state[key] = not st.session_state.get(key, False)
+
+
+def _toggle_show_projects():
+    key = "show_projects"
+    st.session_state[key] = not st.session_state.get(key, False)
+
+
+def _toggle_ts_set_viewer():
+    key = "show_ts_set_viewer"
+    st.session_state[key] = not st.session_state.get(key, False)
+
+
 st.set_page_config(page_title="TidyScreen App", layout="wide")
 
 # Sidebar navigation
@@ -36,7 +56,11 @@ if page == "TidyScreen":
     df = st_funcs.read_database_as_dataframe(db_path, "projects")
     
     ## Create a button to show the projects DataFrame
-    if st.button("Show Projects"):
+    st.button(
+        f"{'Hide' if st.session_state.get('show_projects', False) else 'Show'} Projects",
+        on_click=_toggle_show_projects
+    )
+    if st.session_state.get("show_projects", False):
         st.dataframe(df)
     
     ## Create a selectbox to choose and activate a project
@@ -1110,6 +1134,93 @@ elif page == "ML":
             st.success(f"{len(df_pos)} positive binder(s) registered.")
             st.dataframe(df_pos, use_container_width=True)
 
+            ## --- View Positive Poses ---
+            pos_viewer_key = "show_ml_positive_poses"
+            if pos_viewer_key not in st.session_state:
+                st.session_state[pos_viewer_key] = False
+            st.button(
+                f"{'Hide' if st.session_state[pos_viewer_key] else 'View'} Positive Poses",
+                key="btn_ml_positive_poses",
+                on_click=_toggle_ml_positive_viewer
+            )
+
+            if st.session_state[pos_viewer_key]:
+                ref_file_pos = st.file_uploader(
+                    "Load a reference PDB for superimposition (optional):",
+                    type=["pdb"],
+                    key="ml_pos_ref_pdb_uploader"
+                )
+                if ref_file_pos is not None:
+                    st.session_state["ml_pos_ref_pdb_data"] = ref_file_pos.read().decode("utf-8")
+                    st.success(f"Reference loaded: {ref_file_pos.name}")
+                elif "ml_pos_ref_pdb_data" not in st.session_state:
+                    st.session_state["ml_pos_ref_pdb_data"] = None
+
+                pose_paths_pos = df_pos["pose_full_path"].tolist()
+                pose_labels_pos = [
+                    f"{row['assay_name']} / {row['pose_file']}"
+                    for _, row in df_pos.iterrows()
+                ]
+                idx_key_pos = "ml_pos_pose_idx"
+                if idx_key_pos not in st.session_state:
+                    st.session_state[idx_key_pos] = 0
+                st.session_state[idx_key_pos] = max(0, min(st.session_state[idx_key_pos], len(pose_labels_pos) - 1))
+
+                selected_pos = st.selectbox(
+                    "Select a positive binder pose:",
+                    pose_labels_pos,
+                    index=st.session_state[idx_key_pos],
+                )
+                if selected_pos:
+                    st.session_state[idx_key_pos] = pose_labels_pos.index(selected_pos)
+
+                full_path_pos = pose_paths_pos[st.session_state[idx_key_pos]]
+                if os.path.exists(full_path_pos):
+                    with open(full_path_pos, "r") as f:
+                        pdb_data_pos = f.read()
+                    view_pos = py3Dmol.view(width=800, height=500)
+                    view_pos.addModel(pdb_data_pos, "pdb")
+                    view_pos.setStyle({"model": 0}, {"stick": {}, "cartoon": {"color": "spectrum"}})
+                    if st.session_state.get("ml_pos_ref_pdb_data"):
+                        view_pos.addModel(st.session_state["ml_pos_ref_pdb_data"], "pdb")
+                        view_pos.setStyle({"model": 1}, {"sphere": {"colorscheme": "elementColors", "scale": 0.3, "opacity": 0.6}, "stick": {"colorscheme": "elementColors", "opacity": 0.6}})
+                    view_pos.zoomTo()
+
+                    cur_pos = st.session_state[idx_key_pos]
+                    has_ref_pos = st.session_state.get("ml_pos_ref_pdb_data")
+                    prev_col, viewer_col, next_col = st.columns([0.5, 8, 0.5 if not has_ref_pos else 1])
+                    with prev_col:
+                        st.write(""); st.write(""); st.write("")
+                        if st.button("◀", key="ml_pos_prev", disabled=(cur_pos == 0)):
+                            st.session_state[idx_key_pos] = cur_pos - 1
+                            st.rerun()
+                    with viewer_col:
+                        st.components.v1.html(view_pos.write_html(), height=520)
+                    with next_col:
+                        st.write(""); st.write(""); st.write("")
+                        if st.button("▶", key="ml_pos_next", disabled=(cur_pos >= len(pose_labels_pos) - 1)):
+                            st.session_state[idx_key_pos] = cur_pos + 1
+                            st.rerun()
+                    st.caption(f"Pose {cur_pos + 1} of {len(pose_labels_pos)}")
+
+                    ## Remove current pose from positive registry
+                    current_row_pos = df_pos.iloc[st.session_state[idx_key_pos]]
+                    if st.button("🗑️ Remove pose from set", key=f"ml_pos_remove_{st.session_state[idx_key_pos]}"):
+                        result = st_funcs.remove_binder(
+                            project_path=project_path,
+                            binder_type="positive",
+                            assay_name=current_row_pos["assay_name"],
+                            pose_file=current_row_pos["pose_file"],
+                            directory=current_row_pos["directory"],
+                        )
+                        if result == "removed":
+                            st.session_state[idx_key_pos] = max(0, st.session_state[idx_key_pos] - 1)
+                            st.rerun()
+                        else:
+                            st.error(f"Could not remove pose: {result}")
+                else:
+                    st.warning(f"Pose file not found on disk: {full_path_pos}")
+
         st.divider()
 
         ## --- Negative binders ---
@@ -1120,3 +1231,216 @@ elif page == "ML":
         else:
             st.success(f"{len(df_neg)} negative binder(s) registered.")
             st.dataframe(df_neg, use_container_width=True)
+
+            ## --- View Negative Poses ---
+            neg_viewer_key = "show_ml_negative_poses"
+            if neg_viewer_key not in st.session_state:
+                st.session_state[neg_viewer_key] = False
+            st.button(
+                f"{'Hide' if st.session_state[neg_viewer_key] else 'View'} Negative Poses",
+                key="btn_ml_negative_poses",
+                on_click=_toggle_ml_negative_viewer
+            )
+
+            if st.session_state[neg_viewer_key]:
+                ref_file_neg = st.file_uploader(
+                    "Load a reference PDB for superimposition (optional):",
+                    type=["pdb"],
+                    key="ml_neg_ref_pdb_uploader"
+                )
+                if ref_file_neg is not None:
+                    st.session_state["ml_neg_ref_pdb_data"] = ref_file_neg.read().decode("utf-8")
+                    st.success(f"Reference loaded: {ref_file_neg.name}")
+                elif "ml_neg_ref_pdb_data" not in st.session_state:
+                    st.session_state["ml_neg_ref_pdb_data"] = None
+
+                pose_paths_neg = df_neg["pose_full_path"].tolist()
+                pose_labels_neg = [
+                    f"{row['assay_name']} / {row['pose_file']}"
+                    for _, row in df_neg.iterrows()
+                ]
+                idx_key_neg = "ml_neg_pose_idx"
+                if idx_key_neg not in st.session_state:
+                    st.session_state[idx_key_neg] = 0
+                st.session_state[idx_key_neg] = max(0, min(st.session_state[idx_key_neg], len(pose_labels_neg) - 1))
+
+                selected_neg = st.selectbox(
+                    "Select a negative binder pose:",
+                    pose_labels_neg,
+                    index=st.session_state[idx_key_neg],
+                )
+                if selected_neg:
+                    st.session_state[idx_key_neg] = pose_labels_neg.index(selected_neg)
+
+                full_path_neg = pose_paths_neg[st.session_state[idx_key_neg]]
+                if os.path.exists(full_path_neg):
+                    with open(full_path_neg, "r") as f:
+                        pdb_data_neg = f.read()
+                    view_neg = py3Dmol.view(width=800, height=500)
+                    view_neg.addModel(pdb_data_neg, "pdb")
+                    view_neg.setStyle({"model": 0}, {"stick": {}, "cartoon": {"color": "spectrum"}})
+                    if st.session_state.get("ml_neg_ref_pdb_data"):
+                        view_neg.addModel(st.session_state["ml_neg_ref_pdb_data"], "pdb")
+                        view_neg.setStyle({"model": 1}, {"sphere": {"colorscheme": "elementColors", "scale": 0.3, "opacity": 0.6}, "stick": {"colorscheme": "elementColors", "opacity": 0.6}})
+                    view_neg.zoomTo()
+
+                    cur_neg = st.session_state[idx_key_neg]
+                    has_ref_neg = st.session_state.get("ml_neg_ref_pdb_data")
+                    prev_col, viewer_col, next_col = st.columns([0.5, 8, 0.5 if not has_ref_neg else 1])
+                    with prev_col:
+                        st.write(""); st.write(""); st.write("")
+                        if st.button("◀", key="ml_neg_prev", disabled=(cur_neg == 0)):
+                            st.session_state[idx_key_neg] = cur_neg - 1
+                            st.rerun()
+                    with viewer_col:
+                        st.components.v1.html(view_neg.write_html(), height=520)
+                    with next_col:
+                        st.write(""); st.write(""); st.write("")
+                        if st.button("▶", key="ml_neg_next", disabled=(cur_neg >= len(pose_labels_neg) - 1)):
+                            st.session_state[idx_key_neg] = cur_neg + 1
+                            st.rerun()
+                    st.caption(f"Pose {cur_neg + 1} of {len(pose_labels_neg)}")
+
+                    ## Remove current pose from negative registry
+                    current_row_neg = df_neg.iloc[st.session_state[idx_key_neg]]
+                    if st.button("🗑️ Remove pose from set", key=f"ml_neg_remove_{st.session_state[idx_key_neg]}"):
+                        result = st_funcs.remove_binder(
+                            project_path=project_path,
+                            binder_type="negative",
+                            assay_name=current_row_neg["assay_name"],
+                            pose_file=current_row_neg["pose_file"],
+                            directory=current_row_neg["directory"],
+                        )
+                        if result == "removed":
+                            st.session_state[idx_key_neg] = max(0, st.session_state[idx_key_neg] - 1)
+                            st.rerun()
+                        else:
+                            st.error(f"Could not remove pose: {result}")
+                else:
+                    st.warning(f"Pose file not found on disk: {full_path_neg}")
+
+        st.divider()
+
+        ## --- Consolidate training set ---
+        st.subheader("📦 Consolidate Training Set")
+        st.markdown(
+            "Create a named snapshot of the current positive and negative binders registries "
+            "for use in model training."
+        )
+
+        with st.form("consolidate_ts_form"):
+            ts_id = st.text_input("Training Set ID", placeholder="e.g. ts_run1_2026")
+            ts_notes = st.text_area("Notes (optional)", "")
+            submitted = st.form_submit_button("Consolidate")
+
+        if submitted:
+            if not ts_id.strip():
+                st.error("Please provide a Training Set ID.")
+            else:
+                n_pos = len(df_pos) if df_pos is not None and not df_pos.empty else 0
+                n_neg = len(df_neg) if df_neg is not None and not df_neg.empty else 0
+                result = st_funcs.consolidate_training_set(project_path, ts_id.strip(), ts_notes.strip())
+                if result == "saved":
+                    st.success(f"✅ Training set **'{ts_id.strip()}'** consolidated — {n_pos} positive(s), {n_neg} negative(s).")
+                elif result == "duplicate":
+                    st.warning(f"⚠️ A training set with ID **'{ts_id.strip()}'** already exists. Choose a different ID.")
+                else:
+                    st.error(f"❌ {result}")
+
+        st.divider()
+        st.markdown("#### 🗄️ Existing Training Set Snapshots")
+        df_snaps = st_funcs.get_training_set_snapshots(project_path)
+        if df_snaps is None or df_snaps.empty:
+            st.info("No training sets consolidated yet.")
+        else:
+            st.dataframe(df_snaps, use_container_width=True)
+
+            ## --- View set poses ---
+            snap_ids = df_snaps["training_set_id"].tolist()
+            selected_ts = st.selectbox("Select a training set to inspect:", snap_ids, key="ts_viewer_select")
+
+            ts_viewer_key = "show_ts_set_viewer"
+            if ts_viewer_key not in st.session_state:
+                st.session_state[ts_viewer_key] = False
+            st.button(
+                f"{'Hide' if st.session_state[ts_viewer_key] else 'View'} Set Poses",
+                key="btn_ts_set_viewer",
+                on_click=_toggle_ts_set_viewer
+            )
+
+            if st.session_state[ts_viewer_key] and selected_ts:
+                df_ts_entries = st_funcs.get_training_set_entries(project_path, selected_ts)
+                if df_ts_entries is None or df_ts_entries.empty:
+                    st.info("No entries found for this training set.")
+                else:
+                    ## Reference PDB uploader
+                    ref_file_ts = st.file_uploader(
+                        "Load a reference PDB for superimposition (optional):",
+                        type=["pdb"],
+                        key="ml_ts_ref_pdb_uploader"
+                    )
+                    if ref_file_ts is not None:
+                        st.session_state["ml_ts_ref_pdb_data"] = ref_file_ts.read().decode("utf-8")
+                        st.success(f"Reference loaded: {ref_file_ts.name}")
+                    elif "ml_ts_ref_pdb_data" not in st.session_state:
+                        st.session_state["ml_ts_ref_pdb_data"] = None
+
+                    ## Build pose labels with binder type prefix
+                    BINDER_ICON = {"positive": "✅ POSITIVE", "negative": "❌ NEGATIVE"}
+                    ts_pose_labels = [
+                        f"{BINDER_ICON.get(row['binder_type'], row['binder_type'])} — {row['assay_name']} / {row['pose_file']}"
+                        for _, row in df_ts_entries.iterrows()
+                    ]
+                    ts_pose_paths = df_ts_entries["pose_full_path"].tolist()
+
+                    idx_key_ts = "ml_ts_pose_idx"
+                    if idx_key_ts not in st.session_state:
+                        st.session_state[idx_key_ts] = 0
+                    st.session_state[idx_key_ts] = max(0, min(st.session_state[idx_key_ts], len(ts_pose_labels) - 1))
+
+                    selected_ts_pose = st.selectbox(
+                        "Select a pose:",
+                        ts_pose_labels,
+                        index=st.session_state[idx_key_ts],
+                    )
+                    if selected_ts_pose:
+                        st.session_state[idx_key_ts] = ts_pose_labels.index(selected_ts_pose)
+
+                    cur_ts = st.session_state[idx_key_ts]
+                    current_ts_row = df_ts_entries.iloc[cur_ts]
+                    full_path_ts = ts_pose_paths[cur_ts]
+
+                    ## Binder type badge
+                    if current_ts_row["binder_type"] == "positive":
+                        st.success("✅ Positive binder")
+                    else:
+                        st.error("❌ Negative binder")
+
+                    if os.path.exists(full_path_ts):
+                        with open(full_path_ts, "r") as f:
+                            pdb_data_ts = f.read()
+                        view_ts = py3Dmol.view(width=800, height=500)
+                        view_ts.addModel(pdb_data_ts, "pdb")
+                        view_ts.setStyle({"model": 0}, {"stick": {}, "cartoon": {"color": "spectrum"}})
+                        if st.session_state.get("ml_ts_ref_pdb_data"):
+                            view_ts.addModel(st.session_state["ml_ts_ref_pdb_data"], "pdb")
+                            view_ts.setStyle({"model": 1}, {"sphere": {"colorscheme": "elementColors", "scale": 0.3, "opacity": 0.6}, "stick": {"colorscheme": "elementColors", "opacity": 0.6}})
+                        view_ts.zoomTo()
+
+                        has_ref_ts = st.session_state.get("ml_ts_ref_pdb_data")
+                        prev_col, viewer_col, next_col = st.columns([0.5, 8, 0.5 if not has_ref_ts else 1])
+                        with prev_col:
+                            st.write(""); st.write(""); st.write("")
+                            if st.button("◀", key="ml_ts_prev", disabled=(cur_ts == 0)):
+                                st.session_state[idx_key_ts] = cur_ts - 1
+                                st.rerun()
+                        with viewer_col:
+                            st.components.v1.html(view_ts.write_html(), height=520)
+                        with next_col:
+                            st.write(""); st.write(""); st.write("")
+                            if st.button("▶", key="ml_ts_next", disabled=(cur_ts >= len(ts_pose_labels) - 1)):
+                                st.session_state[idx_key_ts] = cur_ts + 1
+                                st.rerun()
+                        st.caption(f"Pose {cur_ts + 1} of {len(ts_pose_labels)} — {current_ts_row['assay_name']} / {current_ts_row['pose_file']}")
+                    else:
+                        st.warning(f"Pose file not found on disk: {full_path_ts}")
