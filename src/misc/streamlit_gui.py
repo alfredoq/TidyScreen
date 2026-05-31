@@ -30,6 +30,11 @@ def _toggle_ts_set_viewer():
     st.session_state[key] = not st.session_state.get(key, False)
 
 
+def _toggle_ts_snapshot_inspector():
+    key = "show_ts_snapshot_inspector"
+    st.session_state[key] = not st.session_state.get(key, False)
+
+
 st.set_page_config(page_title="TidyScreen App", layout="wide")
 
 # Sidebar navigation
@@ -121,7 +126,48 @@ elif page == "ChemSpace":
                 if selected_display_cols:
                     display_df = st_funcs.read_table_columns_as_dataframe(db_path, display_selected_table, selected_display_cols)
                     if display_df is not None and not display_df.empty:
-                        st.dataframe(display_df, use_container_width=True)
+                        _display_df_sel = display_df.copy()
+                        _display_df_sel.insert(0, "Select", False)
+                        _edited_display = st.data_editor(
+                            _display_df_sel,
+                            column_config={"Select": st.column_config.CheckboxColumn("Select", default=False)},
+                            disabled=[c for c in _display_df_sel.columns if c != "Select"],
+                            hide_index=True,
+                            use_container_width=True,
+                            key=f"data_editor_display_{display_selected_table}",
+                        )
+                        _selected_display_rows = _edited_display[_edited_display["Select"]]
+                        _n_sel_display = len(_selected_display_rows)
+
+                        st.markdown("---")
+                        st.markdown("**📦 Subset Table**")
+                        _subset_col1, _subset_col2 = st.columns([3, 1])
+                        with _subset_col1:
+                            _new_table_name = st.text_input(
+                                "New table name:",
+                                placeholder="e.g. my_subset",
+                                key=f"subset_table_name_{display_selected_table}",
+                            )
+                        with _subset_col2:
+                            st.write("")
+                            st.write("")
+                            if st.button(
+                                f"Create Subset ({_n_sel_display} rows)",
+                                key=f"btn_subset_table_{display_selected_table}",
+                                disabled=(_n_sel_display == 0 or not _new_table_name.strip()),
+                            ):
+                                _row_indices = list(_selected_display_rows.index)
+                                result = st_funcs.create_subset_table(
+                                    db_path, display_selected_table,
+                                    _new_table_name.strip(), _row_indices,
+                                    columns=selected_display_cols
+                                )
+                                if result == "created":
+                                    st.success(f"✅ Subset table **'{_new_table_name.strip()}'** created with {_n_sel_display} row(s).")
+                                elif result == "duplicate":
+                                    st.error(f"A table named **'{_new_table_name.strip()}'** already exists. Choose a different name.")
+                                else:
+                                    st.error(f"Could not create subset: {result}")
                     else:
                         st.info(f"Table '{display_selected_table}' is empty or could not be read.")
                 else:
@@ -1132,17 +1178,79 @@ elif page == "ML":
             st.info("No positive binders registered yet.")
         else:
             st.success(f"{len(df_pos)} positive binder(s) registered.")
-            st.dataframe(df_pos, use_container_width=True)
+            _df_pos_display = df_pos.copy()
+            _df_pos_display.insert(0, "Select", False)
+            _edited_pos = st.data_editor(
+                _df_pos_display,
+                column_config={"Select": st.column_config.CheckboxColumn("Select", default=False)},
+                disabled=[c for c in _df_pos_display.columns if c != "Select"],
+                hide_index=True,
+                use_container_width=True,
+                key="data_editor_pos_binders",
+            )
+            _selected_pos = _edited_pos[_edited_pos["Select"]]
 
-            ## --- View Positive Poses ---
+            ## --- View / Clear / Delete Selected Positive Poses ---
             pos_viewer_key = "show_ml_positive_poses"
             if pos_viewer_key not in st.session_state:
                 st.session_state[pos_viewer_key] = False
-            st.button(
-                f"{'Hide' if st.session_state[pos_viewer_key] else 'View'} Positive Poses",
-                key="btn_ml_positive_poses",
-                on_click=_toggle_ml_positive_viewer
-            )
+            _col_pos_view, _col_pos_clear, _col_pos_delete = st.columns([3, 2, 2])
+            with _col_pos_view:
+                st.button(
+                    f"{'Hide' if st.session_state[pos_viewer_key] else 'View'} Positive Poses",
+                    key="btn_ml_positive_poses",
+                    on_click=_toggle_ml_positive_viewer
+                )
+            with _col_pos_clear:
+                if not st.session_state.get("confirm_clear_positive"):
+                    if st.button("🗑️ Clear Positive Binders", key="btn_clear_positive_binders"):
+                        st.session_state["confirm_clear_positive"] = True
+                        st.rerun()
+                else:
+                    st.warning("⚠️ This will delete **all** positive binders. Are you sure?")
+                    _ccpos1, _ccpos2 = st.columns(2)
+                    with _ccpos1:
+                        if st.button("✅ Yes, clear all", key="btn_confirm_clear_positive"):
+                            result = st_funcs.clear_binders(project_path, "positive")
+                            st.session_state["confirm_clear_positive"] = False
+                            if result == "cleared":
+                                st.session_state[pos_viewer_key] = False
+                                st.rerun()
+                            else:
+                                st.error(f"Could not clear positive binders: {result}")
+                    with _ccpos2:
+                        if st.button("❌ Cancel", key="btn_cancel_clear_positive"):
+                            st.session_state["confirm_clear_positive"] = False
+                            st.rerun()
+            with _col_pos_delete:
+                _n_sel_pos = len(_selected_pos)
+                if not st.session_state.get("confirm_delete_selected_positive"):
+                    if st.button(
+                        f"🗑️ Delete Selected ({_n_sel_pos})",
+                        key="btn_delete_selected_positive",
+                        disabled=(_n_sel_pos == 0),
+                    ):
+                        st.session_state["confirm_delete_selected_positive"] = True
+                        st.rerun()
+                else:
+                    st.warning(f"⚠️ Delete **{_n_sel_pos}** selected row(s)? Are you sure?")
+                    _cdpos1, _cdpos2 = st.columns(2)
+                    with _cdpos1:
+                        if st.button("✅ Yes, delete", key="btn_confirm_delete_selected_positive"):
+                            for _, _row in _selected_pos.iterrows():
+                                st_funcs.remove_binder(
+                                    project_path=project_path,
+                                    binder_type="positive",
+                                    assay_name=_row["assay_name"],
+                                    pose_file=_row["pose_file"],
+                                    directory=_row["directory"],
+                                )
+                            st.session_state["confirm_delete_selected_positive"] = False
+                            st.rerun()
+                    with _cdpos2:
+                        if st.button("❌ Cancel", key="btn_cancel_delete_selected_positive"):
+                            st.session_state["confirm_delete_selected_positive"] = False
+                            st.rerun()
 
             if st.session_state[pos_viewer_key]:
                 ref_file_pos = st.file_uploader(
@@ -1230,17 +1338,79 @@ elif page == "ML":
             st.info("No negative binders registered yet.")
         else:
             st.success(f"{len(df_neg)} negative binder(s) registered.")
-            st.dataframe(df_neg, use_container_width=True)
+            _df_neg_display = df_neg.copy()
+            _df_neg_display.insert(0, "Select", False)
+            _edited_neg = st.data_editor(
+                _df_neg_display,
+                column_config={"Select": st.column_config.CheckboxColumn("Select", default=False)},
+                disabled=[c for c in _df_neg_display.columns if c != "Select"],
+                hide_index=True,
+                use_container_width=True,
+                key="data_editor_neg_binders",
+            )
+            _selected_neg = _edited_neg[_edited_neg["Select"]]
 
-            ## --- View Negative Poses ---
+            ## --- View / Clear / Delete Selected Negative Poses ---
             neg_viewer_key = "show_ml_negative_poses"
             if neg_viewer_key not in st.session_state:
                 st.session_state[neg_viewer_key] = False
-            st.button(
-                f"{'Hide' if st.session_state[neg_viewer_key] else 'View'} Negative Poses",
-                key="btn_ml_negative_poses",
-                on_click=_toggle_ml_negative_viewer
-            )
+            _col_neg_view, _col_neg_clear, _col_neg_delete = st.columns([3, 2, 2])
+            with _col_neg_view:
+                st.button(
+                    f"{'Hide' if st.session_state[neg_viewer_key] else 'View'} Negative Poses",
+                    key="btn_ml_negative_poses",
+                    on_click=_toggle_ml_negative_viewer
+                )
+            with _col_neg_clear:
+                if not st.session_state.get("confirm_clear_negative"):
+                    if st.button("🗑️ Clear Negative Binders", key="btn_clear_negative_binders"):
+                        st.session_state["confirm_clear_negative"] = True
+                        st.rerun()
+                else:
+                    st.warning("⚠️ This will delete **all** negative binders. Are you sure?")
+                    _ccneg1, _ccneg2 = st.columns(2)
+                    with _ccneg1:
+                        if st.button("✅ Yes, clear all", key="btn_confirm_clear_negative"):
+                            result = st_funcs.clear_binders(project_path, "negative")
+                            st.session_state["confirm_clear_negative"] = False
+                            if result == "cleared":
+                                st.session_state[neg_viewer_key] = False
+                                st.rerun()
+                            else:
+                                st.error(f"Could not clear negative binders: {result}")
+                    with _ccneg2:
+                        if st.button("❌ Cancel", key="btn_cancel_clear_negative"):
+                            st.session_state["confirm_clear_negative"] = False
+                            st.rerun()
+            with _col_neg_delete:
+                _n_sel_neg = len(_selected_neg)
+                if not st.session_state.get("confirm_delete_selected_negative"):
+                    if st.button(
+                        f"🗑️ Delete Selected ({_n_sel_neg})",
+                        key="btn_delete_selected_negative",
+                        disabled=(_n_sel_neg == 0),
+                    ):
+                        st.session_state["confirm_delete_selected_negative"] = True
+                        st.rerun()
+                else:
+                    st.warning(f"⚠️ Delete **{_n_sel_neg}** selected row(s)? Are you sure?")
+                    _cdneg1, _cdneg2 = st.columns(2)
+                    with _cdneg1:
+                        if st.button("✅ Yes, delete", key="btn_confirm_delete_selected_negative"):
+                            for _, _row in _selected_neg.iterrows():
+                                st_funcs.remove_binder(
+                                    project_path=project_path,
+                                    binder_type="negative",
+                                    assay_name=_row["assay_name"],
+                                    pose_file=_row["pose_file"],
+                                    directory=_row["directory"],
+                                )
+                            st.session_state["confirm_delete_selected_negative"] = False
+                            st.rerun()
+                    with _cdneg2:
+                        if st.button("❌ Cancel", key="btn_cancel_delete_selected_negative"):
+                            st.session_state["confirm_delete_selected_negative"] = False
+                            st.rerun()
 
             if st.session_state[neg_viewer_key]:
                 ref_file_neg = st.file_uploader(
@@ -1353,20 +1523,97 @@ elif page == "ML":
         if df_snaps is None or df_snaps.empty:
             st.info("No training sets consolidated yet.")
         else:
-            st.dataframe(df_snaps, use_container_width=True)
+            _fp_status = st_funcs.get_training_set_fingerprint_status(project_path)
+            _df_snaps_display = df_snaps.copy()
+            _df_snaps_display.insert(
+                _df_snaps_display.columns.get_loc("notes") + 1,
+                "fingerprints",
+                _df_snaps_display["training_set_id"].map(lambda ts: _fp_status.get(ts, "❌ None")),
+            )
+            _df_snaps_display.insert(0, "Select", False)
+            _edited_snaps = st.data_editor(
+                _df_snaps_display,
+                column_config={"Select": st.column_config.CheckboxColumn("Select", default=False)},
+                disabled=[c for c in _df_snaps_display.columns if c != "Select"],
+                hide_index=True,
+                use_container_width=True,
+                key="data_editor_snaps",
+            )
+            _selected_snaps = _edited_snaps[_edited_snaps["Select"]]
 
-            ## --- View set poses ---
+            ## --- View set poses / Delete Selected ---
             snap_ids = df_snaps["training_set_id"].tolist()
             selected_ts = st.selectbox("Select a training set to inspect:", snap_ids, key="ts_viewer_select")
 
             ts_viewer_key = "show_ts_set_viewer"
             if ts_viewer_key not in st.session_state:
                 st.session_state[ts_viewer_key] = False
-            st.button(
-                f"{'Hide' if st.session_state[ts_viewer_key] else 'View'} Set Poses",
-                key="btn_ts_set_viewer",
-                on_click=_toggle_ts_set_viewer
-            )
+            ts_inspector_key = "show_ts_snapshot_inspector"
+            if ts_inspector_key not in st.session_state:
+                st.session_state[ts_inspector_key] = False
+            _col_ts_view, _col_ts_inspect, _col_ts_delete = st.columns([3, 3, 2])
+            with _col_ts_view:
+                st.button(
+                    f"{'Hide' if st.session_state[ts_viewer_key] else 'View'} Set Poses",
+                    key="btn_ts_set_viewer",
+                    on_click=_toggle_ts_set_viewer
+                )
+            with _col_ts_inspect:
+                st.button(
+                    f"{'Hide' if st.session_state[ts_inspector_key] else 'Inspect'} Set Snapshot",
+                    key="btn_ts_snapshot_inspector",
+                    on_click=_toggle_ts_snapshot_inspector
+                )
+            with _col_ts_delete:
+                _n_sel_snaps = len(_selected_snaps)
+                if not st.session_state.get("confirm_delete_selected_snaps"):
+                    if st.button(
+                        f"🗑️ Delete Selected ({_n_sel_snaps})",
+                        key="btn_delete_selected_snaps",
+                        disabled=(_n_sel_snaps == 0),
+                    ):
+                        st.session_state["confirm_delete_selected_snaps"] = True
+                        st.rerun()
+                else:
+                    st.warning(f"⚠️ Delete **{_n_sel_snaps}** snapshot(s) and all associated data? Are you sure?")
+                    _cdsnap1, _cdsnap2 = st.columns(2)
+                    with _cdsnap1:
+                        if st.button("✅ Yes, delete", key="btn_confirm_delete_selected_snaps"):
+                            _ids_to_delete = _selected_snaps["training_set_id"].tolist()
+                            result = st_funcs.delete_training_set_snapshots(project_path, _ids_to_delete)
+                            st.session_state["confirm_delete_selected_snaps"] = False
+                            if result == "deleted":
+                                st.session_state[ts_viewer_key] = False
+                                st.rerun()
+                            else:
+                                st.error(f"Could not delete snapshots: {result}")
+                    with _cdsnap2:
+                        if st.button("❌ Cancel", key="btn_cancel_delete_selected_snaps"):
+                            st.session_state["confirm_delete_selected_snaps"] = False
+                            st.rerun()
+
+            ## --- Snapshot inspector panel ---
+            if st.session_state[ts_inspector_key] and selected_ts:
+                df_inspect = st_funcs.get_training_set_entries(project_path, selected_ts)
+                st.markdown(f"##### 🔍 Snapshot: **{selected_ts}**")
+                if df_inspect is None or df_inspect.empty:
+                    st.info("No entries found for this snapshot.")
+                else:
+                    df_pos_inspect = df_inspect[df_inspect["binder_type"] == "positive"].drop(columns=["binder_type"], errors="ignore")
+                    df_neg_inspect = df_inspect[df_inspect["binder_type"] == "negative"].drop(columns=["binder_type"], errors="ignore")
+                    _icol1, _icol2 = st.columns(2)
+                    with _icol1:
+                        st.markdown(f"**✅ Positive binders ({len(df_pos_inspect)})**")
+                        if df_pos_inspect.empty:
+                            st.info("None.")
+                        else:
+                            st.dataframe(df_pos_inspect, use_container_width=True, hide_index=True)
+                    with _icol2:
+                        st.markdown(f"**❌ Negative binders ({len(df_neg_inspect)})**")
+                        if df_neg_inspect.empty:
+                            st.info("None.")
+                        else:
+                            st.dataframe(df_neg_inspect, use_container_width=True, hide_index=True)
 
             if st.session_state[ts_viewer_key] and selected_ts:
                 df_ts_entries = st_funcs.get_training_set_entries(project_path, selected_ts)

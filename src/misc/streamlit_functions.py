@@ -737,6 +737,30 @@ def remove_binder(project_path: str, binder_type: str, assay_name: str, pose_fil
         return f"error:{e}"
 
 
+def clear_binders(project_path: str, binder_type: str) -> str:
+    """
+    Delete all entries from the positive or negative binders registry.
+
+    Returns 'cleared', 'not_found', or 'error:<message>'.
+
+    Args:
+        project_path (str): Root path of the active project.
+        binder_type (str): Either 'positive' or 'negative'.
+    """
+    try:
+        db_path = os.path.join(project_path, "ml", "training_sets", f"{binder_type}_binders.db")
+        table = f"{binder_type}_binders"
+        if not os.path.exists(db_path):
+            return "not_found"
+        conn = sqlite3.connect(db_path)
+        conn.execute(f"DELETE FROM {table}")
+        conn.commit()
+        conn.close()
+        return "cleared"
+    except Exception as e:
+        return f"error:{e}"
+
+
 def consolidate_training_set(project_path: str, training_set_id: str, notes: str = "") -> str:
     """
     Snapshot the current positive and negative binders registries into a named training set.
@@ -873,6 +897,89 @@ def get_training_set_snapshots(project_path: str) -> "pd.DataFrame":
         return None
 
 
+def get_training_set_fingerprint_status(project_path: str) -> "dict":
+    """
+    Return a dict mapping training_set_id → fingerprint status string.
+
+    Status values:
+      '✅ Complete'      — every entry in the snapshot has at least one fingerprint
+      '⚠️ Partial (X/Y)' — some but not all entries have fingerprints
+      '❌ None'           — no fingerprints computed for this snapshot
+
+    Entries are counted as distinct (assay_name, pose_file, directory) tuples so
+    that multiple prolif_conditions runs for the same pose do not inflate the count.
+
+    Args:
+        project_path (str): Root path of the active project.
+
+    Returns:
+        dict[str, str]: Mapping of training_set_id to status string.
+                        Empty dict if the database or tables do not exist.
+    """
+    db_path = os.path.join(project_path, "ml", "training_sets", "training_sets_snapshots.db")
+    if not os.path.exists(db_path):
+        return {}
+    try:
+        conn = sqlite3.connect(db_path)
+        totals = pd.read_sql_query(
+            "SELECT training_set_id, COUNT(*) AS total FROM training_set_entries GROUP BY training_set_id",
+            conn,
+        )
+        computed = pd.read_sql_query(
+            """SELECT training_set_id, COUNT(DISTINCT assay_name || '|' || pose_file || '|' || directory) AS done
+               FROM training_set_fingerprints GROUP BY training_set_id""",
+            conn,
+        )
+        conn.close()
+    except Exception:
+        return {}
+
+    merged = totals.merge(computed, on="training_set_id", how="left")
+    merged["done"] = merged["done"].fillna(0).astype(int)
+
+    status = {}
+    for _, row in merged.iterrows():
+        ts_id = row["training_set_id"]
+        total = int(row["total"])
+        done = int(row["done"])
+        if done == 0:
+            status[ts_id] = "❌ None"
+        elif done >= total:
+            status[ts_id] = "✅ Complete"
+        else:
+            status[ts_id] = f"⚠️ Partial ({done}/{total})"
+    return status
+
+
+def delete_training_set_snapshots(project_path: str, training_set_ids: list) -> str:
+    """
+    Delete one or more training set snapshots and all their associated entries.
+
+    Removes matching rows from both training_set_snapshots and training_set_entries
+    for each id in training_set_ids.
+    Returns 'deleted', 'not_found', or 'error:<message>'.
+
+    Args:
+        project_path (str): Root path of the active project.
+        training_set_ids (list[str]): List of training_set_id values to delete.
+    """
+    if not training_set_ids:
+        return "not_found"
+    try:
+        db_path = os.path.join(project_path, "ml", "training_sets", "training_sets_snapshots.db")
+        if not os.path.exists(db_path):
+            return "not_found"
+        placeholders = ",".join("?" * len(training_set_ids))
+        conn = sqlite3.connect(db_path)
+        conn.execute(f"DELETE FROM training_set_snapshots WHERE training_set_id IN ({placeholders})", training_set_ids)
+        conn.execute(f"DELETE FROM training_set_entries WHERE training_set_id IN ({placeholders})", training_set_ids)
+        conn.commit()
+        conn.close()
+        return "deleted"
+    except Exception as e:
+        return f"error:{e}"
+
+
 def get_table_columns(db_path: str, table_name: str) -> list:
     """
     Return the list of column names for a given table in a SQLite database.
@@ -915,6 +1022,48 @@ def read_table_columns_as_dataframe(db_path: str, table_name: str, columns: list
         return df
     except Exception as e:
         return pd.DataFrame()
+
+
+def create_subset_table(db_path: str, source_table: str, new_table: str, row_indices: list, columns: list = None) -> str:
+    """
+    Create a new table in a SQLite database as a subset of rows from an existing table.
+
+    Copies the rows identified by their 0-based positional indices (as returned by
+    pandas iloc) from source_table into a new table called new_table. Only the
+    columns listed in `columns` are written; if `columns` is None all columns are
+    preserved.  The new table must not already exist.
+
+    Returns 'created', 'duplicate', or 'error:<message>'.
+
+    Args:
+        db_path (str): Path to the SQLite database.
+        source_table (str): Name of the source table.
+        new_table (str): Name for the new subset table.
+        row_indices (list[int]): 0-based row positions to include in the subset.
+        columns (list[str], optional): Column names to include. Defaults to all columns.
+    """
+    if not row_indices:
+        return "error:No rows selected"
+    try:
+        conn = sqlite3.connect(db_path)
+        existing = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (new_table,)
+        ).fetchone()
+        if existing:
+            conn.close()
+            return "duplicate"
+        if columns:
+            col_expr = ", ".join(f"[{c}]" for c in columns)
+            df_full = pd.read_sql_query(f"SELECT {col_expr} FROM [{source_table}]", conn)
+        else:
+            df_full = pd.read_sql_query(f"SELECT * FROM [{source_table}]", conn)
+        df_subset = df_full.iloc[row_indices]
+        df_subset.to_sql(new_table, conn, if_exists="fail", index=False)
+        conn.close()
+        return "created"
+    except Exception as e:
+        return f"error:{e}"
+
 
 
 def depict_table_to_images(db_path: str, table_name: str,
