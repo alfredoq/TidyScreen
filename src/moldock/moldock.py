@@ -9025,7 +9025,7 @@ class MolDock:
             pose_id = row[1]['Pose_ID']
             run_number = row[1]['run_number']
             
-            input_model, pose_coords_json = self._retrieve_pose_info(db_path, pose_id)
+            input_model, pose_coords_json = self._retrieve_pose_info(db_path, ligname, run_number)
             pdb_dict = self._process_input_model_for_moldf(input_model, pose_coords_json)
             self._write_pdb_with_moldf(pdb_dict, ligname, run_number, output_dir)
 
@@ -9076,7 +9076,7 @@ class MolDock:
             pose_id = row[1]['Pose_ID']
             run_number = row[1]['run_number']
             
-            input_model, pose_coords_json = self._retrieve_pose_info(db_path, pose_id)
+            input_model, pose_coords_json = self._retrieve_pose_info(db_path, ligname, run_number)
             pdb_dict = self._process_input_model_for_moldf(input_model, pose_coords_json)
             self._write_pdb_with_moldf(pdb_dict, ligname, run_number, output_dir)
 
@@ -9185,14 +9185,17 @@ class MolDock:
         
         return df
 
-    def _retrieve_pose_info(self, db_path, pose_id):
+    def _retrieve_pose_info(self, db_path, ligname, run_number):
         """
-        Retrieves ligand pose information from the database for a given pose ID.
-        Connects to the specified SQLite database, queries the Ligands and Results tables
-        to obtain the input model and ligand coordinates associated with the provided pose ID.
+        Retrieves ligand pose information from the database for a given ligand name and
+        per-ligand run number.  Queries by (LigName, run_number) so the correct pose is
+        returned regardless of the global Pose_ID assignment order.
+
         Args:
             db_path (str): Path to the SQLite database file.
-            pose_id (int or str): Identifier of the pose to retrieve.
+            ligname (str): Ligand name (LigName column in the Ligands / Results tables).
+            run_number (int or str): Per-ligand sequential pose number stored in the
+                Results table and used as the suffix in extracted PDB filenames.
         Returns:
             tuple: A tuple containing:
                 - input_model (str): The input model data for the ligand.
@@ -9207,12 +9210,14 @@ class MolDock:
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
 
-        # Retrieve the info required to reconstruct the ligand pose
+        # Retrieve the info required to reconstruct the ligand pose.
+        # Filter by both LigName and run_number so the correct per-ligand pose is
+        # returned even when run_number values repeat across different ligands.
         cursor.execute("""
         SELECT L.input_model, R.ligand_coordinates FROM Ligands L
         JOIN Results R ON L.LigName = R.LigName
-        WHERE R.Pose_ID = ?
-        """, (pose_id,))
+        WHERE R.LigName = ? AND R.run_number = ?
+        """, (ligname, run_number))
         row = cursor.fetchone()
         
         input_model, pose_coords_json = row
@@ -10528,7 +10533,7 @@ class MolDock:
         
         try:
             conn = sqlite3.connect(results_db)
-            query = "SELECT Pose_ID, LigName, docking_score, cluster_size FROM Results"
+            query = "SELECT Pose_ID, LigName, docking_score, cluster_size, run_number FROM Results"
             df = pd.read_sql(query, conn)
             conn.close()
         except Exception as e:
@@ -10598,11 +10603,13 @@ class MolDock:
 
         for idx, row in df.iterrows():
             pose_id = row['Pose_ID']
+            run_number = row['run_number']
             ligname = row['LigName']
             print(f"Processing Pose_ID: {pose_id}, LigName: {ligname}")
         
-            # Restore every docked pose
-            output_dir, output_file = self._restore_single_docked_pose(results_db, ligname, pose_id)
+            # Restore every docked pose using (ligname, run_number) which matches the
+            # per-ligand sequential number used when PDB filenames are constructed.
+            output_dir, output_file = self._restore_single_docked_pose(results_db, ligname, run_number)
         
             # Create ligand .mol2 and .frcmod files
             if ligname not in processed_ligands:
@@ -10716,13 +10723,16 @@ class MolDock:
             shutil.rmtree(output_dir, ignore_errors=True)
             print("✅ Temporary files cleaned up.")
             
-    def _restore_single_docked_pose(self, results_db, ligname, pose_id):
+    def _restore_single_docked_pose(self, results_db, ligname, run_number):
         """
-        Will use a similar logic than that used in the extract_docked_poses to generate a .pdb file from a single docked pose identified by Pose_ID in the Results table of the assay database
+        Generate a .pdb file for a single docked pose identified by (ligname, run_number).
+        Uses the same logic as extract_docked_poses: the per-ligand run_number matches the
+        suffix that was used when PDB files were written during pose extraction.
         """
 
-        # Retrieve input_model and pose_coords_json
-        input_model, pose_coords_json = self._retrieve_pose_info(results_db, pose_id)
+        # Retrieve input_model and pose_coords_json using (ligname, run_number) so that
+        # the correct per-ligand pose is always retrieved.
+        input_model, pose_coords_json = self._retrieve_pose_info(results_db, ligname, run_number)
         
         pdb_dict = self._process_input_model_for_moldf(input_model, pose_coords_json)
 
@@ -10733,7 +10743,7 @@ class MolDock:
             os.makedirs(output_dir, exist_ok=True)
 
         # # Write the PDB file
-        output_file = self._write_pdb_with_moldf(pdb_dict, ligname, pose_id, output_dir)
+        output_file = self._write_pdb_with_moldf(pdb_dict, ligname, run_number, output_dir)
 
         return output_dir, output_file
 

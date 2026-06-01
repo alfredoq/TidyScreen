@@ -249,8 +249,10 @@ class MachineLearning:
         training_sets_snapshots.db, keyed on
         (training_set_id, assay_name, pose_file, directory, prolif_conditions_id).
 
-        The mapping from pose_file → LigName + Pose_ID relies on the filename
-        convention  ``{LigName}_{Pose_ID}.pdb`` written by MolDock.
+        The mapping from pose_file → LigName + run_number relies on the filename
+        convention  ``{LigName}_{run_number}.pdb`` written by MolDock during pose
+        extraction.  Note: the suffix is the per-ligand run_number, NOT the global
+        Pose_ID from the Ringtail Results table.
         The assay_name column is used to look up assay metadata (receptor path,
         renumbering dict, results DB path) from the docking registers.
         """
@@ -311,6 +313,8 @@ class MachineLearning:
         )
         conn.close()
 
+        print(entries_df) # For debugging
+
         if entries_df.empty:
             print(f"\n❌ No entries found for training set '{training_set_id}'")
             return
@@ -370,7 +374,9 @@ class MachineLearning:
                     print(f"  ❌ Assay '{assay_name}' not found in registry — skipping {pose_file}")
                     continue
 
-                # Parse LigName and Pose_ID from pose_file ({LigName}_{Pose_ID}.pdb)
+                # Parse LigName and run_number from pose_file ({LigName}_{run_number}.pdb).
+                # The suffix is the per-ligand run_number used during pose extraction,
+                # NOT the global Pose_ID from the Ringtail Results table.
                 stem = os.path.splitext(pose_file)[0]
                 parts = stem.rsplit('_', 1)
                 if len(parts) != 2:
@@ -378,9 +384,9 @@ class MachineLearning:
                     continue
                 ligname, pose_id_str = parts
                 try:
-                    pose_id = int(pose_id_str)
+                    pose_id = int(pose_id_str)  # this is the run_number
                 except ValueError:
-                    print(f"  ❌ Cannot parse pose_id from '{pose_id_str}' — skipping {pose_file}")
+                    print(f"  ❌ Cannot parse run_number from '{pose_id_str}' — skipping {pose_file}")
                     continue
 
                 # Derive receptor_checked.pdb path from the pdbqt_file stored in assay info
@@ -401,6 +407,9 @@ class MachineLearning:
                 try:
                     # Step A: Restore docked pose PDB from the assay results DB
                     output_dir, output_file = moldock._restore_single_docked_pose(results_db, ligname, pose_id)
+                    
+                    print(f"    ✅ Restored pose file: {output_file}") # For debugging
+                    
                     if output_dir not in output_dirs:
                         output_dirs.append(output_dir)
 
