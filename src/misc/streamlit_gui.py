@@ -645,7 +645,9 @@ elif page == "Analysis":
                                                 if result == "saved":
                                                     st.success(f"Saved: {selected_file}")
                                                 elif result == "duplicate":
-                                                    st.warning("Already flagged.")
+                                                    st.warning("Already flagged as positive.")
+                                                elif result == "conflict":
+                                                    st.error("Already flagged as negative binder.")
                                                 else:
                                                     st.error(result)
                                             flag_neg_key = f"flag_neg_{entry['directory']}_{selected_file}"
@@ -660,7 +662,9 @@ elif page == "Analysis":
                                                 if result == "saved":
                                                     st.success(f"Saved: {selected_file}")
                                                 elif result == "duplicate":
-                                                    st.warning("Already flagged.")
+                                                    st.warning("Already flagged as negative.")
+                                                elif result == "conflict":
+                                                    st.error("Already flagged as positive binder.")
                                                 else:
                                                     st.error(result)
 

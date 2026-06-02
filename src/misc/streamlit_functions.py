@@ -593,7 +593,8 @@ def save_positive_binder(project_path: str, assay_name: str, pose_file: str, dir
     Save a pose flagged as a positive binder to the positive_binders.db database.
 
     The database is created at <project_path>/ml/training_sets/positive_binders.db.
-    Returns a status string: 'saved', 'duplicate', or 'error:<message>'.
+    Returns a status string: 'saved', 'duplicate', 'conflict', or 'error:<message>'.
+    'conflict' means the pose is already registered as a negative binder.
 
     Args:
         project_path (str): Root path of the active project.
@@ -605,6 +606,29 @@ def save_positive_binder(project_path: str, assay_name: str, pose_file: str, dir
     try:
         db_dir = os.path.join(project_path, "ml", "training_sets")
         os.makedirs(db_dir, exist_ok=True)
+
+        neg_db_path = os.path.join(db_dir, "negative_binders.db")
+        if os.path.exists(neg_db_path):
+            neg_conn = sqlite3.connect(neg_db_path)
+            neg_conn.execute("""
+                CREATE TABLE IF NOT EXISTS negative_binders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    assay_name TEXT NOT NULL,
+                    pose_file TEXT NOT NULL,
+                    directory TEXT NOT NULL,
+                    pose_full_path TEXT NOT NULL,
+                    flagged_at TEXT NOT NULL,
+                    UNIQUE(assay_name, pose_file, directory)
+                )
+            """)
+            row = neg_conn.execute(
+                "SELECT 1 FROM negative_binders WHERE assay_name=? AND pose_file=? AND directory=?",
+                (assay_name, pose_file, directory)
+            ).fetchone()
+            neg_conn.close()
+            if row:
+                return "conflict"
+
         db_path = os.path.join(db_dir, "positive_binders.db")
         conn = sqlite3.connect(db_path)
         conn.execute("""
@@ -639,7 +663,8 @@ def save_negative_binder(project_path: str, assay_name: str, pose_file: str, dir
     Save a pose flagged as a negative binder to the negative_binders.db database.
 
     The database is created at <project_path>/ml/training_sets/negative_binders.db.
-    Returns a status string: 'saved', 'duplicate', or 'error:<message>'.
+    Returns a status string: 'saved', 'duplicate', 'conflict', or 'error:<message>'.
+    'conflict' means the pose is already registered as a positive binder.
 
     Args:
         project_path (str): Root path of the active project.
@@ -651,6 +676,29 @@ def save_negative_binder(project_path: str, assay_name: str, pose_file: str, dir
     try:
         db_dir = os.path.join(project_path, "ml", "training_sets")
         os.makedirs(db_dir, exist_ok=True)
+
+        pos_db_path = os.path.join(db_dir, "positive_binders.db")
+        if os.path.exists(pos_db_path):
+            pos_conn = sqlite3.connect(pos_db_path)
+            pos_conn.execute("""
+                CREATE TABLE IF NOT EXISTS positive_binders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    assay_name TEXT NOT NULL,
+                    pose_file TEXT NOT NULL,
+                    directory TEXT NOT NULL,
+                    pose_full_path TEXT NOT NULL,
+                    flagged_at TEXT NOT NULL,
+                    UNIQUE(assay_name, pose_file, directory)
+                )
+            """)
+            row = pos_conn.execute(
+                "SELECT 1 FROM positive_binders WHERE assay_name=? AND pose_file=? AND directory=?",
+                (assay_name, pose_file, directory)
+            ).fetchone()
+            pos_conn.close()
+            if row:
+                return "conflict"
+
         db_path = os.path.join(db_dir, "negative_binders.db")
         conn = sqlite3.connect(db_path)
         conn.execute("""
