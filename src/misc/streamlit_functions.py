@@ -999,6 +999,73 @@ def get_training_set_fingerprint_status(project_path: str) -> "dict":
     return status
 
 
+def restore_binders_from_snapshot(project_path: str, training_set_id: str) -> "dict | str":
+    """
+    Repopulate the Positive and Negative Binders tables from a training set snapshot.
+
+    Entries already present in the destination table (matched on assay_name, pose_file,
+    directory) are skipped; only genuinely new records are inserted.
+
+    Args:
+        project_path (str): Root path of the active project.
+        training_set_id (str): ID of the training set snapshot to restore from.
+
+    Returns:
+        dict with keys pos_inserted, pos_skipped, neg_inserted, neg_skipped,
+        or a string 'error:<message>' on failure.
+    """
+    try:
+        df = get_training_set_entries(project_path, training_set_id)
+        if df is None or df.empty:
+            return "error:No entries found for this snapshot"
+
+        db_dir = os.path.join(project_path, "ml", "training_sets")
+        os.makedirs(db_dir, exist_ok=True)
+
+        counts = {"pos_inserted": 0, "pos_skipped": 0, "neg_inserted": 0, "neg_skipped": 0}
+
+        for binder_type in ("positive", "negative"):
+            db_path = os.path.join(db_dir, f"{binder_type}_binders.db")
+            table = f"{binder_type}_binders"
+            subset = df[df["binder_type"] == binder_type]
+            if subset.empty:
+                continue
+
+            ins_key = "pos_inserted" if binder_type == "positive" else "neg_inserted"
+            skip_key = "pos_skipped" if binder_type == "positive" else "neg_skipped"
+
+            conn = sqlite3.connect(db_path)
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {table} (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    assay_name TEXT NOT NULL,
+                    pose_file TEXT NOT NULL,
+                    directory TEXT NOT NULL,
+                    pose_full_path TEXT NOT NULL,
+                    flagged_at TEXT NOT NULL,
+                    UNIQUE(assay_name, pose_file, directory)
+                )
+            """)
+            conn.commit()
+
+            for _, row in subset.iterrows():
+                cursor = conn.execute(
+                    f"INSERT OR IGNORE INTO {table} (assay_name, pose_file, directory, pose_full_path, flagged_at) VALUES (?, ?, ?, ?, ?)",
+                    (row["assay_name"], row["pose_file"], row["directory"], row["pose_full_path"], row["flagged_at"])
+                )
+                if cursor.rowcount > 0:
+                    counts[ins_key] += 1
+                else:
+                    counts[skip_key] += 1
+
+            conn.commit()
+            conn.close()
+
+        return counts
+    except Exception as e:
+        return f"error:{e}"
+
+
 def delete_training_set_snapshots(project_path: str, training_set_ids: list) -> str:
     """
     Delete one or more training set snapshots and all their associated entries.

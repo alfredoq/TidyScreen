@@ -1555,13 +1555,29 @@ elif page == "ML":
             ts_inspector_key = "show_ts_snapshot_inspector"
             if ts_inspector_key not in st.session_state:
                 st.session_state[ts_inspector_key] = False
-            _col_ts_view, _col_ts_inspect, _col_ts_delete = st.columns([3, 3, 2])
+            _col_ts_view, _col_ts_restore, _col_ts_inspect, _col_ts_delete = st.columns([3, 3, 3, 2])
             with _col_ts_view:
                 st.button(
                     f"{'Hide' if st.session_state[ts_viewer_key] else 'View'} Set Poses",
                     key="btn_ts_set_viewer",
                     on_click=_toggle_ts_set_viewer
                 )
+            with _col_ts_restore:
+                _restore_ts = _selected_snaps["training_set_id"].iloc[0] if len(_selected_snaps) == 1 else selected_ts
+                if st.button("↩️ Restore to Binders", key="btn_restore_to_binders"):
+                    _restore_result = st_funcs.restore_binders_from_snapshot(project_path, _restore_ts)
+                    if isinstance(_restore_result, str) and _restore_result.startswith("error:"):
+                        st.error(f"❌ {_restore_result[6:]}")
+                    else:
+                        _pos_total = _restore_result['pos_inserted'] + _restore_result['pos_skipped']
+                        _neg_total = _restore_result['neg_inserted'] + _restore_result['neg_skipped']
+                        st.success(
+                            f"Restored from **{_restore_ts}**: "
+                            f"✅ {_pos_total} positive "
+                            f"({_restore_result['pos_inserted']} new, {_restore_result['pos_skipped']} already existed), "
+                            f"❌ {_neg_total} negative "
+                            f"({_restore_result['neg_inserted']} new, {_restore_result['neg_skipped']} already existed)."
+                        )
             with _col_ts_inspect:
                 st.button(
                     f"{'Hide' if st.session_state[ts_inspector_key] else 'Inspect'} Set Snapshot",
