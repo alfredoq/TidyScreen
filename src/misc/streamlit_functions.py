@@ -1,6 +1,7 @@
 from io import StringIO, BytesIO
 import sqlite3
 import os
+import json
 import pandas as pd
 import matplotlib.pyplot as plt
 from datetime import datetime
@@ -622,8 +623,8 @@ def save_positive_binder(project_path: str, assay_name: str, pose_file: str, dir
                 )
             """)
             row = neg_conn.execute(
-                "SELECT 1 FROM negative_binders WHERE assay_name=? AND pose_file=? AND directory=?",
-                (assay_name, pose_file, directory)
+                "SELECT 1 FROM negative_binders WHERE assay_name=? AND pose_file=?",
+                (assay_name, pose_file)
             ).fetchone()
             neg_conn.close()
             if row:
@@ -643,6 +644,13 @@ def save_positive_binder(project_path: str, assay_name: str, pose_file: str, dir
             )
         """)
         conn.commit()
+        existing = conn.execute(
+            "SELECT 1 FROM positive_binders WHERE assay_name=? AND pose_file=?",
+            (assay_name, pose_file)
+        ).fetchone()
+        if existing:
+            conn.close()
+            return "duplicate"
         try:
             conn.execute(
                 "INSERT INTO positive_binders (assay_name, pose_file, directory, pose_full_path, flagged_at) VALUES (?, ?, ?, ?, ?)",
@@ -692,8 +700,8 @@ def save_negative_binder(project_path: str, assay_name: str, pose_file: str, dir
                 )
             """)
             row = pos_conn.execute(
-                "SELECT 1 FROM positive_binders WHERE assay_name=? AND pose_file=? AND directory=?",
-                (assay_name, pose_file, directory)
+                "SELECT 1 FROM positive_binders WHERE assay_name=? AND pose_file=?",
+                (assay_name, pose_file)
             ).fetchone()
             pos_conn.close()
             if row:
@@ -713,6 +721,13 @@ def save_negative_binder(project_path: str, assay_name: str, pose_file: str, dir
             )
         """)
         conn.commit()
+        existing = conn.execute(
+            "SELECT 1 FROM negative_binders WHERE assay_name=? AND pose_file=?",
+            (assay_name, pose_file)
+        ).fetchone()
+        if existing:
+            conn.close()
+            return "duplicate"
         try:
             conn.execute(
                 "INSERT INTO negative_binders (assay_name, pose_file, directory, pose_full_path, flagged_at) VALUES (?, ?, ?, ?, ?)",
@@ -997,6 +1012,141 @@ def get_training_set_fingerprint_status(project_path: str) -> "dict":
         else:
             status[ts_id] = f"⚠️ Partial ({done}/{total})"
     return status
+
+
+def get_training_set_fingerprints_for_pose(project_path: str, training_set_id: str, assay_name: str, pose_file: str, directory: str) -> "list[dict] | None":
+    """
+    Retrieve all computed ProLIF fingerprints for a specific pose in a training set snapshot.
+
+    A pose may have multiple fingerprints if computed under different ProLIF conditions.
+
+    Args:
+        project_path (str): Root path of the active project.
+        training_set_id (str): ID of the training set snapshot.
+        assay_name (str): Name of the docking assay.
+        pose_file (str): PDB filename of the pose.
+        directory (str): Pose folder name (e.g. 'most_stable_poses').
+
+    Returns:
+        List of dicts with keys 'prolif_conditions_id' and 'fingerprint' (dict of interaction→bool),
+        ordered by prolif_conditions_id. Returns None if no fingerprints exist for this pose.
+    """
+    db_path = os.path.join(project_path, "ml", "training_sets", "training_sets_snapshots.db")
+    if not os.path.exists(db_path):
+        return None
+    try:
+        conn = sqlite3.connect(db_path)
+        rows = pd.read_sql_query(
+            """SELECT prolif_conditions_id, fingerprint_json
+               FROM training_set_fingerprints
+               WHERE training_set_id=? AND assay_name=? AND pose_file=? AND directory=?
+               ORDER BY prolif_conditions_id""",
+            conn,
+            params=(training_set_id, assay_name, pose_file, directory),
+        )
+        conn.close()
+        if rows.empty:
+            return None
+        return [
+            {"prolif_conditions_id": row["prolif_conditions_id"], "fingerprint": json.loads(row["fingerprint_json"])}
+            for _, row in rows.iterrows()
+        ]
+    except Exception:
+        return None
+
+
+def get_all_training_set_interactions(project_path: str, training_set_id: str, prolif_conditions_id: int) -> "list[str]":
+    """
+    Return a sorted list of all unique interaction keys present across every pose
+    in a training set snapshot for a given ProLIF conditions ID.
+
+    Args:
+        project_path (str): Root path of the active project.
+        training_set_id (str): ID of the training set snapshot.
+        prolif_conditions_id (int): ProLIF conditions identifier.
+
+    Returns:
+        Sorted list of interaction name strings. Empty list if none found.
+    """
+    db_path = os.path.join(project_path, "ml", "training_sets", "training_sets_snapshots.db")
+    if not os.path.exists(db_path):
+        return []
+    try:
+        conn = sqlite3.connect(db_path)
+        rows = pd.read_sql_query(
+            "SELECT fingerprint_json FROM training_set_fingerprints WHERE training_set_id=? AND prolif_conditions_id=?",
+            conn,
+            params=(training_set_id, prolif_conditions_id),
+        )
+        conn.close()
+        all_keys: set = set()
+        for _, row in rows.iterrows():
+            fp = json.loads(row["fingerprint_json"])
+            all_keys.update(fp.keys())
+
+        def _seq_sort_key(name: str):
+            first = name.split("_")[0]
+            try:
+                return (int(first), name)
+            except ValueError:
+                return (0, name)
+
+        return sorted(all_keys, key=_seq_sort_key)
+    except Exception:
+        return []
+
+
+def get_training_set_interaction_frequencies(project_path: str, training_set_id: str, prolif_conditions_id: int) -> "pd.DataFrame | None":
+    """
+    Compute the frequency (count and percentage) of each interaction across all poses
+    in a training set snapshot for a given ProLIF conditions ID.
+
+    Args:
+        project_path (str): Root path of the active project.
+        training_set_id (str): ID of the training set snapshot.
+        prolif_conditions_id (int): ProLIF conditions identifier.
+
+    Returns:
+        DataFrame with columns ['Interaction', 'Count', 'Frequency (%)'], sorted descending by Count.
+        Returns None if no data is found.
+    """
+    db_path = os.path.join(project_path, "ml", "training_sets", "training_sets_snapshots.db")
+    if not os.path.exists(db_path):
+        return None
+    try:
+        conn = sqlite3.connect(db_path)
+        rows = pd.read_sql_query(
+            "SELECT fingerprint_json FROM training_set_fingerprints WHERE training_set_id=? AND prolif_conditions_id=?",
+            conn,
+            params=(training_set_id, prolif_conditions_id),
+        )
+        conn.close()
+        if rows.empty:
+            return None
+        n_poses = len(rows)
+        counts: dict = {}
+        for _, row in rows.iterrows():
+            fp = json.loads(row["fingerprint_json"])
+            for k, v in fp.items():
+                if v:
+                    counts[k] = counts.get(k, 0) + 1
+        if not counts:
+            return None
+        def _seq_sort_key(name: str):
+            first = name.split("_")[0]
+            try:
+                return (int(first), name)
+            except ValueError:
+                return (0, name)
+
+        df = pd.DataFrame([
+            {"Interaction": k, "Count": v, "Frequency (%)": round(100.0 * v / n_poses, 1)}
+            for k, v in counts.items()
+        ])
+        df = df.iloc[sorted(range(len(df)), key=lambda i: _seq_sort_key(df["Interaction"].iloc[i]))].reset_index(drop=True)
+        return df
+    except Exception:
+        return None
 
 
 def restore_binders_from_snapshot(project_path: str, training_set_id: str) -> "dict | str":

@@ -1578,6 +1578,7 @@ elif page == "ML":
                             f"❌ {_neg_total} negative "
                             f"({_restore_result['neg_inserted']} new, {_restore_result['neg_skipped']} already existed)."
                         )
+                        st.rerun()
             with _col_ts_inspect:
                 st.button(
                     f"{'Hide' if st.session_state[ts_inspector_key] else 'Inspect'} Set Snapshot",
@@ -1660,20 +1661,41 @@ elif page == "ML":
                     ]
                     ts_pose_paths = df_ts_entries["pose_full_path"].tolist()
 
-                    idx_key_ts = "ml_ts_pose_idx"
-                    if idx_key_ts not in st.session_state:
-                        st.session_state[idx_key_ts] = 0
-                    st.session_state[idx_key_ts] = max(0, min(st.session_state[idx_key_ts], len(ts_pose_labels) - 1))
+                    _select_key_ts = "ml_ts_pose_select"
+                    _idx_key_ts = "ml_ts_pose_idx"
+
+                    # Initialise / clamp integer index
+                    if _idx_key_ts not in st.session_state:
+                        st.session_state[_idx_key_ts] = 0
+                    if st.session_state[_idx_key_ts] >= len(ts_pose_labels):
+                        st.session_state[_idx_key_ts] = 0
+
+                    # Initialise selectbox only if absent or stale
+                    if _select_key_ts not in st.session_state or st.session_state[_select_key_ts] not in ts_pose_labels:
+                        st.session_state[_select_key_ts] = ts_pose_labels[st.session_state[_idx_key_ts]]
+
+                    def _ts_go_prev():
+                        if st.session_state[_idx_key_ts] > 0:
+                            st.session_state[_idx_key_ts] -= 1
+                            st.session_state[_select_key_ts] = ts_pose_labels[st.session_state[_idx_key_ts]]
+
+                    def _ts_go_next():
+                        if st.session_state[_idx_key_ts] < len(ts_pose_labels) - 1:
+                            st.session_state[_idx_key_ts] += 1
+                            st.session_state[_select_key_ts] = ts_pose_labels[st.session_state[_idx_key_ts]]
 
                     selected_ts_pose = st.selectbox(
                         "Select a pose:",
                         ts_pose_labels,
-                        index=st.session_state[idx_key_ts],
+                        key=_select_key_ts,
                     )
-                    if selected_ts_pose:
-                        st.session_state[idx_key_ts] = ts_pose_labels.index(selected_ts_pose)
 
-                    cur_ts = st.session_state[idx_key_ts]
+                    # Sync integer index when user picks via dropdown
+                    _dropdown_idx = ts_pose_labels.index(selected_ts_pose)
+                    if _dropdown_idx != st.session_state[_idx_key_ts]:
+                        st.session_state[_idx_key_ts] = _dropdown_idx
+
+                    cur_ts = st.session_state[_idx_key_ts]
                     current_ts_row = df_ts_entries.iloc[cur_ts]
                     full_path_ts = ts_pose_paths[cur_ts]
 
@@ -1695,19 +1717,137 @@ elif page == "ML":
                         view_ts.zoomTo()
 
                         has_ref_ts = st.session_state.get("ml_ts_ref_pdb_data")
-                        prev_col, viewer_col, next_col = st.columns([0.5, 8, 0.5 if not has_ref_ts else 1])
-                        with prev_col:
-                            st.write(""); st.write(""); st.write("")
-                            if st.button("◀", key="ml_ts_prev", disabled=(cur_ts == 0)):
-                                st.session_state[idx_key_ts] = cur_ts - 1
-                                st.rerun()
-                        with viewer_col:
-                            st.components.v1.html(view_ts.write_html(), height=520)
-                        with next_col:
-                            st.write(""); st.write(""); st.write("")
-                            if st.button("▶", key="ml_ts_next", disabled=(cur_ts >= len(ts_pose_labels) - 1)):
-                                st.session_state[idx_key_ts] = cur_ts + 1
-                                st.rerun()
-                        st.caption(f"Pose {cur_ts + 1} of {len(ts_pose_labels)} — {current_ts_row['assay_name']} / {current_ts_row['pose_file']}")
+
+                        _ts_fps = st_funcs.get_training_set_fingerprints_for_pose(
+                            project_path, selected_ts,
+                            current_ts_row["assay_name"], current_ts_row["pose_file"],
+                            current_ts_row["directory"]
+                        )
+
+                        # Pre-compute frequency data and apply threshold — shared by both columns
+                        _ts_fp_meta = {}  # keyed by prolif_conditions_id
+                        if _ts_fps:
+                            for _fp_entry in _ts_fps:
+                                _cid = _fp_entry["prolif_conditions_id"]
+                                _freq_df_full = st_funcs.get_training_set_interaction_frequencies(
+                                    project_path, selected_ts, _cid
+                                )
+                                _all_ints = st_funcs.get_all_training_set_interactions(
+                                    project_path, selected_ts, _cid
+                                )
+                                _thresh_key = f"ml_ts_fp_thresh_{selected_ts}_{_cid}"
+                                if _thresh_key not in st.session_state:
+                                    st.session_state[_thresh_key] = 0.0
+                                _ts_fp_meta[_cid] = {
+                                    "freq_df_full": _freq_df_full,
+                                    "all_interactions": _all_ints,
+                                    "thresh_key": _thresh_key,
+                                }
+
+                        if _ts_fps:
+                            _viewer_area, _fp_area = st.columns([3, 2])
+                        else:
+                            _viewer_area = st.container()
+                            _fp_area = None
+
+                        with _viewer_area:
+                            prev_col, viewer_col, next_col = st.columns([0.5, 8, 0.5 if not has_ref_ts else 1])
+                            with prev_col:
+                                st.write(""); st.write(""); st.write("")
+                                st.button("◀", key="ml_ts_prev", disabled=(cur_ts == 0), on_click=_ts_go_prev)
+                            with viewer_col:
+                                st.components.v1.html(view_ts.write_html(), height=520)
+                            with next_col:
+                                st.write(""); st.write(""); st.write("")
+                                st.button("▶", key="ml_ts_next", disabled=(cur_ts >= len(ts_pose_labels) - 1), on_click=_ts_go_next)
+                            st.caption(f"Pose {cur_ts + 1} of {len(ts_pose_labels)} — {current_ts_row['assay_name']} / {current_ts_row['pose_file']}")
+
+                            ## Interaction frequency table with threshold filter
+                            if _ts_fps:
+                                for _fp_entry in _ts_fps:
+                                    _cond_id = _fp_entry["prolif_conditions_id"]
+                                    _meta = _ts_fp_meta[_cond_id]
+                                    _freq_df_full = _meta["freq_df_full"]
+                                    if _freq_df_full is not None:
+                                        _thresh = st.number_input(
+                                            "Min. frequency (%) to display:",
+                                            min_value=0.0, max_value=100.0, step=5.0,
+                                            key=_meta["thresh_key"],
+                                        )
+                                        _freq_df_shown = _freq_df_full[_freq_df_full["Frequency (%)"] >= _thresh]
+                                        with st.expander(
+                                            f"📊 Interaction frequencies — Conditions ID {_cond_id} "
+                                            f"({len(_freq_df_shown)}/{len(_freq_df_full)} interactions, {len(df_ts_entries)} poses)",
+                                            expanded=False
+                                        ):
+                                            st.dataframe(_freq_df_shown, use_container_width=True, hide_index=True)
+
+                        if _fp_area is not None:
+                            with _fp_area:
+                                st.markdown("##### 🔬 ProLIF Fingerprint")
+                                for _fp_entry in _ts_fps:
+                                    _cond_id = _fp_entry["prolif_conditions_id"]
+                                    _fp_dict = _fp_entry["fingerprint"]
+                                    _active = [k for k, v in _fp_dict.items() if v]
+                                    _meta = _ts_fp_meta[_cond_id]
+
+                                    # Filter all_interactions by current frequency threshold
+                                    _thresh = st.session_state.get(_meta["thresh_key"], 0.0)
+                                    _freq_df_full = _meta["freq_df_full"]
+                                    if _freq_df_full is not None and _thresh > 0:
+                                        _above = set(_freq_df_full.loc[_freq_df_full["Frequency (%)"] >= _thresh, "Interaction"])
+                                        _all_interactions = [i for i in _meta["all_interactions"] if i in _above]
+                                    else:
+                                        _all_interactions = _meta["all_interactions"]
+
+                                    # Per-conditions filter state key
+                                    _filter_key = f"ml_ts_fp_filter_{selected_ts}_{_cond_id}"
+                                    if _filter_key not in st.session_state:
+                                        st.session_state[_filter_key] = set(_all_interactions)
+
+                                    with st.expander(f"Conditions ID {_cond_id} — filter interactions", expanded=False):
+                                        _col_a, _col_b = st.columns(2)
+                                        _all_selected = st.session_state[_filter_key] == set(_all_interactions)
+                                        _none_selected = len(st.session_state[_filter_key]) == 0
+                                        if _col_a.button("✅ All" if _all_selected else "☐ All",
+                                                         key=f"ml_ts_fp_all_{selected_ts}_{_cond_id}",
+                                                         type="primary" if _all_selected else "secondary"):
+                                            st.session_state[_filter_key] = set(_all_interactions)
+                                            for _iname in _all_interactions:
+                                                st.session_state[f"ml_ts_fp_cb_{selected_ts}_{_cond_id}_{_iname}"] = True
+                                            st.rerun()
+                                        if _col_b.button("✅ None" if _none_selected else "☐ None",
+                                                         key=f"ml_ts_fp_none_{selected_ts}_{_cond_id}",
+                                                         type="primary" if _none_selected else "secondary"):
+                                            st.session_state[_filter_key] = set()
+                                            for _iname in _all_interactions:
+                                                st.session_state[f"ml_ts_fp_cb_{selected_ts}_{_cond_id}_{_iname}"] = False
+                                            st.rerun()
+                                        for _iname in _all_interactions:
+                                            _cb_key = f"ml_ts_fp_cb_{selected_ts}_{_cond_id}_{_iname}"
+                                            _checked = st.checkbox(
+                                                _iname,
+                                                value=(_iname in st.session_state[_filter_key]),
+                                                key=_cb_key,
+                                            )
+                                            if _checked:
+                                                st.session_state[_filter_key].add(_iname)
+                                            else:
+                                                st.session_state[_filter_key].discard(_iname)
+
+                                    _visible = [k for k in _active if k in st.session_state[_filter_key]]
+                                    _n_selected = len(st.session_state[_filter_key])
+                                    st.markdown(f"**{len(_visible)} shown** ({_n_selected} selected / {len(_all_interactions)} total)")
+                                    if _visible:
+                                        st.dataframe(
+                                            {"Interaction": _visible},
+                                            use_container_width=True,
+                                            hide_index=True,
+                                        )
+                                    elif _active:
+                                        st.info("All active interactions are filtered out.")
+                                    else:
+                                        st.info("No interactions detected for this pose.")
+
                     else:
                         st.warning(f"Pose file not found on disk: {full_path_ts}")
