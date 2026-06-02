@@ -1238,6 +1238,7 @@ def delete_training_set_snapshots(project_path: str, training_set_ids: list) -> 
         conn = sqlite3.connect(db_path)
         conn.execute(f"DELETE FROM training_set_snapshots WHERE training_set_id IN ({placeholders})", training_set_ids)
         conn.execute(f"DELETE FROM training_set_entries WHERE training_set_id IN ({placeholders})", training_set_ids)
+        conn.execute(f"DELETE FROM training_set_fingerprints WHERE training_set_id IN ({placeholders})", training_set_ids)
         conn.commit()
         conn.close()
         return "deleted"
