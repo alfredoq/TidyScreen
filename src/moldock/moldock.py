@@ -10616,7 +10616,7 @@ class MolDock:
                 prepin_file, frcmod_file  = self._prepare_ligand_tleap_files(ligname, assay_info, output_dir)
         
             # Create complex .prmtop and .inpcrd files
-            prmtop_file, inpcrd_file, output_pdb_file = self._prepare_complex_prmtop_inpcrd(prepin_file, frcmod_file, assay_info, output_dir, output_file, pose_id)
+            prmtop_file, inpcrd_file, output_pdb_file = self._prepare_complex_prmtop_inpcrd(prepin_file, frcmod_file, assay_info, output_dir, output_file, pose_id, ligname=ligname)
             
             if minimize:
                 # Minimize complex
@@ -10943,7 +10943,7 @@ class MolDock:
 
         return espaloma_output_file
 
-    def _prepare_complex_prmtop_inpcrd(self, prepin_file, frcmod_file, assay_info, output_dir, pdb_file, pose_id):
+    def _prepare_complex_prmtop_inpcrd(self, prepin_file, frcmod_file, assay_info, output_dir, pdb_file, pose_id, ligname=None):
 
         import subprocess
         import textwrap
@@ -10957,8 +10957,9 @@ class MolDock:
         tleap_in_file = os.path.join(output_dir, "complex.in")
 
         # Defined output files
-        prmtop_file = os.path.join(output_dir, f'complex_{pose_id}.prmtop')
-        inpcrd_file = os.path.join(output_dir, f'complex_{pose_id}.inpcrd')
+        _prefix = f"{ligname}_" if ligname else ""
+        prmtop_file = os.path.join(output_dir, f'{_prefix}complex_{pose_id}.prmtop')
+        inpcrd_file = os.path.join(output_dir, f'{_prefix}complex_{pose_id}.inpcrd')
 
         # Write an output pdb file with Hidrogens
         output_pdb_file = pdb_file.replace('.pdb', '_withH.pdb')

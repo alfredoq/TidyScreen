@@ -421,7 +421,7 @@ class MachineLearning:
 
                     # Step C: Prepare complex prmtop and inpcrd files using tleap
                     prmtop_file, inpcrd_file, output_pdb_file = moldock._prepare_complex_prmtop_inpcrd(
-                        prepin_file, frcmod_file, assay_info, output_dir, output_file, pose_id
+                        prepin_file, frcmod_file, assay_info, output_dir, output_file, pose_id, ligname=ligname
                     )
 
                     # Step D: Optionally minimize complex (mirrors compute_fingerprints behaviour)
