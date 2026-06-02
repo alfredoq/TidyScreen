@@ -313,8 +313,6 @@ class MachineLearning:
         )
         conn.close()
 
-        print(entries_df) # For debugging
-
         if entries_df.empty:
             print(f"\n❌ No entries found for training set '{training_set_id}'")
             return
@@ -407,8 +405,6 @@ class MachineLearning:
                 try:
                     # Step A: Restore docked pose PDB from the assay results DB
                     output_dir, output_file = moldock._restore_single_docked_pose(results_db, ligname, pose_id)
-                    
-                    print(f"    ✅ Restored pose file: {output_file}") # For debugging
                     
                     if output_dir not in output_dirs:
                         output_dirs.append(output_dir)
