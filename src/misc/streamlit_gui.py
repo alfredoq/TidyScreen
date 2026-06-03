@@ -671,6 +671,40 @@ elif page == "Analysis":
                                     ## pose counter label
                                     st.caption(f"Pose {current_idx + 1} of {len(pdb_names)}")
 
+                                    ## VMD script creation
+                                    with st.expander("🎬 Create VMD Script", expanded=False):
+                                        _default_vmd_path = os.path.join(
+                                            os.path.expanduser("~"), "Desktop",
+                                            os.path.splitext(selected_file)[0] + "_vmd.tcl"
+                                        )
+                                        _vmd_path = st.text_input(
+                                            "Save script to:",
+                                            value=_default_vmd_path,
+                                            key=f"vmd_path_{entry['directory']}_{selected_file}",
+                                        )
+                                        if st.button("💾 Save VMD Script", key=f"btn_save_vmd_{entry['directory']}_{selected_file}"):
+                                            try:
+                                                _ref_pdb_path = None
+                                                if st.session_state.get("reference_pdb_data"):
+                                                    _ref_pdb_path = os.path.join(
+                                                        os.path.dirname(os.path.abspath(_vmd_path.strip())),
+                                                        "reference.pdb"
+                                                    )
+                                                    with open(_ref_pdb_path, "w") as _rf:
+                                                        _rf.write(st.session_state["reference_pdb_data"])
+                                                _script = st_funcs.generate_vmd_script(
+                                                    os.path.abspath(full_path), _ref_pdb_path
+                                                )
+                                                _vmd_out = _vmd_path.strip()
+                                                os.makedirs(os.path.dirname(os.path.abspath(_vmd_out)), exist_ok=True)
+                                                with open(_vmd_out, "w") as _sf:
+                                                    _sf.write(_script)
+                                                st.success(f"VMD script saved to: {_vmd_out}")
+                                                if _ref_pdb_path:
+                                                    st.info(f"Reference PDB saved alongside: {_ref_pdb_path}")
+                                            except Exception as _e:
+                                                st.error(f"Could not save VMD script: {_e}")
+
                                 ## ProLIF Fingerprints for this pose directory
                                 dir_name = entry['directory']
                                 dir_pose_ids = st_funcs.get_pose_ids_for_directory(results_db_path, dir_name)
@@ -1315,6 +1349,40 @@ elif page == "ML":
                             st.rerun()
                     st.caption(f"Pose {cur_pos + 1} of {len(pose_labels_pos)}")
 
+                    ## VMD script creation
+                    with st.expander("🎬 Create VMD Script", expanded=False):
+                        _default_vmd_path_pos = os.path.join(
+                            os.path.expanduser("~"), "Desktop",
+                            os.path.splitext(os.path.basename(full_path_pos))[0] + "_vmd.tcl"
+                        )
+                        _vmd_path_pos = st.text_input(
+                            "Save script to:",
+                            value=_default_vmd_path_pos,
+                            key=f"vmd_path_ml_pos_{cur_pos}",
+                        )
+                        if st.button("💾 Save VMD Script", key=f"btn_save_vmd_ml_pos_{cur_pos}"):
+                            try:
+                                _ref_pdb_path_pos = None
+                                if st.session_state.get("ml_pos_ref_pdb_data"):
+                                    _ref_pdb_path_pos = os.path.join(
+                                        os.path.dirname(os.path.abspath(_vmd_path_pos.strip())),
+                                        "reference.pdb"
+                                    )
+                                    with open(_ref_pdb_path_pos, "w") as _rf:
+                                        _rf.write(st.session_state["ml_pos_ref_pdb_data"])
+                                _script_pos = st_funcs.generate_vmd_script(
+                                    os.path.abspath(full_path_pos), _ref_pdb_path_pos
+                                )
+                                _vmd_out_pos = _vmd_path_pos.strip()
+                                os.makedirs(os.path.dirname(os.path.abspath(_vmd_out_pos)), exist_ok=True)
+                                with open(_vmd_out_pos, "w") as _sf:
+                                    _sf.write(_script_pos)
+                                st.success(f"VMD script saved to: {_vmd_out_pos}")
+                                if _ref_pdb_path_pos:
+                                    st.info(f"Reference PDB saved alongside: {_ref_pdb_path_pos}")
+                            except Exception as _e:
+                                st.error(f"Could not save VMD script: {_e}")
+
                     ## Remove current pose from positive registry
                     current_row_pos = df_pos.iloc[st.session_state[idx_key_pos]]
                     if st.button("🗑️ Remove pose from set", key=f"ml_pos_remove_{st.session_state[idx_key_pos]}"):
@@ -1474,6 +1542,40 @@ elif page == "ML":
                             st.session_state[idx_key_neg] = cur_neg + 1
                             st.rerun()
                     st.caption(f"Pose {cur_neg + 1} of {len(pose_labels_neg)}")
+
+                    ## VMD script creation
+                    with st.expander("🎬 Create VMD Script", expanded=False):
+                        _default_vmd_path_neg = os.path.join(
+                            os.path.expanduser("~"), "Desktop",
+                            os.path.splitext(os.path.basename(full_path_neg))[0] + "_vmd.tcl"
+                        )
+                        _vmd_path_neg = st.text_input(
+                            "Save script to:",
+                            value=_default_vmd_path_neg,
+                            key=f"vmd_path_ml_neg_{cur_neg}",
+                        )
+                        if st.button("💾 Save VMD Script", key=f"btn_save_vmd_ml_neg_{cur_neg}"):
+                            try:
+                                _ref_pdb_path_neg = None
+                                if st.session_state.get("ml_neg_ref_pdb_data"):
+                                    _ref_pdb_path_neg = os.path.join(
+                                        os.path.dirname(os.path.abspath(_vmd_path_neg.strip())),
+                                        "reference.pdb"
+                                    )
+                                    with open(_ref_pdb_path_neg, "w") as _rf:
+                                        _rf.write(st.session_state["ml_neg_ref_pdb_data"])
+                                _script_neg = st_funcs.generate_vmd_script(
+                                    os.path.abspath(full_path_neg), _ref_pdb_path_neg
+                                )
+                                _vmd_out_neg = _vmd_path_neg.strip()
+                                os.makedirs(os.path.dirname(os.path.abspath(_vmd_out_neg)), exist_ok=True)
+                                with open(_vmd_out_neg, "w") as _sf:
+                                    _sf.write(_script_neg)
+                                st.success(f"VMD script saved to: {_vmd_out_neg}")
+                                if _ref_pdb_path_neg:
+                                    st.info(f"Reference PDB saved alongside: {_ref_pdb_path_neg}")
+                            except Exception as _e:
+                                st.error(f"Could not save VMD script: {_e}")
 
                     ## Remove current pose from negative registry
                     current_row_neg = df_neg.iloc[st.session_state[idx_key_neg]]
@@ -1807,6 +1909,40 @@ elif page == "ML":
                                 st.write(""); st.write(""); st.write("")
                                 st.button("▶", key="ml_ts_next", disabled=(cur_ts >= len(ts_pose_labels) - 1), on_click=_ts_go_next)
                             st.caption(f"Pose {cur_ts + 1} of {len(ts_pose_labels)} — {current_ts_row['assay_name']} / {current_ts_row['pose_file']}")
+
+                            ## VMD script creation
+                            with st.expander("🎬 Create VMD Script", expanded=False):
+                                _default_vmd_path_ts = os.path.join(
+                                    os.path.expanduser("~"), "Desktop",
+                                    os.path.splitext(os.path.basename(full_path_ts))[0] + "_vmd.tcl"
+                                )
+                                _vmd_path_ts = st.text_input(
+                                    "Save script to:",
+                                    value=_default_vmd_path_ts,
+                                    key=f"vmd_path_ml_ts_{cur_ts}",
+                                )
+                                if st.button("💾 Save VMD Script", key=f"btn_save_vmd_ml_ts_{cur_ts}"):
+                                    try:
+                                        _ref_pdb_path_ts = None
+                                        if st.session_state.get("ml_ts_ref_pdb_data"):
+                                            _ref_pdb_path_ts = os.path.join(
+                                                os.path.dirname(os.path.abspath(_vmd_path_ts.strip())),
+                                                "reference.pdb"
+                                            )
+                                            with open(_ref_pdb_path_ts, "w") as _rf:
+                                                _rf.write(st.session_state["ml_ts_ref_pdb_data"])
+                                        _script_ts = st_funcs.generate_vmd_script(
+                                            os.path.abspath(full_path_ts), _ref_pdb_path_ts
+                                        )
+                                        _vmd_out_ts = _vmd_path_ts.strip()
+                                        os.makedirs(os.path.dirname(os.path.abspath(_vmd_out_ts)), exist_ok=True)
+                                        with open(_vmd_out_ts, "w") as _sf:
+                                            _sf.write(_script_ts)
+                                        st.success(f"VMD script saved to: {_vmd_out_ts}")
+                                        if _ref_pdb_path_ts:
+                                            st.info(f"Reference PDB saved alongside: {_ref_pdb_path_ts}")
+                                    except Exception as _e:
+                                        st.error(f"Could not save VMD script: {_e}")
 
                             ## Interaction frequency table with threshold filter
                             if _ts_fps:
