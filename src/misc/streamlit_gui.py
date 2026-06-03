@@ -1620,6 +1620,45 @@ elif page == "ML":
                             st.session_state["confirm_delete_selected_snaps"] = False
                             st.rerun()
 
+            ## --- Export Fingerprints CSV ---
+            if len(_selected_snaps) == 0:
+                st.button(
+                    "⬇️ Export Fingerprints CSV",
+                    key="btn_export_fps_csv",
+                    disabled=True,
+                    help="Select a training set snapshot using the checkbox to enable export.",
+                )
+            else:
+                _export_ts_id = _selected_snaps["training_set_id"].iloc[0]
+                _csv_bytes = st_funcs.export_training_set_fingerprints_as_csv_bytes(project_path, _export_ts_id)
+                _safe_ts_id = _export_ts_id.replace(' ', '_')
+                if _csv_bytes is None:
+                    st.button(
+                        "⬇️ Export Fingerprints CSV",
+                        key="btn_export_fps_csv",
+                        disabled=True,
+                        help=f"No fingerprints computed for '{_export_ts_id}' yet. Run compute_training_set_fingerprints() first.",
+                    )
+                else:
+                    _default_csv_path = os.path.join(
+                        project_path, 'ml', 'training_sets',
+                        f'{_safe_ts_id}_fingerprints.csv'
+                    )
+                    _export_path = st.text_input(
+                        "Output CSV path:",
+                        value=_default_csv_path,
+                        key=f"export_fps_csv_path_{_export_ts_id}",
+                    )
+                    if st.button("⬇️ Export Fingerprints CSV", key="btn_export_fps_csv"):
+                        try:
+                            _out = _export_path.strip()
+                            os.makedirs(os.path.dirname(os.path.abspath(_out)), exist_ok=True)
+                            with open(_out, 'wb') as _f:
+                                _f.write(_csv_bytes)
+                            st.success(f"Fingerprints exported to: {_out}")
+                        except Exception as _e:
+                            st.error(f"Export failed: {_e}")
+
             ## --- Snapshot inspector panel ---
             if st.session_state[ts_inspector_key] and selected_ts:
                 df_inspect = st_funcs.get_training_set_entries(project_path, selected_ts)

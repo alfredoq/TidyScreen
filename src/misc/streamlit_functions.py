@@ -1482,6 +1482,50 @@ def depict_table_to_images(db_path: str, table_name: str,
     return images
 
 
+def export_training_set_fingerprints_as_csv_bytes(project_path: str, training_set_id: str) -> "bytes | None":
+    """
+    Build a CSV of all precomputed fingerprints for the given training set snapshot
+    and return it as UTF-8 bytes suitable for st.download_button.
+
+    Returns None if no fingerprints are found or the database is missing.
+    """
+    db_path = os.path.join(project_path, 'ml', 'training_sets', 'training_sets_snapshots.db')
+    if not os.path.exists(db_path):
+        return None
+    try:
+        conn = sqlite3.connect(db_path)
+        rows = pd.read_sql_query(
+            """SELECT assay_name, pose_file, label, fingerprint_json
+               FROM training_set_fingerprints
+               WHERE training_set_id = ?
+               ORDER BY binder_type DESC, assay_name, pose_file""",
+            conn, params=(training_set_id,)
+        )
+        conn.close()
+    except Exception:
+        return None
+
+    if rows.empty:
+        return None
+
+    ligpose_col = (
+        rows['pose_file'].str.replace('.pdb', '', regex=False) + '_' + rows['assay_name']
+    ).reset_index(drop=True)
+    label_col = rows['label'].reset_index(drop=True)
+
+    fp_dicts = [json.loads(fp) for fp in rows['fingerprint_json']]
+    fp_df = pd.DataFrame(fp_dicts).fillna(0).astype(int).reset_index(drop=True)
+
+    out_df = pd.concat(
+        [ligpose_col.rename('ligpose'), fp_df, label_col.rename('label')],
+        axis=1
+    )
+
+    buffer = StringIO()
+    out_df.to_csv(buffer, index=False)
+    return buffer.getvalue().encode('utf-8')
+
+
 def export_pdb_model(pdbs_db_path, file_id, output_dir):
     """
     Export a PDB model blob from the database to a file on disk.
