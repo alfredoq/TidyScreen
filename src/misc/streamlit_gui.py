@@ -41,7 +41,7 @@ st.set_page_config(page_title="TidyScreen App", layout="wide")
 st.sidebar.title("Navigation")
 page = st.sidebar.radio(
     "Go to",
-    ("TidyScreen", "ChemSpace", "Receptors", "Docking Methods", "MolDock", "Analysis", "ML")
+    ("TidyScreen", "ChemSpace", "Receptors", "Docking Methods", "MolDock", "ProLIF Conditions", "Analysis", "ML")
 )
 
 ## Persistent sidebar info: active project and assay
@@ -515,6 +515,47 @@ elif page == "MolDock":
             st.success(f"Selected assay: {selected_assay}")
 
         st.write(f"Selected Docking Assay: {st.session_state.get('selected_assay_name', 'None')}")
+
+
+elif page == "ProLIF Conditions":
+    st.title("ProLIF Conditions")
+
+    if "active_project_path" not in st.session_state:
+        st.warning("No active project. Please select a project first.")
+    else:
+        project_path = st.session_state["active_project_path"]
+
+        st.subheader("Registered ProLIF Conditions")
+
+        _prolif_records = st_funcs.get_prolif_conditions_records(project_path)
+
+        if not _prolif_records:
+            st.info(
+                "No ProLIF conditions registered yet. "
+                "Create conditions using `MolDock.create_prolif_conditions()`."
+            )
+        else:
+            ## Summary table: ID + Description
+            st.dataframe(
+                [{"ID": r["id"], "Description": r["description"]} for r in _prolif_records],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            st.divider()
+
+            ## Selector
+            _descriptions = [r["description"] for r in _prolif_records]
+            _selected_desc = st.selectbox(
+                "Select a condition to inspect:",
+                _descriptions,
+                key="prolif_conditions_inspect_select",
+            )
+
+            if _selected_desc:
+                _selected_record = next(r for r in _prolif_records if r["description"] == _selected_desc)
+                st.markdown(f"#### 📌 {_selected_desc}  *(ID {_selected_record['id']})*")
+                st.json(_selected_record["conditions"], expanded=True)
 
 
 elif page == "Analysis":

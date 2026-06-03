@@ -1482,6 +1482,41 @@ def depict_table_to_images(db_path: str, table_name: str,
     return images
 
 
+def get_prolif_conditions_records(project_path: str) -> "list[dict] | None":
+    """
+    Load all ProLIF conditions stored in params.db.
+
+    Returns a list of dicts with keys ``id``, ``description``, and
+    ``conditions`` (the parsed JSON dict), ordered by id ascending.
+    Returns None when the database or table does not exist.
+    """
+    db_path = os.path.join(project_path, 'docking', 'params', 'params.db')
+    if not os.path.exists(db_path):
+        return None
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='ProLIF_Conditions'"
+        )
+        if not cursor.fetchone():
+            conn.close()
+            return None
+        cursor.execute(
+            "SELECT id, description, conditions FROM ProLIF_Conditions ORDER BY id ASC"
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        if not rows:
+            return None
+        return [
+            {"id": r[0], "description": r[1], "conditions": json.loads(r[2])}
+            for r in rows
+        ]
+    except Exception:
+        return None
+
+
 def generate_vmd_script(pose_path: str, ref_pdb_path: str = None) -> str:
     """
     Generate a VMD Tcl script that loads a docked pose and, optionally, a

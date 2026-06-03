@@ -12101,6 +12101,143 @@ class MolDock:
             print(f"\n❌ Unexpected error retrieving ProLIF conditions: {e}")
             return None
 
+    def list_prolif_conditions(self):
+        """
+        Lists all ProLIF conditions stored in params.db, prompts the user to select
+        one by description, and prints the full conditions dictionary in a readable
+        formatted layout.
+        """
+
+        prolif_params_db = self.__docking_params_db
+
+        try:
+            conn = sqlite3.connect(prolif_params_db)
+            cursor = conn.cursor()
+
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='ProLIF_Conditions'")
+            if not cursor.fetchone():
+                print("\n❌ No ProLIF_Conditions table found in database")
+                conn.close()
+                return
+
+            cursor.execute("SELECT id, description FROM ProLIF_Conditions ORDER BY id ASC")
+            records = cursor.fetchall()
+
+            if not records:
+                print("\n❌ No ProLIF conditions registered in database")
+                conn.close()
+                return
+
+            print(f"\n🔬 PROLIF CONDITIONS")
+            print("=" * 70)
+            for idx, (record_id, description) in enumerate(records, 1):
+                print(f"   {idx}. ID {record_id}: {description}")
+            print("=" * 70)
+
+            while True:
+                try:
+                    selection = input("\nSelect conditions to inspect (enter number or 'c' to cancel): ").strip()
+                    if selection.lower() == 'c':
+                        conn.close()
+                        return
+                    selection_idx = int(selection) - 1
+                    if 0 <= selection_idx < len(records):
+                        selected_id, selected_description = records[selection_idx]
+                        break
+                    print(f"❌ Please enter a valid number (1-{len(records)})")
+                except ValueError:
+                    print("❌ Please enter a valid number")
+
+            cursor.execute("SELECT conditions FROM ProLIF_Conditions WHERE id = ?", (selected_id,))
+            result = cursor.fetchone()
+            conn.close()
+
+            if not result:
+                print("\n❌ Failed to retrieve selected conditions")
+                return
+
+            conditions_dict = json.loads(result[0])
+
+            print(f"\n{'=' * 70}")
+            print(f"  📌 {selected_description}  (ID {selected_id})")
+            print(f"{'=' * 70}")
+            print(json.dumps(conditions_dict, indent=4))
+            print(f"{'=' * 70}\n")
+
+        except sqlite3.Error as e:
+            print(f"\n❌ Database error: {e}")
+        except json.JSONDecodeError as e:
+            print(f"\n❌ Error parsing stored conditions: {e}")
+        except Exception as e:
+            print(f"\n❌ Unexpected error: {e}")
+
+    def delete_prolif_conditions(self):
+        """
+        Lists all ProLIF conditions stored in params.db, prompts the user to select
+        one, and permanently deletes that record from the ProLIF_Conditions table.
+        """
+
+        prolif_params_db = self.__docking_params_db
+
+        try:
+            conn = sqlite3.connect(prolif_params_db)
+            cursor = conn.cursor()
+
+            cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='ProLIF_Conditions'"
+            )
+            if not cursor.fetchone():
+                print("\n❌ No ProLIF_Conditions table found in database")
+                conn.close()
+                return
+
+            cursor.execute("SELECT id, description FROM ProLIF_Conditions ORDER BY id ASC")
+            records = cursor.fetchall()
+
+            if not records:
+                print("\n❌ No ProLIF conditions registered in database")
+                conn.close()
+                return
+
+            print(f"\n🗑️  DELETE PROLIF CONDITIONS")
+            print("=" * 70)
+            for idx, (record_id, description) in enumerate(records, 1):
+                print(f"   {idx}. ID {record_id}: {description}")
+            print("=" * 70)
+
+            while True:
+                try:
+                    selection = input("\nSelect conditions to delete (enter number or 'c' to cancel): ").strip()
+                    if selection.lower() == 'c':
+                        conn.close()
+                        return
+                    selection_idx = int(selection) - 1
+                    if 0 <= selection_idx < len(records):
+                        selected_id, selected_description = records[selection_idx]
+                        break
+                    print(f"❌ Please enter a valid number (1-{len(records)})")
+                except ValueError:
+                    print("❌ Please enter a valid number")
+
+            confirm = input(
+                f"\n⚠️  Delete '{selected_description}' (ID {selected_id})? This cannot be undone. (y/n): "
+            ).strip().lower()
+            if confirm != 'y':
+                print("❌ Deletion cancelled.")
+                conn.close()
+                return
+
+            cursor.execute("DELETE FROM ProLIF_Conditions WHERE id = ?", (selected_id,))
+            conn.commit()
+            conn.close()
+
+            print(f"\n✅ ProLIF conditions '{selected_description}' (ID {selected_id}) deleted successfully.")
+
+        except sqlite3.Error as e:
+            print(f"\n❌ Database error: {e}")
+        except Exception as e:
+            print(f"\n❌ Unexpected error: {e}")
+
     def export_prolif_conditions(self):
         """
         Exports a ProLIF conditions record from the database to a portable JSON file.
