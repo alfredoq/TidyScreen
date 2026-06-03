@@ -1014,6 +1014,62 @@ def get_training_set_fingerprint_status(project_path: str) -> "dict":
     return status
 
 
+def get_training_set_prolif_conditions_used(project_path: str) -> "dict":
+    """
+    Return a dict mapping training_set_id → human-readable ProLIF conditions string.
+
+    For each training set that has fingerprints, collects the distinct
+    prolif_conditions_id values and resolves their descriptions from the
+    ProLIF_Conditions table in the docking params DB.  Falls back to showing
+    the raw IDs when the descriptions cannot be retrieved.
+
+    Args:
+        project_path (str): Root path of the active project.
+
+    Returns:
+        dict[str, str]: {training_set_id: "ID 1: desc1; ID 2: desc2"} or
+                        "❌ None" when no fingerprints exist.
+                        Empty dict if the snapshots database does not exist.
+    """
+    db_path = os.path.join(project_path, "ml", "training_sets", "training_sets_snapshots.db")
+    if not os.path.exists(db_path):
+        return {}
+
+    try:
+        conn = sqlite3.connect(db_path)
+        rows = pd.read_sql_query(
+            "SELECT DISTINCT training_set_id, prolif_conditions_id FROM training_set_fingerprints ORDER BY training_set_id, prolif_conditions_id",
+            conn,
+        )
+        conn.close()
+    except Exception:
+        return {}
+
+    if rows.empty:
+        return {}
+
+    # Try to resolve descriptions from docking params DB
+    params_db = os.path.join(project_path, "docking", "params", "params.db")
+    desc_map = {}
+    try:
+        if os.path.exists(params_db):
+            conn = sqlite3.connect(params_db)
+            conds = pd.read_sql_query("SELECT id, description FROM ProLIF_Conditions", conn)
+            conn.close()
+            desc_map = dict(zip(conds["id"], conds["description"]))
+    except Exception:
+        pass
+
+    result = {}
+    for ts_id, group in rows.groupby("training_set_id"):
+        parts = []
+        for cid in group["prolif_conditions_id"]:
+            desc = desc_map.get(cid)
+            parts.append(f"ID {cid}: {desc}" if desc else f"ID {cid}")
+        result[ts_id] = "; ".join(parts)
+    return result
+
+
 def get_training_set_fingerprints_for_pose(project_path: str, training_set_id: str, assay_name: str, pose_file: str, directory: str) -> "list[dict] | None":
     """
     Retrieve all computed ProLIF fingerprints for a specific pose in a training set snapshot.

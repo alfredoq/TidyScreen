@@ -1528,11 +1528,18 @@ elif page == "ML":
             st.info("No training sets consolidated yet.")
         else:
             _fp_status = st_funcs.get_training_set_fingerprint_status(project_path)
+            _prolif_conditions_used = st_funcs.get_training_set_prolif_conditions_used(project_path)
             _df_snaps_display = df_snaps.copy()
+            _notes_loc = _df_snaps_display.columns.get_loc("notes") + 1
             _df_snaps_display.insert(
-                _df_snaps_display.columns.get_loc("notes") + 1,
+                _notes_loc,
                 "fingerprints",
                 _df_snaps_display["training_set_id"].map(lambda ts: _fp_status.get(ts, "❌ None")),
+            )
+            _df_snaps_display.insert(
+                _notes_loc + 1,
+                "prolif_conditions",
+                _df_snaps_display["training_set_id"].map(lambda ts: _prolif_conditions_used.get(ts, "—")),
             )
             _df_snaps_display.insert(0, "Select", False)
             _edited_snaps = st.data_editor(
