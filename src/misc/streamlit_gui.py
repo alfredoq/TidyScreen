@@ -555,7 +555,25 @@ elif page == "ProLIF Conditions":
             if _selected_desc:
                 _selected_record = next(r for r in _prolif_records if r["description"] == _selected_desc)
                 st.markdown(f"#### 📌 {_selected_desc}  *(ID {_selected_record['id']})*")
-                st.json(_selected_record["conditions"], expanded=True)
+                st.json(_selected_record["conditions"], expanded=False)
+
+                st.divider()
+                _default_export_path = os.path.join(
+                    project_path, 'docking', 'params', 'prolif_conditions.json'
+                )
+                _export_path_input = st.text_input(
+                    "Export path:",
+                    value=_default_export_path,
+                    key=f"prolif_cond_export_path_{_selected_record['id']}",
+                )
+                if st.button("📤 Export ProLIF Conditions", key=f"btn_export_prolif_cond_{_selected_record['id']}"):
+                    _result = st_funcs.export_prolif_conditions_to_file(
+                        project_path, _selected_record['id'], _export_path_input.strip()
+                    )
+                    if _result == "exported":
+                        st.success(f"✅ ProLIF conditions exported to: {_export_path_input.strip()}")
+                    else:
+                        st.error(f"❌ {_result[6:]}")
 
 
 elif page == "Analysis":

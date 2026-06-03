@@ -1517,6 +1517,43 @@ def get_prolif_conditions_records(project_path: str) -> "list[dict] | None":
         return None
 
 
+def export_prolif_conditions_to_file(project_path: str, record_id: int, output_path: str) -> str:
+    """
+    Export a ProLIF conditions record from params.db to a portable JSON file.
+
+    Mirrors the behaviour of MolDock.export_prolif_conditions().
+    Returns 'exported', or 'error:<message>' on failure.
+
+    Args:
+        project_path (str): Root path of the active project.
+        record_id (int): ID of the ProLIF_Conditions record to export.
+        output_path (str): Destination file path for the JSON export.
+    """
+    db_path = os.path.join(project_path, 'docking', 'params', 'params.db')
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT description, conditions FROM ProLIF_Conditions WHERE id = ?",
+            (record_id,)
+        )
+        row = cursor.fetchone()
+        conn.close()
+        if row is None:
+            return f"error:No record found for ID {record_id}"
+        description, conditions_json = row
+        export_payload = {
+            "description": description,
+            "conditions": json.loads(conditions_json),
+        }
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        with open(output_path, 'w') as f:
+            json.dump(export_payload, f, indent=2)
+        return "exported"
+    except Exception as e:
+        return f"error:{e}"
+
+
 def generate_vmd_script(pose_path: str, ref_pdb_path: str = None) -> str:
     """
     Generate a VMD Tcl script that loads a docked pose and, optionally, a
