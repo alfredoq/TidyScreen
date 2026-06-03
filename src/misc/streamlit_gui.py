@@ -1250,6 +1250,15 @@ elif page == "ML":
 
         st.subheader("Training Set Registries")
 
+        if "ml_all_tables_expanded" not in st.session_state:
+            st.session_state["ml_all_tables_expanded"] = False
+        if st.button(
+            "📂 Expand All Tables" if not st.session_state["ml_all_tables_expanded"] else "📁 Collapse All Tables",
+            key="btn_ml_toggle_all_tables",
+        ):
+            st.session_state["ml_all_tables_expanded"] = not st.session_state["ml_all_tables_expanded"]
+            st.rerun()
+
         ## --- Positive binders ---
         st.markdown("### ✅ Positive Binders")
         df_pos = st_funcs.get_binders_registry(project_path, "positive")
@@ -1257,16 +1266,17 @@ elif page == "ML":
             st.info("No positive binders registered yet.")
         else:
             st.success(f"{len(df_pos)} positive binder(s) registered.")
-            _df_pos_display = df_pos.copy()
-            _df_pos_display.insert(0, "Select", False)
-            _edited_pos = st.data_editor(
-                _df_pos_display,
-                column_config={"Select": st.column_config.CheckboxColumn("Select", default=False)},
-                disabled=[c for c in _df_pos_display.columns if c != "Select"],
-                hide_index=True,
-                use_container_width=True,
-                key="data_editor_pos_binders",
-            )
+            with st.expander("📋 Positive Binders Table", expanded=st.session_state.get("ml_all_tables_expanded", False)):
+                _df_pos_display = df_pos.copy()
+                _df_pos_display.insert(0, "Select", False)
+                _edited_pos = st.data_editor(
+                    _df_pos_display,
+                    column_config={"Select": st.column_config.CheckboxColumn("Select", default=False)},
+                    disabled=[c for c in _df_pos_display.columns if c != "Select"],
+                    hide_index=True,
+                    use_container_width=True,
+                    key="data_editor_pos_binders",
+                )
             _selected_pos = _edited_pos[_edited_pos["Select"]]
 
             ## --- View / Clear / Delete Selected Positive Poses ---
@@ -1451,16 +1461,17 @@ elif page == "ML":
             st.info("No negative binders registered yet.")
         else:
             st.success(f"{len(df_neg)} negative binder(s) registered.")
-            _df_neg_display = df_neg.copy()
-            _df_neg_display.insert(0, "Select", False)
-            _edited_neg = st.data_editor(
-                _df_neg_display,
-                column_config={"Select": st.column_config.CheckboxColumn("Select", default=False)},
-                disabled=[c for c in _df_neg_display.columns if c != "Select"],
-                hide_index=True,
-                use_container_width=True,
-                key="data_editor_neg_binders",
-            )
+            with st.expander("📋 Negative Binders Table", expanded=st.session_state.get("ml_all_tables_expanded", False)):
+                _df_neg_display = df_neg.copy()
+                _df_neg_display.insert(0, "Select", False)
+                _edited_neg = st.data_editor(
+                    _df_neg_display,
+                    column_config={"Select": st.column_config.CheckboxColumn("Select", default=False)},
+                    disabled=[c for c in _df_neg_display.columns if c != "Select"],
+                    hide_index=True,
+                    use_container_width=True,
+                    key="data_editor_neg_binders",
+                )
             _selected_neg = _edited_neg[_edited_neg["Select"]]
 
             ## --- View / Clear / Delete Selected Negative Poses ---
@@ -1685,14 +1696,15 @@ elif page == "ML":
                 _df_snaps_display["training_set_id"].map(lambda ts: _prolif_conditions_used.get(ts, "—")),
             )
             _df_snaps_display.insert(0, "Select", False)
-            _edited_snaps = st.data_editor(
-                _df_snaps_display,
-                column_config={"Select": st.column_config.CheckboxColumn("Select", default=False)},
-                disabled=[c for c in _df_snaps_display.columns if c != "Select"],
-                hide_index=True,
-                use_container_width=True,
-                key="data_editor_snaps",
-            )
+            with st.expander("📋 Training Set Snapshots Table", expanded=st.session_state.get("ml_all_tables_expanded", False)):
+                _edited_snaps = st.data_editor(
+                    _df_snaps_display,
+                    column_config={"Select": st.column_config.CheckboxColumn("Select", default=False)},
+                    disabled=[c for c in _df_snaps_display.columns if c != "Select"],
+                    hide_index=True,
+                    use_container_width=True,
+                    key="data_editor_snaps",
+                )
             _selected_snaps = _edited_snaps[_edited_snaps["Select"]]
 
             ## --- View set poses / Delete Selected ---
