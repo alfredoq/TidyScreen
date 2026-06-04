@@ -4,6 +4,7 @@ import io
 import sys
 import os
 import glob
+import sqlite3
 import py3Dmol
 import streamlit_functions as st_funcs
 
@@ -89,6 +90,138 @@ if page == "TidyScreen":
             st.success(f"Activated project: {selected_project}")
     else:
         st.warning("No projects found in the database.")
+
+    ## --- Notes Management ---
+    st.divider()
+    _notes_project = st.session_state.get("selected_project")
+    st.subheader(f"Notes — {_notes_project}" if _notes_project else "Notes")
+
+    if "active_project_path" not in st.session_state:
+        st.info("Activate a project above to manage notes.")
+    else:
+        _notes_db = os.path.join(st.session_state["active_project_path"], "project_notes.db")
+
+        _nc = sqlite3.connect(_notes_db)
+        try:
+            _nc.execute("""
+                CREATE TABLE IF NOT EXISTS notes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            _nc.commit()
+        finally:
+            _nc.close()
+
+        def _fetch_notes():
+            _c = sqlite3.connect(_notes_db)
+            try:
+                return _c.execute(
+                    "SELECT id, title, created_at FROM notes ORDER BY created_at ASC"
+                ).fetchall()
+            finally:
+                _c.close()
+
+        ## Add note form — processed before fetching list so new note appears immediately
+        with st.expander("Add a New Note", expanded=False):
+            with st.form("notes_add_form"):
+                _add_title = st.text_input("Title")
+                _add_content = st.text_area("Content")
+                _add_submitted = st.form_submit_button("Add Note")
+            if _add_submitted:
+                if not _add_title.strip() or not _add_content.strip():
+                    st.error("Title and content cannot be empty.")
+                else:
+                    _c = sqlite3.connect(_notes_db)
+                    try:
+                        _c.execute(
+                            "INSERT INTO notes (title, content) VALUES (?, ?)",
+                            (_add_title.strip(), _add_content.strip())
+                        )
+                        _c.commit()
+                    finally:
+                        _c.close()
+                    st.rerun()
+
+        ## Notes list
+        _notes = _fetch_notes()
+
+        if not _notes:
+            st.info("No notes yet for this project.")
+        else:
+            with st.expander(f"Notes list ({len(_notes)})", expanded=False):
+                st.dataframe(
+                    [{"ID": n[0], "Title": n[1], "Created At": n[2]} for n in _notes],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+            st.divider()
+
+            ## View / Modify / Delete
+            _note_labels = [f"[{n[0]}] {n[1]}" for n in _notes]
+            _sel_label = st.selectbox("Select a note:", _note_labels, key="notes_select")
+            _sel_id = int(_sel_label.split("]")[0].strip("["))
+
+            _c = sqlite3.connect(_notes_db)
+            try:
+                _note = _c.execute(
+                    "SELECT id, title, content, created_at FROM notes WHERE id = ?",
+                    (_sel_id,)
+                ).fetchone()
+            finally:
+                _c.close()
+
+            if _note:
+                st.markdown(f"**Created At:** {_note[3]}")
+
+                with st.expander("View Content", expanded=False):
+                    st.markdown(_note[2])
+
+                with st.expander("Modify Note", expanded=False):
+                    with st.form(f"notes_modify_form_{_sel_id}"):
+                        _mod_title = st.text_input("Title", value=_note[1])
+                        _mod_content = st.text_area("Content", value=_note[2])
+                        _mod_submitted = st.form_submit_button("Save Changes")
+                    if _mod_submitted:
+                        if not _mod_title.strip() or not _mod_content.strip():
+                            st.error("Title and content cannot be empty.")
+                        else:
+                            _c = sqlite3.connect(_notes_db)
+                            try:
+                                _c.execute(
+                                    "UPDATE notes SET title = ?, content = ? WHERE id = ?",
+                                    (_mod_title.strip(), _mod_content.strip(), _sel_id)
+                                )
+                                _c.commit()
+                            finally:
+                                _c.close()
+                            st.rerun()
+
+                _del_key = f"confirm_delete_note_{_sel_id}"
+                if not st.session_state.get(_del_key):
+                    if st.button("Delete Note", key=f"btn_delete_note_{_sel_id}"):
+                        st.session_state[_del_key] = True
+                        st.rerun()
+                else:
+                    st.warning(f"Delete note '{_note[1]}'?")
+                    _dc1, _dc2 = st.columns(2)
+                    with _dc1:
+                        if st.button("Yes, delete", key=f"btn_confirm_del_note_{_sel_id}"):
+                            _c = sqlite3.connect(_notes_db)
+                            try:
+                                _c.execute("DELETE FROM notes WHERE id = ?", (_sel_id,))
+                                _c.commit()
+                            finally:
+                                _c.close()
+                            st.session_state[_del_key] = False
+                            st.rerun()
+                    with _dc2:
+                        if st.button("Cancel", key=f"btn_cancel_del_note_{_sel_id}"):
+                            st.session_state[_del_key] = False
+                            st.rerun()
 
 elif page == "ChemSpace":
     st.title("ChemSpace")
