@@ -4,6 +4,7 @@ import io
 import sys
 import os
 import glob
+import json
 import sqlite3
 import py3Dmol
 import streamlit_functions as st_funcs
@@ -570,20 +571,171 @@ elif page == "Docking Methods":
 
         if st.button(f"{'Hide' if st.session_state['show_docking_methods'] else 'Show'} Docking Methods Table"):
             st.session_state["show_docking_methods"] = not st.session_state["show_docking_methods"]
+            if not st.session_state["show_docking_methods"]:
+                st.session_state["export_dm_selected_name"] = None
 
         if st.session_state["show_docking_methods"]:
-            st.dataframe(df_methods[["id", "method_name", "docking_engine", "description", "created_date"]])
+            _df_dm = df_methods[["id", "method_name", "docking_engine", "description", "created_date"]].copy()
+            _df_dm.insert(0, "Select", False)
+            _edited_dm = st.data_editor(
+                _df_dm,
+                column_config={"Select": st.column_config.CheckboxColumn("Select", default=False)},
+                disabled=[c for c in _df_dm.columns if c != "Select"],
+                hide_index=True,
+                use_container_width=True,
+                key="data_editor_docking_methods",
+            )
+            _sel_dm_rows = _edited_dm[_edited_dm["Select"]]
+            st.session_state["export_dm_selected_name"] = (
+                _sel_dm_rows.iloc[0]["method_name"] if len(_sel_dm_rows) == 1 else None
+            )
+
+        ## Clear export form when selection changes
+        _export_dm_name = st.session_state.get("export_dm_selected_name")
+        if st.session_state.get("_last_export_dm_name") != _export_dm_name:
+            st.session_state["show_export_dm_form"] = False
+            st.session_state["_last_export_dm_name"] = _export_dm_name
+
+        ## Export / Import buttons
+        _col_exp, _col_imp = st.columns(2)
+
+        with _col_exp:
+            if not _export_dm_name:
+                st.button(
+                    "📤 Export Method",
+                    key="btn_export_dm",
+                    disabled=True,
+                    help="Show the table and check exactly one method to enable export.",
+                )
+            else:
+                if st.button(
+                    f"{'Hide Export' if st.session_state.get('show_export_dm_form') else '📤 Export'}: {_export_dm_name}",
+                    key="btn_export_dm",
+                ):
+                    st.session_state["show_export_dm_form"] = not st.session_state.get("show_export_dm_form", False)
+
+                if st.session_state.get("show_export_dm_form"):
+                    _full_row = df_methods[df_methods["method_name"] == _export_dm_name].iloc[0]
+                    _default_exp_path = os.path.join(
+                        st.session_state["active_project_path"],
+                        "docking", "docking_registers",
+                        f"{_export_dm_name}.json",
+                    )
+                    _exp_path = st.text_input(
+                        "Output JSON path:",
+                        value=_default_exp_path,
+                        key=f"export_dm_path_{_export_dm_name}",
+                    )
+                    if st.button("💾 Save", key=f"btn_save_dm_{_export_dm_name}"):
+                        try:
+                            _params = json.loads(_full_row["parameters"]) if _full_row["parameters"] else {}
+                            _lp = json.loads(_full_row["ligand_prep_params"]) if _full_row["ligand_prep_params"] else {}
+                            _payload = {
+                                "method_name": str(_full_row["method_name"]),
+                                "docking_engine": str(_full_row["docking_engine"]),
+                                "description": str(_full_row["description"] or ""),
+                                "parameters": _params,
+                                "ligand_prep_params": _lp,
+                            }
+                            _out = _exp_path.strip()
+                            os.makedirs(os.path.dirname(os.path.abspath(_out)), exist_ok=True)
+                            with open(_out, "w", encoding="utf-8") as _f:
+                                json.dump(_payload, _f, indent=2, ensure_ascii=False)
+                            st.success(f"✅ Exported to: {_out}")
+                            st.session_state["show_export_dm_form"] = False
+                        except Exception as _e:
+                            st.error(f"❌ Export failed: {_e}")
+
+        with _col_imp:
+            if st.button(
+                f"{'Hide Import' if st.session_state.get('show_import_dm_form') else '📥 Import Method'}",
+                key="btn_import_dm",
+            ):
+                st.session_state["show_import_dm_form"] = not st.session_state.get("show_import_dm_form", False)
+
+            if st.session_state.get("show_import_dm_form"):
+                _imp_path = st.text_input(
+                    "JSON file path:",
+                    placeholder="/path/to/method.json",
+                    key="import_dm_path",
+                )
+                if st.button("📥 Load", key="btn_load_dm"):
+                    if not _imp_path.strip():
+                        st.error("Please enter a file path.")
+                    elif not os.path.exists(_imp_path.strip()):
+                        st.error(f"File not found: {_imp_path.strip()}")
+                    else:
+                        try:
+                            with open(_imp_path.strip(), "r", encoding="utf-8") as _f:
+                                _imp_data = json.load(_f)
+                            _required = {"method_name", "docking_engine", "description", "parameters", "ligand_prep_params"}
+                            _missing = _required - set(_imp_data.keys())
+                            if _missing:
+                                st.error(f"JSON missing required fields: {', '.join(sorted(_missing))}")
+                            else:
+                                _docking_dir = os.path.join(
+                                    st.session_state["active_project_path"],
+                                    "docking", "docking_registers",
+                                )
+                                os.makedirs(_docking_dir, exist_ok=True)
+                                _imp_db = os.path.join(_docking_dir, "docking_methods.db")
+                                _nc = sqlite3.connect(_imp_db)
+                                try:
+                                    _nc.execute("""
+                                        CREATE TABLE IF NOT EXISTS docking_methods (
+                                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                            method_name TEXT UNIQUE NOT NULL,
+                                            docking_engine TEXT NOT NULL,
+                                            description TEXT,
+                                            parameters TEXT,
+                                            ligand_prep_params TEXT,
+                                            created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                                        )
+                                    """)
+                                    _nc.execute(
+                                        "SELECT COUNT(*) FROM docking_methods WHERE method_name = ?",
+                                        (_imp_data["method_name"],),
+                                    )
+                                    if _nc.execute(
+                                        "SELECT COUNT(*) FROM docking_methods WHERE method_name = ?",
+                                        (_imp_data["method_name"],),
+                                    ).fetchone()[0] > 0:
+                                        st.warning(f"Method '{_imp_data['method_name']}' already exists in this project.")
+                                    else:
+                                        _nc.execute("""
+                                            INSERT INTO docking_methods
+                                                (method_name, docking_engine, description, parameters, ligand_prep_params)
+                                            VALUES (?, ?, ?, ?, ?)
+                                        """, (
+                                            _imp_data["method_name"],
+                                            _imp_data["docking_engine"],
+                                            _imp_data["description"],
+                                            json.dumps(_imp_data["parameters"], indent=2),
+                                            json.dumps(_imp_data["ligand_prep_params"], indent=2),
+                                        ))
+                                        _nc.commit()
+                                        st.success(f"✅ Method '{_imp_data['method_name']}' imported successfully.")
+                                        st.session_state["show_import_dm_form"] = False
+                                        st.rerun()
+                                finally:
+                                    _nc.close()
+                        except json.JSONDecodeError as _e:
+                            st.error(f"Invalid JSON: {_e}")
+                        except Exception as _e:
+                            st.error(f"Import failed: {_e}")
 
         ## Select a method to inspect details
         method_names = df_methods["method_name"].dropna().unique().tolist()
-        if "selected_docking_method" not in st.session_state and method_names:
-            st.session_state["selected_docking_method"] = method_names[0]
+
+        # Reset to first entry whenever the stored value is stale (project switch or first load)
+        if st.session_state.get("selected_docking_method") not in method_names:
+            st.session_state["selected_docking_method"] = method_names[0] if method_names else None
 
         selected_method = st.selectbox(
             "Select a docking method to inspect:",
             method_names,
             key="select_docking_method",
-            index=method_names.index(st.session_state.get("selected_docking_method", method_names[0])) if method_names else 0
+            index=method_names.index(st.session_state["selected_docking_method"]) if st.session_state.get("selected_docking_method") in method_names else 0
         )
         if selected_method != st.session_state.get("selected_docking_method"):
             st.session_state["selected_docking_method"] = selected_method

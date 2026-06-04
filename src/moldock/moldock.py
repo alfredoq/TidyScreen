@@ -443,6 +443,227 @@ class MolDock:
             print(f"❌ Error listing docking methods: {e}")
             return None
 
+    def export_docking_method(self):
+        """
+        Export a docking method as a JSON file suitable for recreating it with create_docking_method.
+        Uses list_docking_methods() to display available methods and prompts the user to select one.
+        """
+        import sqlite3
+        import json
+
+        print(f"\n📤 EXPORT DOCKING METHOD")
+        print("=" * 50)
+
+        # Show available methods and let user browse details
+        methods_list = self.list_docking_methods()
+
+        if not methods_list:
+            return None
+
+        # Select method to export
+        while True:
+            try:
+                selection = input(
+                    f"\nEnter the number of the method to export (1-{len(methods_list)}) or 'cancel': "
+                ).strip()
+
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    print("❌ Export cancelled.")
+                    return None
+
+                idx = int(selection)
+                if 1 <= idx <= len(methods_list):
+                    selected = methods_list[idx - 1]
+                    break
+                else:
+                    print(f"❌ Invalid selection. Choose between 1 and {len(methods_list)}.")
+            except ValueError:
+                print("❌ Please enter a valid number or 'cancel'.")
+
+        # Build the export payload — all fields required to recreate the method
+        export_data = {
+            "method_name": selected['method_name'],
+            "docking_engine": selected['docking_engine'],
+            "description": selected['description'],
+            "parameters": selected['parameters'],
+            "ligand_prep_params": selected['ligand_prep_params'],
+        }
+
+        # Suggest a default output path next to the methods database
+        docking_registers_dir = os.path.dirname(self.__docking_registers_db)
+        default_output = os.path.join(docking_registers_dir, f"{selected['method_name']}.json")
+
+        output_path = input(f"\n📁 Enter output file path\n   (default: {default_output}): ").strip()
+        if not output_path:
+            output_path = default_output
+
+        if not output_path.endswith('.json'):
+            output_path += '.json'
+
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+            with open(output_path, 'w', encoding='utf-8') as f:
+                json.dump(export_data, f, indent=2, ensure_ascii=False)
+
+            print(f"\n✅ Method '{selected['method_name']}' exported successfully.")
+            print(f"📍 File: {output_path}")
+            return output_path
+
+        except Exception as e:
+            print(f"❌ Error writing export file: {e}")
+            return None
+
+    def import_docking_method(self):
+        """
+        Import a docking method from a JSON file previously exported with export_docking_method.
+        """
+        import sqlite3
+        import json
+
+        print(f"\n📥 IMPORT DOCKING METHOD")
+        print("=" * 50)
+
+        # Ask for the JSON file path
+        while True:
+            json_path = input("📁 Enter path to the JSON file (or 'cancel'): ").strip()
+
+            if json_path.lower() in ['cancel', 'quit', 'exit']:
+                print("❌ Import cancelled.")
+                return None
+
+            if not json_path:
+                print("❌ Path cannot be empty.")
+                continue
+
+            if not os.path.exists(json_path):
+                print(f"❌ File not found: {json_path}")
+                continue
+
+            break
+
+        # Read and validate the JSON
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except json.JSONDecodeError as e:
+            print(f"❌ Invalid JSON file: {e}")
+            return None
+        except Exception as e:
+            print(f"❌ Error reading file: {e}")
+            return None
+
+        required_keys = {'method_name', 'docking_engine', 'description', 'parameters', 'ligand_prep_params'}
+        missing = required_keys - set(data.keys())
+        if missing:
+            print(f"❌ JSON is missing required fields: {', '.join(sorted(missing))}")
+            return None
+
+        method_name     = data['method_name']
+        docking_engine  = data['docking_engine']
+        description     = data['description']
+        parameters      = data['parameters']
+        ligand_prep_params = data['ligand_prep_params']
+
+        # Show a preview before writing
+        print(f"\n📋 METHOD TO IMPORT:")
+        print(f"   {'─' * 46}")
+        print(f"   🏷️  Name:   {method_name}")
+        print(f"   🧬 Engine: {docking_engine}")
+        print(f"   📝 Desc:   {description or 'None'}")
+        print(f"   {'─' * 46}")
+
+        confirm = input("\nProceed with import? (y/n): ").strip().lower()
+        if confirm not in ['y', 'yes']:
+            print("❌ Import cancelled.")
+            return None
+
+        # Ensure docking directories exist
+        docking_registers_dir = os.path.dirname(self.__docking_registers_db)
+        os.makedirs(docking_registers_dir, exist_ok=True)
+        methods_db_path = os.path.join(docking_registers_dir, 'docking_methods.db')
+
+        try:
+            conn = sqlite3.connect(methods_db_path)
+            cursor = conn.cursor()
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS docking_methods (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    method_name TEXT UNIQUE NOT NULL,
+                    docking_engine TEXT NOT NULL,
+                    description TEXT,
+                    parameters TEXT,
+                    ligand_prep_params TEXT,
+                    created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
+            cursor.execute("SELECT COUNT(*) FROM docking_methods WHERE method_name = ?", (method_name,))
+            exists = cursor.fetchone()[0] > 0
+
+            if exists:
+                print(f"⚠️  Method name '{method_name}' already exists.")
+                while True:
+                    overwrite = input("Overwrite existing method? (y/n): ").strip().lower()
+                    if overwrite in ['y', 'yes']:
+                        cursor.execute('''
+                            UPDATE docking_methods
+                            SET docking_engine = ?, description = ?, parameters = ?,
+                                ligand_prep_params = ?, created_date = CURRENT_TIMESTAMP
+                            WHERE method_name = ?
+                        ''', (
+                            docking_engine,
+                            description,
+                            self._serialize_parameters(parameters),
+                            self._serialize_parameters(ligand_prep_params),
+                            method_name,
+                        ))
+                        print(f"✅ Updated existing docking method '{method_name}'.")
+                        break
+                    elif overwrite in ['n', 'no']:
+                        print("❌ Import cancelled — name already exists.")
+                        conn.close()
+                        return None
+                    else:
+                        print("❌ Please answer 'y' or 'n'.")
+            else:
+                cursor.execute('''
+                    INSERT INTO docking_methods
+                        (method_name, docking_engine, description, parameters, ligand_prep_params)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (
+                    method_name,
+                    docking_engine,
+                    description,
+                    self._serialize_parameters(parameters),
+                    self._serialize_parameters(ligand_prep_params),
+                ))
+                print(f"✅ Imported docking method '{method_name}'.")
+
+            method_id = cursor.execute(
+                "SELECT id FROM docking_methods WHERE method_name = ?", (method_name,)
+            ).fetchone()[0]
+
+            conn.commit()
+            conn.close()
+
+            print(f"📋 Method ID: {method_id}")
+            print(f"🗂️  Database:  {methods_db_path}")
+
+            return {
+                'method_id': method_id,
+                'method_name': method_name,
+                'docking_engine': docking_engine,
+                'description': description,
+                'parameters': parameters,
+                'ligand_prep_params': ligand_prep_params,
+                'database_path': methods_db_path,
+            }
+
+        except Exception as e:
+            print(f"❌ Error importing docking method: {e}")
+            return None
+
     def delete_docking_method(self):
         """
         Delete a docking method registry from the database as created using the create_docking_method method
