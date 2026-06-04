@@ -2266,6 +2266,146 @@ elif page == "ML":
                                 st.button("▶", key="ml_ts_next", disabled=(cur_ts >= len(ts_pose_labels) - 1), on_click=_ts_go_next)
                             st.caption(f"Pose {cur_ts + 1} of {len(ts_pose_labels)} — {current_ts_row['assay_name']} / {current_ts_row['pose_file']}")
 
+                            ## Delete pose from Positive / Negative Binders registries
+                            st.divider()
+                            _df_pos_reg = st_funcs.get_binders_registry(project_path, "positive")
+                            _df_neg_reg = st_funcs.get_binders_registry(project_path, "negative")
+
+                            def _pose_in_registry(df, row):
+                                if df is None or df.empty:
+                                    return False
+                                return (
+                                    (df["assay_name"] == row["assay_name"]) &
+                                    (df["pose_file"] == row["pose_file"]) &
+                                    (df["directory"] == row["directory"])
+                                ).any()
+
+                            _in_pos = _pose_in_registry(_df_pos_reg, current_ts_row)
+                            _in_neg = _pose_in_registry(_df_neg_reg, current_ts_row)
+
+                            if not _in_pos and not _in_neg:
+                                st.info(
+                                    f"ℹ️ **{current_ts_row['pose_file']}** is not registered "
+                                    f"in Positive or Negative Binders."
+                                )
+                            else:
+                                _found_labels = []
+                                if _in_pos:
+                                    _found_labels.append("✅ Positive Binders")
+                                if _in_neg:
+                                    _found_labels.append("❌ Negative Binders")
+
+                                # Reflag target: only defined when pose is in exactly one registry
+                                if _in_pos and not _in_neg:
+                                    _reflag_target = "negative"
+                                    _reflag_label = "❌ Negative"
+                                elif _in_neg and not _in_pos:
+                                    _reflag_target = "positive"
+                                    _reflag_label = "✅ Positive"
+                                else:
+                                    _reflag_target = None
+                                    _reflag_label = None
+
+                                _del_binders_key = f"confirm_del_binders_{selected_ts}_{cur_ts}"
+                                _reflag_key = f"confirm_reflag_binders_{selected_ts}_{cur_ts}"
+
+                                _btn_col_del, _btn_col_ref = st.columns(2)
+
+                                with _btn_col_del:
+                                    if not st.session_state.get(_del_binders_key):
+                                        if st.button(
+                                            f"🗑️ Delete from {' & '.join(_found_labels)}",
+                                            key=f"btn_del_binders_{selected_ts}_{cur_ts}",
+                                        ):
+                                            st.session_state[_del_binders_key] = True
+                                            st.session_state[_reflag_key] = False
+                                            st.rerun()
+                                    else:
+                                        st.warning(
+                                            f"Delete **{current_ts_row['pose_file']}** from "
+                                            f"{', '.join(_found_labels)}?"
+                                        )
+                                        _dbc1, _dbc2 = st.columns(2)
+                                        with _dbc1:
+                                            if st.button("Yes, delete", key=f"btn_confirm_del_binders_{selected_ts}_{cur_ts}"):
+                                                if _in_pos:
+                                                    st_funcs.remove_binder(
+                                                        project_path=project_path,
+                                                        binder_type="positive",
+                                                        assay_name=current_ts_row["assay_name"],
+                                                        pose_file=current_ts_row["pose_file"],
+                                                        directory=current_ts_row["directory"],
+                                                    )
+                                                if _in_neg:
+                                                    st_funcs.remove_binder(
+                                                        project_path=project_path,
+                                                        binder_type="negative",
+                                                        assay_name=current_ts_row["assay_name"],
+                                                        pose_file=current_ts_row["pose_file"],
+                                                        directory=current_ts_row["directory"],
+                                                    )
+                                                st.session_state[_del_binders_key] = False
+                                                st.rerun()
+                                        with _dbc2:
+                                            if st.button("Cancel", key=f"btn_cancel_del_binders_{selected_ts}_{cur_ts}"):
+                                                st.session_state[_del_binders_key] = False
+                                                st.rerun()
+
+                                with _btn_col_ref:
+                                    if _reflag_target is None:
+                                        st.button(
+                                            "🔄 Reflag",
+                                            key=f"btn_reflag_{selected_ts}_{cur_ts}",
+                                            disabled=True,
+                                            help="Pose is in both registries — remove from one first.",
+                                        )
+                                    elif not st.session_state.get(_reflag_key):
+                                        if st.button(
+                                            f"🔄 Reflag as {_reflag_label}",
+                                            key=f"btn_reflag_{selected_ts}_{cur_ts}",
+                                        ):
+                                            st.session_state[_reflag_key] = True
+                                            st.session_state[_del_binders_key] = False
+                                            st.rerun()
+                                    else:
+                                        st.warning(
+                                            f"Move **{current_ts_row['pose_file']}** to {_reflag_label}?"
+                                        )
+                                        _rfc1, _rfc2 = st.columns(2)
+                                        with _rfc1:
+                                            if st.button("Yes, reflag", key=f"btn_confirm_reflag_{selected_ts}_{cur_ts}"):
+                                                _src = "positive" if _in_pos else "negative"
+                                                st_funcs.remove_binder(
+                                                    project_path=project_path,
+                                                    binder_type=_src,
+                                                    assay_name=current_ts_row["assay_name"],
+                                                    pose_file=current_ts_row["pose_file"],
+                                                    directory=current_ts_row["directory"],
+                                                )
+                                                if _reflag_target == "positive":
+                                                    st_funcs.save_positive_binder(
+                                                        project_path=project_path,
+                                                        assay_name=current_ts_row["assay_name"],
+                                                        pose_file=current_ts_row["pose_file"],
+                                                        directory=current_ts_row["directory"],
+                                                        pose_full_path=current_ts_row["pose_full_path"],
+                                                    )
+                                                else:
+                                                    st_funcs.save_negative_binder(
+                                                        project_path=project_path,
+                                                        assay_name=current_ts_row["assay_name"],
+                                                        pose_file=current_ts_row["pose_file"],
+                                                        directory=current_ts_row["directory"],
+                                                        pose_full_path=current_ts_row["pose_full_path"],
+                                                    )
+                                                st.session_state[_reflag_key] = False
+                                                st.rerun()
+                                        with _rfc2:
+                                            if st.button("Cancel", key=f"btn_cancel_reflag_{selected_ts}_{cur_ts}"):
+                                                st.session_state[_reflag_key] = False
+                                                st.rerun()
+                            st.divider()
+
                             ## VMD script creation
                             with st.expander("🎬 Create VMD Script", expanded=False):
                                 _default_vmd_path_ts = os.path.join(
