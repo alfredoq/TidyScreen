@@ -72,6 +72,47 @@ def get_docking_methods(db_path):
     except Exception as e:
         return None
 
+def get_md_method_registers(db_path):
+    """
+    Retrieve all entries from the 'md_methods' table in md_methods.db.
+
+    Args:
+        db_path (str): Path to the md_methods.db SQLite database.
+
+    Returns:
+        pd.DataFrame: DataFrame with all MD method records, or None on error.
+    """
+    columns = ['method_id', 'method_name', 'description', 'engine', 'parameters']
+    try:
+        conn = sqlite3.connect(db_path)
+        query = f"SELECT {', '.join(columns)} FROM md_methods"
+        df = pd.read_sql_query(query, conn)
+        conn.close()
+        return df
+    except Exception:
+        return None
+
+def get_md_assay_registers(db_path):
+    """
+    Retrieve all entries from the 'md_assays' table in md_registers.db.
+
+    Args:
+        db_path (str): Path to the md_registers.db SQLite database.
+
+    Returns:
+        pd.DataFrame: DataFrame with all MD assay records, or None on error.
+    """
+    columns = ['assay_id', 'md_assay', 'description', 'assay_folder_path',
+               'docking_assay_id', 'ligand_name', 'pose_id', 'md_parameters']
+    try:
+        conn = sqlite3.connect(db_path)
+        query = f"SELECT {', '.join(columns)} FROM md_assays"
+        df = pd.read_sql_query(query, conn)
+        conn.close()
+        return df
+    except Exception:
+        return None
+
 def get_docking_assay_registers(db_path):
     """
     Retrieve columns 'assay_name', 'table_name', 'docking_method_name', 'compound_count', and 'notes'
