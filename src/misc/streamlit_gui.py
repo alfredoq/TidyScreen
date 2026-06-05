@@ -883,20 +883,23 @@ elif page == "Analysis":
 
             if st.button(f"{'Hide' if st.session_state['show_results'] else 'Show'} {st.session_state['selected_assay_name']} Docking Results"):
                 st.session_state["show_results"] = not st.session_state["show_results"]
+                st.rerun()
 
             if st.session_state["show_results"]:
                 st.write(df_results)
 
-            if df_mmpbsa_poses_results is not None and not df_mmpbsa_poses_results.empty:
-                if st.button("Update MMGBSA data", key="btn_update_mmgbsa_results"):
-                    n_updated, errs = st_funcs.populate_results_with_mmgbsa_energies(results_db_path)
-                    if errs:
-                        for msg in errs:
-                            st.warning(msg)
-                    if n_updated > 0:
-                        st.success(f"Updated mmgbsa_total_energy and mmgbsa_gas_energy for {n_updated} pose(s) in the Results table.")
-                    else:
-                        st.info("No poses were updated.")
+                if df_mmpbsa_poses_results is not None and not df_mmpbsa_poses_results.empty:
+                    _sp, _col = st.columns([1, 9])
+                    with _col:
+                        if st.button("Update MMGBSA data", key="btn_update_mmgbsa_results"):
+                            n_updated, errs = st_funcs.populate_results_with_mmgbsa_energies(results_db_path)
+                            if errs:
+                                for msg in errs:
+                                    st.warning(msg)
+                            if n_updated > 0:
+                                st.success(f"Updated mmgbsa_total_energy and mmgbsa_gas_energy for {n_updated} pose(s) in the Results table.")
+                            else:
+                                st.info("No poses were updated.")
 
             ## Single "View Poses" button that expands to show the four folder buttons
             extracted_poses = st_funcs.get_extracted_poses_info(results_db_path)
@@ -910,19 +913,22 @@ elif page == "Analysis":
 
                 if st.button(f"{'Hide' if st.session_state['show_view_poses'] else 'View'} Poses"):
                     st.session_state["show_view_poses"] = not st.session_state["show_view_poses"]
+                    st.rerun()
 
                 if st.session_state["show_view_poses"]:
                     ## Reference PDB uploader (shared across all pose folders)
-                    ref_file = st.file_uploader(
-                        "Load a reference PDB for superimposition (optional):",
-                        type=["pdb"],
-                        key="reference_pdb_uploader"
-                    )
-                    if ref_file is not None:
-                        st.session_state["reference_pdb_data"] = ref_file.read().decode("utf-8")
-                        st.success(f"Reference loaded: {ref_file.name}")
-                    elif "reference_pdb_data" not in st.session_state:
-                        st.session_state["reference_pdb_data"] = None
+                    _sp, _col = st.columns([1, 9])
+                    with _col:
+                        ref_file = st.file_uploader(
+                            "Load a reference PDB for superimposition (optional):",
+                            type=["pdb"],
+                            key="reference_pdb_uploader"
+                        )
+                        if ref_file is not None:
+                            st.session_state["reference_pdb_data"] = ref_file.read().decode("utf-8")
+                            st.success(f"Reference loaded: {ref_file.name}")
+                        elif "reference_pdb_data" not in st.session_state:
+                            st.session_state["reference_pdb_data"] = None
 
                     for entry in extracted_poses:
                         label = f"{entry['directory']} ({entry['count']} PDB files)" if entry["active"] else entry["directory"]
@@ -930,8 +936,11 @@ elif page == "Analysis":
                         if entry["active"]:
                             if key not in st.session_state:
                                 st.session_state[key] = False
-                            if st.button(f"{'Hide' if st.session_state[key] else 'Show'} {label}", key=key + "_btn"):
-                                st.session_state[key] = not st.session_state[key]
+                            _sp, _col = st.columns([1, 9])
+                            with _col:
+                                if st.button(f"{'Hide' if st.session_state[key] else 'Show'} {label}", key=key + "_btn"):
+                                    st.session_state[key] = not st.session_state[key]
+                                    st.rerun()
                             if st.session_state[key]:
                                 st.divider()
                                 filename_to_pose_id = st_funcs.get_filename_to_pose_id_map(results_db_path)
@@ -947,11 +956,13 @@ elif page == "Analysis":
                                 st.session_state[idx_key] = max(0, min(st.session_state[idx_key], len(pdb_names) - 1))
 
                                 ## Selectbox with NO key — driven entirely by idx_key via index param
-                                selected_file = st.selectbox(
-                                    f"Select a pose file from {entry['directory']}:",
-                                    pdb_names,
-                                    index=st.session_state[idx_key],
-                                )
+                                _sp, _col = st.columns([2, 8])
+                                with _col:
+                                    selected_file = st.selectbox(
+                                        f"Select a pose file from {entry['directory']}:",
+                                        pdb_names,
+                                        index=st.session_state[idx_key],
+                                    )
                                 ## Keep index in sync when user picks from the selectbox directly
                                 if selected_file:
                                     st.session_state[idx_key] = pdb_names.index(selected_file)
@@ -1073,7 +1084,9 @@ elif page == "Analysis":
                                 prolif_tables_dir = st_funcs.get_prolif_tables_by_pose_ids(results_db_path, dir_pose_ids)
                                 prolif_dir_key = f"show_prolif_{dir_name}"
                                 if not prolif_tables_dir:
-                                    st.button("Show ProLIF Fingerprints", disabled=True, key=f"btn_prolif_disabled_{dir_name}")
+                                    _sp, _col = st.columns([2, 8])
+                                    with _col:
+                                        st.button("Show ProLIF Fingerprints", disabled=True, key=f"btn_prolif_disabled_{dir_name}")
                                 else:
                                     if prolif_dir_key not in st.session_state:
                                         st.session_state[prolif_dir_key] = False
@@ -1083,12 +1096,14 @@ elif page == "Analysis":
                                         "most_populated_and_stable_poses": "most_populated_and_stable",
                                         "all_poses": "all_poses",
                                     }.get(dir_name, dir_name)
-                                    if st.button(
-                                        f"{'Hide' if st.session_state[prolif_dir_key] else 'Show'} ProLIF FPS - {_dir_label}",
-                                        key=f"btn_prolif_{dir_name}"
-                                    ):
-                                        st.session_state[prolif_dir_key] = not st.session_state[prolif_dir_key]
-                                        st.rerun()
+                                    _sp, _col = st.columns([2, 8])
+                                    with _col:
+                                        if st.button(
+                                            f"{'Hide' if st.session_state[prolif_dir_key] else 'Show'} ProLIF FPS - {_dir_label}",
+                                            key=f"btn_prolif_{dir_name}"
+                                        ):
+                                            st.session_state[prolif_dir_key] = not st.session_state[prolif_dir_key]
+                                            st.rerun()
                                     if st.session_state[prolif_dir_key]:
                                         selected_table_dir = st.selectbox(
                                             "Select a ProLIF condition table:",
@@ -1132,12 +1147,14 @@ elif page == "Analysis":
                                             show_all_dir_key = f"show_all_prolif_{dir_name}"
                                             if show_all_dir_key not in st.session_state:
                                                 st.session_state[show_all_dir_key] = False
-                                            if st.button(
-                                                f"{'Hide' if st.session_state[show_all_dir_key] else 'Show'} all fingerprints for {selected_table_dir}",
-                                                key=f"btn_all_prolif_{dir_name}"
-                                            ):
-                                                st.session_state[show_all_dir_key] = not st.session_state[show_all_dir_key]
-                                                st.rerun()
+                                            _sp, _col = st.columns([3, 7])
+                                            with _col:
+                                                if st.button(
+                                                    f"{'Hide' if st.session_state[show_all_dir_key] else 'Show'} all fingerprints for {selected_table_dir}",
+                                                    key=f"btn_all_prolif_{dir_name}"
+                                                ):
+                                                    st.session_state[show_all_dir_key] = not st.session_state[show_all_dir_key]
+                                                    st.rerun()
                                             if st.session_state[show_all_dir_key]:
                                                 all_fps_dir_df = st_funcs.get_all_prolif_fingerprints_by_pose_ids(results_db_path, selected_table_dir, dir_pose_ids)
                                                 if all_fps_dir_df is not None and not all_fps_dir_df.empty:
@@ -1152,7 +1169,9 @@ elif page == "Analysis":
                                             st.warning(f"No ProLIF poses found for {dir_name}.")
                                 st.divider()
                         else:
-                            st.button(label, disabled=True, key=key + "_btn")
+                            _sp, _col = st.columns([1, 9])
+                            with _col:
+                                st.button(label, disabled=True, key=key + "_btn")
 
             if df_mmpbsa_poses_results is None or df_mmpbsa_poses_results.empty:
                 st.button(f"No MMPBSA results available for {st.session_state['selected_assay_name']}", disabled=True)
@@ -1163,27 +1182,38 @@ elif page == "Analysis":
 
                 if st.button(f"{'Hide' if st.session_state['show_mmpbsa_results'] else 'Show'} {st.session_state['selected_assay_name']} MMPBSA Results"):
                     st.session_state["show_mmpbsa_results"] = not st.session_state["show_mmpbsa_results"]
+                    st.rerun()
 
                 if st.session_state["show_mmpbsa_results"]:
                     # Create a selection box for MMPBSA poses.
-                    poses = df_mmpbsa_poses_results['pose_id'].dropna().tolist()
+                    poses = sorted(df_mmpbsa_poses_results['pose_id'].dropna().tolist())
                     if poses:
+                        pose_label_map = st_funcs.get_pose_labels_for_pose_ids(results_db_path, poses)
+
                         default_pose = st.session_state.get('selected_pose_id', poses[0])
                         if default_pose not in poses:
                             default_pose = poses[0]
 
-                        selected_pose = st.selectbox(
-                            f"Select a docked pose: {st.session_state['selected_assay_name']}",
-                            poses,
-                            key="select_pose_id",
-                            index=poses.index(default_pose)
-                        )
+                        _sp, _col = st.columns([1, 9])
+                        with _col:
+                            selected_pose = st.selectbox(
+                                f"Select a docked pose: {st.session_state['selected_assay_name']}",
+                                poses,
+                                key="select_pose_id",
+                                index=poses.index(default_pose),
+                                format_func=lambda pid: pose_label_map.get(pid, str(pid))
+                            )
 
-                        # Always update session state and plot on selection change
+                        # Collapse sub-panels and update tracking when the selection changes
                         if selected_pose != st.session_state.get('selected_pose_id', None):
                             st.session_state['selected_pose_id'] = selected_pose
+                            st.session_state['show_mmpbsa_summary_data'] = False
+                            st.session_state['show_mmpbsa_decomposition_data'] = False
 
-                        st.success(f"Selected Pose: {selected_pose}")
+                        selected_pose_label = pose_label_map.get(selected_pose, str(selected_pose))
+                        _sp, _col = st.columns([1, 9])
+                        with _col:
+                            st.success(f"Selected Pose: {selected_pose_label}")
                         
                         # Using the selected pose, retrieve de MMPBSA data from the database
                         
@@ -1191,15 +1221,20 @@ elif page == "Analysis":
                         
                         # Display the retrieved MMPBSA data
                         if mmpbsa_data is not None and not mmpbsa_data.empty:
-                            st.write(mmpbsa_data)
+                            _sp, _col = st.columns([1, 9])
+                            with _col:
+                                st.write(mmpbsa_data)
                         
                         
                         ## Add a button to show/hide the MMPBSA data for the selected pose
                         if "show_mmpbsa_summary_data" not in st.session_state:
                             st.session_state["show_mmpbsa_summary_data"] = False
                         
-                        if st.button(f"{'Hide' if st.session_state['show_mmpbsa_summary_data'] else 'Show'} MMPBSA Summary Data for Pose {selected_pose}"):
-                            st.session_state["show_mmpbsa_summary_data"] = not st.session_state["show_mmpbsa_summary_data"]
+                        _sp, _col = st.columns([1, 9])
+                        with _col:
+                            if st.button(f"{'Hide' if st.session_state['show_mmpbsa_summary_data'] else 'Show'} MMPBSA Summary Data for {selected_pose_label}"):
+                                st.session_state["show_mmpbsa_summary_data"] = not st.session_state["show_mmpbsa_summary_data"]
+                                st.rerun()
                         if st.session_state["show_mmpbsa_summary_data"]:
                             # Show sum of the energy components for the selected pose
                             if mmpbsa_data is not None and not mmpbsa_data.empty:
@@ -1209,43 +1244,49 @@ elif page == "Analysis":
                                 vdw_energy = mmpbsa_data['vdw'].sum()
                                 polar_solvation = mmpbsa_data['polar_solvation'].sum()
                                 nonpolar_solvation = mmpbsa_data['nonpolar_solvation'].sum()
-                                st.write("MMPBSA Energy Components and Total Energy:")
-                                st.write(f"Total Energy: {total_energy:.2f} kcal/mol")
-                                st.write(f"Gas Energy: {gas_energy:.2f} kcal/mol")
-                                st.write(f"Electrostatic Energy: {ele_energy:.2f} kcal/mol")
-                                st.write(f"Van der Waals Energy: {vdw_energy:.2f} kcal/mol")
-                                st.write(f"Polar Solvation Energy: {polar_solvation:.2f} kcal/mol")
-                                st.write(f"Nonpolar Solvation Energy: {nonpolar_solvation:.2f} kcal/mol")
+                                _sp, _col = st.columns([2, 8])
+                                with _col:
+                                    st.write("MMPBSA Energy Components and Total Energy:")
+                                    st.write(f"Total Energy: {total_energy:.2f} kcal/mol")
+                                    st.write(f"Gas Energy: {gas_energy:.2f} kcal/mol")
+                                    st.write(f"Electrostatic Energy: {ele_energy:.2f} kcal/mol")
+                                    st.write(f"Van der Waals Energy: {vdw_energy:.2f} kcal/mol")
+                                    st.write(f"Polar Solvation Energy: {polar_solvation:.2f} kcal/mol")
+                                    st.write(f"Nonpolar Solvation Energy: {nonpolar_solvation:.2f} kcal/mol")
                         
                         ## Add a button to show per residue decomposition data for the selected pose
                         if "show_mmpbsa_decomposition_data" not in st.session_state:
                             st.session_state["show_mmpbsa_decomposition_data"] = False
 
-                        if st.button(
-                            f"{'Hide' if st.session_state['show_mmpbsa_decomposition_data'] else 'Show'} "
-                            f"MMPBSA Per-Residue Decomposition Data for Pose {selected_pose}"
+                        _sp, _col = st.columns([1, 9])
+                        with _col:
+                            if st.button(
+                                f"{'Hide' if st.session_state['show_mmpbsa_decomposition_data'] else 'Show'} "
+                                f"MMPBSA Per-Residue Decomposition Data for {selected_pose_label}"
                             ):
-                            
-                            st.session_state["show_mmpbsa_decomposition_data"] = not st.session_state["show_mmpbsa_decomposition_data"]
+                                st.session_state["show_mmpbsa_decomposition_data"] = not st.session_state["show_mmpbsa_decomposition_data"]
+                                st.rerun()
 
                         # IMPORTANT: keep this outside the button block
                         if st.session_state["show_mmpbsa_decomposition_data"]:
                             if "energy_threshold" not in st.session_state:
                                 st.session_state["energy_threshold"] = -1.0
 
-                            st.session_state["energy_threshold"] = st.number_input(
-                                f"Set Energy Threshold for Per-Residue Decomposition Data for Pose {selected_pose} (kcal/mol):",
-                                value=st.session_state["energy_threshold"],
-                                step=0.1,
-                                format="%.2f"
-                            )
+                            _sp, _col = st.columns([2, 8])
+                            with _col:
+                                st.session_state["energy_threshold"] = st.number_input(
+                                    f"Set Energy Threshold for Per-Residue Decomposition Data for Pose {selected_pose} (kcal/mol):",
+                                    value=st.session_state["energy_threshold"],
+                                    step=0.1,
+                                    format="%.2f"
+                                )
 
                             # create a button to show the electrostatic energy profile for the selected pose using the MMPBSA data and the energy threshold
                             if "show_electrostatic_profile" not in st.session_state:
                                 st.session_state["show_electrostatic_profile"] = False
 
                             # Indent to the right (tab-like) using a spacer column
-                            _spacer, col_profile = st.columns([1, 5])
+                            _spacer, col_profile = st.columns([2, 8])
                             with col_profile:
                                 if st.button(
                                     f"{'Hide' if st.session_state['show_electrostatic_profile'] else 'Show'} "
@@ -1281,7 +1322,7 @@ elif page == "Analysis":
                                 st.session_state["show_vdw_profile"] = False
 
                             # Indent to the right (tab-like) using a spacer column
-                            _spacer, col_profile = st.columns([1, 5])
+                            _spacer, col_profile = st.columns([2, 8])
                             with col_profile:
                                 if st.button(
                                     f"{'Hide' if st.session_state['show_vdw_profile'] else 'Show'} "
@@ -1318,7 +1359,7 @@ elif page == "Analysis":
                                 st.session_state["show_polar_solvation_profile"] = False
 
                             # Indent to the right (tab-like) using a spacer column
-                            _spacer, col_profile = st.columns([1, 5])
+                            _spacer, col_profile = st.columns([2, 8])
                             with col_profile:
                                 if st.button(
                                     f"{'Hide' if st.session_state['show_polar_solvation_profile'] else 'Show'} "
@@ -1355,7 +1396,7 @@ elif page == "Analysis":
                                 st.session_state["show_non_polar_solvation_profile"] = False
 
                             # Indent to the right (tab-like) using a spacer column
-                            _spacer, col_profile = st.columns([1, 5])
+                            _spacer, col_profile = st.columns([2, 8])
                             with col_profile:
                                 if st.button(
                                     f"{'Hide' if st.session_state['show_non_polar_solvation_profile'] else 'Show'} "
@@ -1393,7 +1434,7 @@ elif page == "Analysis":
                                 st.session_state["show_gas_profile"] = False
 
                             # Indent to the right (tab-like) using a spacer column
-                            _spacer, col_profile = st.columns([1, 5])
+                            _spacer, col_profile = st.columns([2, 8])
                             with col_profile:
                                 if st.button(
                                     f"{'Hide' if st.session_state['show_gas_profile'] else 'Show'} "
@@ -1430,7 +1471,7 @@ elif page == "Analysis":
                                 st.session_state["show_total_profile"] = False
 
                             # Indent to the right (tab-like) using a spacer column
-                            _spacer, col_profile = st.columns([1, 5])
+                            _spacer, col_profile = st.columns([2, 8])
                             with col_profile:
                                 if st.button(
                                     f"{'Hide' if st.session_state['show_total_profile'] else 'Show'} "
@@ -1464,7 +1505,9 @@ elif page == "Analysis":
                         
                         
                     else:
-                        st.warning("No valid pose IDs found in MMPBSA results")
+                        _sp, _col = st.columns([1, 9])
+                        with _col:
+                            st.warning("No valid pose IDs found in MMPBSA results")
 
             # ProLIF fingerprints button
             prolif_tables = st_funcs.get_prolif_tables(results_db_path)
@@ -1476,88 +1519,96 @@ elif page == "Analysis":
 
                 if st.button(f"{'Hide' if st.session_state['show_prolif'] else 'Show'} ProLIF Fingerprints"):
                     st.session_state["show_prolif"] = not st.session_state["show_prolif"]
+                    st.rerun()
 
                 if st.session_state["show_prolif"]:
-                    selected_table = st.selectbox(
-                        "Select a ProLIF condition table:",
-                        prolif_tables,
-                        key="select_prolif_table"
-                    )
-                    prolif_poses_df = st_funcs.get_prolif_poses(results_db_path, selected_table)
-                    if prolif_poses_df is not None and not prolif_poses_df.empty:
-                        pose_options = prolif_poses_df["pose_id"].tolist()
-                        selected_prolif_pose = st.selectbox(
-                            "Select a pose to display fingerprints:",
-                            pose_options,
-                            key="select_prolif_pose"
+                    _sp, _col = st.columns([1, 9])
+                    with _col:
+                        selected_table = st.selectbox(
+                            "Select a ProLIF condition table:",
+                            prolif_tables,
+                            key="select_prolif_table"
                         )
-                        fps_df = st_funcs.get_prolif_fingerprint_for_pose(results_db_path, selected_table, selected_prolif_pose)
+                        prolif_poses_df = st_funcs.get_prolif_poses(results_db_path, selected_table)
+                        if prolif_poses_df is not None and not prolif_poses_df.empty:
+                            pose_options = prolif_poses_df["pose_id"].tolist()
+                            selected_prolif_pose = st.selectbox(
+                                "Select a pose to display fingerprints:",
+                                pose_options,
+                                key="select_prolif_pose"
+                            )
+                            fps_df = st_funcs.get_prolif_fingerprint_for_pose(results_db_path, selected_table, selected_prolif_pose)
 
-                        if fps_df is not None and not fps_df.empty:
-                            ## Build interaction-type filter checkboxes from the union of ALL poses' columns
-                            reserved = {"pose_id"}
-                            all_columns = st_funcs.get_prolif_all_column_names(results_db_path, selected_table)
-                            all_interaction_types = sorted(set(
-                                col.split("_")[-1] for col in all_columns if col not in reserved
-                            ))
-                            st.markdown("**Filter by interaction type:**")
-                            filter_cols = st.columns(min(len(all_interaction_types), 6))
-                            selected_types = []
-                            for i, itype in enumerate(all_interaction_types):
-                                ck_key = f"prolif_filter_{itype}"
-                                if ck_key not in st.session_state:
-                                    st.session_state[ck_key] = True
-                                checked = filter_cols[i % len(filter_cols)].checkbox(itype, key=ck_key)
-                                if checked:
-                                    selected_types.append(itype)
+                            if fps_df is not None and not fps_df.empty:
+                                ## Build interaction-type filter checkboxes from the union of ALL poses' columns
+                                reserved = {"pose_id"}
+                                all_columns = st_funcs.get_prolif_all_column_names(results_db_path, selected_table)
+                                all_interaction_types = sorted(set(
+                                    col.split("_")[-1] for col in all_columns if col not in reserved
+                                ))
+                                st.markdown("**Filter by interaction type:**")
+                                filter_cols = st.columns(min(len(all_interaction_types), 6))
+                                selected_types = []
+                                for i, itype in enumerate(all_interaction_types):
+                                    ck_key = f"prolif_filter_{itype}"
+                                    if ck_key not in st.session_state:
+                                        st.session_state[ck_key] = True
+                                    checked = filter_cols[i % len(filter_cols)].checkbox(itype, key=ck_key)
+                                    if checked:
+                                        selected_types.append(itype)
 
-                            def filter_fps(df):
-                                keep = [c for c in df.columns
-                                        if c in reserved or c.split("_")[-1] in selected_types]
-                                return df[keep]
+                                def filter_fps(df):
+                                    keep = [c for c in df.columns
+                                            if c in reserved or c.split("_")[-1] in selected_types]
+                                    return df[keep]
 
-                            st.dataframe(filter_fps(fps_df), use_container_width=True)
-                        else:
-                            st.warning(f"No fingerprint data found for pose {selected_prolif_pose}.")
-
-                        ## Button to concatenate and display all poses for the selected condition
-                        if "show_all_prolif" not in st.session_state:
-                            st.session_state["show_all_prolif"] = False
-
-                        if st.button(f"{'Hide' if st.session_state['show_all_prolif'] else 'Show'} all fingerprints for {selected_table}"):
-                            st.session_state["show_all_prolif"] = not st.session_state["show_all_prolif"]
-
-                        if st.session_state["show_all_prolif"]:
-                            all_fps_df = st_funcs.get_all_prolif_fingerprints(results_db_path, selected_table)
-                            if all_fps_df is not None and not all_fps_df.empty:
-                                st.dataframe(filter_fps(all_fps_df), use_container_width=True)
+                                st.dataframe(filter_fps(fps_df), use_container_width=True)
                             else:
-                                st.warning("Could not retrieve fingerprints for all poses.")
-                    else:
-                        st.warning("No poses found in the selected ProLIF table.")
+                                st.warning(f"No fingerprint data found for pose {selected_prolif_pose}.")
+
+                            ## Button to concatenate and display all poses for the selected condition
+                            if "show_all_prolif" not in st.session_state:
+                                st.session_state["show_all_prolif"] = False
+
+                            _sp2, _col2 = st.columns([1, 9])
+                            with _col2:
+                                if st.button(f"{'Hide' if st.session_state['show_all_prolif'] else 'Show'} all fingerprints for {selected_table}"):
+                                    st.session_state["show_all_prolif"] = not st.session_state["show_all_prolif"]
+                                    st.rerun()
+
+                            if st.session_state["show_all_prolif"]:
+                                all_fps_df = st_funcs.get_all_prolif_fingerprints(results_db_path, selected_table)
+                                if all_fps_df is not None and not all_fps_df.empty:
+                                    st.dataframe(filter_fps(all_fps_df), use_container_width=True)
+                                else:
+                                    st.warning("Could not retrieve fingerprints for all poses.")
+                        else:
+                            st.warning("No poses found in the selected ProLIF table.")
 
             # Create a button to show/hide the histogram of docking scores for the selected ligand in the selected assay
             if st.button("Show/Hide Histogram"):
-                 st.session_state["show_histogram"] = not st.session_state.get("show_histogram", False)
+                st.session_state["show_histogram"] = not st.session_state.get("show_histogram", False)
+                st.rerun()
             if st.session_state.get("show_histogram", False):
-
-                # Create a selectbox for unique LigName values if present
-                if 'LigName' in df_results.columns:
-                    lig_names = df_results['LigName'].dropna().unique().tolist()
-                    if 'selected_lig_name' not in st.session_state and lig_names:
-                        st.session_state['selected_lig_name'] = lig_names[0]
-                    selected_lig = st.selectbox(
-                        f"Select a Ligand (LigName) in Assay: {st.session_state['selected_assay_name']}",
-                        lig_names,
-                        key="select_lig_name",
-                        index=lig_names.index(st.session_state.get('selected_lig_name', lig_names[0])) if lig_names else 0
-                    )
-                    # Always update session state and plot on selection change
-                    if selected_lig != st.session_state.get('selected_lig_name', None):
-                        st.session_state['selected_lig_name'] = selected_lig
-                    st.success(f"Selected Ligand: {selected_lig}")
-                    histogram = st_funcs.construct_hist_for_ligand(df_results, selected_lig)
-                    st.pyplot(histogram, use_container_width=False, clear_figure=True)
+                _sp, _col = st.columns([1, 9])
+                with _col:
+                    # Create a selectbox for unique LigName values if present
+                    if 'LigName' in df_results.columns:
+                        lig_names = df_results['LigName'].dropna().unique().tolist()
+                        if 'selected_lig_name' not in st.session_state and lig_names:
+                            st.session_state['selected_lig_name'] = lig_names[0]
+                        selected_lig = st.selectbox(
+                            f"Select a Ligand (LigName) in Assay: {st.session_state['selected_assay_name']}",
+                            lig_names,
+                            key="select_lig_name",
+                            index=lig_names.index(st.session_state.get('selected_lig_name', lig_names[0])) if lig_names else 0
+                        )
+                        # Always update session state and plot on selection change
+                        if selected_lig != st.session_state.get('selected_lig_name', None):
+                            st.session_state['selected_lig_name'] = selected_lig
+                        st.success(f"Selected Ligand: {selected_lig}")
+                        histogram = st_funcs.construct_hist_for_ligand(df_results, selected_lig)
+                        st.pyplot(histogram, use_container_width=False, clear_figure=True)
                 
                 
     
