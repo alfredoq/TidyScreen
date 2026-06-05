@@ -887,6 +887,17 @@ elif page == "Analysis":
             if st.session_state["show_results"]:
                 st.write(df_results)
 
+            if df_mmpbsa_poses_results is not None and not df_mmpbsa_poses_results.empty:
+                if st.button("Update MMGBSA data", key="btn_update_mmgbsa_results"):
+                    n_updated, errs = st_funcs.populate_results_with_mmgbsa_energies(results_db_path)
+                    if errs:
+                        for msg in errs:
+                            st.warning(msg)
+                    if n_updated > 0:
+                        st.success(f"Updated mmgbsa_total_energy and mmgbsa_gas_energy for {n_updated} pose(s) in the Results table.")
+                    else:
+                        st.info("No poses were updated.")
+
             ## Single "View Poses" button that expands to show the four folder buttons
             extracted_poses = st_funcs.get_extracted_poses_info(results_db_path)
             any_active = any(e["active"] for e in extracted_poses)
@@ -923,7 +934,11 @@ elif page == "Analysis":
                                 st.session_state[key] = not st.session_state[key]
                             if st.session_state[key]:
                                 st.divider()
-                                pdb_files = sorted(glob.glob(os.path.join(entry["path"], "*.pdb")))
+                                filename_to_pose_id = st_funcs.get_filename_to_pose_id_map(results_db_path)
+                                pdb_files = sorted(
+                                    glob.glob(os.path.join(entry["path"], "*.pdb")),
+                                    key=lambda f: filename_to_pose_id.get(os.path.basename(f), {}).get("pose_id", float("inf"))
+                                )
                                 pdb_names = [os.path.basename(f) for f in pdb_files]
                                 idx_key = f"pose_idx_{entry['directory']}"
                                 if idx_key not in st.session_state:
@@ -1013,7 +1028,10 @@ elif page == "Analysis":
                                                     st.error(result)
 
                                     ## pose counter label
-                                    st.caption(f"Pose {current_idx + 1} of {len(pdb_names)}")
+                                    pose_info = filename_to_pose_id.get(selected_file, {})
+                                    pose_id_label = pose_info.get("pose_id", "?")
+                                    lig_label = pose_info["ligname"] if pose_info else "?"
+                                    st.caption(f"Pose ID: {pose_id_label}  |  {lig_label}  ({current_idx + 1} of {len(pdb_names)})")
 
                                     ## VMD script creation
                                     with st.expander("🎬 Create VMD Script", expanded=False):

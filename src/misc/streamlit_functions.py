@@ -97,6 +97,7 @@ def get_docking_results(db_path):
     """
     Retrieve columns 'LigName', 'pose_rank', 'run_number', 'docking_score', and 'cluster_size'
     from the 'Results' table in the given SQLite database.
+    Also includes 'mmgbsa_total_energy' and 'mmgbsa_gas_energy' when present.
 
     Args:
         db_path (str): Path to the SQLite database.
@@ -104,15 +105,18 @@ def get_docking_results(db_path):
     Returns:
         pd.DataFrame: DataFrame with the specified columns, or empty DataFrame if not found.
     """
-    columns = ['LigName', 'pose_rank', 'run_number', 'docking_score', 'cluster_size']
+    base_columns = ['Pose_ID', 'LigName', 'pose_rank', 'run_number', 'docking_score', 'cluster_size']
+    optional_columns = ['mmgbsa_total_energy', 'mmgbsa_gas_energy']
     try:
         conn = sqlite3.connect(db_path)
-        query = f"SELECT {', '.join(columns)} FROM Results"
-        df = pd.read_sql_query(query, conn)
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(Results)")
+        existing = {row[1] for row in cursor.fetchall()}
+        columns = base_columns + [c for c in optional_columns if c in existing]
+        df = pd.read_sql_query(f"SELECT {', '.join(columns)} FROM Results", conn)
         conn.close()
         return df
     except Exception as e:
-        
         return None
 
 def get_extracted_poses_info(results_db_path):
@@ -274,6 +278,25 @@ def get_pose_ids_for_directory(db_path, directory_name):
         return ids
     except Exception:
         return []
+
+def get_filename_to_pose_id_map(db_path):
+    """
+    Return a dict mapping PDB filename -> pose info dict for every row in Results.
+    Each value has keys 'pose_id', 'ligname', and 'pose_rank'.
+    Filenames follow the convention '{LigName}_{run_number}.pdb' used during pose extraction.
+    """
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT Pose_ID, LigName, run_number, pose_rank FROM Results")
+        rows = cursor.fetchall()
+        conn.close()
+        return {
+            f"{ligname}_{run_number}.pdb": {"pose_id": pose_id, "ligname": ligname, "pose_rank": pose_rank}
+            for pose_id, ligname, run_number, pose_rank in rows
+        }
+    except Exception:
+        return {}
 
 def get_pose_labels_for_pose_ids(db_path, pose_ids):
     """
@@ -587,6 +610,7 @@ def create_mmpbsa_component_plot(df, x_col, y_col, title, xlabel, ylabel):
     ax.grid(axis='y', alpha=0.3)
 
     fig.set_size_inches(6, 3)
+    return fig
 
 
 def save_positive_binder(project_path: str, assay_name: str, pose_file: str, directory: str, pose_full_path: str) -> str:
@@ -1679,3 +1703,55 @@ def export_pdb_model(pdbs_db_path, file_id, output_dir):
 
     except Exception as e:
         return False, str(e)
+
+
+def populate_results_with_mmgbsa_energies(db_path):
+    """
+    Read all per-pose MMGBSA decomposition data from processed_mmgbsa_decomposition_json,
+    sum the 'total' and 'gas' columns for each pose, and write the results into
+    mmgbsa_total_energy and mmgbsa_gas_energy columns of the Results table.
+
+    Columns are added to Results via ALTER TABLE if they do not already exist.
+
+    Returns:
+        tuple[int, list[str]]: (number of rows updated, list of error messages)
+    """
+    errors = []
+    updated = 0
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+
+        # Ensure destination columns exist in Results
+        cursor.execute("PRAGMA table_info(Results)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+        for col_name, col_type in [('mmgbsa_total_energy', 'REAL'), ('mmgbsa_gas_energy', 'REAL')]:
+            if col_name not in existing_columns:
+                cursor.execute(f"ALTER TABLE Results ADD COLUMN {col_name} {col_type}")
+
+        # Read all decomposition entries
+        cursor.execute("SELECT pose_id, data FROM processed_mmgbsa_decomposition_json")
+        rows = cursor.fetchall()
+
+        for pose_id, mmgbsa_json in rows:
+            try:
+                mmgbsa_df = pd.read_json(StringIO(mmgbsa_json), orient='split')
+                total_energy = round(float(mmgbsa_df['total'].sum()), 3)
+                gas_energy = round(float(mmgbsa_df['gas'].sum()), 3)
+            except Exception as e:
+                errors.append(f"Pose {pose_id}: could not parse MMGBSA data — {e}")
+                total_energy, gas_energy = -1, -1
+
+            cursor.execute(
+                "UPDATE Results SET mmgbsa_total_energy = ?, mmgbsa_gas_energy = ? WHERE Pose_ID = ?",
+                (total_energy, gas_energy, pose_id)
+            )
+            updated += 1
+
+        conn.commit()
+        conn.close()
+
+    except Exception as e:
+        errors.append(f"Database error: {e}")
+
+    return updated, errors

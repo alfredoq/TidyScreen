@@ -10913,19 +10913,34 @@ class MolDock:
                 
             if mmbgsa == True:
 
-                ## Compute MMGBSA binding energy
-                complex_prmtop, receptor_prmtop, ligand_prmtop = self._prepare_mmgbsa_files(ligname, pose_id, prmtop_file, output_dir)
+                try:
+                    ## Compute MMGBSA binding energy
+                    complex_prmtop, receptor_prmtop, ligand_prmtop = self._prepare_mmgbsa_files(ligname, pose_id, prmtop_file, output_dir)
 
-                self._compute_mmgbsa_fingerprint(ligname, pose_id, complex_prmtop, receptor_prmtop, ligand_prmtop, rst_cpptraj_file, output_dir)
-            
-                # Parse MMGBSA decomposition original output
-                df = self._parse_mmgbsa_decomposition_output(ligname, pose_id, output_dir)
-            
-                # Renumber the residue numbers to match the crystal numbering
-                df['residue'] = df['residue'].apply(lambda x: renumbering_dict.get(x, x))
-            
-                # Store the processed mmgbsa df in the assay database for posterior processing
-                self._store_processed_mmgbsa_df_in_db(df, pose_id, results_db, computation_mode)
+                    self._compute_mmgbsa_fingerprint(ligname, pose_id, complex_prmtop, receptor_prmtop, ligand_prmtop, rst_cpptraj_file, output_dir)
+
+                    # Parse MMGBSA decomposition original output
+                    mmgbsa_df = self._parse_mmgbsa_decomposition_output(ligname, pose_id, output_dir)
+
+                    # Renumber the residue numbers to match the crystal numbering
+                    if not mmgbsa_df.empty:
+                        mmgbsa_df['residue'] = mmgbsa_df['residue'].apply(lambda x: renumbering_dict.get(x, x))
+
+                    # Store the processed mmgbsa df in the assay database for posterior processing
+                    self._store_processed_mmgbsa_df_in_db(mmgbsa_df, pose_id, results_db, computation_mode)
+
+                    # Extract summary energies to write back to the Results table
+                    if not mmgbsa_df.empty:
+                        total_energy = round(mmgbsa_df['total'].sum(), 3)
+                        gas_energy = round(mmgbsa_df['gas'].sum(), 3)
+                    else:
+                        total_energy, gas_energy = -1, -1
+
+                except Exception as e:
+                    print(f"Error occurred while computing MMGBSA for Pose_ID: {pose_id}, LigName: {ligname}: {e}")
+                    total_energy, gas_energy = -1, -1
+
+                self._update_results_mmgbsa_energies(results_db, pose_id, total_energy, gas_energy)
                 
             # Add processed ligand to list
             processed_ligands.append(ligname)
@@ -13267,7 +13282,36 @@ class MolDock:
             
         except Exception as e:
             print(f"\n❌ Error storing processed MMGBSA decomposition dataframe as JSON in database: {e}")
-            
+
+    def _update_results_mmgbsa_energies(self, results_db, pose_id, total_energy, gas_energy):
+        """
+        Write mmgbsa_total_energy and mmgbsa_gas_energy into the Results table for pose_id.
+        Columns are added via ALTER TABLE if they do not already exist (idempotent).
+        -1 is stored when the MMPBSA computation failed for this pose.
+        """
+        import sqlite3
+        try:
+            conn = sqlite3.connect(results_db)
+            cursor = conn.cursor()
+
+            cursor.execute("PRAGMA table_info(Results)")
+            existing_columns = {row[1] for row in cursor.fetchall()}
+
+            for col_name, col_type in [('mmgbsa_total_energy', 'REAL'), ('mmgbsa_gas_energy', 'REAL')]:
+                if col_name not in existing_columns:
+                    cursor.execute(f"ALTER TABLE Results ADD COLUMN {col_name} {col_type}")
+
+            cursor.execute(
+                "UPDATE Results SET mmgbsa_total_energy = ?, mmgbsa_gas_energy = ? WHERE Pose_ID = ?",
+                (total_energy, gas_energy, pose_id)
+            )
+
+            conn.commit()
+            conn.close()
+
+        except Exception as e:
+            print(f"\n❌ Error updating Results table with MMPBSA energies for Pose_ID {pose_id}: {e}")
+
     def _check_table_in_db(self, db, table_name):
         
         import sqlite3
