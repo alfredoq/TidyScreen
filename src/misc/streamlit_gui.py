@@ -232,7 +232,11 @@ elif page == "ChemSpace":
     df = st_funcs.get_tables_info(db_path)
     
     ## Create a button to show the project tables info DataFrame
-    if st.button("Show ChemSpace Tables Info"):
+    if "show_tables_info" not in st.session_state:
+        st.session_state["show_tables_info"] = False
+    if st.button(f"{'Hide' if st.session_state['show_tables_info'] else 'Show'} ChemSpace Tables Info"):
+        st.session_state["show_tables_info"] = not st.session_state["show_tables_info"]
+    if st.session_state["show_tables_info"]:
         st.dataframe(df)
 
     ## Display full content of a selected table
@@ -243,7 +247,7 @@ elif page == "ChemSpace":
         st.session_state["show_display_table"] = False
 
     if df is not None and not df.empty:
-        if st.button("Display Table"):
+        if st.button(f"{'Hide' if st.session_state['show_display_table'] else 'Display'} Table"):
             st.session_state["show_display_table"] = not st.session_state["show_display_table"]
 
         if st.session_state["show_display_table"]:
@@ -323,7 +327,7 @@ elif page == "ChemSpace":
         st.session_state["show_depict_options"] = False
 
     if df is not None and not df.empty:
-        if st.button("Depict Table"):
+        if st.button(f"{'Hide' if st.session_state['show_depict_options'] else 'Depict'} Table"):
             st.session_state["show_depict_options"] = not st.session_state["show_depict_options"]
             if not st.session_state["show_depict_options"]:
                 st.session_state["show_depiction"] = False
@@ -395,7 +399,7 @@ elif page == "ChemSpace":
         st.session_state["export_save_path"] = ""
 
     if df is not None and not df.empty:
-        if st.button("Export Table"):
+        if st.button(f"{'Hide' if st.session_state['show_export_options'] else 'Export'} Table"):
             st.session_state["show_export_options"] = not st.session_state["show_export_options"]
             if not st.session_state["show_export_options"]:
                 st.session_state["export_save_path"] = ""
@@ -486,7 +490,7 @@ elif page == "Receptors":
         if "show_export_pdb" not in st.session_state:
             st.session_state["show_export_pdb"] = False
 
-        if st.button("Export PDB Model", key="toggle_export_pdb"):
+        if st.button(f"{'Hide' if st.session_state['show_export_pdb'] else 'Export'} PDB Model", key="toggle_export_pdb"):
             st.session_state["show_export_pdb"] = not st.session_state["show_export_pdb"]
 
         if st.session_state["show_export_pdb"]:
@@ -1884,7 +1888,7 @@ elif page == "Analysis":
                             st.warning("No poses found in the selected ProLIF table.")
 
             # Create a button to show/hide the histogram of docking scores for the selected ligand in the selected assay
-            if st.button("Show/Hide Histogram"):
+            if st.button(f"{'Hide' if st.session_state.get('show_histogram', False) else 'Show'} Histogram"):
                 st.session_state["show_histogram"] = not st.session_state.get("show_histogram", False)
                 st.rerun()
             if st.session_state.get("show_histogram", False):
