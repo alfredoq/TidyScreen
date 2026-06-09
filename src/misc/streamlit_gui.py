@@ -234,7 +234,7 @@ elif page == "ChemSpace":
     ## Create a button to show the project tables info DataFrame
     if "show_tables_info" not in st.session_state:
         st.session_state["show_tables_info"] = False
-    if st.button(f"{'Hide' if st.session_state['show_tables_info'] else 'Show'} ChemSpace Tables Info"):
+    if st.button(f"{'Hide' if st.session_state['show_tables_info'] else 'Show'} ChemSpace Tables Info", key="btn_chemspace_tables_info"):
         st.session_state["show_tables_info"] = not st.session_state["show_tables_info"]
     if st.session_state["show_tables_info"]:
         st.dataframe(df)
@@ -247,7 +247,7 @@ elif page == "ChemSpace":
         st.session_state["show_display_table"] = False
 
     if df is not None and not df.empty:
-        if st.button(f"{'Hide' if st.session_state['show_display_table'] else 'Display'} Table"):
+        if st.button(f"{'Hide' if st.session_state['show_display_table'] else 'Display'} Table", key="btn_display_table"):
             st.session_state["show_display_table"] = not st.session_state["show_display_table"]
 
         if st.session_state["show_display_table"]:
@@ -327,7 +327,7 @@ elif page == "ChemSpace":
         st.session_state["show_depict_options"] = False
 
     if df is not None and not df.empty:
-        if st.button(f"{'Hide' if st.session_state['show_depict_options'] else 'Depict'} Table"):
+        if st.button(f"{'Hide' if st.session_state['show_depict_options'] else 'Depict'} Table", key="btn_depict_table"):
             st.session_state["show_depict_options"] = not st.session_state["show_depict_options"]
             if not st.session_state["show_depict_options"]:
                 st.session_state["show_depiction"] = False
@@ -358,7 +358,7 @@ elif page == "ChemSpace":
                 mol_size = st.number_input("Molecule cell size (px):", min_value=100, max_value=600, value=300, step=50, key="depict_mol_size")
 
             button_label = "Hide Depictions" if st.session_state["show_depiction"] else "Depict Selected Table"
-            if st.button(button_label):
+            if st.button(button_label, key="btn_depict_selected"):
                 if st.session_state["show_depiction"]:
                     st.session_state["show_depiction"] = False
                     st.session_state["depiction_images"] = []
@@ -399,10 +399,11 @@ elif page == "ChemSpace":
         st.session_state["export_save_path"] = ""
 
     if df is not None and not df.empty:
-        if st.button(f"{'Hide' if st.session_state['show_export_options'] else 'Export'} Table"):
+        if st.button(f"{'Hide' if st.session_state['show_export_options'] else 'Export'} Table", key="btn_export_table"):
             st.session_state["show_export_options"] = not st.session_state["show_export_options"]
             if not st.session_state["show_export_options"]:
                 st.session_state["export_save_path"] = ""
+                st.session_state["show_export_path_input"] = False
 
         if st.session_state["show_export_options"]:
             export_table_names = df["table"].tolist()
@@ -417,7 +418,7 @@ elif page == "ChemSpace":
                 st.markdown("**Select columns to export:**")
                 selected_cols = [col for col in export_columns if st.checkbox(col, value=True, key=f"export_col_{export_selected_table}_{col}")]
 
-                if st.button("Save Table"):
+                if st.button("Save Table", key="btn_save_table_csv"):
                     if not selected_cols:
                         st.warning("Please select at least one column.")
                     else:
@@ -430,7 +431,7 @@ elif page == "ChemSpace":
                         value=st.session_state["export_save_path"],
                         key="export_path_input"
                     )
-                    if st.button("Confirm Save"):
+                    if st.button("Confirm Save", key="btn_confirm_save_csv"):
                         if not save_path.strip():
                             st.warning("Please enter a valid file path.")
                         else:
@@ -572,17 +573,7 @@ elif page == "MolDock":
             unsafe_allow_html=True
         )
     else:
-        ## Show/hide summary table
-        if "show_docking_methods" not in st.session_state:
-            st.session_state["show_docking_methods"] = False
-
-        if st.button(f"{'Hide' if st.session_state['show_docking_methods'] else 'Show'} Docking Methods Table"):
-            st.session_state["show_docking_methods"] = not st.session_state["show_docking_methods"]
-            if not st.session_state["show_docking_methods"]:
-                st.session_state["export_dm_selected_name"] = None
-            st.rerun()
-
-        if st.session_state["show_docking_methods"]:
+        with st.expander("Docking Methods Table", expanded=False):
             _df_dm = df_methods[["id", "method_name", "docking_engine", "description", "created_date"]].copy()
             _df_dm.insert(0, "Select", False)
             _edited_dm = st.data_editor(
@@ -765,34 +756,34 @@ elif page == "MolDock":
                                 st.session_state[_del_dm_key] = False
                                 st.rerun()
 
-        ## Inspector — visible only when table is shown
-        if st.session_state.get("show_docking_methods"):
-            _sp, _col_dm_insp = st.columns([1, 9])
-            with _col_dm_insp:
-                method_names = df_methods["method_name"].dropna().unique().tolist()
+        ## Inspector — always visible, collapsed expander above does not hide it
+        _export_dm_name = st.session_state.get("export_dm_selected_name")
+        _sp, _col_dm_insp = st.columns([1, 9])
+        with _col_dm_insp:
+            method_names = df_methods["method_name"].dropna().unique().tolist()
 
-                if st.session_state.get("selected_docking_method") not in method_names:
-                    st.session_state["selected_docking_method"] = method_names[0] if method_names else None
+            if st.session_state.get("selected_docking_method") not in method_names:
+                st.session_state["selected_docking_method"] = method_names[0] if method_names else None
 
-                selected_method = st.selectbox(
-                    "Select a docking method to inspect:",
-                    method_names,
-                    key="select_docking_method",
-                    index=method_names.index(st.session_state["selected_docking_method"]) if st.session_state.get("selected_docking_method") in method_names else 0,
-                )
-                if selected_method != st.session_state.get("selected_docking_method"):
-                    st.session_state["selected_docking_method"] = selected_method
+            selected_method = st.selectbox(
+                "Select a docking method to inspect:",
+                method_names,
+                key="select_docking_method",
+                index=method_names.index(st.session_state["selected_docking_method"]) if st.session_state.get("selected_docking_method") in method_names else 0,
+            )
+            if selected_method != st.session_state.get("selected_docking_method"):
+                st.session_state["selected_docking_method"] = selected_method
 
-                method_row = df_methods[df_methods["method_name"] == selected_method].iloc[0]
+            method_row = df_methods[df_methods["method_name"] == selected_method].iloc[0]
 
-                st.markdown(f"### Method: `{method_row['method_name']}`")
-                st.markdown(f"**Docking Engine:** {method_row['docking_engine']}")
-                st.markdown(f"**Description:** {method_row['description'] or 'N/A'}")
-                st.markdown(f"**Created:** {method_row['created_date']}")
-                with st.expander("Docking Parameters", expanded=False):
-                    st.code(method_row["parameters"] or "N/A", language="json")
-                with st.expander("Ligand Preparation Parameters", expanded=False):
-                    st.code(method_row["ligand_prep_params"] or "N/A", language="json")
+            st.markdown(f"### Method: `{method_row['method_name']}`")
+            st.markdown(f"**Docking Engine:** {method_row['docking_engine']}")
+            st.markdown(f"**Description:** {method_row['description'] or 'N/A'}")
+            st.markdown(f"**Created:** {method_row['created_date']}")
+            with st.expander("Docking Parameters", expanded=False):
+                st.code(method_row["parameters"] or "N/A", language="json")
+            with st.expander("Ligand Preparation Parameters", expanded=False):
+                st.code(method_row["ligand_prep_params"] or "N/A", language="json")
 
     st.divider()
 
