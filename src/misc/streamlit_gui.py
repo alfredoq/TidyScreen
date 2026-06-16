@@ -1170,15 +1170,7 @@ elif page == "Analysis":
         if df_results is None or df_results.empty:
             st.warning("No docking results")
         else:
-            ## Button to show/hide docking results DataFrame
-            if "show_results" not in st.session_state:
-                st.session_state["show_results"] = False
-
-            if st.button(f"{'Hide' if st.session_state['show_results'] else 'Show'} {st.session_state['selected_assay_name']} Docking Results"):
-                st.session_state["show_results"] = not st.session_state["show_results"]
-                st.rerun()
-
-            if st.session_state["show_results"]:
+            with st.expander(f"📊 {st.session_state['selected_assay_name']} Docking Results", expanded=False):
                 st.write(df_results)
 
                 if df_mmpbsa_poses_results is not None and not df_mmpbsa_poses_results.empty:
@@ -1201,14 +1193,7 @@ elif page == "Analysis":
             if not any_active:
                 st.button("View Poses", disabled=True)
             else:
-                if "show_view_poses" not in st.session_state:
-                    st.session_state["show_view_poses"] = False
-
-                if st.button(f"{'Hide' if st.session_state['show_view_poses'] else 'View'} Poses"):
-                    st.session_state["show_view_poses"] = not st.session_state["show_view_poses"]
-                    st.rerun()
-
-                if st.session_state["show_view_poses"]:
+                with st.expander("🔍 View Poses", expanded=False):
                     ## Reference PDB uploader (shared across all pose folders)
                     _sp, _col = st.columns([1, 9])
                     with _col:
@@ -1469,15 +1454,7 @@ elif page == "Analysis":
             if df_mmpbsa_poses_results is None or df_mmpbsa_poses_results.empty:
                 st.button(f"No MMPBSA results available for {st.session_state['selected_assay_name']}", disabled=True)
             else:
-                ## Button to show/hide MMPBSA results DataFrame
-                if "show_mmpbsa_results" not in st.session_state:
-                    st.session_state["show_mmpbsa_results"] = False
-
-                if st.button(f"{'Hide' if st.session_state['show_mmpbsa_results'] else 'Show'} {st.session_state['selected_assay_name']} MMPBSA Results"):
-                    st.session_state["show_mmpbsa_results"] = not st.session_state["show_mmpbsa_results"]
-                    st.rerun()
-
-                if st.session_state["show_mmpbsa_results"]:
+                with st.expander(f"📈 {st.session_state['selected_assay_name']} MMPBSA Results", expanded=False):
                     # Create a selection box for MMPBSA poses.
                     poses = sorted(df_mmpbsa_poses_results['pose_id'].dropna().tolist())
                     if poses:
@@ -1807,14 +1784,7 @@ elif page == "Analysis":
             if not prolif_tables:
                 st.button("Show ProLIF Fingerprints", disabled=True)
             else:
-                if "show_prolif" not in st.session_state:
-                    st.session_state["show_prolif"] = False
-
-                if st.button(f"{'Hide' if st.session_state['show_prolif'] else 'Show'} ProLIF Fingerprints"):
-                    st.session_state["show_prolif"] = not st.session_state["show_prolif"]
-                    st.rerun()
-
-                if st.session_state["show_prolif"]:
+                with st.expander("🧬 ProLIF Fingerprints", expanded=False):
                     _sp, _col = st.columns([1, 9])
                     with _col:
                         selected_table = st.selectbox(
@@ -1878,11 +1848,7 @@ elif page == "Analysis":
                         else:
                             st.warning("No poses found in the selected ProLIF table.")
 
-            # Create a button to show/hide the histogram of docking scores for the selected ligand in the selected assay
-            if st.button(f"{'Hide' if st.session_state.get('show_histogram', False) else 'Show'} Histogram"):
-                st.session_state["show_histogram"] = not st.session_state.get("show_histogram", False)
-                st.rerun()
-            if st.session_state.get("show_histogram", False):
+            with st.expander("📊 Docking Score Histogram", expanded=False):
                 _sp, _col = st.columns([1, 9])
                 with _col:
                     # Create a selectbox for unique LigName values if present
