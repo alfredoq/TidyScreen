@@ -1913,981 +1913,982 @@ elif page == "ML":
     else:
         project_path = st.session_state["active_project_path"]
 
-        st.subheader("Training Set Registries")
+        with st.expander("📚 Training Set Registries", expanded=False):
+            if "ml_all_tables_expanded" not in st.session_state:
+                st.session_state["ml_all_tables_expanded"] = False
+            if st.button(
+                "📂 Expand All Tables" if not st.session_state["ml_all_tables_expanded"] else "📁 Collapse All Tables",
+                key="btn_ml_toggle_all_tables",
+            ):
+                st.session_state["ml_all_tables_expanded"] = not st.session_state["ml_all_tables_expanded"]
+                st.rerun()
 
-        if "ml_all_tables_expanded" not in st.session_state:
-            st.session_state["ml_all_tables_expanded"] = False
-        if st.button(
-            "📂 Expand All Tables" if not st.session_state["ml_all_tables_expanded"] else "📁 Collapse All Tables",
-            key="btn_ml_toggle_all_tables",
-        ):
-            st.session_state["ml_all_tables_expanded"] = not st.session_state["ml_all_tables_expanded"]
-            st.rerun()
-
-        ## --- Positive binders ---
-        st.markdown("### ✅ Positive Binders")
-        df_pos = st_funcs.get_binders_registry(project_path, "positive")
-        if df_pos is None or df_pos.empty:
-            st.info("No positive binders registered yet.")
-        else:
-            st.success(f"{len(df_pos)} positive binder(s) registered.")
-            with st.expander("📋 Positive Binders Table", expanded=st.session_state.get("ml_all_tables_expanded", False)):
-                _df_pos_display = df_pos.copy()
-                _df_pos_display.insert(0, "Select", False)
-                _edited_pos = st.data_editor(
-                    _df_pos_display,
-                    column_config={"Select": st.column_config.CheckboxColumn("Select", default=False)},
-                    disabled=[c for c in _df_pos_display.columns if c != "Select"],
-                    hide_index=True,
-                    use_container_width=True,
-                    key="data_editor_pos_binders",
-                )
-            _selected_pos = _edited_pos[_edited_pos["Select"]]
-
-            ## --- View / Clear / Delete Selected Positive Poses ---
-            pos_viewer_key = "show_ml_positive_poses"
-            if pos_viewer_key not in st.session_state:
-                st.session_state[pos_viewer_key] = False
-            _col_pos_view, _col_pos_clear, _col_pos_delete = st.columns([3, 2, 2])
-            with _col_pos_view:
-                st.button(
-                    f"{'Hide' if st.session_state[pos_viewer_key] else 'View'} Positive Poses",
-                    key="btn_ml_positive_poses",
-                    on_click=_toggle_ml_positive_viewer
-                )
-            with _col_pos_clear:
-                if not st.session_state.get("confirm_clear_positive"):
-                    if st.button("🗑️ Clear Positive Binders", key="btn_clear_positive_binders"):
-                        st.session_state["confirm_clear_positive"] = True
-                        st.rerun()
+            _ts_indent, _ts_content = st.columns([0.05, 0.95])
+            with _ts_content:
+                ## --- Positive binders ---
+                st.markdown("### ✅ Positive Binders")
+                df_pos = st_funcs.get_binders_registry(project_path, "positive")
+                if df_pos is None or df_pos.empty:
+                    st.info("No positive binders registered yet.")
                 else:
-                    st.warning("⚠️ This will delete **all** positive binders. Are you sure?")
-                    _ccpos1, _ccpos2 = st.columns(2)
-                    with _ccpos1:
-                        if st.button("✅ Yes, clear all", key="btn_confirm_clear_positive"):
-                            result = st_funcs.clear_binders(project_path, "positive")
-                            st.session_state["confirm_clear_positive"] = False
-                            if result == "cleared":
-                                st.session_state[pos_viewer_key] = False
+                    st.success(f"{len(df_pos)} positive binder(s) registered.")
+                    with st.expander("📋 Positive Binders Table", expanded=st.session_state.get("ml_all_tables_expanded", False)):
+                        _df_pos_display = df_pos.copy()
+                        _df_pos_display.insert(0, "Select", False)
+                        _edited_pos = st.data_editor(
+                            _df_pos_display,
+                            column_config={"Select": st.column_config.CheckboxColumn("Select", default=False)},
+                            disabled=[c for c in _df_pos_display.columns if c != "Select"],
+                            hide_index=True,
+                            use_container_width=True,
+                            key="data_editor_pos_binders",
+                        )
+                    _selected_pos = _edited_pos[_edited_pos["Select"]]
+
+                    ## --- View / Clear / Delete Selected Positive Poses ---
+                    pos_viewer_key = "show_ml_positive_poses"
+                    if pos_viewer_key not in st.session_state:
+                        st.session_state[pos_viewer_key] = False
+                    _col_pos_view, _col_pos_clear, _col_pos_delete = st.columns([3, 2, 2])
+                    with _col_pos_view:
+                        st.button(
+                            f"{'Hide' if st.session_state[pos_viewer_key] else 'View'} Positive Poses",
+                            key="btn_ml_positive_poses",
+                            on_click=_toggle_ml_positive_viewer
+                        )
+                    with _col_pos_clear:
+                        if not st.session_state.get("confirm_clear_positive"):
+                            if st.button("🗑️ Clear Positive Binders", key="btn_clear_positive_binders"):
+                                st.session_state["confirm_clear_positive"] = True
                                 st.rerun()
-                            else:
-                                st.error(f"Could not clear positive binders: {result}")
-                    with _ccpos2:
-                        if st.button("❌ Cancel", key="btn_cancel_clear_positive"):
-                            st.session_state["confirm_clear_positive"] = False
-                            st.rerun()
-            with _col_pos_delete:
-                _n_sel_pos = len(_selected_pos)
-                if not st.session_state.get("confirm_delete_selected_positive"):
-                    if st.button(
-                        f"🗑️ Delete Selected ({_n_sel_pos})",
-                        key="btn_delete_selected_positive",
-                        disabled=(_n_sel_pos == 0),
-                    ):
-                        st.session_state["confirm_delete_selected_positive"] = True
-                        st.rerun()
-                else:
-                    st.warning(f"⚠️ Delete **{_n_sel_pos}** selected row(s)? Are you sure?")
-                    _cdpos1, _cdpos2 = st.columns(2)
-                    with _cdpos1:
-                        if st.button("✅ Yes, delete", key="btn_confirm_delete_selected_positive"):
-                            for _, _row in _selected_pos.iterrows():
-                                st_funcs.remove_binder(
+                        else:
+                            st.warning("⚠️ This will delete **all** positive binders. Are you sure?")
+                            _ccpos1, _ccpos2 = st.columns(2)
+                            with _ccpos1:
+                                if st.button("✅ Yes, clear all", key="btn_confirm_clear_positive"):
+                                    result = st_funcs.clear_binders(project_path, "positive")
+                                    st.session_state["confirm_clear_positive"] = False
+                                    if result == "cleared":
+                                        st.session_state[pos_viewer_key] = False
+                                        st.rerun()
+                                    else:
+                                        st.error(f"Could not clear positive binders: {result}")
+                            with _ccpos2:
+                                if st.button("❌ Cancel", key="btn_cancel_clear_positive"):
+                                    st.session_state["confirm_clear_positive"] = False
+                                    st.rerun()
+                    with _col_pos_delete:
+                        _n_sel_pos = len(_selected_pos)
+                        if not st.session_state.get("confirm_delete_selected_positive"):
+                            if st.button(
+                                f"🗑️ Delete Selected ({_n_sel_pos})",
+                                key="btn_delete_selected_positive",
+                                disabled=(_n_sel_pos == 0),
+                            ):
+                                st.session_state["confirm_delete_selected_positive"] = True
+                                st.rerun()
+                        else:
+                            st.warning(f"⚠️ Delete **{_n_sel_pos}** selected row(s)? Are you sure?")
+                            _cdpos1, _cdpos2 = st.columns(2)
+                            with _cdpos1:
+                                if st.button("✅ Yes, delete", key="btn_confirm_delete_selected_positive"):
+                                    for _, _row in _selected_pos.iterrows():
+                                        st_funcs.remove_binder(
+                                            project_path=project_path,
+                                            binder_type="positive",
+                                            assay_name=_row["assay_name"],
+                                            pose_file=_row["pose_file"],
+                                            directory=_row["directory"],
+                                        )
+                                    st.session_state["confirm_delete_selected_positive"] = False
+                                    st.rerun()
+                            with _cdpos2:
+                                if st.button("❌ Cancel", key="btn_cancel_delete_selected_positive"):
+                                    st.session_state["confirm_delete_selected_positive"] = False
+                                    st.rerun()
+
+                    if st.session_state[pos_viewer_key]:
+                        ref_file_pos = st.file_uploader(
+                            "Load a reference PDB for superimposition (optional):",
+                            type=["pdb"],
+                            key="ml_pos_ref_pdb_uploader"
+                        )
+                        if ref_file_pos is not None:
+                            st.session_state["ml_pos_ref_pdb_data"] = ref_file_pos.read().decode("utf-8")
+                            st.success(f"Reference loaded: {ref_file_pos.name}")
+                        elif "ml_pos_ref_pdb_data" not in st.session_state:
+                            st.session_state["ml_pos_ref_pdb_data"] = None
+
+                        pose_paths_pos = df_pos["pose_full_path"].tolist()
+                        pose_labels_pos = [
+                            f"{row['assay_name']} / {row['pose_file']}"
+                            for _, row in df_pos.iterrows()
+                        ]
+                        idx_key_pos = "ml_pos_pose_idx"
+                        if idx_key_pos not in st.session_state:
+                            st.session_state[idx_key_pos] = 0
+                        st.session_state[idx_key_pos] = max(0, min(st.session_state[idx_key_pos], len(pose_labels_pos) - 1))
+
+                        selected_pos = st.selectbox(
+                            "Select a positive binder pose:",
+                            pose_labels_pos,
+                            index=st.session_state[idx_key_pos],
+                        )
+                        if selected_pos:
+                            st.session_state[idx_key_pos] = pose_labels_pos.index(selected_pos)
+
+                        full_path_pos = pose_paths_pos[st.session_state[idx_key_pos]]
+                        if os.path.exists(full_path_pos):
+                            with open(full_path_pos, "r") as f:
+                                pdb_data_pos = f.read()
+                            view_pos = py3Dmol.view(width=800, height=500)
+                            view_pos.addModel(pdb_data_pos, "pdb")
+                            view_pos.setStyle({"model": 0}, {"stick": {}, "cartoon": {"color": "spectrum"}})
+                            if st.session_state.get("ml_pos_ref_pdb_data"):
+                                view_pos.addModel(st.session_state["ml_pos_ref_pdb_data"], "pdb")
+                                view_pos.setStyle({"model": 1}, {"sphere": {"colorscheme": "elementColors", "scale": 0.3, "opacity": 0.6}, "stick": {"colorscheme": "elementColors", "opacity": 0.6}})
+                            view_pos.zoomTo()
+
+                            cur_pos = st.session_state[idx_key_pos]
+                            has_ref_pos = st.session_state.get("ml_pos_ref_pdb_data")
+                            prev_col, viewer_col, next_col = st.columns([0.5, 8, 0.5 if not has_ref_pos else 1])
+                            with prev_col:
+                                st.write(""); st.write(""); st.write("")
+                                if st.button("◀", key="ml_pos_prev", disabled=(cur_pos == 0)):
+                                    st.session_state[idx_key_pos] = cur_pos - 1
+                                    st.rerun()
+                            with viewer_col:
+                                st.components.v1.html(view_pos.write_html(), height=520)
+                            with next_col:
+                                st.write(""); st.write(""); st.write("")
+                                if st.button("▶", key="ml_pos_next", disabled=(cur_pos >= len(pose_labels_pos) - 1)):
+                                    st.session_state[idx_key_pos] = cur_pos + 1
+                                    st.rerun()
+                            st.caption(f"Pose {cur_pos + 1} of {len(pose_labels_pos)}")
+
+                            ## VMD script creation
+                            with st.expander("🎬 Create VMD Script", expanded=False):
+                                _default_vmd_path_pos = os.path.join(
+                                    os.path.expanduser("~"), "Desktop",
+                                    os.path.splitext(os.path.basename(full_path_pos))[0] + "_vmd.tcl"
+                                )
+                                _vmd_path_pos = st.text_input(
+                                    "Save script to:",
+                                    value=_default_vmd_path_pos,
+                                    key=f"vmd_path_ml_pos_{cur_pos}",
+                                )
+                                if st.button("💾 Save VMD Script", key=f"btn_save_vmd_ml_pos_{cur_pos}"):
+                                    try:
+                                        _ref_pdb_path_pos = None
+                                        if st.session_state.get("ml_pos_ref_pdb_data"):
+                                            _ref_pdb_path_pos = os.path.join(
+                                                os.path.dirname(os.path.abspath(_vmd_path_pos.strip())),
+                                                "reference.pdb"
+                                            )
+                                            with open(_ref_pdb_path_pos, "w") as _rf:
+                                                _rf.write(st.session_state["ml_pos_ref_pdb_data"])
+                                        _script_pos = st_funcs.generate_vmd_script(
+                                            os.path.abspath(full_path_pos), _ref_pdb_path_pos
+                                        )
+                                        _vmd_out_pos = _vmd_path_pos.strip()
+                                        os.makedirs(os.path.dirname(os.path.abspath(_vmd_out_pos)), exist_ok=True)
+                                        with open(_vmd_out_pos, "w") as _sf:
+                                            _sf.write(_script_pos)
+                                        st.success(f"VMD script saved to: {_vmd_out_pos}")
+                                        if _ref_pdb_path_pos:
+                                            st.info(f"Reference PDB saved alongside: {_ref_pdb_path_pos}")
+                                    except Exception as _e:
+                                        st.error(f"Could not save VMD script: {_e}")
+
+                            ## Remove current pose from positive registry
+                            current_row_pos = df_pos.iloc[st.session_state[idx_key_pos]]
+                            if st.button("🗑️ Remove pose from set", key=f"ml_pos_remove_{st.session_state[idx_key_pos]}"):
+                                result = st_funcs.remove_binder(
                                     project_path=project_path,
                                     binder_type="positive",
-                                    assay_name=_row["assay_name"],
-                                    pose_file=_row["pose_file"],
-                                    directory=_row["directory"],
+                                    assay_name=current_row_pos["assay_name"],
+                                    pose_file=current_row_pos["pose_file"],
+                                    directory=current_row_pos["directory"],
                                 )
-                            st.session_state["confirm_delete_selected_positive"] = False
-                            st.rerun()
-                    with _cdpos2:
-                        if st.button("❌ Cancel", key="btn_cancel_delete_selected_positive"):
-                            st.session_state["confirm_delete_selected_positive"] = False
-                            st.rerun()
-
-            if st.session_state[pos_viewer_key]:
-                ref_file_pos = st.file_uploader(
-                    "Load a reference PDB for superimposition (optional):",
-                    type=["pdb"],
-                    key="ml_pos_ref_pdb_uploader"
-                )
-                if ref_file_pos is not None:
-                    st.session_state["ml_pos_ref_pdb_data"] = ref_file_pos.read().decode("utf-8")
-                    st.success(f"Reference loaded: {ref_file_pos.name}")
-                elif "ml_pos_ref_pdb_data" not in st.session_state:
-                    st.session_state["ml_pos_ref_pdb_data"] = None
-
-                pose_paths_pos = df_pos["pose_full_path"].tolist()
-                pose_labels_pos = [
-                    f"{row['assay_name']} / {row['pose_file']}"
-                    for _, row in df_pos.iterrows()
-                ]
-                idx_key_pos = "ml_pos_pose_idx"
-                if idx_key_pos not in st.session_state:
-                    st.session_state[idx_key_pos] = 0
-                st.session_state[idx_key_pos] = max(0, min(st.session_state[idx_key_pos], len(pose_labels_pos) - 1))
-
-                selected_pos = st.selectbox(
-                    "Select a positive binder pose:",
-                    pose_labels_pos,
-                    index=st.session_state[idx_key_pos],
-                )
-                if selected_pos:
-                    st.session_state[idx_key_pos] = pose_labels_pos.index(selected_pos)
-
-                full_path_pos = pose_paths_pos[st.session_state[idx_key_pos]]
-                if os.path.exists(full_path_pos):
-                    with open(full_path_pos, "r") as f:
-                        pdb_data_pos = f.read()
-                    view_pos = py3Dmol.view(width=800, height=500)
-                    view_pos.addModel(pdb_data_pos, "pdb")
-                    view_pos.setStyle({"model": 0}, {"stick": {}, "cartoon": {"color": "spectrum"}})
-                    if st.session_state.get("ml_pos_ref_pdb_data"):
-                        view_pos.addModel(st.session_state["ml_pos_ref_pdb_data"], "pdb")
-                        view_pos.setStyle({"model": 1}, {"sphere": {"colorscheme": "elementColors", "scale": 0.3, "opacity": 0.6}, "stick": {"colorscheme": "elementColors", "opacity": 0.6}})
-                    view_pos.zoomTo()
-
-                    cur_pos = st.session_state[idx_key_pos]
-                    has_ref_pos = st.session_state.get("ml_pos_ref_pdb_data")
-                    prev_col, viewer_col, next_col = st.columns([0.5, 8, 0.5 if not has_ref_pos else 1])
-                    with prev_col:
-                        st.write(""); st.write(""); st.write("")
-                        if st.button("◀", key="ml_pos_prev", disabled=(cur_pos == 0)):
-                            st.session_state[idx_key_pos] = cur_pos - 1
-                            st.rerun()
-                    with viewer_col:
-                        st.components.v1.html(view_pos.write_html(), height=520)
-                    with next_col:
-                        st.write(""); st.write(""); st.write("")
-                        if st.button("▶", key="ml_pos_next", disabled=(cur_pos >= len(pose_labels_pos) - 1)):
-                            st.session_state[idx_key_pos] = cur_pos + 1
-                            st.rerun()
-                    st.caption(f"Pose {cur_pos + 1} of {len(pose_labels_pos)}")
-
-                    ## VMD script creation
-                    with st.expander("🎬 Create VMD Script", expanded=False):
-                        _default_vmd_path_pos = os.path.join(
-                            os.path.expanduser("~"), "Desktop",
-                            os.path.splitext(os.path.basename(full_path_pos))[0] + "_vmd.tcl"
-                        )
-                        _vmd_path_pos = st.text_input(
-                            "Save script to:",
-                            value=_default_vmd_path_pos,
-                            key=f"vmd_path_ml_pos_{cur_pos}",
-                        )
-                        if st.button("💾 Save VMD Script", key=f"btn_save_vmd_ml_pos_{cur_pos}"):
-                            try:
-                                _ref_pdb_path_pos = None
-                                if st.session_state.get("ml_pos_ref_pdb_data"):
-                                    _ref_pdb_path_pos = os.path.join(
-                                        os.path.dirname(os.path.abspath(_vmd_path_pos.strip())),
-                                        "reference.pdb"
-                                    )
-                                    with open(_ref_pdb_path_pos, "w") as _rf:
-                                        _rf.write(st.session_state["ml_pos_ref_pdb_data"])
-                                _script_pos = st_funcs.generate_vmd_script(
-                                    os.path.abspath(full_path_pos), _ref_pdb_path_pos
-                                )
-                                _vmd_out_pos = _vmd_path_pos.strip()
-                                os.makedirs(os.path.dirname(os.path.abspath(_vmd_out_pos)), exist_ok=True)
-                                with open(_vmd_out_pos, "w") as _sf:
-                                    _sf.write(_script_pos)
-                                st.success(f"VMD script saved to: {_vmd_out_pos}")
-                                if _ref_pdb_path_pos:
-                                    st.info(f"Reference PDB saved alongside: {_ref_pdb_path_pos}")
-                            except Exception as _e:
-                                st.error(f"Could not save VMD script: {_e}")
-
-                    ## Remove current pose from positive registry
-                    current_row_pos = df_pos.iloc[st.session_state[idx_key_pos]]
-                    if st.button("🗑️ Remove pose from set", key=f"ml_pos_remove_{st.session_state[idx_key_pos]}"):
-                        result = st_funcs.remove_binder(
-                            project_path=project_path,
-                            binder_type="positive",
-                            assay_name=current_row_pos["assay_name"],
-                            pose_file=current_row_pos["pose_file"],
-                            directory=current_row_pos["directory"],
-                        )
-                        if result == "removed":
-                            st.session_state[idx_key_pos] = max(0, st.session_state[idx_key_pos] - 1)
-                            st.rerun()
+                                if result == "removed":
+                                    st.session_state[idx_key_pos] = max(0, st.session_state[idx_key_pos] - 1)
+                                    st.rerun()
+                                else:
+                                    st.error(f"Could not remove pose: {result}")
                         else:
-                            st.error(f"Could not remove pose: {result}")
+                            st.warning(f"Pose file not found on disk: {full_path_pos}")
+
+                st.divider()
+
+                ## --- Negative binders ---
+                st.markdown("### ❌ Negative Binders")
+                df_neg = st_funcs.get_binders_registry(project_path, "negative")
+                if df_neg is None or df_neg.empty:
+                    st.info("No negative binders registered yet.")
                 else:
-                    st.warning(f"Pose file not found on disk: {full_path_pos}")
+                    st.success(f"{len(df_neg)} negative binder(s) registered.")
+                    with st.expander("📋 Negative Binders Table", expanded=st.session_state.get("ml_all_tables_expanded", False)):
+                        _df_neg_display = df_neg.copy()
+                        _df_neg_display.insert(0, "Select", False)
+                        _edited_neg = st.data_editor(
+                            _df_neg_display,
+                            column_config={"Select": st.column_config.CheckboxColumn("Select", default=False)},
+                            disabled=[c for c in _df_neg_display.columns if c != "Select"],
+                            hide_index=True,
+                            use_container_width=True,
+                            key="data_editor_neg_binders",
+                        )
+                    _selected_neg = _edited_neg[_edited_neg["Select"]]
 
-        st.divider()
-
-        ## --- Negative binders ---
-        st.markdown("### ❌ Negative Binders")
-        df_neg = st_funcs.get_binders_registry(project_path, "negative")
-        if df_neg is None or df_neg.empty:
-            st.info("No negative binders registered yet.")
-        else:
-            st.success(f"{len(df_neg)} negative binder(s) registered.")
-            with st.expander("📋 Negative Binders Table", expanded=st.session_state.get("ml_all_tables_expanded", False)):
-                _df_neg_display = df_neg.copy()
-                _df_neg_display.insert(0, "Select", False)
-                _edited_neg = st.data_editor(
-                    _df_neg_display,
-                    column_config={"Select": st.column_config.CheckboxColumn("Select", default=False)},
-                    disabled=[c for c in _df_neg_display.columns if c != "Select"],
-                    hide_index=True,
-                    use_container_width=True,
-                    key="data_editor_neg_binders",
-                )
-            _selected_neg = _edited_neg[_edited_neg["Select"]]
-
-            ## --- View / Clear / Delete Selected Negative Poses ---
-            neg_viewer_key = "show_ml_negative_poses"
-            if neg_viewer_key not in st.session_state:
-                st.session_state[neg_viewer_key] = False
-            _col_neg_view, _col_neg_clear, _col_neg_delete = st.columns([3, 2, 2])
-            with _col_neg_view:
-                st.button(
-                    f"{'Hide' if st.session_state[neg_viewer_key] else 'View'} Negative Poses",
-                    key="btn_ml_negative_poses",
-                    on_click=_toggle_ml_negative_viewer
-                )
-            with _col_neg_clear:
-                if not st.session_state.get("confirm_clear_negative"):
-                    if st.button("🗑️ Clear Negative Binders", key="btn_clear_negative_binders"):
-                        st.session_state["confirm_clear_negative"] = True
-                        st.rerun()
-                else:
-                    st.warning("⚠️ This will delete **all** negative binders. Are you sure?")
-                    _ccneg1, _ccneg2 = st.columns(2)
-                    with _ccneg1:
-                        if st.button("✅ Yes, clear all", key="btn_confirm_clear_negative"):
-                            result = st_funcs.clear_binders(project_path, "negative")
-                            st.session_state["confirm_clear_negative"] = False
-                            if result == "cleared":
-                                st.session_state[neg_viewer_key] = False
+                    ## --- View / Clear / Delete Selected Negative Poses ---
+                    neg_viewer_key = "show_ml_negative_poses"
+                    if neg_viewer_key not in st.session_state:
+                        st.session_state[neg_viewer_key] = False
+                    _col_neg_view, _col_neg_clear, _col_neg_delete = st.columns([3, 2, 2])
+                    with _col_neg_view:
+                        st.button(
+                            f"{'Hide' if st.session_state[neg_viewer_key] else 'View'} Negative Poses",
+                            key="btn_ml_negative_poses",
+                            on_click=_toggle_ml_negative_viewer
+                        )
+                    with _col_neg_clear:
+                        if not st.session_state.get("confirm_clear_negative"):
+                            if st.button("🗑️ Clear Negative Binders", key="btn_clear_negative_binders"):
+                                st.session_state["confirm_clear_negative"] = True
                                 st.rerun()
-                            else:
-                                st.error(f"Could not clear negative binders: {result}")
-                    with _ccneg2:
-                        if st.button("❌ Cancel", key="btn_cancel_clear_negative"):
-                            st.session_state["confirm_clear_negative"] = False
-                            st.rerun()
-            with _col_neg_delete:
-                _n_sel_neg = len(_selected_neg)
-                if not st.session_state.get("confirm_delete_selected_negative"):
-                    if st.button(
-                        f"🗑️ Delete Selected ({_n_sel_neg})",
-                        key="btn_delete_selected_negative",
-                        disabled=(_n_sel_neg == 0),
-                    ):
-                        st.session_state["confirm_delete_selected_negative"] = True
-                        st.rerun()
-                else:
-                    st.warning(f"⚠️ Delete **{_n_sel_neg}** selected row(s)? Are you sure?")
-                    _cdneg1, _cdneg2 = st.columns(2)
-                    with _cdneg1:
-                        if st.button("✅ Yes, delete", key="btn_confirm_delete_selected_negative"):
-                            for _, _row in _selected_neg.iterrows():
-                                st_funcs.remove_binder(
+                        else:
+                            st.warning("⚠️ This will delete **all** negative binders. Are you sure?")
+                            _ccneg1, _ccneg2 = st.columns(2)
+                            with _ccneg1:
+                                if st.button("✅ Yes, clear all", key="btn_confirm_clear_negative"):
+                                    result = st_funcs.clear_binders(project_path, "negative")
+                                    st.session_state["confirm_clear_negative"] = False
+                                    if result == "cleared":
+                                        st.session_state[neg_viewer_key] = False
+                                        st.rerun()
+                                    else:
+                                        st.error(f"Could not clear negative binders: {result}")
+                            with _ccneg2:
+                                if st.button("❌ Cancel", key="btn_cancel_clear_negative"):
+                                    st.session_state["confirm_clear_negative"] = False
+                                    st.rerun()
+                    with _col_neg_delete:
+                        _n_sel_neg = len(_selected_neg)
+                        if not st.session_state.get("confirm_delete_selected_negative"):
+                            if st.button(
+                                f"🗑️ Delete Selected ({_n_sel_neg})",
+                                key="btn_delete_selected_negative",
+                                disabled=(_n_sel_neg == 0),
+                            ):
+                                st.session_state["confirm_delete_selected_negative"] = True
+                                st.rerun()
+                        else:
+                            st.warning(f"⚠️ Delete **{_n_sel_neg}** selected row(s)? Are you sure?")
+                            _cdneg1, _cdneg2 = st.columns(2)
+                            with _cdneg1:
+                                if st.button("✅ Yes, delete", key="btn_confirm_delete_selected_negative"):
+                                    for _, _row in _selected_neg.iterrows():
+                                        st_funcs.remove_binder(
+                                            project_path=project_path,
+                                            binder_type="negative",
+                                            assay_name=_row["assay_name"],
+                                            pose_file=_row["pose_file"],
+                                            directory=_row["directory"],
+                                        )
+                                    st.session_state["confirm_delete_selected_negative"] = False
+                                    st.rerun()
+                            with _cdneg2:
+                                if st.button("❌ Cancel", key="btn_cancel_delete_selected_negative"):
+                                    st.session_state["confirm_delete_selected_negative"] = False
+                                    st.rerun()
+
+                    if st.session_state[neg_viewer_key]:
+                        ref_file_neg = st.file_uploader(
+                            "Load a reference PDB for superimposition (optional):",
+                            type=["pdb"],
+                            key="ml_neg_ref_pdb_uploader"
+                        )
+                        if ref_file_neg is not None:
+                            st.session_state["ml_neg_ref_pdb_data"] = ref_file_neg.read().decode("utf-8")
+                            st.success(f"Reference loaded: {ref_file_neg.name}")
+                        elif "ml_neg_ref_pdb_data" not in st.session_state:
+                            st.session_state["ml_neg_ref_pdb_data"] = None
+
+                        pose_paths_neg = df_neg["pose_full_path"].tolist()
+                        pose_labels_neg = [
+                            f"{row['assay_name']} / {row['pose_file']}"
+                            for _, row in df_neg.iterrows()
+                        ]
+                        idx_key_neg = "ml_neg_pose_idx"
+                        if idx_key_neg not in st.session_state:
+                            st.session_state[idx_key_neg] = 0
+                        st.session_state[idx_key_neg] = max(0, min(st.session_state[idx_key_neg], len(pose_labels_neg) - 1))
+
+                        selected_neg = st.selectbox(
+                            "Select a negative binder pose:",
+                            pose_labels_neg,
+                            index=st.session_state[idx_key_neg],
+                        )
+                        if selected_neg:
+                            st.session_state[idx_key_neg] = pose_labels_neg.index(selected_neg)
+
+                        full_path_neg = pose_paths_neg[st.session_state[idx_key_neg]]
+                        if os.path.exists(full_path_neg):
+                            with open(full_path_neg, "r") as f:
+                                pdb_data_neg = f.read()
+                            view_neg = py3Dmol.view(width=800, height=500)
+                            view_neg.addModel(pdb_data_neg, "pdb")
+                            view_neg.setStyle({"model": 0}, {"stick": {}, "cartoon": {"color": "spectrum"}})
+                            if st.session_state.get("ml_neg_ref_pdb_data"):
+                                view_neg.addModel(st.session_state["ml_neg_ref_pdb_data"], "pdb")
+                                view_neg.setStyle({"model": 1}, {"sphere": {"colorscheme": "elementColors", "scale": 0.3, "opacity": 0.6}, "stick": {"colorscheme": "elementColors", "opacity": 0.6}})
+                            view_neg.zoomTo()
+
+                            cur_neg = st.session_state[idx_key_neg]
+                            has_ref_neg = st.session_state.get("ml_neg_ref_pdb_data")
+                            prev_col, viewer_col, next_col = st.columns([0.5, 8, 0.5 if not has_ref_neg else 1])
+                            with prev_col:
+                                st.write(""); st.write(""); st.write("")
+                                if st.button("◀", key="ml_neg_prev", disabled=(cur_neg == 0)):
+                                    st.session_state[idx_key_neg] = cur_neg - 1
+                                    st.rerun()
+                            with viewer_col:
+                                st.components.v1.html(view_neg.write_html(), height=520)
+                            with next_col:
+                                st.write(""); st.write(""); st.write("")
+                                if st.button("▶", key="ml_neg_next", disabled=(cur_neg >= len(pose_labels_neg) - 1)):
+                                    st.session_state[idx_key_neg] = cur_neg + 1
+                                    st.rerun()
+                            st.caption(f"Pose {cur_neg + 1} of {len(pose_labels_neg)}")
+
+                            ## VMD script creation
+                            with st.expander("🎬 Create VMD Script", expanded=False):
+                                _default_vmd_path_neg = os.path.join(
+                                    os.path.expanduser("~"), "Desktop",
+                                    os.path.splitext(os.path.basename(full_path_neg))[0] + "_vmd.tcl"
+                                )
+                                _vmd_path_neg = st.text_input(
+                                    "Save script to:",
+                                    value=_default_vmd_path_neg,
+                                    key=f"vmd_path_ml_neg_{cur_neg}",
+                                )
+                                if st.button("💾 Save VMD Script", key=f"btn_save_vmd_ml_neg_{cur_neg}"):
+                                    try:
+                                        _ref_pdb_path_neg = None
+                                        if st.session_state.get("ml_neg_ref_pdb_data"):
+                                            _ref_pdb_path_neg = os.path.join(
+                                                os.path.dirname(os.path.abspath(_vmd_path_neg.strip())),
+                                                "reference.pdb"
+                                            )
+                                            with open(_ref_pdb_path_neg, "w") as _rf:
+                                                _rf.write(st.session_state["ml_neg_ref_pdb_data"])
+                                        _script_neg = st_funcs.generate_vmd_script(
+                                            os.path.abspath(full_path_neg), _ref_pdb_path_neg
+                                        )
+                                        _vmd_out_neg = _vmd_path_neg.strip()
+                                        os.makedirs(os.path.dirname(os.path.abspath(_vmd_out_neg)), exist_ok=True)
+                                        with open(_vmd_out_neg, "w") as _sf:
+                                            _sf.write(_script_neg)
+                                        st.success(f"VMD script saved to: {_vmd_out_neg}")
+                                        if _ref_pdb_path_neg:
+                                            st.info(f"Reference PDB saved alongside: {_ref_pdb_path_neg}")
+                                    except Exception as _e:
+                                        st.error(f"Could not save VMD script: {_e}")
+
+                            ## Remove current pose from negative registry
+                            current_row_neg = df_neg.iloc[st.session_state[idx_key_neg]]
+                            if st.button("🗑️ Remove pose from set", key=f"ml_neg_remove_{st.session_state[idx_key_neg]}"):
+                                result = st_funcs.remove_binder(
                                     project_path=project_path,
                                     binder_type="negative",
-                                    assay_name=_row["assay_name"],
-                                    pose_file=_row["pose_file"],
-                                    directory=_row["directory"],
+                                    assay_name=current_row_neg["assay_name"],
+                                    pose_file=current_row_neg["pose_file"],
+                                    directory=current_row_neg["directory"],
                                 )
-                            st.session_state["confirm_delete_selected_negative"] = False
-                            st.rerun()
-                    with _cdneg2:
-                        if st.button("❌ Cancel", key="btn_cancel_delete_selected_negative"):
-                            st.session_state["confirm_delete_selected_negative"] = False
-                            st.rerun()
-
-            if st.session_state[neg_viewer_key]:
-                ref_file_neg = st.file_uploader(
-                    "Load a reference PDB for superimposition (optional):",
-                    type=["pdb"],
-                    key="ml_neg_ref_pdb_uploader"
-                )
-                if ref_file_neg is not None:
-                    st.session_state["ml_neg_ref_pdb_data"] = ref_file_neg.read().decode("utf-8")
-                    st.success(f"Reference loaded: {ref_file_neg.name}")
-                elif "ml_neg_ref_pdb_data" not in st.session_state:
-                    st.session_state["ml_neg_ref_pdb_data"] = None
-
-                pose_paths_neg = df_neg["pose_full_path"].tolist()
-                pose_labels_neg = [
-                    f"{row['assay_name']} / {row['pose_file']}"
-                    for _, row in df_neg.iterrows()
-                ]
-                idx_key_neg = "ml_neg_pose_idx"
-                if idx_key_neg not in st.session_state:
-                    st.session_state[idx_key_neg] = 0
-                st.session_state[idx_key_neg] = max(0, min(st.session_state[idx_key_neg], len(pose_labels_neg) - 1))
-
-                selected_neg = st.selectbox(
-                    "Select a negative binder pose:",
-                    pose_labels_neg,
-                    index=st.session_state[idx_key_neg],
-                )
-                if selected_neg:
-                    st.session_state[idx_key_neg] = pose_labels_neg.index(selected_neg)
-
-                full_path_neg = pose_paths_neg[st.session_state[idx_key_neg]]
-                if os.path.exists(full_path_neg):
-                    with open(full_path_neg, "r") as f:
-                        pdb_data_neg = f.read()
-                    view_neg = py3Dmol.view(width=800, height=500)
-                    view_neg.addModel(pdb_data_neg, "pdb")
-                    view_neg.setStyle({"model": 0}, {"stick": {}, "cartoon": {"color": "spectrum"}})
-                    if st.session_state.get("ml_neg_ref_pdb_data"):
-                        view_neg.addModel(st.session_state["ml_neg_ref_pdb_data"], "pdb")
-                        view_neg.setStyle({"model": 1}, {"sphere": {"colorscheme": "elementColors", "scale": 0.3, "opacity": 0.6}, "stick": {"colorscheme": "elementColors", "opacity": 0.6}})
-                    view_neg.zoomTo()
-
-                    cur_neg = st.session_state[idx_key_neg]
-                    has_ref_neg = st.session_state.get("ml_neg_ref_pdb_data")
-                    prev_col, viewer_col, next_col = st.columns([0.5, 8, 0.5 if not has_ref_neg else 1])
-                    with prev_col:
-                        st.write(""); st.write(""); st.write("")
-                        if st.button("◀", key="ml_neg_prev", disabled=(cur_neg == 0)):
-                            st.session_state[idx_key_neg] = cur_neg - 1
-                            st.rerun()
-                    with viewer_col:
-                        st.components.v1.html(view_neg.write_html(), height=520)
-                    with next_col:
-                        st.write(""); st.write(""); st.write("")
-                        if st.button("▶", key="ml_neg_next", disabled=(cur_neg >= len(pose_labels_neg) - 1)):
-                            st.session_state[idx_key_neg] = cur_neg + 1
-                            st.rerun()
-                    st.caption(f"Pose {cur_neg + 1} of {len(pose_labels_neg)}")
-
-                    ## VMD script creation
-                    with st.expander("🎬 Create VMD Script", expanded=False):
-                        _default_vmd_path_neg = os.path.join(
-                            os.path.expanduser("~"), "Desktop",
-                            os.path.splitext(os.path.basename(full_path_neg))[0] + "_vmd.tcl"
-                        )
-                        _vmd_path_neg = st.text_input(
-                            "Save script to:",
-                            value=_default_vmd_path_neg,
-                            key=f"vmd_path_ml_neg_{cur_neg}",
-                        )
-                        if st.button("💾 Save VMD Script", key=f"btn_save_vmd_ml_neg_{cur_neg}"):
-                            try:
-                                _ref_pdb_path_neg = None
-                                if st.session_state.get("ml_neg_ref_pdb_data"):
-                                    _ref_pdb_path_neg = os.path.join(
-                                        os.path.dirname(os.path.abspath(_vmd_path_neg.strip())),
-                                        "reference.pdb"
-                                    )
-                                    with open(_ref_pdb_path_neg, "w") as _rf:
-                                        _rf.write(st.session_state["ml_neg_ref_pdb_data"])
-                                _script_neg = st_funcs.generate_vmd_script(
-                                    os.path.abspath(full_path_neg), _ref_pdb_path_neg
-                                )
-                                _vmd_out_neg = _vmd_path_neg.strip()
-                                os.makedirs(os.path.dirname(os.path.abspath(_vmd_out_neg)), exist_ok=True)
-                                with open(_vmd_out_neg, "w") as _sf:
-                                    _sf.write(_script_neg)
-                                st.success(f"VMD script saved to: {_vmd_out_neg}")
-                                if _ref_pdb_path_neg:
-                                    st.info(f"Reference PDB saved alongside: {_ref_pdb_path_neg}")
-                            except Exception as _e:
-                                st.error(f"Could not save VMD script: {_e}")
-
-                    ## Remove current pose from negative registry
-                    current_row_neg = df_neg.iloc[st.session_state[idx_key_neg]]
-                    if st.button("🗑️ Remove pose from set", key=f"ml_neg_remove_{st.session_state[idx_key_neg]}"):
-                        result = st_funcs.remove_binder(
-                            project_path=project_path,
-                            binder_type="negative",
-                            assay_name=current_row_neg["assay_name"],
-                            pose_file=current_row_neg["pose_file"],
-                            directory=current_row_neg["directory"],
-                        )
-                        if result == "removed":
-                            st.session_state[idx_key_neg] = max(0, st.session_state[idx_key_neg] - 1)
-                            st.rerun()
+                                if result == "removed":
+                                    st.session_state[idx_key_neg] = max(0, st.session_state[idx_key_neg] - 1)
+                                    st.rerun()
+                                else:
+                                    st.error(f"Could not remove pose: {result}")
                         else:
-                            st.error(f"Could not remove pose: {result}")
-                else:
-                    st.warning(f"Pose file not found on disk: {full_path_neg}")
+                            st.warning(f"Pose file not found on disk: {full_path_neg}")
 
         st.divider()
 
         ## --- Consolidate training set ---
-        st.subheader("📦 Consolidate Training Set")
-        st.markdown(
-            "Create a named snapshot of the current positive and negative binders registries "
-            "for use in model training."
-        )
+        with st.expander("📦 Consolidate Training Set", expanded=False):
+            st.markdown(
+                "Create a named snapshot of the current positive and negative binders registries "
+                "for use in model training."
+            )
 
-        with st.form("consolidate_ts_form"):
-            ts_id = st.text_input("Training Set ID", placeholder="e.g. ts_run1_2026")
-            ts_notes = st.text_area("Notes (optional)", "")
-            submitted = st.form_submit_button("Consolidate")
+            with st.form("consolidate_ts_form"):
+                ts_id = st.text_input("Training Set ID", placeholder="e.g. ts_run1_2026")
+                ts_notes = st.text_area("Notes (optional)", "")
+                submitted = st.form_submit_button("Consolidate")
 
-        if submitted:
-            if not ts_id.strip():
-                st.error("Please provide a Training Set ID.")
-            else:
-                n_pos = len(df_pos) if df_pos is not None and not df_pos.empty else 0
-                n_neg = len(df_neg) if df_neg is not None and not df_neg.empty else 0
-                result = st_funcs.consolidate_training_set(project_path, ts_id.strip(), ts_notes.strip())
-                if result == "saved":
-                    st.success(f"✅ Training set **'{ts_id.strip()}'** consolidated — {n_pos} positive(s), {n_neg} negative(s).")
-                elif result == "duplicate":
-                    st.warning(f"⚠️ A training set with ID **'{ts_id.strip()}'** already exists. Choose a different ID.")
+            if submitted:
+                if not ts_id.strip():
+                    st.error("Please provide a Training Set ID.")
                 else:
-                    st.error(f"❌ {result}")
+                    n_pos = len(df_pos) if df_pos is not None and not df_pos.empty else 0
+                    n_neg = len(df_neg) if df_neg is not None and not df_neg.empty else 0
+                    result = st_funcs.consolidate_training_set(project_path, ts_id.strip(), ts_notes.strip())
+                    if result == "saved":
+                        st.success(f"✅ Training set **'{ts_id.strip()}'** consolidated — {n_pos} positive(s), {n_neg} negative(s).")
+                    elif result == "duplicate":
+                        st.warning(f"⚠️ A training set with ID **'{ts_id.strip()}'** already exists. Choose a different ID.")
+                    else:
+                        st.error(f"❌ {result}")
 
         st.divider()
-        st.markdown("#### 🗄️ Existing Training Set Snapshots")
-        df_snaps = st_funcs.get_training_set_snapshots(project_path)
-        if df_snaps is None or df_snaps.empty:
-            st.info("No training sets consolidated yet.")
-        else:
-            _fp_status = st_funcs.get_training_set_fingerprint_status(project_path)
-            _prolif_conditions_used = st_funcs.get_training_set_prolif_conditions_used(project_path)
-            _df_snaps_display = df_snaps.copy()
-            _notes_loc = _df_snaps_display.columns.get_loc("notes") + 1
-            _df_snaps_display.insert(
-                _notes_loc,
-                "fingerprints",
-                _df_snaps_display["training_set_id"].map(lambda ts: _fp_status.get(ts, "❌ None")),
-            )
-            _df_snaps_display.insert(
-                _notes_loc + 1,
-                "prolif_conditions",
-                _df_snaps_display["training_set_id"].map(lambda ts: _prolif_conditions_used.get(ts, "—")),
-            )
-            _df_snaps_display.insert(0, "Select", False)
-            with st.expander("📋 Training Set Snapshots Table", expanded=st.session_state.get("ml_all_tables_expanded", False)):
-                _edited_snaps = st.data_editor(
-                    _df_snaps_display,
-                    column_config={"Select": st.column_config.CheckboxColumn("Select", default=False)},
-                    disabled=[c for c in _df_snaps_display.columns if c != "Select"],
-                    hide_index=True,
-                    use_container_width=True,
-                    key="data_editor_snaps",
-                )
-            _selected_snaps = _edited_snaps[_edited_snaps["Select"]]
-
-            ## --- View set poses / Delete Selected ---
-            snap_ids = df_snaps["training_set_id"].tolist()
-            selected_ts = st.selectbox("Select a training set to inspect:", snap_ids, key="ts_viewer_select")
-
-            ts_viewer_key = "show_ts_set_viewer"
-            if ts_viewer_key not in st.session_state:
-                st.session_state[ts_viewer_key] = False
-            ts_inspector_key = "show_ts_snapshot_inspector"
-            if ts_inspector_key not in st.session_state:
-                st.session_state[ts_inspector_key] = False
-            _col_ts_view, _col_ts_restore, _col_ts_inspect, _col_ts_delete = st.columns([3, 3, 3, 2])
-            with _col_ts_view:
-                st.button(
-                    f"{'Hide' if st.session_state[ts_viewer_key] else 'View'} Set Poses",
-                    key="btn_ts_set_viewer",
-                    on_click=_toggle_ts_set_viewer
-                )
-            with _col_ts_restore:
-                _restore_ts = _selected_snaps["training_set_id"].iloc[0] if len(_selected_snaps) == 1 else selected_ts
-                if st.button("↩️ Restore to Binders", key="btn_restore_to_binders"):
-                    _restore_result = st_funcs.restore_binders_from_snapshot(project_path, _restore_ts)
-                    if isinstance(_restore_result, str) and _restore_result.startswith("error:"):
-                        st.error(f"❌ {_restore_result[6:]}")
-                    else:
-                        _pos_total = _restore_result['pos_inserted'] + _restore_result['pos_skipped']
-                        _neg_total = _restore_result['neg_inserted'] + _restore_result['neg_skipped']
-                        st.success(
-                            f"Restored from **{_restore_ts}**: "
-                            f"✅ {_pos_total} positive "
-                            f"({_restore_result['pos_inserted']} new, {_restore_result['pos_skipped']} already existed), "
-                            f"❌ {_neg_total} negative "
-                            f"({_restore_result['neg_inserted']} new, {_restore_result['neg_skipped']} already existed)."
-                        )
-                        st.rerun()
-            with _col_ts_inspect:
-                st.button(
-                    f"{'Hide' if st.session_state[ts_inspector_key] else 'Inspect'} Set Snapshot",
-                    key="btn_ts_snapshot_inspector",
-                    on_click=_toggle_ts_snapshot_inspector
-                )
-            with _col_ts_delete:
-                _n_sel_snaps = len(_selected_snaps)
-                if not st.session_state.get("confirm_delete_selected_snaps"):
-                    if st.button(
-                        f"🗑️ Delete Selected ({_n_sel_snaps})",
-                        key="btn_delete_selected_snaps",
-                        disabled=(_n_sel_snaps == 0),
-                    ):
-                        st.session_state["confirm_delete_selected_snaps"] = True
-                        st.rerun()
-                else:
-                    st.warning(f"⚠️ Delete **{_n_sel_snaps}** snapshot(s) and all associated data? Are you sure?")
-                    _cdsnap1, _cdsnap2 = st.columns(2)
-                    with _cdsnap1:
-                        if st.button("✅ Yes, delete", key="btn_confirm_delete_selected_snaps"):
-                            _ids_to_delete = _selected_snaps["training_set_id"].tolist()
-                            result = st_funcs.delete_training_set_snapshots(project_path, _ids_to_delete)
-                            st.session_state["confirm_delete_selected_snaps"] = False
-                            if result == "deleted":
-                                st.session_state[ts_viewer_key] = False
-                                st.rerun()
-                            else:
-                                st.error(f"Could not delete snapshots: {result}")
-                    with _cdsnap2:
-                        if st.button("❌ Cancel", key="btn_cancel_delete_selected_snaps"):
-                            st.session_state["confirm_delete_selected_snaps"] = False
-                            st.rerun()
-
-            ## --- Export Fingerprints CSV ---
-            if len(_selected_snaps) == 0:
-                st.button(
-                    "⬇️ Export Fingerprints CSV",
-                    key="btn_export_fps_csv",
-                    disabled=True,
-                    help="Select a training set snapshot using the checkbox to enable export.",
-                )
+        with st.expander("🗄️ Existing Training Set Snapshots", expanded=False):
+            df_snaps = st_funcs.get_training_set_snapshots(project_path)
+            if df_snaps is None or df_snaps.empty:
+                st.info("No training sets consolidated yet.")
             else:
-                _export_ts_id = _selected_snaps["training_set_id"].iloc[0]
-                _csv_bytes = st_funcs.export_training_set_fingerprints_as_csv_bytes(project_path, _export_ts_id)
-                _safe_ts_id = _export_ts_id.replace(' ', '_')
-                if _csv_bytes is None:
+                _fp_status = st_funcs.get_training_set_fingerprint_status(project_path)
+                _prolif_conditions_used = st_funcs.get_training_set_prolif_conditions_used(project_path)
+                _df_snaps_display = df_snaps.copy()
+                _notes_loc = _df_snaps_display.columns.get_loc("notes") + 1
+                _df_snaps_display.insert(
+                    _notes_loc,
+                    "fingerprints",
+                    _df_snaps_display["training_set_id"].map(lambda ts: _fp_status.get(ts, "❌ None")),
+                )
+                _df_snaps_display.insert(
+                    _notes_loc + 1,
+                    "prolif_conditions",
+                    _df_snaps_display["training_set_id"].map(lambda ts: _prolif_conditions_used.get(ts, "—")),
+                )
+                _df_snaps_display.insert(0, "Select", False)
+                with st.expander("📋 Training Set Snapshots Table", expanded=st.session_state.get("ml_all_tables_expanded", False)):
+                    _edited_snaps = st.data_editor(
+                        _df_snaps_display,
+                        column_config={"Select": st.column_config.CheckboxColumn("Select", default=False)},
+                        disabled=[c for c in _df_snaps_display.columns if c != "Select"],
+                        hide_index=True,
+                        use_container_width=True,
+                        key="data_editor_snaps",
+                    )
+                _selected_snaps = _edited_snaps[_edited_snaps["Select"]]
+
+                ## --- View set poses / Delete Selected ---
+                snap_ids = df_snaps["training_set_id"].tolist()
+                selected_ts = st.selectbox("Select a training set to inspect:", snap_ids, key="ts_viewer_select")
+
+                ts_viewer_key = "show_ts_set_viewer"
+                if ts_viewer_key not in st.session_state:
+                    st.session_state[ts_viewer_key] = False
+                ts_inspector_key = "show_ts_snapshot_inspector"
+                if ts_inspector_key not in st.session_state:
+                    st.session_state[ts_inspector_key] = False
+                _col_ts_view, _col_ts_restore, _col_ts_inspect, _col_ts_delete = st.columns([3, 3, 3, 2])
+                with _col_ts_view:
+                    st.button(
+                        f"{'Hide' if st.session_state[ts_viewer_key] else 'View'} Set Poses",
+                        key="btn_ts_set_viewer",
+                        on_click=_toggle_ts_set_viewer
+                    )
+                with _col_ts_restore:
+                    _restore_ts = _selected_snaps["training_set_id"].iloc[0] if len(_selected_snaps) == 1 else selected_ts
+                    if st.button("↩️ Restore to Binders", key="btn_restore_to_binders"):
+                        _restore_result = st_funcs.restore_binders_from_snapshot(project_path, _restore_ts)
+                        if isinstance(_restore_result, str) and _restore_result.startswith("error:"):
+                            st.error(f"❌ {_restore_result[6:]}")
+                        else:
+                            _pos_total = _restore_result['pos_inserted'] + _restore_result['pos_skipped']
+                            _neg_total = _restore_result['neg_inserted'] + _restore_result['neg_skipped']
+                            st.success(
+                                f"Restored from **{_restore_ts}**: "
+                                f"✅ {_pos_total} positive "
+                                f"({_restore_result['pos_inserted']} new, {_restore_result['pos_skipped']} already existed), "
+                                f"❌ {_neg_total} negative "
+                                f"({_restore_result['neg_inserted']} new, {_restore_result['neg_skipped']} already existed)."
+                            )
+                            st.rerun()
+                with _col_ts_inspect:
+                    st.button(
+                        f"{'Hide' if st.session_state[ts_inspector_key] else 'Inspect'} Set Snapshot",
+                        key="btn_ts_snapshot_inspector",
+                        on_click=_toggle_ts_snapshot_inspector
+                    )
+                with _col_ts_delete:
+                    _n_sel_snaps = len(_selected_snaps)
+                    if not st.session_state.get("confirm_delete_selected_snaps"):
+                        if st.button(
+                            f"🗑️ Delete Selected ({_n_sel_snaps})",
+                            key="btn_delete_selected_snaps",
+                            disabled=(_n_sel_snaps == 0),
+                        ):
+                            st.session_state["confirm_delete_selected_snaps"] = True
+                            st.rerun()
+                    else:
+                        st.warning(f"⚠️ Delete **{_n_sel_snaps}** snapshot(s) and all associated data? Are you sure?")
+                        _cdsnap1, _cdsnap2 = st.columns(2)
+                        with _cdsnap1:
+                            if st.button("✅ Yes, delete", key="btn_confirm_delete_selected_snaps"):
+                                _ids_to_delete = _selected_snaps["training_set_id"].tolist()
+                                result = st_funcs.delete_training_set_snapshots(project_path, _ids_to_delete)
+                                st.session_state["confirm_delete_selected_snaps"] = False
+                                if result == "deleted":
+                                    st.session_state[ts_viewer_key] = False
+                                    st.rerun()
+                                else:
+                                    st.error(f"Could not delete snapshots: {result}")
+                        with _cdsnap2:
+                            if st.button("❌ Cancel", key="btn_cancel_delete_selected_snaps"):
+                                st.session_state["confirm_delete_selected_snaps"] = False
+                                st.rerun()
+
+                ## --- Export Fingerprints CSV ---
+                if len(_selected_snaps) == 0:
                     st.button(
                         "⬇️ Export Fingerprints CSV",
                         key="btn_export_fps_csv",
                         disabled=True,
-                        help=f"No fingerprints computed for '{_export_ts_id}' yet. Run compute_training_set_fingerprints() first.",
+                        help="Select a training set snapshot using the checkbox to enable export.",
                     )
                 else:
-                    _default_csv_path = os.path.join(
-                        project_path, 'ml', 'training_sets',
-                        f'{_safe_ts_id}_fingerprints.csv'
-                    )
-                    _export_path = st.text_input(
-                        "Output CSV path:",
-                        value=_default_csv_path,
-                        key=f"export_fps_csv_path_{_export_ts_id}",
-                    )
-                    if st.button("⬇️ Export Fingerprints CSV", key="btn_export_fps_csv"):
-                        try:
-                            _out = _export_path.strip()
-                            os.makedirs(os.path.dirname(os.path.abspath(_out)), exist_ok=True)
-                            with open(_out, 'wb') as _f:
-                                _f.write(_csv_bytes)
-                            st.success(f"Fingerprints exported to: {_out}")
-                        except Exception as _e:
-                            st.error(f"Export failed: {_e}")
-
-            ## --- Snapshot inspector panel ---
-            if st.session_state[ts_inspector_key] and selected_ts:
-                df_inspect = st_funcs.get_training_set_entries(project_path, selected_ts)
-                st.markdown(f"##### 🔍 Snapshot: **{selected_ts}**")
-                if df_inspect is None or df_inspect.empty:
-                    st.info("No entries found for this snapshot.")
-                else:
-                    df_pos_inspect = df_inspect[df_inspect["binder_type"] == "positive"].drop(columns=["binder_type"], errors="ignore")
-                    df_neg_inspect = df_inspect[df_inspect["binder_type"] == "negative"].drop(columns=["binder_type"], errors="ignore")
-                    _icol1, _icol2 = st.columns(2)
-                    with _icol1:
-                        st.markdown(f"**✅ Positive binders ({len(df_pos_inspect)})**")
-                        if df_pos_inspect.empty:
-                            st.info("None.")
-                        else:
-                            st.dataframe(df_pos_inspect, use_container_width=True, hide_index=True)
-                    with _icol2:
-                        st.markdown(f"**❌ Negative binders ({len(df_neg_inspect)})**")
-                        if df_neg_inspect.empty:
-                            st.info("None.")
-                        else:
-                            st.dataframe(df_neg_inspect, use_container_width=True, hide_index=True)
-
-            if st.session_state[ts_viewer_key] and selected_ts:
-                df_ts_entries = st_funcs.get_training_set_entries(project_path, selected_ts)
-                if df_ts_entries is None or df_ts_entries.empty:
-                    st.info("No entries found for this training set.")
-                else:
-                    ## Reference PDB uploader
-                    ref_file_ts = st.file_uploader(
-                        "Load a reference PDB for superimposition (optional):",
-                        type=["pdb"],
-                        key="ml_ts_ref_pdb_uploader"
-                    )
-                    if ref_file_ts is not None:
-                        st.session_state["ml_ts_ref_pdb_data"] = ref_file_ts.read().decode("utf-8")
-                        st.success(f"Reference loaded: {ref_file_ts.name}")
-                    elif "ml_ts_ref_pdb_data" not in st.session_state:
-                        st.session_state["ml_ts_ref_pdb_data"] = None
-
-                    ## Build pose labels with binder type prefix
-                    BINDER_ICON = {"positive": "✅ POSITIVE", "negative": "❌ NEGATIVE"}
-                    ts_pose_labels = [
-                        f"{BINDER_ICON.get(row['binder_type'], row['binder_type'])} — {row['assay_name']} / {row['pose_file']}"
-                        for _, row in df_ts_entries.iterrows()
-                    ]
-                    ts_pose_paths = df_ts_entries["pose_full_path"].tolist()
-
-                    _select_key_ts = "ml_ts_pose_select"
-                    _idx_key_ts = "ml_ts_pose_idx"
-
-                    # Initialise / clamp integer index
-                    if _idx_key_ts not in st.session_state:
-                        st.session_state[_idx_key_ts] = 0
-                    if st.session_state[_idx_key_ts] >= len(ts_pose_labels):
-                        st.session_state[_idx_key_ts] = 0
-
-                    # Initialise selectbox only if absent or stale
-                    if _select_key_ts not in st.session_state or st.session_state[_select_key_ts] not in ts_pose_labels:
-                        st.session_state[_select_key_ts] = ts_pose_labels[st.session_state[_idx_key_ts]]
-
-                    def _ts_go_prev():
-                        if st.session_state[_idx_key_ts] > 0:
-                            st.session_state[_idx_key_ts] -= 1
-                            st.session_state[_select_key_ts] = ts_pose_labels[st.session_state[_idx_key_ts]]
-
-                    def _ts_go_next():
-                        if st.session_state[_idx_key_ts] < len(ts_pose_labels) - 1:
-                            st.session_state[_idx_key_ts] += 1
-                            st.session_state[_select_key_ts] = ts_pose_labels[st.session_state[_idx_key_ts]]
-
-                    selected_ts_pose = st.selectbox(
-                        "Select a pose:",
-                        ts_pose_labels,
-                        key=_select_key_ts,
-                    )
-
-                    # Sync integer index when user picks via dropdown
-                    _dropdown_idx = ts_pose_labels.index(selected_ts_pose)
-                    if _dropdown_idx != st.session_state[_idx_key_ts]:
-                        st.session_state[_idx_key_ts] = _dropdown_idx
-
-                    cur_ts = st.session_state[_idx_key_ts]
-                    current_ts_row = df_ts_entries.iloc[cur_ts]
-                    full_path_ts = ts_pose_paths[cur_ts]
-
-                    ## Binder type badge
-                    if current_ts_row["binder_type"] == "positive":
-                        st.success("✅ Positive binder")
+                    _export_ts_id = _selected_snaps["training_set_id"].iloc[0]
+                    _csv_bytes = st_funcs.export_training_set_fingerprints_as_csv_bytes(project_path, _export_ts_id)
+                    _safe_ts_id = _export_ts_id.replace(' ', '_')
+                    if _csv_bytes is None:
+                        st.button(
+                            "⬇️ Export Fingerprints CSV",
+                            key="btn_export_fps_csv",
+                            disabled=True,
+                            help=f"No fingerprints computed for '{_export_ts_id}' yet. Run compute_training_set_fingerprints() first.",
+                        )
                     else:
-                        st.error("❌ Negative binder")
+                        _default_csv_path = os.path.join(
+                            project_path, 'ml', 'training_sets',
+                            f'{_safe_ts_id}_fingerprints.csv'
+                        )
+                        _export_path = st.text_input(
+                            "Output CSV path:",
+                            value=_default_csv_path,
+                            key=f"export_fps_csv_path_{_export_ts_id}",
+                        )
+                        if st.button("⬇️ Export Fingerprints CSV", key="btn_export_fps_csv"):
+                            try:
+                                _out = _export_path.strip()
+                                os.makedirs(os.path.dirname(os.path.abspath(_out)), exist_ok=True)
+                                with open(_out, 'wb') as _f:
+                                    _f.write(_csv_bytes)
+                                st.success(f"Fingerprints exported to: {_out}")
+                            except Exception as _e:
+                                st.error(f"Export failed: {_e}")
 
-                    if os.path.exists(full_path_ts):
-                        with open(full_path_ts, "r") as f:
-                            pdb_data_ts = f.read()
-                        view_ts = py3Dmol.view(width=800, height=500)
-                        view_ts.addModel(pdb_data_ts, "pdb")
-                        view_ts.setStyle({"model": 0}, {"stick": {}, "cartoon": {"color": "spectrum"}})
-                        if st.session_state.get("ml_ts_ref_pdb_data"):
-                            view_ts.addModel(st.session_state["ml_ts_ref_pdb_data"], "pdb")
-                            view_ts.setStyle({"model": 1}, {"sphere": {"colorscheme": "elementColors", "scale": 0.3, "opacity": 0.6}, "stick": {"colorscheme": "elementColors", "opacity": 0.6}})
-                        view_ts.zoomTo()
+                ## --- Snapshot inspector panel ---
+                if st.session_state[ts_inspector_key] and selected_ts:
+                    df_inspect = st_funcs.get_training_set_entries(project_path, selected_ts)
+                    st.markdown(f"##### 🔍 Snapshot: **{selected_ts}**")
+                    if df_inspect is None or df_inspect.empty:
+                        st.info("No entries found for this snapshot.")
+                    else:
+                        df_pos_inspect = df_inspect[df_inspect["binder_type"] == "positive"].drop(columns=["binder_type"], errors="ignore")
+                        df_neg_inspect = df_inspect[df_inspect["binder_type"] == "negative"].drop(columns=["binder_type"], errors="ignore")
+                        _icol1, _icol2 = st.columns(2)
+                        with _icol1:
+                            st.markdown(f"**✅ Positive binders ({len(df_pos_inspect)})**")
+                            if df_pos_inspect.empty:
+                                st.info("None.")
+                            else:
+                                st.dataframe(df_pos_inspect, use_container_width=True, hide_index=True)
+                        with _icol2:
+                            st.markdown(f"**❌ Negative binders ({len(df_neg_inspect)})**")
+                            if df_neg_inspect.empty:
+                                st.info("None.")
+                            else:
+                                st.dataframe(df_neg_inspect, use_container_width=True, hide_index=True)
 
-                        has_ref_ts = st.session_state.get("ml_ts_ref_pdb_data")
+                if st.session_state[ts_viewer_key] and selected_ts:
+                    df_ts_entries = st_funcs.get_training_set_entries(project_path, selected_ts)
+                    if df_ts_entries is None or df_ts_entries.empty:
+                        st.info("No entries found for this training set.")
+                    else:
+                        ## Reference PDB uploader
+                        ref_file_ts = st.file_uploader(
+                            "Load a reference PDB for superimposition (optional):",
+                            type=["pdb"],
+                            key="ml_ts_ref_pdb_uploader"
+                        )
+                        if ref_file_ts is not None:
+                            st.session_state["ml_ts_ref_pdb_data"] = ref_file_ts.read().decode("utf-8")
+                            st.success(f"Reference loaded: {ref_file_ts.name}")
+                        elif "ml_ts_ref_pdb_data" not in st.session_state:
+                            st.session_state["ml_ts_ref_pdb_data"] = None
 
-                        _ts_fps = st_funcs.get_training_set_fingerprints_for_pose(
-                            project_path, selected_ts,
-                            current_ts_row["assay_name"], current_ts_row["pose_file"],
-                            current_ts_row["directory"]
+                        ## Build pose labels with binder type prefix
+                        BINDER_ICON = {"positive": "✅ POSITIVE", "negative": "❌ NEGATIVE"}
+                        ts_pose_labels = [
+                            f"{BINDER_ICON.get(row['binder_type'], row['binder_type'])} — {row['assay_name']} / {row['pose_file']}"
+                            for _, row in df_ts_entries.iterrows()
+                        ]
+                        ts_pose_paths = df_ts_entries["pose_full_path"].tolist()
+
+                        _select_key_ts = "ml_ts_pose_select"
+                        _idx_key_ts = "ml_ts_pose_idx"
+
+                        # Initialise / clamp integer index
+                        if _idx_key_ts not in st.session_state:
+                            st.session_state[_idx_key_ts] = 0
+                        if st.session_state[_idx_key_ts] >= len(ts_pose_labels):
+                            st.session_state[_idx_key_ts] = 0
+
+                        # Initialise selectbox only if absent or stale
+                        if _select_key_ts not in st.session_state or st.session_state[_select_key_ts] not in ts_pose_labels:
+                            st.session_state[_select_key_ts] = ts_pose_labels[st.session_state[_idx_key_ts]]
+
+                        def _ts_go_prev():
+                            if st.session_state[_idx_key_ts] > 0:
+                                st.session_state[_idx_key_ts] -= 1
+                                st.session_state[_select_key_ts] = ts_pose_labels[st.session_state[_idx_key_ts]]
+
+                        def _ts_go_next():
+                            if st.session_state[_idx_key_ts] < len(ts_pose_labels) - 1:
+                                st.session_state[_idx_key_ts] += 1
+                                st.session_state[_select_key_ts] = ts_pose_labels[st.session_state[_idx_key_ts]]
+
+                        selected_ts_pose = st.selectbox(
+                            "Select a pose:",
+                            ts_pose_labels,
+                            key=_select_key_ts,
                         )
 
-                        # Pre-compute frequency data and apply threshold — shared by both columns
-                        _ts_fp_meta = {}  # keyed by prolif_conditions_id
-                        if _ts_fps:
-                            for _fp_entry in _ts_fps:
-                                _cid = _fp_entry["prolif_conditions_id"]
-                                _freq_df_full = st_funcs.get_training_set_interaction_frequencies(
-                                    project_path, selected_ts, _cid
-                                )
-                                _all_ints = st_funcs.get_all_training_set_interactions(
-                                    project_path, selected_ts, _cid
-                                )
-                                _thresh_key = f"ml_ts_fp_thresh_{selected_ts}_{_cid}"
-                                if _thresh_key not in st.session_state:
-                                    st.session_state[_thresh_key] = 0.0
-                                _ts_fp_meta[_cid] = {
-                                    "freq_df_full": _freq_df_full,
-                                    "all_interactions": _all_ints,
-                                    "thresh_key": _thresh_key,
-                                }
+                        # Sync integer index when user picks via dropdown
+                        _dropdown_idx = ts_pose_labels.index(selected_ts_pose)
+                        if _dropdown_idx != st.session_state[_idx_key_ts]:
+                            st.session_state[_idx_key_ts] = _dropdown_idx
 
-                        if _ts_fps:
-                            _viewer_area, _fp_area = st.columns([3, 2])
+                        cur_ts = st.session_state[_idx_key_ts]
+                        current_ts_row = df_ts_entries.iloc[cur_ts]
+                        full_path_ts = ts_pose_paths[cur_ts]
+
+                        ## Binder type badge
+                        if current_ts_row["binder_type"] == "positive":
+                            st.success("✅ Positive binder")
                         else:
-                            _viewer_area = st.container()
-                            _fp_area = None
+                            st.error("❌ Negative binder")
 
-                        with _viewer_area:
-                            prev_col, viewer_col, next_col = st.columns([0.5, 8, 0.5 if not has_ref_ts else 1])
-                            with prev_col:
-                                st.write(""); st.write(""); st.write("")
-                                st.button("◀", key="ml_ts_prev", disabled=(cur_ts == 0), on_click=_ts_go_prev)
-                            with viewer_col:
-                                st.components.v1.html(view_ts.write_html(), height=520)
-                            with next_col:
-                                st.write(""); st.write(""); st.write("")
-                                st.button("▶", key="ml_ts_next", disabled=(cur_ts >= len(ts_pose_labels) - 1), on_click=_ts_go_next)
-                            st.caption(f"Pose {cur_ts + 1} of {len(ts_pose_labels)} — {current_ts_row['assay_name']} / {current_ts_row['pose_file']}")
+                        if os.path.exists(full_path_ts):
+                            with open(full_path_ts, "r") as f:
+                                pdb_data_ts = f.read()
+                            view_ts = py3Dmol.view(width=800, height=500)
+                            view_ts.addModel(pdb_data_ts, "pdb")
+                            view_ts.setStyle({"model": 0}, {"stick": {}, "cartoon": {"color": "spectrum"}})
+                            if st.session_state.get("ml_ts_ref_pdb_data"):
+                                view_ts.addModel(st.session_state["ml_ts_ref_pdb_data"], "pdb")
+                                view_ts.setStyle({"model": 1}, {"sphere": {"colorscheme": "elementColors", "scale": 0.3, "opacity": 0.6}, "stick": {"colorscheme": "elementColors", "opacity": 0.6}})
+                            view_ts.zoomTo()
 
-                            ## Delete pose from Positive / Negative Binders registries
-                            st.divider()
-                            _df_pos_reg = st_funcs.get_binders_registry(project_path, "positive")
-                            _df_neg_reg = st_funcs.get_binders_registry(project_path, "negative")
+                            has_ref_ts = st.session_state.get("ml_ts_ref_pdb_data")
 
-                            def _pose_in_registry(df, row):
-                                if df is None or df.empty:
-                                    return False
-                                return (
-                                    (df["assay_name"] == row["assay_name"]) &
-                                    (df["pose_file"] == row["pose_file"]) &
-                                    (df["directory"] == row["directory"])
-                                ).any()
+                            _ts_fps = st_funcs.get_training_set_fingerprints_for_pose(
+                                project_path, selected_ts,
+                                current_ts_row["assay_name"], current_ts_row["pose_file"],
+                                current_ts_row["directory"]
+                            )
 
-                            _in_pos = _pose_in_registry(_df_pos_reg, current_ts_row)
-                            _in_neg = _pose_in_registry(_df_neg_reg, current_ts_row)
-
-                            if not _in_pos and not _in_neg:
-                                st.info(
-                                    f"ℹ️ **{current_ts_row['pose_file']}** is not registered "
-                                    f"in Positive or Negative Binders."
-                                )
-                            else:
-                                _found_labels = []
-                                if _in_pos:
-                                    _found_labels.append("✅ Positive Binders")
-                                if _in_neg:
-                                    _found_labels.append("❌ Negative Binders")
-
-                                # Reflag target: only defined when pose is in exactly one registry
-                                if _in_pos and not _in_neg:
-                                    _reflag_target = "negative"
-                                    _reflag_label = "❌ Negative"
-                                elif _in_neg and not _in_pos:
-                                    _reflag_target = "positive"
-                                    _reflag_label = "✅ Positive"
-                                else:
-                                    _reflag_target = None
-                                    _reflag_label = None
-
-                                _del_binders_key = f"confirm_del_binders_{selected_ts}_{cur_ts}"
-                                _reflag_key = f"confirm_reflag_binders_{selected_ts}_{cur_ts}"
-
-                                _btn_col_del, _btn_col_ref = st.columns(2)
-
-                                with _btn_col_del:
-                                    if not st.session_state.get(_del_binders_key):
-                                        if st.button(
-                                            f"🗑️ Delete from {' & '.join(_found_labels)}",
-                                            key=f"btn_del_binders_{selected_ts}_{cur_ts}",
-                                        ):
-                                            st.session_state[_del_binders_key] = True
-                                            st.session_state[_reflag_key] = False
-                                            st.rerun()
-                                    else:
-                                        st.warning(
-                                            f"Delete **{current_ts_row['pose_file']}** from "
-                                            f"{', '.join(_found_labels)}?"
-                                        )
-                                        _dbc1, _dbc2 = st.columns(2)
-                                        with _dbc1:
-                                            if st.button("Yes, delete", key=f"btn_confirm_del_binders_{selected_ts}_{cur_ts}"):
-                                                if _in_pos:
-                                                    st_funcs.remove_binder(
-                                                        project_path=project_path,
-                                                        binder_type="positive",
-                                                        assay_name=current_ts_row["assay_name"],
-                                                        pose_file=current_ts_row["pose_file"],
-                                                        directory=current_ts_row["directory"],
-                                                    )
-                                                if _in_neg:
-                                                    st_funcs.remove_binder(
-                                                        project_path=project_path,
-                                                        binder_type="negative",
-                                                        assay_name=current_ts_row["assay_name"],
-                                                        pose_file=current_ts_row["pose_file"],
-                                                        directory=current_ts_row["directory"],
-                                                    )
-                                                st.session_state[_del_binders_key] = False
-                                                st.rerun()
-                                        with _dbc2:
-                                            if st.button("Cancel", key=f"btn_cancel_del_binders_{selected_ts}_{cur_ts}"):
-                                                st.session_state[_del_binders_key] = False
-                                                st.rerun()
-
-                                with _btn_col_ref:
-                                    if _reflag_target is None:
-                                        st.button(
-                                            "🔄 Reflag",
-                                            key=f"btn_reflag_{selected_ts}_{cur_ts}",
-                                            disabled=True,
-                                            help="Pose is in both registries — remove from one first.",
-                                        )
-                                    elif not st.session_state.get(_reflag_key):
-                                        if st.button(
-                                            f"🔄 Reflag as {_reflag_label}",
-                                            key=f"btn_reflag_{selected_ts}_{cur_ts}",
-                                        ):
-                                            st.session_state[_reflag_key] = True
-                                            st.session_state[_del_binders_key] = False
-                                            st.rerun()
-                                    else:
-                                        st.warning(
-                                            f"Move **{current_ts_row['pose_file']}** to {_reflag_label}?"
-                                        )
-                                        _rfc1, _rfc2 = st.columns(2)
-                                        with _rfc1:
-                                            if st.button("Yes, reflag", key=f"btn_confirm_reflag_{selected_ts}_{cur_ts}"):
-                                                _src = "positive" if _in_pos else "negative"
-                                                st_funcs.remove_binder(
-                                                    project_path=project_path,
-                                                    binder_type=_src,
-                                                    assay_name=current_ts_row["assay_name"],
-                                                    pose_file=current_ts_row["pose_file"],
-                                                    directory=current_ts_row["directory"],
-                                                )
-                                                if _reflag_target == "positive":
-                                                    st_funcs.save_positive_binder(
-                                                        project_path=project_path,
-                                                        assay_name=current_ts_row["assay_name"],
-                                                        pose_file=current_ts_row["pose_file"],
-                                                        directory=current_ts_row["directory"],
-                                                        pose_full_path=current_ts_row["pose_full_path"],
-                                                    )
-                                                else:
-                                                    st_funcs.save_negative_binder(
-                                                        project_path=project_path,
-                                                        assay_name=current_ts_row["assay_name"],
-                                                        pose_file=current_ts_row["pose_file"],
-                                                        directory=current_ts_row["directory"],
-                                                        pose_full_path=current_ts_row["pose_full_path"],
-                                                    )
-                                                st.session_state[_reflag_key] = False
-                                                st.rerun()
-                                        with _rfc2:
-                                            if st.button("Cancel", key=f"btn_cancel_reflag_{selected_ts}_{cur_ts}"):
-                                                st.session_state[_reflag_key] = False
-                                                st.rerun()
-                            st.divider()
-
-                            ## VMD script creation
-                            with st.expander("🎬 Create VMD Script", expanded=False):
-                                _default_vmd_path_ts = os.path.join(
-                                    os.path.expanduser("~"), "Desktop",
-                                    os.path.splitext(os.path.basename(full_path_ts))[0] + "_vmd.tcl"
-                                )
-                                _vmd_path_ts = st.text_input(
-                                    "Save script to:",
-                                    value=_default_vmd_path_ts,
-                                    key=f"vmd_path_ml_ts_{cur_ts}",
-                                )
-                                if st.button("💾 Save VMD Script", key=f"btn_save_vmd_ml_ts_{cur_ts}"):
-                                    try:
-                                        _ref_pdb_path_ts = None
-                                        if st.session_state.get("ml_ts_ref_pdb_data"):
-                                            _ref_pdb_path_ts = os.path.join(
-                                                os.path.dirname(os.path.abspath(_vmd_path_ts.strip())),
-                                                "reference.pdb"
-                                            )
-                                            with open(_ref_pdb_path_ts, "w") as _rf:
-                                                _rf.write(st.session_state["ml_ts_ref_pdb_data"])
-                                        _script_ts = st_funcs.generate_vmd_script(
-                                            os.path.abspath(full_path_ts), _ref_pdb_path_ts
-                                        )
-                                        _vmd_out_ts = _vmd_path_ts.strip()
-                                        os.makedirs(os.path.dirname(os.path.abspath(_vmd_out_ts)), exist_ok=True)
-                                        with open(_vmd_out_ts, "w") as _sf:
-                                            _sf.write(_script_ts)
-                                        st.success(f"VMD script saved to: {_vmd_out_ts}")
-                                        if _ref_pdb_path_ts:
-                                            st.info(f"Reference PDB saved alongside: {_ref_pdb_path_ts}")
-                                    except Exception as _e:
-                                        st.error(f"Could not save VMD script: {_e}")
-
-                            ## Interaction frequency table with threshold filter
+                            # Pre-compute frequency data and apply threshold — shared by both columns
+                            _ts_fp_meta = {}  # keyed by prolif_conditions_id
                             if _ts_fps:
                                 for _fp_entry in _ts_fps:
-                                    _cond_id = _fp_entry["prolif_conditions_id"]
-                                    _meta = _ts_fp_meta[_cond_id]
-                                    _freq_df_full = _meta["freq_df_full"]
-                                    if _freq_df_full is not None:
-                                        _thresh = st.number_input(
-                                            "Min. frequency (%) to display:",
-                                            min_value=0.0, max_value=100.0, step=5.0,
-                                            key=_meta["thresh_key"],
-                                        )
-                                        _freq_df_shown = _freq_df_full[_freq_df_full["Frequency (%)"] >= _thresh]
-                                        with st.expander(
-                                            f"📊 Interaction frequencies — Conditions ID {_cond_id} "
-                                            f"({len(_freq_df_shown)}/{len(_freq_df_full)} interactions, {len(df_ts_entries)} poses)",
-                                            expanded=False
-                                        ):
-                                            st.dataframe(_freq_df_shown, use_container_width=True, hide_index=True)
+                                    _cid = _fp_entry["prolif_conditions_id"]
+                                    _freq_df_full = st_funcs.get_training_set_interaction_frequencies(
+                                        project_path, selected_ts, _cid
+                                    )
+                                    _all_ints = st_funcs.get_all_training_set_interactions(
+                                        project_path, selected_ts, _cid
+                                    )
+                                    _thresh_key = f"ml_ts_fp_thresh_{selected_ts}_{_cid}"
+                                    if _thresh_key not in st.session_state:
+                                        st.session_state[_thresh_key] = 0.0
+                                    _ts_fp_meta[_cid] = {
+                                        "freq_df_full": _freq_df_full,
+                                        "all_interactions": _all_ints,
+                                        "thresh_key": _thresh_key,
+                                    }
 
-                        if _fp_area is not None:
-                            with _fp_area:
-                                st.markdown("##### 🔬 ProLIF Fingerprint")
-                                for _fp_entry in _ts_fps:
-                                    _cond_id = _fp_entry["prolif_conditions_id"]
-                                    _fp_dict = _fp_entry["fingerprint"]
-                                    _active = [k for k, v in _fp_dict.items() if v]
-                                    _meta = _ts_fp_meta[_cond_id]
+                            if _ts_fps:
+                                _viewer_area, _fp_area = st.columns([3, 2])
+                            else:
+                                _viewer_area = st.container()
+                                _fp_area = None
 
-                                    # Filter all_interactions by current frequency threshold
-                                    _thresh = st.session_state.get(_meta["thresh_key"], 0.0)
-                                    _freq_df_full = _meta["freq_df_full"]
-                                    if _freq_df_full is not None and _thresh > 0:
-                                        _above = set(_freq_df_full.loc[_freq_df_full["Frequency (%)"] >= _thresh, "Interaction"])
-                                        _all_interactions = [i for i in _meta["all_interactions"] if i in _above]
+                            with _viewer_area:
+                                prev_col, viewer_col, next_col = st.columns([0.5, 8, 0.5 if not has_ref_ts else 1])
+                                with prev_col:
+                                    st.write(""); st.write(""); st.write("")
+                                    st.button("◀", key="ml_ts_prev", disabled=(cur_ts == 0), on_click=_ts_go_prev)
+                                with viewer_col:
+                                    st.components.v1.html(view_ts.write_html(), height=520)
+                                with next_col:
+                                    st.write(""); st.write(""); st.write("")
+                                    st.button("▶", key="ml_ts_next", disabled=(cur_ts >= len(ts_pose_labels) - 1), on_click=_ts_go_next)
+                                st.caption(f"Pose {cur_ts + 1} of {len(ts_pose_labels)} — {current_ts_row['assay_name']} / {current_ts_row['pose_file']}")
+
+                                ## Delete pose from Positive / Negative Binders registries
+                                st.divider()
+                                _df_pos_reg = st_funcs.get_binders_registry(project_path, "positive")
+                                _df_neg_reg = st_funcs.get_binders_registry(project_path, "negative")
+
+                                def _pose_in_registry(df, row):
+                                    if df is None or df.empty:
+                                        return False
+                                    return (
+                                        (df["assay_name"] == row["assay_name"]) &
+                                        (df["pose_file"] == row["pose_file"]) &
+                                        (df["directory"] == row["directory"])
+                                    ).any()
+
+                                _in_pos = _pose_in_registry(_df_pos_reg, current_ts_row)
+                                _in_neg = _pose_in_registry(_df_neg_reg, current_ts_row)
+
+                                if not _in_pos and not _in_neg:
+                                    st.info(
+                                        f"ℹ️ **{current_ts_row['pose_file']}** is not registered "
+                                        f"in Positive or Negative Binders."
+                                    )
+                                else:
+                                    _found_labels = []
+                                    if _in_pos:
+                                        _found_labels.append("✅ Positive Binders")
+                                    if _in_neg:
+                                        _found_labels.append("❌ Negative Binders")
+
+                                    # Reflag target: only defined when pose is in exactly one registry
+                                    if _in_pos and not _in_neg:
+                                        _reflag_target = "negative"
+                                        _reflag_label = "❌ Negative"
+                                    elif _in_neg and not _in_pos:
+                                        _reflag_target = "positive"
+                                        _reflag_label = "✅ Positive"
                                     else:
-                                        _all_interactions = _meta["all_interactions"]
+                                        _reflag_target = None
+                                        _reflag_label = None
 
-                                    # Per-conditions filter state key
-                                    _filter_key = f"ml_ts_fp_filter_{selected_ts}_{_cond_id}"
-                                    if _filter_key not in st.session_state:
-                                        st.session_state[_filter_key] = set(_all_interactions)
+                                    _del_binders_key = f"confirm_del_binders_{selected_ts}_{cur_ts}"
+                                    _reflag_key = f"confirm_reflag_binders_{selected_ts}_{cur_ts}"
 
-                                    with st.expander(f"Conditions ID {_cond_id} — filter interactions", expanded=False):
-                                        _col_a, _col_b = st.columns(2)
-                                        _all_selected = st.session_state[_filter_key] == set(_all_interactions)
-                                        _none_selected = len(st.session_state[_filter_key]) == 0
-                                        if _col_a.button("✅ All" if _all_selected else "☐ All",
-                                                         key=f"ml_ts_fp_all_{selected_ts}_{_cond_id}",
-                                                         type="primary" if _all_selected else "secondary"):
-                                            st.session_state[_filter_key] = set(_all_interactions)
-                                            for _iname in _all_interactions:
-                                                st.session_state[f"ml_ts_fp_cb_{selected_ts}_{_cond_id}_{_iname}"] = True
-                                            st.rerun()
-                                        if _col_b.button("✅ None" if _none_selected else "☐ None",
-                                                         key=f"ml_ts_fp_none_{selected_ts}_{_cond_id}",
-                                                         type="primary" if _none_selected else "secondary"):
-                                            st.session_state[_filter_key] = set()
-                                            for _iname in _all_interactions:
-                                                st.session_state[f"ml_ts_fp_cb_{selected_ts}_{_cond_id}_{_iname}"] = False
-                                            st.rerun()
-                                        for _iname in _all_interactions:
-                                            _cb_key = f"ml_ts_fp_cb_{selected_ts}_{_cond_id}_{_iname}"
-                                            _checked = st.checkbox(
-                                                _iname,
-                                                value=(_iname in st.session_state[_filter_key]),
-                                                key=_cb_key,
+                                    _btn_col_del, _btn_col_ref = st.columns(2)
+
+                                    with _btn_col_del:
+                                        if not st.session_state.get(_del_binders_key):
+                                            if st.button(
+                                                f"🗑️ Delete from {' & '.join(_found_labels)}",
+                                                key=f"btn_del_binders_{selected_ts}_{cur_ts}",
+                                            ):
+                                                st.session_state[_del_binders_key] = True
+                                                st.session_state[_reflag_key] = False
+                                                st.rerun()
+                                        else:
+                                            st.warning(
+                                                f"Delete **{current_ts_row['pose_file']}** from "
+                                                f"{', '.join(_found_labels)}?"
                                             )
-                                            if _checked:
-                                                st.session_state[_filter_key].add(_iname)
-                                            else:
-                                                st.session_state[_filter_key].discard(_iname)
+                                            _dbc1, _dbc2 = st.columns(2)
+                                            with _dbc1:
+                                                if st.button("Yes, delete", key=f"btn_confirm_del_binders_{selected_ts}_{cur_ts}"):
+                                                    if _in_pos:
+                                                        st_funcs.remove_binder(
+                                                            project_path=project_path,
+                                                            binder_type="positive",
+                                                            assay_name=current_ts_row["assay_name"],
+                                                            pose_file=current_ts_row["pose_file"],
+                                                            directory=current_ts_row["directory"],
+                                                        )
+                                                    if _in_neg:
+                                                        st_funcs.remove_binder(
+                                                            project_path=project_path,
+                                                            binder_type="negative",
+                                                            assay_name=current_ts_row["assay_name"],
+                                                            pose_file=current_ts_row["pose_file"],
+                                                            directory=current_ts_row["directory"],
+                                                        )
+                                                    st.session_state[_del_binders_key] = False
+                                                    st.rerun()
+                                            with _dbc2:
+                                                if st.button("Cancel", key=f"btn_cancel_del_binders_{selected_ts}_{cur_ts}"):
+                                                    st.session_state[_del_binders_key] = False
+                                                    st.rerun()
 
-                                    _visible = [k for k in _active if k in st.session_state[_filter_key]]
-                                    _n_selected = len(st.session_state[_filter_key])
-                                    st.markdown(f"**{len(_visible)} shown** ({_n_selected} selected / {len(_all_interactions)} total)")
-                                    if _visible:
-                                        st.dataframe(
-                                            {"Interaction": _visible},
-                                            use_container_width=True,
-                                            hide_index=True,
-                                        )
-                                    elif _active:
-                                        st.info("All active interactions are filtered out.")
-                                    else:
-                                        st.info("No interactions detected for this pose.")
+                                    with _btn_col_ref:
+                                        if _reflag_target is None:
+                                            st.button(
+                                                "🔄 Reflag",
+                                                key=f"btn_reflag_{selected_ts}_{cur_ts}",
+                                                disabled=True,
+                                                help="Pose is in both registries — remove from one first.",
+                                            )
+                                        elif not st.session_state.get(_reflag_key):
+                                            if st.button(
+                                                f"🔄 Reflag as {_reflag_label}",
+                                                key=f"btn_reflag_{selected_ts}_{cur_ts}",
+                                            ):
+                                                st.session_state[_reflag_key] = True
+                                                st.session_state[_del_binders_key] = False
+                                                st.rerun()
+                                        else:
+                                            st.warning(
+                                                f"Move **{current_ts_row['pose_file']}** to {_reflag_label}?"
+                                            )
+                                            _rfc1, _rfc2 = st.columns(2)
+                                            with _rfc1:
+                                                if st.button("Yes, reflag", key=f"btn_confirm_reflag_{selected_ts}_{cur_ts}"):
+                                                    _src = "positive" if _in_pos else "negative"
+                                                    st_funcs.remove_binder(
+                                                        project_path=project_path,
+                                                        binder_type=_src,
+                                                        assay_name=current_ts_row["assay_name"],
+                                                        pose_file=current_ts_row["pose_file"],
+                                                        directory=current_ts_row["directory"],
+                                                    )
+                                                    if _reflag_target == "positive":
+                                                        st_funcs.save_positive_binder(
+                                                            project_path=project_path,
+                                                            assay_name=current_ts_row["assay_name"],
+                                                            pose_file=current_ts_row["pose_file"],
+                                                            directory=current_ts_row["directory"],
+                                                            pose_full_path=current_ts_row["pose_full_path"],
+                                                        )
+                                                    else:
+                                                        st_funcs.save_negative_binder(
+                                                            project_path=project_path,
+                                                            assay_name=current_ts_row["assay_name"],
+                                                            pose_file=current_ts_row["pose_file"],
+                                                            directory=current_ts_row["directory"],
+                                                            pose_full_path=current_ts_row["pose_full_path"],
+                                                        )
+                                                    st.session_state[_reflag_key] = False
+                                                    st.rerun()
+                                            with _rfc2:
+                                                if st.button("Cancel", key=f"btn_cancel_reflag_{selected_ts}_{cur_ts}"):
+                                                    st.session_state[_reflag_key] = False
+                                                    st.rerun()
+                                st.divider()
 
-                    else:
-                        st.warning(f"Pose file not found on disk: {full_path_ts}")
+                                ## VMD script creation
+                                with st.expander("🎬 Create VMD Script", expanded=False):
+                                    _default_vmd_path_ts = os.path.join(
+                                        os.path.expanduser("~"), "Desktop",
+                                        os.path.splitext(os.path.basename(full_path_ts))[0] + "_vmd.tcl"
+                                    )
+                                    _vmd_path_ts = st.text_input(
+                                        "Save script to:",
+                                        value=_default_vmd_path_ts,
+                                        key=f"vmd_path_ml_ts_{cur_ts}",
+                                    )
+                                    if st.button("💾 Save VMD Script", key=f"btn_save_vmd_ml_ts_{cur_ts}"):
+                                        try:
+                                            _ref_pdb_path_ts = None
+                                            if st.session_state.get("ml_ts_ref_pdb_data"):
+                                                _ref_pdb_path_ts = os.path.join(
+                                                    os.path.dirname(os.path.abspath(_vmd_path_ts.strip())),
+                                                    "reference.pdb"
+                                                )
+                                                with open(_ref_pdb_path_ts, "w") as _rf:
+                                                    _rf.write(st.session_state["ml_ts_ref_pdb_data"])
+                                            _script_ts = st_funcs.generate_vmd_script(
+                                                os.path.abspath(full_path_ts), _ref_pdb_path_ts
+                                            )
+                                            _vmd_out_ts = _vmd_path_ts.strip()
+                                            os.makedirs(os.path.dirname(os.path.abspath(_vmd_out_ts)), exist_ok=True)
+                                            with open(_vmd_out_ts, "w") as _sf:
+                                                _sf.write(_script_ts)
+                                            st.success(f"VMD script saved to: {_vmd_out_ts}")
+                                            if _ref_pdb_path_ts:
+                                                st.info(f"Reference PDB saved alongside: {_ref_pdb_path_ts}")
+                                        except Exception as _e:
+                                            st.error(f"Could not save VMD script: {_e}")
+
+                                ## Interaction frequency table with threshold filter
+                                if _ts_fps:
+                                    for _fp_entry in _ts_fps:
+                                        _cond_id = _fp_entry["prolif_conditions_id"]
+                                        _meta = _ts_fp_meta[_cond_id]
+                                        _freq_df_full = _meta["freq_df_full"]
+                                        if _freq_df_full is not None:
+                                            _thresh = st.number_input(
+                                                "Min. frequency (%) to display:",
+                                                min_value=0.0, max_value=100.0, step=5.0,
+                                                key=_meta["thresh_key"],
+                                            )
+                                            _freq_df_shown = _freq_df_full[_freq_df_full["Frequency (%)"] >= _thresh]
+                                            with st.expander(
+                                                f"📊 Interaction frequencies — Conditions ID {_cond_id} "
+                                                f"({len(_freq_df_shown)}/{len(_freq_df_full)} interactions, {len(df_ts_entries)} poses)",
+                                                expanded=False
+                                            ):
+                                                st.dataframe(_freq_df_shown, use_container_width=True, hide_index=True)
+
+                            if _fp_area is not None:
+                                with _fp_area:
+                                    st.markdown("##### 🔬 ProLIF Fingerprint")
+                                    for _fp_entry in _ts_fps:
+                                        _cond_id = _fp_entry["prolif_conditions_id"]
+                                        _fp_dict = _fp_entry["fingerprint"]
+                                        _active = [k for k, v in _fp_dict.items() if v]
+                                        _meta = _ts_fp_meta[_cond_id]
+
+                                        # Filter all_interactions by current frequency threshold
+                                        _thresh = st.session_state.get(_meta["thresh_key"], 0.0)
+                                        _freq_df_full = _meta["freq_df_full"]
+                                        if _freq_df_full is not None and _thresh > 0:
+                                            _above = set(_freq_df_full.loc[_freq_df_full["Frequency (%)"] >= _thresh, "Interaction"])
+                                            _all_interactions = [i for i in _meta["all_interactions"] if i in _above]
+                                        else:
+                                            _all_interactions = _meta["all_interactions"]
+
+                                        # Per-conditions filter state key
+                                        _filter_key = f"ml_ts_fp_filter_{selected_ts}_{_cond_id}"
+                                        if _filter_key not in st.session_state:
+                                            st.session_state[_filter_key] = set(_all_interactions)
+
+                                        with st.expander(f"Conditions ID {_cond_id} — filter interactions", expanded=False):
+                                            _col_a, _col_b = st.columns(2)
+                                            _all_selected = st.session_state[_filter_key] == set(_all_interactions)
+                                            _none_selected = len(st.session_state[_filter_key]) == 0
+                                            if _col_a.button("✅ All" if _all_selected else "☐ All",
+                                                             key=f"ml_ts_fp_all_{selected_ts}_{_cond_id}",
+                                                             type="primary" if _all_selected else "secondary"):
+                                                st.session_state[_filter_key] = set(_all_interactions)
+                                                for _iname in _all_interactions:
+                                                    st.session_state[f"ml_ts_fp_cb_{selected_ts}_{_cond_id}_{_iname}"] = True
+                                                st.rerun()
+                                            if _col_b.button("✅ None" if _none_selected else "☐ None",
+                                                             key=f"ml_ts_fp_none_{selected_ts}_{_cond_id}",
+                                                             type="primary" if _none_selected else "secondary"):
+                                                st.session_state[_filter_key] = set()
+                                                for _iname in _all_interactions:
+                                                    st.session_state[f"ml_ts_fp_cb_{selected_ts}_{_cond_id}_{_iname}"] = False
+                                                st.rerun()
+                                            for _iname in _all_interactions:
+                                                _cb_key = f"ml_ts_fp_cb_{selected_ts}_{_cond_id}_{_iname}"
+                                                _checked = st.checkbox(
+                                                    _iname,
+                                                    value=(_iname in st.session_state[_filter_key]),
+                                                    key=_cb_key,
+                                                )
+                                                if _checked:
+                                                    st.session_state[_filter_key].add(_iname)
+                                                else:
+                                                    st.session_state[_filter_key].discard(_iname)
+
+                                        _visible = [k for k in _active if k in st.session_state[_filter_key]]
+                                        _n_selected = len(st.session_state[_filter_key])
+                                        st.markdown(f"**{len(_visible)} shown** ({_n_selected} selected / {len(_all_interactions)} total)")
+                                        if _visible:
+                                            st.dataframe(
+                                                {"Interaction": _visible},
+                                                use_container_width=True,
+                                                hide_index=True,
+                                            )
+                                        elif _active:
+                                            st.info("All active interactions are filtered out.")
+                                        else:
+                                            st.info("No interactions detected for this pose.")
+
+                        else:
+                            st.warning(f"Pose file not found on disk: {full_path_ts}")
