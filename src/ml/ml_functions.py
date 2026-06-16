@@ -392,7 +392,8 @@ class MachineLearning:
                 if not receptor_pdbqt:
                     print(f"  ❌ No receptor pdbqt_file for assay '{assay_name}' — skipping {pose_file}")
                     continue
-                receptor_file = '/'.join(receptor_pdbqt.split('/')[:-1]) + '/receptor_checked.pdb'
+                receptor_pdbqt = self._remap_project_path(receptor_pdbqt)
+                receptor_file = os.path.join(os.path.dirname(receptor_pdbqt), 'receptor_checked.pdb')
 
                 assay_folder_path = assay_info['assay_folder_path']
                 assay_id = assay_info['assay_id']
@@ -772,11 +773,13 @@ class MachineLearning:
                     receptor_info = json.loads(receptor_info_json) if receptor_info_json else {}
                 except Exception:
                     receptor_info = {}
+                if receptor_info.get('pdbqt_file'):
+                    receptor_info['pdbqt_file'] = self._remap_project_path(receptor_info['pdbqt_file'])
                 result[assay_name] = {
                     'assay_id': assay_id,
                     'assay_name': assay_name,
                     'table_name': table_name,
-                    'assay_folder_path': assay_folder_path,
+                    'assay_folder_path': self._remap_project_path(assay_folder_path),
                     'receptor_info': receptor_info,
                 }
             conn.close()
@@ -802,6 +805,25 @@ class MachineLearning:
         except Exception as e:
             print(f"Error loading renumbering dict for '{template_name}': {e}")
         return {}
+
+    def _remap_project_path(self, stored_path: str) -> str:
+        """
+        Remap a stored absolute path to the current project location.
+
+        When a project is imported to a new location, paths stored in the
+        SQLite databases still reference the original directory.  This method
+        detects the first occurrence of a known top-level project subdirectory
+        inside *stored_path* and replaces everything before it with self.path,
+        leaving the relative suffix intact.
+        """
+        if not stored_path or os.path.exists(stored_path):
+            return stored_path
+        for marker in ('/docking/', '/chemspace/', '/ml/', '/dynamics/'):
+            pos = stored_path.find(marker)
+            if pos != -1:
+                relative = stored_path[pos + 1:]  # strip the leading '/'
+                return os.path.join(self.path, relative)
+        return stored_path
 
     def _ensure_fingerprints_table(self):
         """Create the training_set_fingerprints table in the snapshots DB if absent."""

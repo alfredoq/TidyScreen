@@ -10959,6 +10959,25 @@ class MolDock:
             shutil.rmtree(output_dir, ignore_errors=True)
             print("✅ Temporary files cleaned up.")
             
+    def _remap_project_path(self, stored_path: str) -> str:
+        """
+        Remap a stored absolute path to the current project location.
+
+        When a project is imported to a new location the paths stored inside
+        SQLite blobs still reference the original directory.  This method
+        detects the first occurrence of a known top-level project subdirectory
+        inside *stored_path* and replaces everything before it with self.path,
+        leaving the relative suffix intact.
+        """
+        if not stored_path or os.path.exists(stored_path):
+            return stored_path
+        for marker in ('/docking/', '/chemspace/', '/ml/', '/dynamics/'):
+            pos = stored_path.find(marker)
+            if pos != -1:
+                relative = stored_path[pos + 1:]  # strip the leading '/'
+                return os.path.join(self.path, relative)
+        return stored_path
+
     def _restore_single_docked_pose(self, results_db, ligname, run_number):
         """
         Generate a .pdb file for a single docked pose identified by (ligname, run_number).
@@ -11185,9 +11204,10 @@ class MolDock:
         import textwrap
 
         receptor_pdb = assay_info.get('receptor_info', None).get('pdbqt_file', None)
+        receptor_pdb = self._remap_project_path(receptor_pdb)
 
         # Define the raw .pdb file of the receptor
-        receptor_pdb_path = '/'.join(receptor_pdb.split('/')[:-1]) + '/receptor_checked.pdb'
+        receptor_pdb_path = os.path.join(os.path.dirname(receptor_pdb), 'receptor_checked.pdb')
 
         # Create tleap input file to load receptor and ligand
         tleap_in_file = os.path.join(output_dir, "complex.in")
@@ -11202,10 +11222,10 @@ class MolDock:
 
 
         ### Determine if ligands are bound as cofactors
-        ## Get the pdb template n>ame
+        ## Get the pdb template name
         pdb_template_name = assay_info.get('receptor_info', None).get('template_name', None)
         ligands_in_template, cofactors_names, mol2_files_names, frcmod_files_names = self._check_ligands_in_template(pdb_template_name)
-        
+
         # Will write the header of the tleap input file
         with open(tleap_in_file, 'w') as f:
             f.write(textwrap.dedent("""\
@@ -11215,14 +11235,14 @@ class MolDock:
                 HOH = WAT
 
                 """))
-    
+
         ## Evaluate if ligands/cofactors are required to be loaded with the receptor
         if ligands_in_template:
             # loop over cofactors_name and get the index and item
             for index, cofactor_name in enumerate(cofactors_names):
                 name = cofactor_name
-                mol2_file_lig = mol2_files_names[index]
-                frcmod_file_lig = frcmod_files_names[index]
+                mol2_file_lig = self._remap_project_path(mol2_files_names[index])
+                frcmod_file_lig = self._remap_project_path(frcmod_files_names[index])
                 
                 # Append each cofactor information to the file
                 with open(tleap_in_file, 'a') as f:
