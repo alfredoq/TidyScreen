@@ -808,6 +808,14 @@ def save_negative_binder(project_path: str, assay_name: str, pose_file: str, dir
         return f"error:{e}"
 
 
+def _rebase_pose_path(project_path: str, stored_path: str, assay_name: str, directory: str, pose_file: str) -> str:
+    """Return stored_path if it exists on disk; otherwise reconstruct from project structure."""
+    if os.path.exists(stored_path):
+        return stored_path
+    rebased = os.path.join(project_path, "docking", "docking_assays", assay_name, "results", directory, pose_file)
+    return rebased
+
+
 def get_binders_registry(project_path: str, binder_type: str) -> "pd.DataFrame":
     """
     Load the positive or negative binders registry from the ml/training_sets database.
@@ -827,6 +835,10 @@ def get_binders_registry(project_path: str, binder_type: str) -> "pd.DataFrame":
         conn = sqlite3.connect(db_path)
         df = pd.read_sql_query(f"SELECT * FROM {table} ORDER BY flagged_at DESC", conn)
         conn.close()
+        df["pose_full_path"] = df.apply(
+            lambda r: _rebase_pose_path(project_path, r["pose_full_path"], r["assay_name"], r["directory"], r["pose_file"]),
+            axis=1,
+        )
         return df
     except Exception:
         return None
@@ -995,7 +1007,13 @@ def get_training_set_entries(project_path: str, training_set_id: str) -> "pd.Dat
             params=(training_set_id,)
         )
         conn.close()
-        return df if not df.empty else None
+        if df.empty:
+            return None
+        df["pose_full_path"] = df.apply(
+            lambda r: _rebase_pose_path(project_path, r["pose_full_path"], r["assay_name"], r["directory"], r["pose_file"]),
+            axis=1,
+        )
+        return df
     except Exception:
         return None
 
