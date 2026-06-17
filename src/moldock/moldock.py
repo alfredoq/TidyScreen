@@ -8344,7 +8344,7 @@ class MolDock:
             rtc = RingtailCore(db_file = results_db_file, docking_mode=docking_mode )
             # If Vina docking engine, add computation of fingerprints
             if selected_method['docking_engine'] == 'Vina':
-                receptor_file = assay_registry.get('receptor_info').get('pdbqt_file')
+                receptor_file = self._remap_project_path(assay_registry.get('receptor_info').get('pdbqt_file'))
                 rtc.add_results_from_files(file_path = f"{assay_folder}/results", recursive = True, save_receptor = True, max_poses=max_poses, add_interactions = True, receptor_file = receptor_file)
             elif selected_method['docking_engine'] == 'AutoDockGPU':
                 rtc.add_results_from_files(file_path = f"{assay_folder}/results", recursive = True, save_receptor = False, max_poses=max_poses) # Interactions already computed
@@ -10720,7 +10720,9 @@ class MolDock:
         assay_id = self._prompt_assay("for ProLIF fingerprint computation", assay_by_id)
         
         # Get the receptor file used for the corresponding docking studies
-        receptor_file = ('/').join(assay_by_id[assay_id].get('receptor_info', {})["pdbqt_file"].split('/')[:-1]) + "/receptor_checked.pdb"
+        _pdbqt = assay_by_id[assay_id].get('receptor_info', {}).get('pdbqt_file', '')
+        _pdbqt = self._remap_project_path(_pdbqt)
+        receptor_file = os.path.join(os.path.dirname(_pdbqt), 'receptor_checked.pdb')
         
         # Prompt user for fingerprint/computation options
         print("\nSelect fingerprint/computation options:")
@@ -10748,12 +10750,28 @@ class MolDock:
             return None
 
         assay_info = assay_by_id[assay_id]
-        
+
         # Get the path to the results database for the selected assay
-        results_db = os.path.join(assay_info['assay_folder_path'], "results", f"assay_{assay_id}.db")
-        
+        _remapped_folder = self._remap_project_path(assay_info['assay_folder_path'])
+        results_db = os.path.join(_remapped_folder, "results", f"assay_{assay_id}.db")
+        print(f"📂 Results DB: {results_db}")
+
+        if not os.path.isfile(results_db):
+            print(f"❌ Results database not found: {results_db}")
+            print(f"   Stored assay folder : {assay_info['assay_folder_path']}")
+            print(f"   Remapped assay folder: {_remapped_folder}")
+            print("   Make sure docking has been run for this assay and the results file exists.")
+            return None
+
         try:
             conn = sqlite3.connect(results_db)
+            # Verify the Results table exists before querying
+            tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+            if 'Results' not in tables:
+                print(f"❌ 'Results' table not found in {results_db}")
+                print(f"   Tables present: {tables}")
+                conn.close()
+                return None
             query = "SELECT Pose_ID, LigName, docking_score, cluster_size, run_number FROM Results"
             df = pd.read_sql(query, conn)
             conn.close()
