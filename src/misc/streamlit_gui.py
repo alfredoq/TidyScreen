@@ -3291,3 +3291,78 @@ elif page == "RF model training":
                 mime="application/octet-stream",
                 key="rf_dl_model",
             )
+
+            st.markdown("---")
+            st.subheader("Save Model to Project Database")
+            _save_project_path = st.session_state.get("active_project_path")
+            if not _save_project_path:
+                st.warning("No active project. Activate a project in the TidyScreen page first.")
+            else:
+                _sv1, _sv2 = st.columns(2)
+                with _sv1:
+                    _rf_save_name = st.text_input(
+                        "Model name", placeholder="e.g. rf_v1_baseline", key="rf_save_name"
+                    )
+                with _sv2:
+                    _rf_save_desc = st.text_input(
+                        "Description (optional)", placeholder="Short note about this model", key="rf_save_desc"
+                    )
+
+                if st.button("Save model (.pkl) to project DB", type="primary", key="rf_save_db_btn"):
+                    if not _rf_save_name.strip():
+                        st.error("Please enter a model name before saving.")
+                    else:
+                        try:
+                            import pickle, datetime
+                            _pkl_bytes = pickle.dumps(st.session_state.rf_model)
+                            _ev = st.session_state.rf_eval_results
+                            _rpt = _ev["classification_report"]
+                            _roc = float(_ev["roc_auc"])
+                            _acc = float(_rpt["accuracy"])
+                            _f1  = float(_rpt["macro avg"]["f1-score"])
+                            _cv_mean = float(st.session_state.rf_cv_scores.mean()) if st.session_state.rf_cv_scores is not None else None
+                            _cv_std  = float(st.session_state.rf_cv_scores.std())  if st.session_state.rf_cv_scores is not None else None
+
+                            _models_dir = os.path.join(_save_project_path, "ml", "models")
+                            os.makedirs(_models_dir, exist_ok=True)
+                            _db_path = os.path.join(_models_dir, "rf_trained_models.db")
+
+                            _conn = sqlite3.connect(_db_path)
+                            _cur  = _conn.cursor()
+                            _cur.execute("""
+                                CREATE TABLE IF NOT EXISTS rf_trained_models (
+                                    model_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                                    model_name    TEXT NOT NULL,
+                                    description   TEXT,
+                                    roc_auc       REAL,
+                                    accuracy      REAL,
+                                    macro_f1      REAL,
+                                    cv_roc_mean   REAL,
+                                    cv_roc_std    REAL,
+                                    model_pkl     BLOB NOT NULL,
+                                    created_at    TEXT NOT NULL
+                                )
+                            """)
+                            _cur.execute(
+                                """INSERT INTO rf_trained_models
+                                   (model_name, description, roc_auc, accuracy, macro_f1,
+                                    cv_roc_mean, cv_roc_std, model_pkl, created_at)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                (
+                                    _rf_save_name.strip(),
+                                    _rf_save_desc.strip(),
+                                    _roc, _acc, _f1,
+                                    _cv_mean, _cv_std,
+                                    _pkl_bytes,
+                                    datetime.datetime.now().isoformat(timespec="seconds"),
+                                ),
+                            )
+                            _conn.commit()
+                            _new_id = _cur.lastrowid
+                            _conn.close()
+                            st.success(
+                                f"Model **'{_rf_save_name.strip()}'** saved as ID {_new_id} "
+                                f"in `{os.path.relpath(_db_path, _save_project_path)}`."
+                            )
+                        except Exception as _exc:
+                            st.error(f"Failed to save model: {_exc}")
