@@ -3298,6 +3298,12 @@ elif page == "RF model training":
             if not _save_project_path:
                 st.warning("No active project. Activate a project in the TidyScreen page first.")
             else:
+                _rf_snap_ref = st.session_state.get("rf_snap_select")
+                if _rf_snap_ref:
+                    st.caption(f"Training set snapshot linked to this model: **{_rf_snap_ref}**")
+                else:
+                    st.caption("Training set snapshot: *none* (model was trained from a CSV file)")
+
                 _sv1, _sv2 = st.columns(2)
                 with _sv1:
                     _rf_save_name = st.text_input(
@@ -3331,26 +3337,28 @@ elif page == "RF model training":
                             _cur  = _conn.cursor()
                             _cur.execute("""
                                 CREATE TABLE IF NOT EXISTS rf_trained_models (
-                                    model_id      INTEGER PRIMARY KEY AUTOINCREMENT,
-                                    model_name    TEXT NOT NULL,
-                                    description   TEXT,
-                                    roc_auc       REAL,
-                                    accuracy      REAL,
-                                    macro_f1      REAL,
-                                    cv_roc_mean   REAL,
-                                    cv_roc_std    REAL,
-                                    model_pkl     BLOB NOT NULL,
-                                    created_at    TEXT NOT NULL
+                                    model_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                                    model_name       TEXT NOT NULL,
+                                    description      TEXT,
+                                    training_set_id  TEXT,
+                                    roc_auc          REAL,
+                                    accuracy         REAL,
+                                    macro_f1         REAL,
+                                    cv_roc_mean      REAL,
+                                    cv_roc_std       REAL,
+                                    model_pkl        BLOB NOT NULL,
+                                    created_at       TEXT NOT NULL
                                 )
                             """)
                             _cur.execute(
                                 """INSERT INTO rf_trained_models
-                                   (model_name, description, roc_auc, accuracy, macro_f1,
+                                   (model_name, description, training_set_id, roc_auc, accuracy, macro_f1,
                                     cv_roc_mean, cv_roc_std, model_pkl, created_at)
-                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                                 (
                                     _rf_save_name.strip(),
                                     _rf_save_desc.strip(),
+                                    _rf_snap_ref,
                                     _roc, _acc, _f1,
                                     _cv_mean, _cv_std,
                                     _pkl_bytes,
