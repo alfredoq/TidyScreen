@@ -43,7 +43,7 @@ st.set_page_config(page_title="TidyScreen App", layout="wide")
 st.sidebar.title("Navigation")
 page = st.sidebar.radio(
     "Go to",
-    ("TidyScreen", "ChemSpace", "Receptors", "MolDock", "MolDyn", "ProLIF Conditions", "Analysis", "ML")
+    ("TidyScreen", "ChemSpace", "Receptors", "MolDock", "MolDyn", "ProLIF Conditions", "Analysis", "ML features management")
 )
 
 ## Persistent sidebar info: active project and assay
@@ -1871,7 +1871,7 @@ elif page == "Analysis":
                 
                 
     
-elif page == "ML":
+elif page == "ML features management":
     st.title("Machine Learning")
 
     if "active_project_path" not in st.session_state:
