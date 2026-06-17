@@ -917,3 +917,98 @@ class MachineLearning:
                 print("❌ Enter a valid number")
 
         print(f"\n✅ Selected assay: [{selected_assay['assay_id']}] {selected_assay['assay_name']}")
+
+        # ── 2. Select RF model ────────────────────────────────────────────────
+        model, model_meta = self._prompt_rf_model()
+        if model is None:
+            return
+
+        print(f"\n✅ Selected model: [{model_meta['model_id']}] {model_meta['model_name']}")
+
+    def _prompt_rf_model(self):
+        """
+        List trained RF models stored in the project and prompt the user to select one.
+
+        Returns (model, metadata_dict) where model is the deserialized sklearn object
+        and metadata_dict contains all non-blob columns.  Returns (None, None) on
+        cancel or error.
+        """
+        import pickle
+
+        rf_db_path = os.path.join(self.__ml_models_path, 'rf_trained_models.db')
+
+        if not os.path.exists(rf_db_path):
+            print(f"\n❌ No trained models found. Database not present: {rf_db_path}")
+            return None, None
+
+        try:
+            conn = sqlite3.connect(rf_db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                """SELECT model_id, model_name, description, training_set_id,
+                          roc_auc, accuracy, macro_f1, cv_roc_mean, cv_roc_std, created_at
+                   FROM rf_trained_models
+                   ORDER BY model_id ASC"""
+            )
+            rows = cursor.fetchall()
+            conn.close()
+        except Exception as e:
+            print(f"\n❌ Error reading RF models database: {e}")
+            return None, None
+
+        if not rows:
+            print("\n❌ No trained RF models found in the database.")
+            return None, None
+
+        columns = ('model_id', 'model_name', 'description', 'training_set_id',
+                   'roc_auc', 'accuracy', 'macro_f1', 'cv_roc_mean', 'cv_roc_std', 'created_at')
+
+        print(f"\n🤖 TRAINED RF MODELS IN PROJECT '{self.name}'")
+        print("=" * 70)
+        models_meta = []
+        for row in rows:
+            meta = dict(zip(columns, row))
+            models_meta.append(meta)
+            cv_str = (f"{meta['cv_roc_mean']:.4f} ± {meta['cv_roc_std']:.4f}"
+                      if meta['cv_roc_mean'] is not None else "—")
+            print(f"   {len(models_meta)}. [{meta['model_id']}] {meta['model_name']}")
+            print(f"        ROC-AUC: {meta['roc_auc']:.4f}  Accuracy: {meta['accuracy']:.4f}"
+                  f"  Macro-F1: {meta['macro_f1']:.4f}  CV ROC-AUC: {cv_str}")
+            print(f"        Training set: {meta['training_set_id'] or '—'}"
+                  f"   Created: {meta['created_at']}")
+            if meta['description']:
+                print(f"        Description: {meta['description']}")
+        print("=" * 70)
+
+        while True:
+            try:
+                sel = input("\nSelect model (number or 'c' to cancel): ").strip()
+                if sel.lower() == 'c':
+                    print("❌ Operation cancelled.")
+                    return None, None
+                idx = int(sel) - 1
+                if 0 <= idx < len(models_meta):
+                    selected_meta = models_meta[idx]
+                    break
+                print(f"❌ Enter a number between 1 and {len(models_meta)}")
+            except ValueError:
+                print("❌ Enter a valid number")
+
+        try:
+            conn = sqlite3.connect(rf_db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT model_pkl FROM rf_trained_models WHERE model_id = ?",
+                (selected_meta['model_id'],)
+            )
+            row = cursor.fetchone()
+            conn.close()
+            if not row or not row[0]:
+                print(f"\n❌ Model blob missing for model_id {selected_meta['model_id']}")
+                return None, None
+            model = pickle.loads(row[0])
+        except Exception as e:
+            print(f"\n❌ Failed to load model: {e}")
+            return None, None
+
+        return model, selected_meta
