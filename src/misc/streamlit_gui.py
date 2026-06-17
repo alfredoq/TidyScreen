@@ -8,6 +8,19 @@ import json
 import sqlite3
 import py3Dmol
 import streamlit_functions as st_funcs
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import joblib
+from rf_classifier import (
+    evaluate_model,
+    feature_importances,
+    prepare_features,
+    split_data,
+    train_baseline,
+    tune_hyperparameters,
+)
 
 tidyscreen_package_path = sys.argv[1]
 
@@ -35,6 +48,72 @@ def _toggle_ts_set_viewer():
 def _toggle_ts_snapshot_inspector():
     key = "show_ts_snapshot_inspector"
     st.session_state[key] = not st.session_state.get(key, False)
+
+
+# ── GridSearch hyperparameter input callbacks ──────────────────────────────
+# Each callback parses the text input, appends new values to the accumulated
+# list, then clears the input box.  Defined at module level so they are
+# available before the page block executes.
+
+def _gs_cb_n_est():
+    raw = st.session_state.get("rf_gs_n_est_extra", "").strip()
+    if raw:
+        new_vals = [int(t.strip()) for t in raw.split(",") if t.strip().lstrip("-").isdigit()]
+        if new_vals:
+            acc = st.session_state.get("rf_gs_n_est_accum", [])
+            st.session_state["rf_gs_n_est_accum"] = list(dict.fromkeys(acc + new_vals))
+    st.session_state["rf_gs_n_est_extra"] = ""
+
+
+def _gs_cb_depth():
+    raw = st.session_state.get("rf_gs_depth_extra", "").strip()
+    if raw:
+        new_vals = []
+        for token in raw.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            if token.lower() == "none":
+                new_vals.append("None")
+            else:
+                try:
+                    new_vals.append(str(int(token)))
+                except ValueError:
+                    pass
+        if new_vals:
+            acc = st.session_state.get("rf_gs_depth_accum", [])
+            st.session_state["rf_gs_depth_accum"] = list(dict.fromkeys(acc + new_vals))
+    st.session_state["rf_gs_depth_extra"] = ""
+
+
+def _gs_cb_split():
+    raw = st.session_state.get("rf_gs_split_extra", "").strip()
+    if raw:
+        new_vals = [int(t.strip()) for t in raw.split(",") if t.strip().lstrip("-").isdigit()]
+        if new_vals:
+            acc = st.session_state.get("rf_gs_split_accum", [])
+            st.session_state["rf_gs_split_accum"] = list(dict.fromkeys(acc + new_vals))
+    st.session_state["rf_gs_split_extra"] = ""
+
+
+def _gs_cb_leaf():
+    raw = st.session_state.get("rf_gs_leaf_extra", "").strip()
+    if raw:
+        new_vals = [int(t.strip()) for t in raw.split(",") if t.strip().lstrip("-").isdigit()]
+        if new_vals:
+            acc = st.session_state.get("rf_gs_leaf_accum", [])
+            st.session_state["rf_gs_leaf_accum"] = list(dict.fromkeys(acc + new_vals))
+    st.session_state["rf_gs_leaf_extra"] = ""
+
+
+def _gs_cb_feat():
+    raw = st.session_state.get("rf_gs_feat_extra", "").strip()
+    if raw:
+        new_vals = [t.strip() for t in raw.split(",") if t.strip()]
+        if new_vals:
+            acc = st.session_state.get("rf_gs_feat_accum", [])
+            st.session_state["rf_gs_feat_accum"] = list(dict.fromkeys(acc + new_vals))
+    st.session_state["rf_gs_feat_extra"] = ""
 
 
 st.set_page_config(page_title="TidyScreen App", layout="wide")
@@ -2861,4 +2940,354 @@ elif page == "ML features management":
 
 elif page == "RF model training":
     st.title("RF model training")
-    st.info("RF model training functionality coming soon.")
+
+    # ── Session state defaults ─────────────────────────────────────────────
+    for _k in ("rf_df", "rf_model", "rf_eval_results", "rf_fi", "rf_cv_scores",
+               "rf_best_params", "rf_best_cv_score"):
+        if _k not in st.session_state:
+            st.session_state[_k] = None
+
+    # ── Helpers for parsing custom hyperparameter values ──────────────────
+    def _rf_parse_ints(text):
+        result = []
+        for token in text.split(","):
+            token = token.strip()
+            if token:
+                try:
+                    result.append(int(token))
+                except ValueError:
+                    st.warning(f"Ignored invalid integer value: '{token}'")
+        return result
+
+    def _rf_parse_depth(text):
+        result = []
+        for token in text.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            if token.lower() == "none":
+                result.append("None")
+            else:
+                try:
+                    result.append(str(int(token)))
+                except ValueError:
+                    st.warning(f"Ignored invalid max_depth value: '{token}'")
+        return result
+
+    def _rf_parse_strs(text):
+        return [t.strip() for t in text.split(",") if t.strip()]
+
+    def _rf_combine(selected, extra):
+        return list(dict.fromkeys(selected + extra))
+
+    # ── Tabs ──────────────────────────────────────────────────────────────
+    rf_tab_data, rf_tab_train, rf_tab_results = st.tabs(["Data", "Training", "Results"])
+
+    # ══ Tab 1 — Data ══════════════════════════════════════════════════════
+    with rf_tab_data:
+        st.subheader("Load Dataset")
+        source = st.radio(
+            "Data source",
+            ["TidyScreen training set", "CSV file"],
+            horizontal=True,
+            key="rf_data_source",
+        )
+
+        if source == "TidyScreen training set":
+            project_path = st.session_state.get("active_project_path")
+            if not project_path:
+                st.warning("No active project. Activate a project in the TidyScreen page first.")
+            else:
+                df_snaps = st_funcs.get_training_set_snapshots(project_path)
+                if df_snaps is None or df_snaps.empty:
+                    st.warning("No training set snapshots found for this project.")
+                else:
+                    snap_ids = df_snaps["training_set_id"].tolist()
+                    selected_snap = st.selectbox("Training set snapshot", snap_ids, key="rf_snap_select")
+                    fp_status = st_funcs.get_training_set_fingerprint_status(project_path)
+                    st.caption(f"Fingerprint status: {fp_status.get(selected_snap, '❌ None')}")
+                    if st.button("Load fingerprints", key="rf_load_btn"):
+                        csv_bytes = st_funcs.export_training_set_fingerprints_as_csv_bytes(project_path, selected_snap)
+                        if csv_bytes is None:
+                            st.error("No fingerprints found for this snapshot. Compute fingerprints first in the ML features management page.")
+                        else:
+                            st.session_state.rf_df = pd.read_csv(io.BytesIO(csv_bytes))
+                            st.success(f"Loaded fingerprints from snapshot '{selected_snap}'.")
+
+        else:
+            file_path = st.text_input("CSV file path", placeholder="/path/to/dataset.csv", key="rf_csv_path")
+            uploaded = st.file_uploader("… or upload CSV", type="csv", key="rf_csv_upload")
+            if file_path:
+                try:
+                    st.session_state.rf_df = pd.read_csv(file_path)
+                except FileNotFoundError:
+                    st.error(f"File not found: {file_path}")
+                except Exception as exc:
+                    st.error(f"Could not read file: {exc}")
+            elif uploaded is not None:
+                st.session_state.rf_df = pd.read_csv(uploaded)
+
+        if st.session_state.rf_df is not None:
+            _df = st.session_state.rf_df
+            st.success(f"Dataset loaded — {_df.shape[0]:,} rows × {_df.shape[1]} columns")
+            st.markdown("---")
+            st.subheader("Dataset Overview")
+            st.dataframe(_df, use_container_width=True)
+            st.markdown("---")
+            ov1, ov2 = st.columns(2)
+            with ov1:
+                st.markdown("**Class counts**")
+                _label_preview = "label" if "label" in _df.columns else _df.columns[-1]
+                counts = _df[_label_preview].value_counts().reset_index()
+                counts.columns = ["Class", "Count"]
+                st.bar_chart(counts.set_index("Class")["Count"])
+                st.dataframe(counts, use_container_width=True, hide_index=True)
+            with ov2:
+                st.markdown("**Column info**")
+                _info = pd.DataFrame({
+                    "Column":   _df.columns,
+                    "dtype":    _df.dtypes.astype(str).values,
+                    "non-null": _df.notna().sum().values,
+                    "null":     _df.isna().sum().values,
+                })
+                st.dataframe(_info, use_container_width=True, hide_index=True)
+
+    # ══ Tab 2 — Training ══════════════════════════════════════════════════
+    with rf_tab_train:
+        _df_train = st.session_state.rf_df
+        if _df_train is None:
+            st.info("Please load a dataset in the **Data** tab first.")
+        else:
+            all_cols = _df_train.columns.tolist()
+
+            st.subheader("Configuration")
+            cfg1, cfg2 = st.columns(2)
+            with cfg1:
+                st.markdown("**Dataset columns**")
+                _default_label_idx = all_cols.index("label") if "label" in all_cols else 0
+                label_col = st.selectbox("Label column", all_cols, index=_default_label_idx, key="rf_label_col")
+                _candidate_drop = [c for c in all_cols if c != label_col]
+                _default_drop = [c for c in ("ligpose",) if c in _candidate_drop]
+                drop_cols = st.multiselect("Extra columns to drop", _candidate_drop, default=_default_drop, key="rf_drop_cols")
+            with cfg2:
+                st.markdown("**Train / Test Split**")
+                test_size = st.slider("Test set fraction", 0.10, 0.40, 0.20, 0.05, format="%.2f", key="rf_test_size")
+                random_state = int(st.number_input("Random state", 0, 9999, 42, step=1, key="rf_random_state"))
+                st.markdown("**Cross-Validation**")
+                cv_folds = st.slider("Number of folds", 3, 10, 5, key="rf_cv_folds")
+                st.markdown("**Feature Importances**")
+                top_n = st.slider("Top N features", 5, 50, 20, key="rf_top_n")
+
+            st.markdown("**Model Parameters**")
+            use_gridsearch = st.checkbox("Hyperparameter tuning (GridSearchCV)", value=False, key="rf_use_gridsearch")
+
+            if not use_gridsearch:
+                bp1, bp2 = st.columns(2)
+                with bp1:
+                    n_estimators      = int(st.number_input("n_estimators",      min_value=10,  max_value=5000, value=200, step=10, key="rf_n_est"))
+                    min_samples_split = int(st.number_input("min_samples_split", min_value=2,   max_value=50,   value=2,   step=1,  key="rf_min_split"))
+                    min_samples_leaf  = int(st.number_input("min_samples_leaf",  min_value=1,   max_value=50,   value=1,   step=1,  key="rf_min_leaf"))
+                with bp2:
+                    max_features    = st.selectbox("max_features", ["sqrt", "log2"], key="rf_max_features")
+                    unlimited_depth = st.checkbox("max_depth = None (unlimited)", value=True, key="rf_unlimited_depth")
+                    max_depth = None if unlimited_depth else int(st.number_input("max_depth", min_value=1, max_value=200, value=10, step=1, key="rf_max_depth"))
+
+            if use_gridsearch:
+                with st.expander("Hyperparameter Grid", expanded=True):
+                    st.caption("Type custom values (comma-separated) and press Enter — they are added as selected chips and the box is cleared.")
+                    h1, h2 = st.columns(2)
+                    with h1:
+                        # ── n_estimators ──────────────────────────────────
+                        _n_est_extra = st.session_state.get("rf_gs_n_est_accum", [])
+                        _n_est_opts  = sorted(set([100, 200, 500] + _n_est_extra))
+                        _n_est_prev  = sorted(set(v for v in st.session_state.get("rf_gs_n_est", [100, 200, 500]) if v in _n_est_opts))
+                        st.session_state["rf_gs_n_est"] = sorted(set(_n_est_prev + _n_est_extra))
+                        _n_est_sel   = st.multiselect("n_estimators", _n_est_opts, key="rf_gs_n_est")
+                        st.text_input("Add n_estimators", placeholder="e.g. 300, 1000", key="rf_gs_n_est_extra", on_change=_gs_cb_n_est)
+
+                        # ── max_depth (numeric sort, "None" last) ─────────
+                        _depth_extra = st.session_state.get("rf_gs_depth_accum", [])
+                        _depth_all   = list(dict.fromkeys(["None", "10", "20"] + _depth_extra))
+                        _depth_opts  = sorted((v for v in _depth_all if v != "None"), key=int) + (["None"] if "None" in _depth_all else [])
+                        _depth_prev  = [v for v in st.session_state.get("rf_gs_depth", ["None", "10", "20"]) if v in _depth_opts]
+                        _depth_merged = list(dict.fromkeys(_depth_prev + _depth_extra))
+                        st.session_state["rf_gs_depth"] = sorted((v for v in _depth_merged if v != "None"), key=int) + (["None"] if "None" in _depth_merged else [])
+                        _depth_sel   = st.multiselect("max_depth", _depth_opts, key="rf_gs_depth")
+                        st.text_input("Add max_depth", placeholder="e.g. 5, 30, None", key="rf_gs_depth_extra", on_change=_gs_cb_depth)
+
+                        # ── min_samples_split ─────────────────────────────
+                        _split_extra = st.session_state.get("rf_gs_split_accum", [])
+                        _split_opts  = sorted(set([2, 5, 10] + _split_extra))
+                        _split_prev  = sorted(set(v for v in st.session_state.get("rf_gs_split", [2, 5, 10]) if v in _split_opts))
+                        st.session_state["rf_gs_split"] = sorted(set(_split_prev + _split_extra))
+                        _split_sel   = st.multiselect("min_samples_split", _split_opts, key="rf_gs_split")
+                        st.text_input("Add min_samples_split", placeholder="e.g. 3, 7", key="rf_gs_split_extra", on_change=_gs_cb_split)
+
+                    with h2:
+                        # ── min_samples_leaf ──────────────────────────────
+                        _leaf_extra  = st.session_state.get("rf_gs_leaf_accum", [])
+                        _leaf_opts   = sorted(set([1, 2, 4] + _leaf_extra))
+                        _leaf_prev   = sorted(set(v for v in st.session_state.get("rf_gs_leaf", [1, 2, 4]) if v in _leaf_opts))
+                        st.session_state["rf_gs_leaf"] = sorted(set(_leaf_prev + _leaf_extra))
+                        _leaf_sel    = st.multiselect("min_samples_leaf", _leaf_opts, key="rf_gs_leaf")
+                        st.text_input("Add min_samples_leaf", placeholder="e.g. 3, 6", key="rf_gs_leaf_extra", on_change=_gs_cb_leaf)
+
+                        # ── max_features (alphabetical) ───────────────────
+                        _feat_extra  = st.session_state.get("rf_gs_feat_accum", [])
+                        _feat_opts   = sorted(set(["sqrt", "log2"] + _feat_extra))
+                        _feat_prev   = sorted(set(v for v in st.session_state.get("rf_gs_feat", ["sqrt", "log2"]) if v in _feat_opts))
+                        st.session_state["rf_gs_feat"] = sorted(set(_feat_prev + _feat_extra))
+                        _feat_sel    = st.multiselect("max_features", _feat_opts, key="rf_gs_feat")
+                        st.text_input("Add max_features", placeholder="e.g. 0.5, 0.8", key="rf_gs_feat_extra", on_change=_gs_cb_feat)
+
+            st.markdown("---")
+            if st.button("Train Model", type="primary", key="rf_train_btn"):
+                X, y = prepare_features(_df_train, label_col=label_col, drop_cols=drop_cols)
+                X_train, X_test, y_train, y_test = split_data(X, y, test_size=test_size, random_state=random_state)
+
+                if use_gridsearch:
+                    _depth_vals = [None if v == "None" else int(v) for v in _depth_sel]
+                    param_grid = {
+                        "n_estimators":      _n_est_sel,
+                        "max_depth":         _depth_vals,
+                        "min_samples_split": _split_sel,
+                        "min_samples_leaf":  _leaf_sel,
+                        "max_features":      _feat_sel,
+                    }
+                    with st.spinner("Running GridSearchCV — this may take several minutes…"):
+                        model, best_params, best_cv_score = tune_hyperparameters(
+                            X_train, y_train, param_grid=param_grid, cv=cv_folds, random_state=random_state,
+                        )
+                    st.session_state.rf_cv_scores     = None
+                    st.session_state.rf_best_params   = best_params
+                    st.session_state.rf_best_cv_score = best_cv_score
+                else:
+                    with st.spinner("Training baseline model…"):
+                        model, cv_scores = train_baseline(
+                            X_train, y_train,
+                            n_estimators=n_estimators,
+                            max_depth=max_depth,
+                            min_samples_split=min_samples_split,
+                            min_samples_leaf=min_samples_leaf,
+                            max_features=max_features,
+                            cv=cv_folds,
+                            random_state=random_state,
+                        )
+                    st.session_state.rf_cv_scores     = cv_scores
+                    st.session_state.rf_best_params   = None
+                    st.session_state.rf_best_cv_score = None
+
+                st.session_state.rf_eval_results = evaluate_model(model, X_test, y_test)
+                st.session_state.rf_fi           = feature_importances(model, X.columns.tolist(), top_n=top_n)
+                st.session_state.rf_model        = model
+                st.success("Model trained successfully! See the **Results** tab.")
+
+    # ══ Tab 3 — Results ═══════════════════════════════════════════════════
+    with rf_tab_results:
+        if st.session_state.rf_model is None:
+            st.info("Train a model in the **Training** tab first.")
+        else:
+            ev     = st.session_state.rf_eval_results
+            fi     = st.session_state.rf_fi
+            report = ev["classification_report"]
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Test ROC-AUC", f"{ev['roc_auc']:.4f}")
+            m2.metric("Accuracy",     f"{report['accuracy']:.4f}")
+            m3.metric("Macro F1",     f"{report['macro avg']['f1-score']:.4f}")
+            if st.session_state.rf_cv_scores is not None:
+                _cv = st.session_state.rf_cv_scores
+                m4.metric("Mean CV ROC-AUC", f"{_cv.mean():.4f} ± {_cv.std():.4f}")
+            elif st.session_state.rf_best_cv_score is not None:
+                m4.metric("Best CV ROC-AUC", f"{st.session_state.rf_best_cv_score:.4f}")
+
+            st.markdown("---")
+
+            if st.session_state.rf_cv_scores is not None:
+                st.subheader("Cross-Validation ROC-AUC per Fold")
+                cv_arr = st.session_state.rf_cv_scores
+                cv_df  = pd.DataFrame({
+                    "Fold":    [f"Fold {i + 1}" for i in range(len(cv_arr))],
+                    "ROC-AUC": cv_arr,
+                })
+                fig, ax = plt.subplots(figsize=(7, 3))
+                ax.bar(cv_df["Fold"], cv_df["ROC-AUC"], color="steelblue", edgecolor="white")
+                ax.axhline(cv_arr.mean(), color="crimson", linestyle="--", linewidth=1.5,
+                           label=f"Mean = {cv_arr.mean():.4f}")
+                ax.set_ylim(max(0, cv_arr.min() - 0.05), min(1.0, cv_arr.max() + 0.05))
+                ax.set_ylabel("ROC-AUC")
+                ax.legend()
+                ax.spines[["top", "right"]].set_visible(False)
+                st.pyplot(fig)
+                plt.close(fig)
+
+            if st.session_state.rf_best_params is not None:
+                st.subheader("Best Hyperparameters (GridSearchCV)")
+                bp_df = pd.DataFrame(st.session_state.rf_best_params.items(), columns=["Parameter", "Value"])
+                st.dataframe(bp_df, use_container_width=True, hide_index=True)
+
+            st.markdown("---")
+
+            col_cm, col_fi = st.columns(2)
+            with col_cm:
+                st.subheader("Confusion Matrix")
+                cm = ev["confusion_matrix"]
+                fig, ax = plt.subplots(figsize=(4, 3))
+                sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", cbar=False, linewidths=0.5, ax=ax)
+                ax.set_xlabel("Predicted label")
+                ax.set_ylabel("True label")
+                fig.tight_layout()
+                st.pyplot(fig)
+                plt.close(fig)
+            with col_fi:
+                st.subheader(f"Top {len(fi)} Feature Importances")
+                fig, ax = plt.subplots(figsize=(5, max(3, len(fi) * 0.28)))
+                colors = plt.cm.viridis_r(np.linspace(0.2, 0.85, len(fi)))
+                ax.barh(fi.index[::-1], fi.values[::-1], color=colors[::-1])
+                ax.set_xlabel("Mean decrease in impurity")
+                ax.spines[["top", "right"]].set_visible(False)
+                fig.tight_layout()
+                st.pyplot(fig)
+                plt.close(fig)
+
+            st.subheader("Classification Report")
+            _rows = [{"class": cls, **vals} for cls, vals in report.items() if isinstance(vals, dict)]
+            rep_df = (
+                pd.DataFrame(_rows)
+                .set_index("class")
+                .rename(columns={"precision": "Precision", "recall": "Recall",
+                                 "f1-score": "F1-score", "support": "Support"})
+            )
+            rep_df["Support"] = rep_df["Support"].astype(int)
+            st.dataframe(
+                rep_df.style.format({"Precision": "{:.4f}", "Recall": "{:.4f}", "F1-score": "{:.4f}"}),
+                use_container_width=True,
+            )
+
+            st.subheader("Feature Importance Table")
+            fi_df = fi.reset_index()
+            fi_df.columns = ["Feature", "Importance"]
+            fi_df.insert(0, "Rank", range(1, len(fi_df) + 1))
+            st.dataframe(
+                fi_df.style.format({"Importance": "{:.6f}"}),
+                use_container_width=True, hide_index=True, height=400,
+            )
+            st.download_button(
+                "Download feature importances (.csv)",
+                data=fi_df.to_csv(index=False).encode(),
+                file_name="feature_importances.csv",
+                mime="text/csv",
+                key="rf_dl_fi",
+            )
+
+            st.markdown("---")
+            st.subheader("Export Trained Model")
+            _buf = io.BytesIO()
+            joblib.dump(st.session_state.rf_model, _buf)
+            st.download_button(
+                label="Download model (.joblib)",
+                data=_buf.getvalue(),
+                file_name="rf_model.joblib",
+                mime="application/octet-stream",
+                key="rf_dl_model",
+            )
