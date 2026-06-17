@@ -7936,9 +7936,9 @@ class MolDock:
         receptor_main_path = self.__receptor_path + f"/{receptor_info.get('pdb_name', None)}"
         receptor_charge_model = receptor_info.get('configs', None).get('receptor_charge_model', 'unknown')
         #receptor_pdbqt_file = receptor_main_path + f"/processed/receptor_checked.pdbqt"
-        receptor_pdbqt_file = receptor_info.get('pdbqt_file', None)
+        receptor_pdbqt_file = self._remap_project_path(receptor_info.get('pdbqt_file', None))
         #fld_file = receptor_main_path + f"/grid_files/receptor_checked.maps.fld"
-        grids_path = receptor_info.get('configs', None).get('grids_path', None)
+        grids_path = self._remap_project_path(receptor_info.get('configs', None).get('grids_path', None))
         fld_file = grids_path + f"/receptor_checked_{receptor_charge_model}.maps.fld"
         assay_folder = assay_registry['assay_folder_path']
     
@@ -9589,20 +9589,20 @@ class MolDock:
         # Select the receptor to be used for docking
         receptor_conditions = self._get_receptor_conditions(receptor_info.get('id', None))
         
-        receptor_pdbqt_file = receptor_info.get('pdbqt_file', None)
+        receptor_pdbqt_file = self._remap_project_path(receptor_info.get('pdbqt_file', None))
         charge_model = receptor_info.get('configs', None).get('receptor_charge_model', None)
-        grids_path = receptor_info.get('grids_path', None)
+        grids_path = self._remap_project_path(receptor_info.get('configs', {}).get('grids_path', None))
         fld_file = f"{grids_path}/receptor_checked_{charge_model}.maps.fld"
         assay_folder = assay_registry['assay_folder_path']
 
         if not receptor_pdbqt_file:
             print("❌ No receptor .pdbqt file found.")
             return
-        
+
         if not fld_file:
             print("❌ No receptor .maps.fld file found.")
             return
-            
+
         # Connect to chemspace database and get compounds
         try:
             conn = sqlite3.connect(self.__chemspace_db)
@@ -9629,7 +9629,7 @@ class MolDock:
             progress_bar = tqdm(total=len(compounds), desc="Docking compounds", unit="ligand")
 
         ## If 'vina' scoring function is to be applied, compute the maps once for batch docking
-        if method_params['sf_name'] == 'vina':          
+        if method_params['sf_name'] == 'vina':
             vina_rec_object = self._prepare_vina_receptor(method_params, receptor_pdbqt_file, receptor_conditions)
         elif method_params['sf_name'] == 'ad4':
             vina_rec_object = None
@@ -9700,20 +9700,20 @@ class MolDock:
         # Select the receptor to be used for docking
         receptor_conditions = self._get_receptor_conditions(receptor_info.get('id', None))
         
-        receptor_pdbqt_file = receptor_info.get('pdbqt_file', None)
+        receptor_pdbqt_file = self._remap_project_path(receptor_info.get('pdbqt_file', None))
         charge_model = receptor_info.get('configs', None).get('receptor_charge_model', None)
-        grids_path = receptor_info.get('grids_path', None)
+        grids_path = self._remap_project_path(receptor_info.get('configs', {}).get('grids_path', None))
         fld_file = f"{grids_path}/receptor_checked_{charge_model}.maps.fld"
         assay_folder = assay_registry['assay_folder_path']
 
         if not receptor_pdbqt_file:
             print("❌ No receptor .pdbqt file found.")
             return
-        
+
         if not fld_file:
             print("❌ No receptor .maps.fld file found.")
             return
-            
+
         # Connect to chemspace database and get compounds
         try:
             conn = sqlite3.connect(self.__chemspace_db)
@@ -9740,16 +9740,16 @@ class MolDock:
             progress_bar = tqdm(total=len(compounds), desc="Docking compounds", unit="ligand")
 
         ## If 'vina' scoring function is to be applied, compute the maps once for batch docking
-        if method_params['sf_name'] == 'vina':          
+        if method_params['sf_name'] == 'vina':
             unidock_cmd = "unidock --scoring vina "
-        
+
         elif method_params['sf_name'] == 'ad4':
             unidock_cmd = "unidock --scoring ad4 "
 
             # Append the maps prefix to the command
-            maps_path = receptor_info["configs"]["grids_path"]
+            maps_path = grids_path
             maps_prefix = f"{maps_path}/receptor_checked_{charge_model} "
-            unidock_cmd += f"--maps {maps_prefix} " 
+            unidock_cmd += f"--maps {maps_prefix} "
 
         # Iterate and dock each compound
         for idx, (inchi_key, sdf_blob) in enumerate(compounds, 1):
@@ -9818,20 +9818,20 @@ class MolDock:
         # Select the receptor to be used for docking
         receptor_conditions = self._get_receptor_conditions(receptor_info.get('id', None))
         
-        receptor_pdbqt_file = receptor_info.get('pdbqt_file', None)
+        receptor_pdbqt_file = self._remap_project_path(receptor_info.get('pdbqt_file', None))
         charge_model = receptor_info.get('configs', None).get('receptor_charge_model', None)
-        grids_path = receptor_info.get('grids_path', None)
+        grids_path = self._remap_project_path(receptor_info.get('configs', {}).get('grids_path', None))
         fld_file = f"{grids_path}/receptor_checked_{charge_model}.maps.fld"
         assay_folder = assay_registry['assay_folder_path']
 
         if not receptor_pdbqt_file:
             print("❌ No receptor .pdbqt file found.")
             return
-        
+
         if not fld_file:
             print("❌ No receptor .maps.fld file found.")
             return
-            
+
         # Connect to chemspace database and get compounds
         try:
             conn = sqlite3.connect(self.__chemspace_db)
@@ -9853,16 +9853,16 @@ class MolDock:
         docking_results_dir = f"{assay_folder}/results"
 
         ## If 'vina' scoring function is to be applied, compute the maps once for batch docking
-        if method_params['sf_name'] == 'vina':          
+        if method_params['sf_name'] == 'vina':
             unidock_cmd = "unidock --scoring vina "
-        
+
         elif method_params['sf_name'] == 'ad4':
             unidock_cmd = "unidock --scoring ad4 "
 
             # Append the maps prefix to the command
-            maps_path = receptor_info["configs"]["grids_path"]
+            maps_path = grids_path
             maps_prefix = f"{maps_path}/receptor_checked_{charge_model} "
-            unidock_cmd += f"--maps {maps_prefix} " 
+            unidock_cmd += f"--maps {maps_prefix} "
 
         # Iterate and dock each compound
         for idx, (inchi_key, sdf_blob) in enumerate(compounds, 1):
@@ -9991,9 +9991,9 @@ class MolDock:
                 vina_rec_object = Vina(sf_name = method_params['sf_name'])
                 
                 # Determine the grids files path
-                grid_maps_path = receptor_conditions.get('configs', None).get('grids_path', None)
+                grid_maps_path = self._remap_project_path(receptor_conditions.get('configs', None).get('grids_path', None))
                 receptor_charge_model = receptor_conditions.get('configs', None).get('receptor_charge_model', None)
-                grid_files_prefix = f"{grid_maps_path}/receptor_checked_{receptor_charge_model}" 
+                grid_files_prefix = f"{grid_maps_path}/receptor_checked_{receptor_charge_model}"
 
                 vina_rec_object.load_maps(grid_files_prefix)
                 
