@@ -845,3 +845,75 @@ class MachineLearning:
         )
         conn.commit()
         conn.close()
+
+    # -------------------------------------------------------------------------
+    # RF predictions on docking assays
+    # -------------------------------------------------------------------------
+
+    def make_rf_predictions_on_docking_assay(self):
+        """
+        Apply a trained RF model to all poses in a selected docking assay.
+
+        The user is prompted to select a docking assay from the project registry.
+        Further steps (model selection, fingerprint computation, prediction) will
+        be added incrementally.
+        """
+
+        if not os.path.exists(self.__docking_assays_db):
+            print(f"\n❌ Docking assays database not found: {self.__docking_assays_db}")
+            return
+
+        try:
+            conn = sqlite3.connect(self.__docking_assays_db)
+            cursor = conn.cursor()
+            cursor.execute(
+                """SELECT assay_id, assay_name, table_name, assay_folder_path, receptor_info
+                   FROM docking_assays
+                   WHERE project_name = ?
+                   ORDER BY assay_id ASC""",
+                (self.name,)
+            )
+            rows = cursor.fetchall()
+            conn.close()
+        except Exception as e:
+            print(f"\n❌ Error reading docking assays: {e}")
+            return
+
+        if not rows:
+            print("\n❌ No docking assays found for this project.")
+            return
+
+        print(f"\n🧬 DOCKING ASSAYS IN PROJECT '{self.name}'")
+        print("=" * 70)
+        assays = []
+        for assay_id, assay_name, table_name, assay_folder_path, receptor_info_json in rows:
+            try:
+                receptor_info = json.loads(receptor_info_json) if receptor_info_json else {}
+            except Exception:
+                receptor_info = {}
+            assay = {
+                'assay_id': assay_id,
+                'assay_name': assay_name,
+                'table_name': table_name,
+                'assay_folder_path': self._remap_project_path(assay_folder_path),
+                'receptor_info': receptor_info,
+            }
+            assays.append(assay)
+            print(f"   {len(assays)}. [{assay_id}] {assay_name}  (table: {table_name})")
+        print("=" * 70)
+
+        while True:
+            try:
+                sel = input("\nSelect docking assay (number or 'c' to cancel): ").strip()
+                if sel.lower() == 'c':
+                    print("❌ Operation cancelled.")
+                    return
+                idx = int(sel) - 1
+                if 0 <= idx < len(assays):
+                    selected_assay = assays[idx]
+                    break
+                print(f"❌ Enter a number between 1 and {len(assays)}")
+            except ValueError:
+                print("❌ Enter a valid number")
+
+        print(f"\n✅ Selected assay: [{selected_assay['assay_id']}] {selected_assay['assay_name']}")
