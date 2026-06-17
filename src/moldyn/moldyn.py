@@ -604,6 +604,8 @@ class MolDyn:
 
             # Create MD assay folder structure and prepare input files for the selected MD engine
             md_assay_id, md_assay_folder = self._create_md_assay_folder()
+            if md_assay_id is None:
+                return
 
             # Save the docked pose PDB file in the MD assay folder
             selected_pose_pdb = lm.write_pdb_with_moldf(pdb_dict, docking_assay_params_dict.get('selected_ligand_name'), docking_assay_params_dict.get('selected_pose_id'), md_assay_folder)
@@ -804,11 +806,20 @@ class MolDyn:
         new_assay_folder = os.path.join(self.__md_assays_folder, f'md_assay_{new_assay_id}')
         try:
             os.makedirs(new_assay_folder, exist_ok=False)
-            print(f"✅ Created MD assay folder: {new_assay_folder}")
-            # Further input file preparation can be implemented here
-            return new_assay_id, new_assay_folder
+        except FileExistsError:
+            print(f"⚠️  MD assay folder already exists: {new_assay_folder}")
+            confirm = input("🗑️  Delete existing folder and continue? (yes/no) [default: no]: ").strip().lower() or 'no'
+            if confirm not in ['yes', 'y']:
+                print("❌ MD assay creation cancelled.")
+                return None, None
+            import shutil
+            shutil.rmtree(new_assay_folder)
+            os.makedirs(new_assay_folder)
         except Exception as e:
             print(f"❌ Error creating MD assay folder: {e}")
+            return None, None
+        print(f"✅ Created MD assay folder: {new_assay_folder}")
+        return new_assay_id, new_assay_folder
 
     def _get_last_md_assay_id(self):
         """Retrieve the last MD assay ID from the MD registers database."""
@@ -900,9 +911,17 @@ class MolDyn:
 
         # get the .pdbqt used for docking
         receptor_pdb = receptor_details.get('pdbqt_file', None)
-        
+
+        # Remap stored absolute path to the current project location so that
+        # imported projects (whose original path differs) work correctly.
+        if receptor_pdb:
+            anchor = 'docking/receptors'
+            if anchor in receptor_pdb:
+                rel_part = receptor_pdb[receptor_pdb.index(anchor):]
+                receptor_pdb = os.path.join(self.path, rel_part)
+
         # Define the raw .pdb file of the receptor
-        receptor_pdb_path = '/'.join(receptor_pdb.split('/')[:-1]) + '/receptor_checked.pdb'
+        receptor_pdb_path = os.path.join(os.path.dirname(receptor_pdb), 'receptor_checked.pdb')
 
         # # Create tleap input file to load receptor and ligand
         tleap_in_file = os.path.join(output_dir, "complex.in")
