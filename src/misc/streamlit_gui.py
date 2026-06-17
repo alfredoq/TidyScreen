@@ -43,7 +43,7 @@ st.set_page_config(page_title="TidyScreen App", layout="wide")
 st.sidebar.title("Navigation")
 page = st.sidebar.radio(
     "Go to",
-    ("TidyScreen", "ChemSpace", "Receptors", "MolDock", "MolDyn", "ProLIF Conditions", "Analysis", "ML features management")
+    ("TidyScreen", "ChemSpace", "Receptors", "MolDock", "MolDyn", "ProLIF Conditions", "Analysis", "ML features management", "RF model training")
 )
 
 ## Persistent sidebar info: active project and assay
@@ -2858,3 +2858,7 @@ elif page == "ML features management":
 
                         else:
                             st.warning(f"Pose file not found on disk: {full_path_ts}")
+
+elif page == "RF model training":
+    st.title("RF model training")
+    st.info("RF model training functionality coming soon.")
