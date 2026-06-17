@@ -2981,7 +2981,7 @@ elif page == "RF model training":
         return list(dict.fromkeys(selected + extra))
 
     # ── Tabs ──────────────────────────────────────────────────────────────
-    rf_tab_data, rf_tab_train, rf_tab_results = st.tabs(["Data", "Training", "Results"])
+    rf_tab_data, rf_tab_train, rf_tab_results, rf_tab_stored = st.tabs(["Data", "Training", "Results", "Stored models"])
 
     # ══ Tab 1 — Data ══════════════════════════════════════════════════════
     with rf_tab_data:
@@ -3374,3 +3374,45 @@ elif page == "RF model training":
                             )
                         except Exception as _exc:
                             st.error(f"Failed to save model: {_exc}")
+
+    # ══ Tab 4 — Stored models ═════════════════════════════════════════════
+    with rf_tab_stored:
+        st.subheader("Stored RF Models")
+        _stored_project_path = st.session_state.get("active_project_path")
+        if not _stored_project_path:
+            st.warning("No active project. Activate a project in the TidyScreen page first.")
+        else:
+            _stored_db_path = os.path.join(_stored_project_path, "ml", "models", "rf_trained_models.db")
+            if not os.path.exists(_stored_db_path):
+                st.info("No stored models found for this project yet. Train and save a model first.")
+            else:
+                try:
+                    _sc = sqlite3.connect(_stored_db_path)
+                    _sm_df = pd.read_sql_query(
+                        """SELECT model_id, model_name, description, training_set_id,
+                                  roc_auc, accuracy, macro_f1, cv_roc_mean, cv_roc_std,
+                                  created_at
+                           FROM rf_trained_models
+                           ORDER BY model_id DESC""",
+                        _sc,
+                    )
+                    _sc.close()
+
+                    if _sm_df.empty:
+                        st.info("No models stored yet.")
+                    else:
+                        st.dataframe(
+                            _sm_df.style.format({
+                                "roc_auc":    "{:.4f}",
+                                "accuracy":   "{:.4f}",
+                                "macro_f1":   "{:.4f}",
+                                "cv_roc_mean": lambda v: f"{v:.4f}" if pd.notna(v) else "—",
+                                "cv_roc_std":  lambda v: f"{v:.4f}" if pd.notna(v) else "—",
+                            }),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+
+
+                except Exception as _exc:
+                    st.error(f"Failed to load stored models: {_exc}")
