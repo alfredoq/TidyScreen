@@ -215,6 +215,143 @@ def extract_poses_for_assay(project_name, project_path, assay_name, selection):
         return (False, str(e))
 
 
+def get_compounds_for_lig_names(project_path, assay_name, lig_names):
+    """
+    Retrieve smiles, name, and flag from the chemspace table associated with
+    *assay_name* for the given *lig_names* list.
+
+    Steps:
+      1. Look up table_name for assay_name in docking_assays.db
+      2. Query chemspace.db for rows whose name is in lig_names
+
+    Returns (DataFrame, None) on success or (None, error_string) on failure.
+    The DataFrame always has columns [smiles, name, flag]; flag is '' when the
+    column is absent from the chemspace table.
+    """
+    if not lig_names:
+        return None, "No ligand names provided."
+
+    # ── Step 1: resolve chemspace table name from the docking registry ────────
+    registry_db = os.path.join(
+        project_path, "docking", "docking_registers", "docking_assays.db"
+    )
+    if not os.path.exists(registry_db):
+        return None, f"Docking registry not found: {registry_db}"
+    try:
+        conn = sqlite3.connect(registry_db)
+        row = conn.execute(
+            "SELECT table_name FROM docking_assays WHERE assay_name = ?", (assay_name,)
+        ).fetchone()
+        conn.close()
+    except Exception as e:
+        return None, f"Error reading docking registry: {e}"
+    if not row:
+        return None, f"Assay '{assay_name}' not found in docking registry."
+    table_name = row[0]
+
+    # ── Step 2: query chemspace.db ────────────────────────────────────────────
+    chemspace_db = os.path.join(
+        project_path, "chemspace", "processed_data", "chemspace.db"
+    )
+    if not os.path.exists(chemspace_db):
+        return None, f"ChemSpace database not found: {chemspace_db}"
+    try:
+        conn = sqlite3.connect(chemspace_db)
+        # Discover available columns — flag may be absent in some table variants
+        cursor = conn.cursor()
+        cursor.execute(f'PRAGMA table_info("{table_name}")')
+        available = {r[1].lower() for r in cursor.fetchall()}
+        if not available:
+            conn.close()
+            return None, f"Table '{table_name}' not found in chemspace database."
+        if "inchi_key" not in available:
+            conn.close()
+            return None, f"Table '{table_name}' has no 'inchi_key' column."
+        select_cols = ["smiles", "name"]
+        if "flag" in available:
+            select_cols.append("flag")
+        placeholders = ",".join("?" * len(lig_names))
+        query = (
+            f'SELECT {", ".join(select_cols)} FROM "{table_name}" '
+            f"WHERE inchi_key IN ({placeholders})"
+        )
+        df = pd.read_sql_query(query, conn, params=list(lig_names))
+        conn.close()
+    except Exception as e:
+        return None, f"Error querying chemspace table '{table_name}': {e}"
+
+    if df.empty:
+        return None, f"No compounds found in '{table_name}' matching the given LigNames."
+
+    # Ensure flag column is always present
+    if "flag" not in df.columns:
+        df["flag"] = ""
+    return df[["smiles", "name", "flag"]], None
+
+
+def create_chemspace_subset(project_path, assay_name, inchi_keys, new_table_name):
+    """
+    Create a new table in chemspace.db as a subset of the compound table used for
+    *assay_name*, copying ALL columns so the new table is ready for docking.
+
+    Returns (True, success_message) or (False, error_message).
+    """
+    if not inchi_keys:
+        return False, "No compounds to subset."
+    if not new_table_name or not new_table_name.strip():
+        return False, "Table name cannot be empty."
+    new_table_name = new_table_name.strip().replace(" ", "_")
+
+    # Resolve source table from docking registry
+    registry_db = os.path.join(
+        project_path, "docking", "docking_registers", "docking_assays.db"
+    )
+    if not os.path.exists(registry_db):
+        return False, f"Docking registry not found: {registry_db}"
+    try:
+        conn = sqlite3.connect(registry_db)
+        row = conn.execute(
+            "SELECT table_name FROM docking_assays WHERE assay_name = ?", (assay_name,)
+        ).fetchone()
+        conn.close()
+    except Exception as e:
+        return False, f"Error reading docking registry: {e}"
+    if not row:
+        return False, f"Assay '{assay_name}' not found in docking registry."
+    source_table = row[0]
+
+    # Create subset in chemspace.db
+    chemspace_db = os.path.join(
+        project_path, "chemspace", "processed_data", "chemspace.db"
+    )
+    if not os.path.exists(chemspace_db):
+        return False, f"ChemSpace database not found: {chemspace_db}"
+    try:
+        conn = sqlite3.connect(chemspace_db)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            (new_table_name,),
+        )
+        if cursor.fetchone():
+            conn.close()
+            return False, f"Table '{new_table_name}' already exists in ChemSpace database."
+        placeholders = ",".join("?" * len(inchi_keys))
+        cursor.execute(
+            f'CREATE TABLE "{new_table_name}" AS '
+            f'SELECT * FROM "{source_table}" WHERE inchi_key IN ({placeholders})',
+            list(inchi_keys),
+        )
+        count = cursor.execute(
+            f'SELECT COUNT(*) FROM "{new_table_name}"'
+        ).fetchone()[0]
+        conn.commit()
+        conn.close()
+        return True, f"Created '{new_table_name}' with {count} compound(s)."
+    except Exception as e:
+        return False, f"Error creating subset table: {e}"
+
+
 def get_rf_prediction_tables(results_db_path):
     """
     Return a list of model-name suffixes for every rf_predictions_* table
