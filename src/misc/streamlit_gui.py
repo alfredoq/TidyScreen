@@ -2003,9 +2003,237 @@ elif page == "Analysis":
                         st.success(f"Selected Ligand: {selected_lig}")
                         histogram = st_funcs.construct_hist_for_ligand(df_results, selected_lig)
                         st.pyplot(histogram, use_container_width=False, clear_figure=True)
-                
-                
-    
+
+            ## Classified Poses Viewer
+            with st.expander("🏷️ Classified Poses Viewer", expanded=False):
+                _cpv_project_path = st.session_state.get("active_project_path")
+                _cpv_assay = st.session_state.get("selected_assay_name")
+                _cpv_rf_models = st_funcs.get_rf_prediction_tables(results_db_path)
+
+                ## Reference PDB uploader — shared across both columns
+                _sp, _cpv_ref_col = st.columns([1, 9])
+                with _cpv_ref_col:
+                    _cpv_ref_file = st.file_uploader(
+                        "Load a reference PDB for superimposition (optional):",
+                        type=["pdb"],
+                        key="cpv_reference_pdb_uploader",
+                    )
+                    if _cpv_ref_file is not None:
+                        st.session_state["cpv_reference_pdb_data"] = _cpv_ref_file.read().decode("utf-8")
+                        st.success(f"Reference loaded: {_cpv_ref_file.name}")
+                    elif "cpv_reference_pdb_data" not in st.session_state:
+                        st.session_state["cpv_reference_pdb_data"] = None
+
+                if _cpv_rf_models:
+                    ## ── RF predictions path ──────────────────────────────────────────
+                    if len(_cpv_rf_models) > 1:
+                        _cpv_model = st.selectbox(
+                            "RF model:", _cpv_rf_models, key="cpv_model_select"
+                        )
+                    else:
+                        _cpv_model = _cpv_rf_models[0]
+                        st.caption(f"RF model: **{_cpv_model}**")
+
+                    _cpv_classified = st_funcs.get_rf_classified_poses(results_db_path, _cpv_model)
+                    _cpv_df_pos = _cpv_classified["positive"]
+                    _cpv_df_neg = _cpv_classified["negative"]
+                    _cpv_has_pos = not _cpv_df_pos.empty
+                    _cpv_has_neg = not _cpv_df_neg.empty
+
+                    if not _cpv_has_pos and not _cpv_has_neg:
+                        st.info("No classified poses found for the selected model.")
+                    else:
+                        _cpv_col_pos, _cpv_col_neg = st.columns(2)
+
+                        with _cpv_col_pos:
+                            st.markdown(f"### ✅ Positive Predictions ({len(_cpv_df_pos)})")
+                            if not _cpv_has_pos:
+                                st.info("No positive predictions.")
+                            else:
+                                _cpv_pos_labels = [
+                                    f"{r['LigName']}_{r['run_number']}  (prob: {r['rf_prob_positive']:.2f})"
+                                    for _, r in _cpv_df_pos.iterrows()
+                                ]
+                                _cpv_pos_sel = st.selectbox(
+                                    "Select a positive pose:",
+                                    _cpv_pos_labels,
+                                    key="cpv_pos_selectbox",
+                                )
+                                _cpv_pos_row = _cpv_df_pos.iloc[_cpv_pos_labels.index(_cpv_pos_sel)]
+                                _cpv_pos_pdb_path = st_funcs.find_pose_pdb(
+                                    results_db_path, _cpv_pos_row["LigName"], _cpv_pos_row["run_number"]
+                                )
+                                if _cpv_pos_pdb_path:
+                                    with open(_cpv_pos_pdb_path, "r") as _f:
+                                        _cpv_pos_pdb = _f.read()
+                                    _cpv_pos_view = py3Dmol.view(width=480, height=420)
+                                    _cpv_pos_view.addModel(_cpv_pos_pdb, "pdb")
+                                    _cpv_pos_view.setStyle({"model": 0}, {"stick": {}, "cartoon": {"color": "spectrum"}})
+                                    if st.session_state.get("cpv_reference_pdb_data"):
+                                        _cpv_pos_view.addModel(st.session_state["cpv_reference_pdb_data"], "pdb")
+                                        _cpv_pos_view.setStyle({"model": 1}, {"sphere": {"colorscheme": "elementColors", "scale": 0.3, "opacity": 0.6}, "stick": {"colorscheme": "elementColors", "opacity": 0.6}})
+                                    _cpv_pos_view.zoomTo()
+                                    st.components.v1.html(_cpv_pos_view.write_html(), height=430)
+                                    st.caption(
+                                        f"Pose ID: {_cpv_pos_row['Pose_ID']}  |  "
+                                        f"Score: {_cpv_pos_row['docking_score']:.2f}  |  "
+                                        f"Prob: {_cpv_pos_row['rf_prob_positive']:.3f}"
+                                    )
+                                else:
+                                    st.warning(
+                                        f"PDB not found for {_cpv_pos_row['LigName']}_{_cpv_pos_row['run_number']}. "
+                                        "Extract poses first."
+                                    )
+
+                        with _cpv_col_neg:
+                            st.markdown(f"### ❌ Negative Predictions ({len(_cpv_df_neg)})")
+                            if not _cpv_has_neg:
+                                st.info("No negative predictions.")
+                            else:
+                                _cpv_neg_labels = [
+                                    f"{r['LigName']}_{r['run_number']}  (prob: {r['rf_prob_positive']:.2f})"
+                                    for _, r in _cpv_df_neg.iterrows()
+                                ]
+                                _cpv_neg_sel = st.selectbox(
+                                    "Select a negative pose:",
+                                    _cpv_neg_labels,
+                                    key="cpv_neg_selectbox",
+                                )
+                                _cpv_neg_row = _cpv_df_neg.iloc[_cpv_neg_labels.index(_cpv_neg_sel)]
+                                _cpv_neg_pdb_path = st_funcs.find_pose_pdb(
+                                    results_db_path, _cpv_neg_row["LigName"], _cpv_neg_row["run_number"]
+                                )
+                                if _cpv_neg_pdb_path:
+                                    with open(_cpv_neg_pdb_path, "r") as _f:
+                                        _cpv_neg_pdb = _f.read()
+                                    _cpv_neg_view = py3Dmol.view(width=480, height=420)
+                                    _cpv_neg_view.addModel(_cpv_neg_pdb, "pdb")
+                                    _cpv_neg_view.setStyle({"model": 0}, {"stick": {}, "cartoon": {"color": "spectrum"}})
+                                    if st.session_state.get("cpv_reference_pdb_data"):
+                                        _cpv_neg_view.addModel(st.session_state["cpv_reference_pdb_data"], "pdb")
+                                        _cpv_neg_view.setStyle({"model": 1}, {"sphere": {"colorscheme": "elementColors", "scale": 0.3, "opacity": 0.6}, "stick": {"colorscheme": "elementColors", "opacity": 0.6}})
+                                    _cpv_neg_view.zoomTo()
+                                    st.components.v1.html(_cpv_neg_view.write_html(), height=430)
+                                    st.caption(
+                                        f"Pose ID: {_cpv_neg_row['Pose_ID']}  |  "
+                                        f"Score: {_cpv_neg_row['docking_score']:.2f}  |  "
+                                        f"Prob: {_cpv_neg_row['rf_prob_positive']:.3f}"
+                                    )
+                                else:
+                                    st.warning(
+                                        f"PDB not found for {_cpv_neg_row['LigName']}_{_cpv_neg_row['run_number']}. "
+                                        "Extract poses first."
+                                    )
+
+                else:
+                    ## ── Fallback: manual positive/negative binder flags ───────────
+                    _cpv_df_pos = st_funcs.get_binders_registry(_cpv_project_path, "positive")
+                    _cpv_df_neg = st_funcs.get_binders_registry(_cpv_project_path, "negative")
+
+                    if _cpv_df_pos is not None and not _cpv_df_pos.empty:
+                        _cpv_df_pos = _cpv_df_pos[_cpv_df_pos["assay_name"] == _cpv_assay].reset_index(drop=True)
+                    if _cpv_df_neg is not None and not _cpv_df_neg.empty:
+                        _cpv_df_neg = _cpv_df_neg[_cpv_df_neg["assay_name"] == _cpv_assay].reset_index(drop=True)
+
+                    _cpv_has_pos = _cpv_df_pos is not None and not _cpv_df_pos.empty
+                    _cpv_has_neg = _cpv_df_neg is not None and not _cpv_df_neg.empty
+
+                    if not _cpv_has_pos and not _cpv_has_neg:
+                        st.info(f"No classified poses for assay '{_cpv_assay}'.")
+                    else:
+                        _cpv_col_pos, _cpv_col_neg = st.columns(2)
+
+                        with _cpv_col_pos:
+                            st.markdown(f"### ✅ Positive Binders ({len(_cpv_df_pos) if _cpv_has_pos else 0})")
+                            if not _cpv_has_pos:
+                                st.info("No positive binders for this assay.")
+                            else:
+                                _cpv_pos_labels = [
+                                    f"{r['pose_file']}  [{r['directory']}]"
+                                    for _, r in _cpv_df_pos.iterrows()
+                                ]
+                                _cpv_pos_sel = st.selectbox(
+                                    "Select a positive pose:", _cpv_pos_labels, key="cpv_pos_selectbox"
+                                )
+                                _cpv_pos_row = _cpv_df_pos.iloc[_cpv_pos_labels.index(_cpv_pos_sel)]
+                                _cpv_pos_path = _cpv_pos_row["pose_full_path"]
+                                if os.path.exists(_cpv_pos_path):
+                                    with open(_cpv_pos_path, "r") as _f:
+                                        _cpv_pos_pdb = _f.read()
+                                    _cpv_pos_view = py3Dmol.view(width=480, height=420)
+                                    _cpv_pos_view.addModel(_cpv_pos_pdb, "pdb")
+                                    _cpv_pos_view.setStyle({"model": 0}, {"stick": {}, "cartoon": {"color": "spectrum"}})
+                                    if st.session_state.get("cpv_reference_pdb_data"):
+                                        _cpv_pos_view.addModel(st.session_state["cpv_reference_pdb_data"], "pdb")
+                                        _cpv_pos_view.setStyle({"model": 1}, {"sphere": {"colorscheme": "elementColors", "scale": 0.3, "opacity": 0.6}, "stick": {"colorscheme": "elementColors", "opacity": 0.6}})
+                                    _cpv_pos_view.zoomTo()
+                                    st.components.v1.html(_cpv_pos_view.write_html(), height=430)
+                                    st.caption(
+                                        f"{_cpv_pos_row['pose_file']}  |  {_cpv_pos_row['directory']}  |  "
+                                        f"flagged: {_cpv_pos_row['flagged_at'][:10]}"
+                                    )
+                                else:
+                                    st.warning(f"PDB file not found: {_cpv_pos_path}")
+                                if st.button("Remove from positive binders", key="cpv_btn_remove_pos"):
+                                    _cpv_rem = st_funcs.remove_binder(
+                                        project_path=_cpv_project_path,
+                                        binder_type="positive",
+                                        assay_name=_cpv_pos_row["assay_name"],
+                                        pose_file=_cpv_pos_row["pose_file"],
+                                        directory=_cpv_pos_row["directory"],
+                                    )
+                                    if _cpv_rem == "removed":
+                                        st.success(f"Removed: {_cpv_pos_row['pose_file']}")
+                                        st.rerun()
+                                    else:
+                                        st.error(f"Could not remove: {_cpv_rem}")
+
+                        with _cpv_col_neg:
+                            st.markdown(f"### ❌ Negative Binders ({len(_cpv_df_neg) if _cpv_has_neg else 0})")
+                            if not _cpv_has_neg:
+                                st.info("No negative binders for this assay.")
+                            else:
+                                _cpv_neg_labels = [
+                                    f"{r['pose_file']}  [{r['directory']}]"
+                                    for _, r in _cpv_df_neg.iterrows()
+                                ]
+                                _cpv_neg_sel = st.selectbox(
+                                    "Select a negative pose:", _cpv_neg_labels, key="cpv_neg_selectbox"
+                                )
+                                _cpv_neg_row = _cpv_df_neg.iloc[_cpv_neg_labels.index(_cpv_neg_sel)]
+                                _cpv_neg_path = _cpv_neg_row["pose_full_path"]
+                                if os.path.exists(_cpv_neg_path):
+                                    with open(_cpv_neg_path, "r") as _f:
+                                        _cpv_neg_pdb = _f.read()
+                                    _cpv_neg_view = py3Dmol.view(width=480, height=420)
+                                    _cpv_neg_view.addModel(_cpv_neg_pdb, "pdb")
+                                    _cpv_neg_view.setStyle({"model": 0}, {"stick": {}, "cartoon": {"color": "spectrum"}})
+                                    if st.session_state.get("cpv_reference_pdb_data"):
+                                        _cpv_neg_view.addModel(st.session_state["cpv_reference_pdb_data"], "pdb")
+                                        _cpv_neg_view.setStyle({"model": 1}, {"sphere": {"colorscheme": "elementColors", "scale": 0.3, "opacity": 0.6}, "stick": {"colorscheme": "elementColors", "opacity": 0.6}})
+                                    _cpv_neg_view.zoomTo()
+                                    st.components.v1.html(_cpv_neg_view.write_html(), height=430)
+                                    st.caption(
+                                        f"{_cpv_neg_row['pose_file']}  |  {_cpv_neg_row['directory']}  |  "
+                                        f"flagged: {_cpv_neg_row['flagged_at'][:10]}"
+                                    )
+                                else:
+                                    st.warning(f"PDB file not found: {_cpv_neg_path}")
+                                if st.button("Remove from negative binders", key="cpv_btn_remove_neg"):
+                                    _cpv_rem = st_funcs.remove_binder(
+                                        project_path=_cpv_project_path,
+                                        binder_type="negative",
+                                        assay_name=_cpv_neg_row["assay_name"],
+                                        pose_file=_cpv_neg_row["pose_file"],
+                                        directory=_cpv_neg_row["directory"],
+                                    )
+                                    if _cpv_rem == "removed":
+                                        st.success(f"Removed: {_cpv_neg_row['pose_file']}")
+                                        st.rerun()
+                                    else:
+                                        st.error(f"Could not remove: {_cpv_rem}")
+
+
 elif page == "ML features management":
     st.title("Machine Learning")
 

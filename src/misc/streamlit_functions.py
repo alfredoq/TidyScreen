@@ -215,6 +215,82 @@ def extract_poses_for_assay(project_name, project_path, assay_name, selection):
         return (False, str(e))
 
 
+def get_rf_prediction_tables(results_db_path):
+    """
+    Return a list of model-name suffixes for every rf_predictions_* table
+    present in the results DB (e.g. ['MyModel'] for 'rf_predictions_MyModel').
+    Returns an empty list when the DB doesn't exist or has no such tables.
+    """
+    if not results_db_path or not os.path.exists(results_db_path):
+        return []
+    try:
+        conn = sqlite3.connect(results_db_path)
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'rf_predictions_%'"
+        ).fetchall()
+        conn.close()
+        prefix = "rf_predictions_"
+        return [r[0][len(prefix):] for r in rows]
+    except Exception:
+        return []
+
+
+def get_rf_classified_poses(results_db_path, model_suffix):
+    """
+    Join rf_predictions_{model_suffix} with the Results table on Pose_ID.
+
+    Returns {"positive": DataFrame, "negative": DataFrame}.
+    Positive poses are sorted by rf_prob_positive DESC; negative ASC.
+    Columns: Pose_ID, LigName, run_number, docking_score, rf_prob_positive.
+    """
+    table = f"rf_predictions_{model_suffix}"
+    empty = {"positive": pd.DataFrame(), "negative": pd.DataFrame()}
+    if not os.path.exists(results_db_path):
+        return empty
+    try:
+        conn = sqlite3.connect(results_db_path)
+        df_pos = pd.read_sql_query(
+            f"""
+            SELECT R.Pose_ID, R.LigName, R.run_number, R.docking_score, P.rf_prob_positive
+            FROM Results AS R
+            JOIN "{table}" AS P ON R.Pose_ID = P.Pose_ID
+            WHERE P.rf_label = 1
+            ORDER BY P.rf_prob_positive DESC
+            """,
+            conn,
+        )
+        df_neg = pd.read_sql_query(
+            f"""
+            SELECT R.Pose_ID, R.LigName, R.run_number, R.docking_score, P.rf_prob_positive
+            FROM Results AS R
+            JOIN "{table}" AS P ON R.Pose_ID = P.Pose_ID
+            WHERE P.rf_label = 0
+            ORDER BY P.rf_prob_positive ASC
+            """,
+            conn,
+        )
+        conn.close()
+        return {"positive": df_pos, "negative": df_neg}
+    except Exception:
+        return empty
+
+
+def find_pose_pdb(results_db_path, ligname, run_number):
+    """
+    Search extracted pose directories adjacent to results_db_path for
+    {ligname}_{run_number}.pdb.  Returns the full path on the first hit,
+    or None if the file is not found in any directory.
+    """
+    results_dir = os.path.dirname(os.path.abspath(results_db_path))
+    filename = f"{ligname}_{run_number}.pdb"
+    for subdir in ("most_stable_poses", "most_populated_poses",
+                   "most_populated_and_stable_poses", "all_poses"):
+        candidate = os.path.join(results_dir, subdir, filename)
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
 def get_extracted_poses_info(results_db_path):
     """
     Check for extracted docked poses in the four known output subdirectories adjacent to the results DB.
