@@ -160,6 +160,61 @@ def get_docking_results(db_path):
     except Exception as e:
         return None
 
+def get_assay_engine(project_path, assay_name):
+    """
+    Return the docking engine string for the named assay, or None if not found.
+    """
+    registry_db = os.path.join(project_path, "docking", "docking_registers", "docking_assays.db")
+    try:
+        conn = sqlite3.connect(registry_db)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT docking_engine FROM docking_assays WHERE assay_name = ?", (assay_name,)
+        )
+        row = cursor.fetchone()
+        conn.close()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
+def _load_moldock_class():
+    """
+    Import MolDock from the source tree that contains this file, bypassing
+    whatever version of tidyscreen the Streamlit conda env has installed.
+    streamlit_functions.py lives at <pkg>/misc/streamlit_functions.py and
+    moldock.py lives at <pkg>/moldock/moldock.py.
+    """
+    import importlib.util
+    src_pkg = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    moldock_file = os.path.join(src_pkg, "moldock", "moldock.py")
+    spec = importlib.util.spec_from_file_location("_tidyscreen_moldock_src", moldock_file)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.MolDock
+
+
+def extract_poses_for_assay(project_name, project_path, assay_name, selection):
+    """
+    Extract docked poses for *assay_name* using the native MolDock method.
+
+    *selection* is the string code passed to the engine-specific extractor:
+      AutoDockGPU — "1" most stable, "2" most populated, "3" both, "4" all
+      AutoDock Vina — "1" most stable, "2" all
+
+    Returns (success: bool, message: str).
+    """
+    try:
+        MolDock = _load_moldock_class()
+        moldock = MolDock.from_path(project_name, project_path)
+        output_dir = moldock.extract_docked_poses(assay=assay_name, selection=selection)
+        if output_dir:
+            return (True, f"Poses extracted to: {output_dir}")
+        return (False, "Extraction returned no output directory — check console for details.")
+    except Exception as e:
+        return (False, str(e))
+
+
 def get_extracted_poses_info(results_db_path):
     """
     Check for extracted docked poses in the four known output subdirectories adjacent to the results DB.

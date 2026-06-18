@@ -76,6 +76,29 @@ class MolDock:
         data_dir = os.path.dirname(self.__chemspace_db)
         os.makedirs(data_dir, exist_ok=True)
 
+    @classmethod
+    def from_path(cls, project_name, project_path):
+        """
+        Construct a MolDock instance directly from project_name and project_path,
+        without requiring an ActivateProject lookup against the global projects DB.
+        Intended for use in contexts (e.g. the Streamlit GUI) where the project is
+        already known but ActivateProject cannot resolve the registry correctly.
+        """
+        instance = cls.__new__(cls)
+        instance.project = None
+        instance.name = project_name
+        instance.path = project_path
+        instance.description = None
+        instance.id = None
+        instance.created_date = None
+        instance._MolDock__chemspace_db = os.path.join(project_path, 'chemspace/processed_data', 'chemspace.db')
+        instance._MolDock__receptor_path = os.path.join(project_path, 'docking/receptors')
+        instance._MolDock__docking_registers_db = os.path.join(project_path, 'docking/docking_registers', 'registers.db')
+        instance._MolDock__docking_params_db = os.path.join(project_path, 'docking/params', 'params.db')
+        data_dir = os.path.dirname(instance._MolDock__chemspace_db)
+        os.makedirs(data_dir, exist_ok=True)
+        return instance
+
     def create_docking_method(self):
         """
         Will prompt the user for the following method parameters:
@@ -9072,7 +9095,7 @@ class MolDock:
             return None
         pass
     
-    def extract_docked_poses(self, assay=None):
+    def extract_docked_poses(self, assay=None, selection=None):
         """
         Extract docked poses from a docking assay and save them as PDB files based on user-selected criteria.
         This method allows users to select a docking assay from the registry and extract poses based on three
@@ -9189,26 +9212,32 @@ class MolDock:
 
         ## Evaluate the docking engine in order to use the corresponding pose extraction method
         if docking_engine == "AutoDockGPU":
-            self._extract_docked_poses_autodockgpu(db_path)
-            
+            return self._extract_docked_poses_autodockgpu(db_path, selection=selection)
+
         else:
-            self._extract_docked_poses_autodockvina(db_path)
+            return self._extract_docked_poses_autodockvina(db_path, selection=selection)
     
-    def _extract_docked_poses_autodockgpu(self, db_path):
+    def _extract_docked_poses_autodockgpu(self, db_path, selection=None):
         ## Start the analysis
         print("Starting poses extraction for engine AutoDockGPU")
         print("")
-        print("Select an option:")
-        print("1 - Select lowest energy poses")
-        print("2 - Select most populated poses")
-        print("3 - Select most lowest energy AND populated poses (both criteria)")
-        print("4 - Select ALL poses")
-        selection = input("Enter your choice (1, 2, 3, or 4): ").strip()
 
-        ## Prompt the user which selection to make
-        while selection not in ("1", "2", "3", "4"):
-            print("Invalid selection. Only 1, 2, 3, or 4 can be selected.")
+        if selection is None:
+            print("Select an option:")
+            print("1 - Select lowest energy poses")
+            print("2 - Select most populated poses")
+            print("3 - Select most lowest energy AND populated poses (both criteria)")
+            print("4 - Select ALL poses")
             selection = input("Enter your choice (1, 2, 3, or 4): ").strip()
+
+            ## Prompt the user which selection to make
+            while selection not in ("1", "2", "3", "4"):
+                print("Invalid selection. Only 1, 2, 3, or 4 can be selected.")
+                selection = input("Enter your choice (1, 2, 3, or 4): ").strip()
+
+        if selection not in ("1", "2", "3", "4"):
+            print(f"❌ Invalid selection '{selection}' for AutoDockGPU. Choose 1, 2, 3, or 4.")
+            return None
 
         # Act according to user selection
         if selection == "1":
@@ -9257,30 +9286,38 @@ class MolDock:
         elif selection == "3":
             print(f"Most populated and stable poses extracted and saved as PDB files to: \n \t {output_dir}")
         elif selection == "4":
-            print(f"All poses extracted and saved as PDB files to: \n \t {output_dir}")    
-    
-    def _extract_docked_poses_autodockvina(self, db_path):
-        
+            print(f"All poses extracted and saved as PDB files to: \n \t {output_dir}")
+
+        return output_dir
+
+    def _extract_docked_poses_autodockvina(self, db_path, selection=None):
+
         ## Start the analysis
         print("Starting poses extraction for engine Vina")
         print("")
-        print("Select an option:")
-        print("1 - Extract lowest energy pose")
-        print("2 - Extract all poses")
-        selection = input("Enter your choice (1 or 2): ").strip()
-        
-        ## Prompt the user which selection to make
-        while selection not in ("1", "2"):
-            print("Invalid selection. Only 1 or 2 can be selected.")
+
+        if selection is None:
+            print("Select an option:")
+            print("1 - Extract lowest energy pose")
+            print("2 - Extract all poses")
             selection = input("Enter your choice (1 or 2): ").strip()
-        
+
+            ## Prompt the user which selection to make
+            while selection not in ("1", "2"):
+                print("Invalid selection. Only 1 or 2 can be selected.")
+                selection = input("Enter your choice (1 or 2): ").strip()
+
+        if selection not in ("1", "2"):
+            print(f"❌ Invalid selection '{selection}' for AutoDock Vina. Choose 1 or 2.")
+            return None
+
         # Act according to user selection
         if selection == "1":
             print("You selected: lowest energy poses")
             # Create output directory for most stable poses
             output_dir = os.path.join(os.path.dirname(os.path.abspath(db_path)), "most_stable_poses")
             os.makedirs(output_dir, exist_ok=True)
-            
+
             df = self._select_most_stable_poses(db_path)
 
         elif selection == "2":
@@ -9288,20 +9325,21 @@ class MolDock:
             # Create output directory for all poses
             output_dir = os.path.join(os.path.dirname(os.path.abspath(db_path)), "all_poses")
             os.makedirs(output_dir, exist_ok=True)
-            
+
             df = self._select_all_poses(db_path)
 
-        # Continue pprocessing the selected poses
+        # Continue processing the selected poses
         for row in df.iterrows():
             ligname = row[1]['LigName']
             pose_id = row[1]['Pose_ID']
             run_number = row[1]['run_number']
-            
+
             input_model, pose_coords_json = self._retrieve_pose_info(db_path, ligname, run_number)
             pdb_dict = self._process_input_model_for_moldf(input_model, pose_coords_json)
             self._write_pdb_with_moldf(pdb_dict, ligname, run_number, output_dir)
 
         print(f"Docked poses extracted to {output_dir}")
+        return output_dir
 
     def _select_most_stable_poses(self, db_path):
         """

@@ -1283,7 +1283,50 @@ elif page == "Analysis":
             any_active = any(e["active"] for e in extracted_poses)
 
             if not any_active:
-                st.button("View Poses", disabled=True)
+                _vp_col, _ep_col = st.columns([2, 5])
+                with _vp_col:
+                    st.button("View Poses", disabled=True, key="btn_view_poses_disabled")
+                with _ep_col:
+                    _engine = st_funcs.get_assay_engine(
+                        st.session_state["active_project_path"],
+                        st.session_state["selected_assay_name"]
+                    )
+                    if _engine == "AutoDockGPU":
+                        _criteria_labels = [
+                            "1 - Most stable poses",
+                            "2 - Most populated poses",
+                            "3 - Most stable + most populated",
+                            "4 - All poses",
+                        ]
+                    else:
+                        _criteria_labels = [
+                            "1 - Most stable poses",
+                            "2 - All poses",
+                        ]
+                    _ep_inner_left, _ep_inner_right = st.columns([3, 2])
+                    with _ep_inner_left:
+                        _criteria = st.selectbox(
+                            "Extraction criteria:",
+                            _criteria_labels,
+                            key="extract_poses_criteria",
+                        )
+                    with _ep_inner_right:
+                        st.write("")
+                        st.write("")
+                        if st.button("Extract Poses", key="btn_extract_poses"):
+                            _selection = _criteria[0]  # leading digit "1", "2", "3", or "4"
+                            with st.spinner("Extracting poses..."):
+                                _ok, _msg = st_funcs.extract_poses_for_assay(
+                                    st.session_state["selected_project"],
+                                    st.session_state["active_project_path"],
+                                    st.session_state["selected_assay_name"],
+                                    _selection,
+                                )
+                            if _ok:
+                                st.success(_msg)
+                                st.rerun()
+                            else:
+                                st.error(_msg)
             else:
                 with st.expander("🔍 View Poses", expanded=False):
                     ## Reference PDB uploader (shared across all pose folders)
