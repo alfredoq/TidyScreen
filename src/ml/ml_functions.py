@@ -460,11 +460,12 @@ class MachineLearning:
                     conn.execute(
                         """INSERT OR REPLACE INTO training_set_fingerprints
                            (training_set_id, assay_name, pose_file, directory,
-                            binder_type, label, prolif_conditions_id, fingerprint_json, computed_at)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            binder_type, label, prolif_conditions_id, minimized,
+                            fingerprint_json, computed_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (training_set_id, assay_name, pose_file, directory,
-                         binder_type, label, condition_selection, fp_json,
-                         datetime.now().isoformat())
+                         binder_type, label, condition_selection, int(minimize),
+                         fp_json, datetime.now().isoformat())
                     )
                     conn.commit()
                     conn.close()
@@ -826,7 +827,8 @@ class MachineLearning:
         return stored_path
 
     def _ensure_fingerprints_table(self):
-        """Create the training_set_fingerprints table in the snapshots DB if absent."""
+        """Create the training_set_fingerprints table in the snapshots DB if absent.
+        Also migrates existing tables that pre-date the 'minimized' column."""
         conn = sqlite3.connect(self.__training_sets_db)
         conn.execute(
             """CREATE TABLE IF NOT EXISTS training_set_fingerprints (
@@ -838,11 +840,20 @@ class MachineLearning:
                 binder_type          TEXT    NOT NULL,
                 label                INTEGER NOT NULL,
                 prolif_conditions_id INTEGER NOT NULL,
+                minimized            INTEGER NOT NULL DEFAULT 0,
                 fingerprint_json     TEXT    NOT NULL,
                 computed_at          TEXT    NOT NULL,
-                UNIQUE(training_set_id, assay_name, pose_file, directory, prolif_conditions_id)
+                UNIQUE(training_set_id, assay_name, pose_file, directory, prolif_conditions_id, minimized)
             )"""
         )
+        # Migrate existing tables that lack the 'minimized' column
+        existing_cols = [r[1] for r in conn.execute(
+            "PRAGMA table_info(training_set_fingerprints)"
+        ).fetchall()]
+        if 'minimized' not in existing_cols:
+            conn.execute(
+                "ALTER TABLE training_set_fingerprints ADD COLUMN minimized INTEGER NOT NULL DEFAULT 0"
+            )
         conn.commit()
         conn.close()
 
@@ -994,20 +1005,12 @@ class MachineLearning:
                     return
                 print("❌ Please enter 'y' or 'n'")
 
-        # ── 4. Resolve ProLIF conditions that match the training run ──────────
-        prolif_params_dict, condition_id = self._resolve_prolif_conditions_for_model(model_meta)
+        # ── 4. Resolve ProLIF conditions and minimization from training metadata ─
+        prolif_params_dict, condition_id, minimize = self._resolve_prolif_conditions_for_model(model_meta)
         if prolif_params_dict is None:
             return
 
-        # ── 5. Ask whether to minimize (must match training fingerprint setting) ─
-        while True:
-            ans = input("\nMinimize complex before fingerprint computation? (y/n): ").strip().lower()
-            if ans in ('y', 'n'):
-                minimize = ans == 'y'
-                break
-            print("❌ Please enter 'y' or 'n'")
-
-        # ── 6. Resolve receptor and renumbering dict from assay metadata ──────
+        # ── 5. Resolve receptor and renumbering dict from assay metadata ──────
         receptor_pdbqt = self._remap_project_path(
             selected_assay['receptor_info'].get('pdbqt_file', '')
         )
@@ -1016,7 +1019,7 @@ class MachineLearning:
         template_name = selected_assay['receptor_info'].get('template_name')
         renumbering_dict = self._load_renumbering_dict(template_name) if template_name else {}
 
-        # ── 7. Compute ProLIF fingerprints for each pose ──────────────────────
+        # ── 6. Compute ProLIF fingerprints for each pose ──────────────────────
         import shutil
         from datetime import datetime
         from moldock.moldock import MolDock
@@ -1139,72 +1142,89 @@ class MachineLearning:
 
     def _resolve_prolif_conditions_for_model(self, model_meta: dict) -> tuple:
         """
-        Determine the ProLIF conditions used when training the given RF model.
+        Recover the ProLIF conditions ID, params dict, and minimization flag used
+        when the training fingerprints for the given RF model were computed.
 
         If the model has a training_set_id, queries training_set_fingerprints for the
-        distinct prolif_conditions_id values used for that snapshot:
+        distinct (prolif_conditions_id, minimized) combinations for that snapshot:
           - exactly one  → auto-selected, no prompt
           - more than one → user picks from the list
-        If training_set_id is None (CSV-trained model), falls back to the interactive
-        _prompt_prolif_conditions() selector.
+        If training_set_id is None (CSV-trained model), falls back to interactive
+        _prompt_prolif_conditions() and asks the user about minimization.
 
-        Returns (prolif_params_dict, condition_id) or (None, None) on cancel/error.
+        Returns (prolif_params_dict, condition_id, minimize_bool)
+        or (None, None, None) on cancel/error.
         """
         training_set_id = model_meta.get('training_set_id')
 
         if training_set_id:
             if not os.path.exists(self.__training_sets_db):
                 print("\n❌ Training sets database not found.")
-                return None, None
+                return None, None, None
 
             try:
                 conn = sqlite3.connect(self.__training_sets_db)
                 rows = conn.execute(
-                    "SELECT DISTINCT prolif_conditions_id FROM training_set_fingerprints "
-                    "WHERE training_set_id = ?",
+                    "SELECT DISTINCT prolif_conditions_id, minimized "
+                    "FROM training_set_fingerprints WHERE training_set_id = ?",
                     (training_set_id,)
                 ).fetchall()
                 conn.close()
             except Exception as e:
                 print(f"\n❌ Error reading training set fingerprints: {e}")
-                return None, None
+                return None, None, None
 
-            condition_ids = [r[0] for r in rows]
-
-            if not condition_ids:
+            if not rows:
                 print(f"\n⚠️  No fingerprints found for training set '{training_set_id}'. "
-                      "Falling back to manual ProLIF condition selection.")
-                return self._prompt_prolif_conditions()
+                      "Falling back to manual selection.")
+                prolif_params_dict, condition_id = self._prompt_prolif_conditions()
+                if prolif_params_dict is None:
+                    return None, None, None
+                while True:
+                    ans = input("\nMinimize complex before fingerprint computation? (y/n): ").strip().lower()
+                    if ans in ('y', 'n'):
+                        return prolif_params_dict, condition_id, ans == 'y'
+                    print("❌ Please enter 'y' or 'n'")
 
-            if len(condition_ids) == 1:
-                selected_id = condition_ids[0]
-                print(f"\n✅ Auto-selected ProLIF condition ID {selected_id} "
-                      f"(used when training set '{training_set_id}' was featurized)")
+            if len(rows) == 1:
+                selected_id, minimized_int = rows[0]
+                minimize = bool(minimized_int)
+                print(f"\n✅ Auto-selected ProLIF condition ID {selected_id}, "
+                      f"minimized={'yes' if minimize else 'no'} "
+                      f"(recovered from training set '{training_set_id}')")
             else:
-                print(f"\n⚠️  Multiple ProLIF conditions found for training set '{training_set_id}':")
-                for i, cid in enumerate(condition_ids, 1):
-                    print(f"   {i}. Condition ID {cid}")
+                print(f"\n⚠️  Multiple featurization settings found for training set '{training_set_id}':")
+                for i, (cid, mini) in enumerate(rows, 1):
+                    print(f"   {i}. Condition ID {cid}  |  minimized={'yes' if mini else 'no'}")
                 while True:
                     try:
-                        sel = input("\nSelect conditions to match training (number or 'c' to cancel): ").strip()
+                        sel = input("\nSelect setting to match training (number or 'c' to cancel): ").strip()
                         if sel.lower() == 'c':
-                            return None, None
+                            return None, None, None
                         idx = int(sel) - 1
-                        if 0 <= idx < len(condition_ids):
-                            selected_id = condition_ids[idx]
+                        if 0 <= idx < len(rows):
+                            selected_id, minimized_int = rows[idx]
+                            minimize = bool(minimized_int)
                             break
-                        print(f"❌ Enter a number between 1 and {len(condition_ids)}")
+                        print(f"❌ Enter a number between 1 and {len(rows)}")
                     except ValueError:
                         print("❌ Enter a valid number")
         else:
             print("\n⚠️  Model has no linked training set (CSV-trained). "
-                  "Please select ProLIF conditions manually.")
-            return self._prompt_prolif_conditions()
+                  "Please select ProLIF conditions and minimization manually.")
+            prolif_params_dict, condition_id = self._prompt_prolif_conditions()
+            if prolif_params_dict is None:
+                return None, None, None
+            while True:
+                ans = input("\nMinimize complex before fingerprint computation? (y/n): ").strip().lower()
+                if ans in ('y', 'n'):
+                    return prolif_params_dict, condition_id, ans == 'y'
+                print("❌ Please enter 'y' or 'n'")
 
         # Load the prolif_params_dict for the resolved condition ID
         if not os.path.exists(self.__docking_params_db):
             print(f"\n❌ Docking params database not found: {self.__docking_params_db}")
-            return None, None
+            return None, None, None
 
         try:
             conn = sqlite3.connect(self.__docking_params_db)
@@ -1214,13 +1234,13 @@ class MachineLearning:
             conn.close()
         except Exception as e:
             print(f"\n❌ Error reading ProLIF conditions: {e}")
-            return None, None
+            return None, None, None
 
         if not row:
             print(f"\n❌ ProLIF condition ID {selected_id} not found in params database.")
-            return None, None
+            return None, None, None
 
-        return json.loads(row[0]), selected_id
+        return json.loads(row[0]), selected_id, minimize
 
     def _prompt_rf_model(self):
         """
