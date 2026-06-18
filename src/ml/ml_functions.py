@@ -925,6 +925,303 @@ class MachineLearning:
 
         print(f"\n✅ Selected model: [{model_meta['model_id']}] {model_meta['model_name']}")
 
+        # ── 3. Load all poses from the assay Results table ────────────────────
+        results_db = os.path.join(
+            selected_assay['assay_folder_path'], 'results',
+            f"assay_{selected_assay['assay_id']}.db"
+        )
+
+        if not os.path.isfile(results_db):
+            print(f"\n❌ Results database not found: {results_db}")
+            return
+
+        try:
+            conn = sqlite3.connect(results_db)
+            tables = [r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()]
+            if 'Results' not in tables:
+                print(f"\n❌ 'Results' table not found in {results_db}")
+                conn.close()
+                return
+            poses_df = pd.read_sql_query(
+                "SELECT Pose_ID, LigName, docking_score, run_number FROM Results",
+                conn
+            )
+            conn.close()
+        except Exception as e:
+            print(f"\n❌ Error reading Results table: {e}")
+            return
+
+        if poses_df.empty:
+            print("\n❌ No poses found in the Results table.")
+            return
+
+        print(f"\n📋 Loaded {len(poses_df)} poses from assay '{selected_assay['assay_name']}'")
+
+        # ── 3b. Check if the predictions table already exists ─────────────────
+        import re
+        safe_model_name = re.sub(r'[^a-zA-Z0-9_]', '_', model_meta['model_name'])
+        predictions_table = f"rf_predictions_{safe_model_name}"
+
+        try:
+            conn = sqlite3.connect(results_db)
+            existing_tables = [r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()]
+            conn.close()
+        except Exception as e:
+            print(f"\n❌ Error checking existing tables: {e}")
+            return
+
+        if predictions_table in existing_tables:
+            print(f"\n⚠️  Table '{predictions_table}' already exists in the assay database.")
+            while True:
+                ans = input("Delete existing predictions and recompute? (y/n): ").strip().lower()
+                if ans == 'y':
+                    try:
+                        conn = sqlite3.connect(results_db)
+                        conn.execute(f"DROP TABLE {predictions_table}")
+                        conn.commit()
+                        conn.close()
+                        print(f"✅ Table '{predictions_table}' deleted.")
+                    except Exception as e:
+                        print(f"\n❌ Failed to delete table: {e}")
+                        return
+                    break
+                elif ans == 'n':
+                    print("❌ Operation cancelled.")
+                    return
+                print("❌ Please enter 'y' or 'n'")
+
+        # ── 4. Resolve ProLIF conditions that match the training run ──────────
+        prolif_params_dict, condition_id = self._resolve_prolif_conditions_for_model(model_meta)
+        if prolif_params_dict is None:
+            return
+
+        # ── 5. Ask whether to minimize (must match training fingerprint setting) ─
+        while True:
+            ans = input("\nMinimize complex before fingerprint computation? (y/n): ").strip().lower()
+            if ans in ('y', 'n'):
+                minimize = ans == 'y'
+                break
+            print("❌ Please enter 'y' or 'n'")
+
+        # ── 6. Resolve receptor and renumbering dict from assay metadata ──────
+        receptor_pdbqt = self._remap_project_path(
+            selected_assay['receptor_info'].get('pdbqt_file', '')
+        )
+        receptor_file = os.path.join(os.path.dirname(receptor_pdbqt), 'receptor_checked.pdb')
+
+        template_name = selected_assay['receptor_info'].get('template_name')
+        renumbering_dict = self._load_renumbering_dict(template_name) if template_name else {}
+
+        # ── 7. Compute ProLIF fingerprints for each pose ──────────────────────
+        import shutil
+        from datetime import datetime
+        from moldock.moldock import MolDock
+
+        moldock = MolDock(self.project)
+        processed_ligands = {}   # {ligname: (prepin_file, frcmod_file)}
+        fp_records = []           # [{pose_id, lig_name, docking_score, **fp_dict}, ...]
+        output_dir = None
+
+        try:
+            for _, row in poses_df.iterrows():
+                pose_id       = row['Pose_ID']
+                run_number    = row['run_number']
+                ligname       = row['LigName']
+                docking_score = row['docking_score']
+
+                print(f"\n  🔬 Processing Pose_ID: {pose_id}  LigName: {ligname}")
+
+                try:
+                    output_dir, output_file = moldock._restore_single_docked_pose(
+                        results_db, ligname, run_number
+                    )
+
+                    if ligname not in processed_ligands:
+                        prepin_file, frcmod_file = moldock._prepare_ligand_tleap_files(
+                            ligname, selected_assay, output_dir
+                        )
+                        processed_ligands[ligname] = (prepin_file, frcmod_file)
+                    else:
+                        prepin_file, frcmod_file = processed_ligands[ligname]
+
+                    prmtop_file, inpcrd_file, output_pdb_file = moldock._prepare_complex_prmtop_inpcrd(
+                        prepin_file, frcmod_file, selected_assay, output_dir,
+                        output_file, pose_id, ligname=ligname
+                    )
+
+                    if minimize:
+                        try:
+                            print("    MINIMIZING COMPLEX...")
+                            _, output_pdb_file = moldock._minimize_complex(
+                                prmtop_file, inpcrd_file, output_dir, ligname, pose_id, output_pdb_file
+                            )
+                        except Exception as e:
+                            print(f"    ⚠️  Minimization failed: {e}. Using original structure.")
+
+                    fps_df = moldock._compute_prolif_fingerprints3(
+                        prolif_params_dict, output_pdb_file, receptor_file,
+                        prmtop_file, inpcrd_file, ligname, pose_id
+                    )
+
+                    fps_df.columns = fps_df.columns.droplevel(0)
+                    if renumbering_dict:
+                        fps_df = fps_df.rename(columns=renumbering_dict, level=0)
+                    fps_df.columns = [f"{a}_{b}" for a, b in fps_df.columns]
+
+                    fp_row = fps_df.iloc[0].to_dict()
+                    fp_records.append({
+                        'pose_id':       pose_id,
+                        'lig_name':      ligname,
+                        'docking_score': docking_score,
+                        **{k: bool(v) for k, v in fp_row.items()},
+                    })
+                    print(f"    ✅ Fingerprint computed for Pose_ID {pose_id}")
+
+                except Exception as e:
+                    print(f"    ❌ Error processing Pose_ID {pose_id} ({ligname}): {e} — skipping")
+                    continue
+
+        finally:
+            if output_dir:
+                shutil.rmtree(output_dir, ignore_errors=True)
+                print("\n✅ Temporary files cleaned up.")
+
+        if not fp_records:
+            print("\n❌ No fingerprints were successfully computed. Aborting prediction.")
+            return
+
+        # ── 8. Align features to the model's training space and predict ───────
+        pred_df = pd.DataFrame(fp_records)
+        meta_cols = ['pose_id', 'lig_name', 'docking_score']
+        X = pred_df.drop(columns=meta_cols)
+
+        expected_cols = list(model.feature_names_in_)
+        X = X.reindex(columns=expected_cols, fill_value=0).fillna(0).astype(int)
+
+        labels = model.predict(X)
+        probs  = model.predict_proba(X)[:, 1]
+
+        print(f"\n📊 Predictions complete: {int((labels == 1).sum())} positives / "
+              f"{int((labels == 0).sum())} negatives out of {len(labels)} poses")
+
+        # ── 9. Store predictions in the assay results DB ──────────────────────
+        try:
+            conn = sqlite3.connect(results_db)
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {predictions_table} (
+                    Pose_ID          INTEGER PRIMARY KEY,
+                    rf_label         INTEGER NOT NULL,
+                    rf_prob_positive REAL NOT NULL
+                )
+            """)
+            conn.executemany(
+                f"""INSERT OR REPLACE INTO {predictions_table}
+                   (Pose_ID, rf_label, rf_prob_positive)
+                   VALUES (?, ?, ?)""",
+                [
+                    (
+                        int(pred_df.iloc[i]['pose_id']),
+                        int(labels[i]),
+                        float(probs[i]),
+                    )
+                    for i in range(len(pred_df))
+                ]
+            )
+            conn.commit()
+            conn.close()
+            print(f"\n✅ Predictions written to '{predictions_table}' table in:\n   {results_db}")
+        except Exception as e:
+            print(f"\n❌ Error writing predictions to database: {e}")
+
+    def _resolve_prolif_conditions_for_model(self, model_meta: dict) -> tuple:
+        """
+        Determine the ProLIF conditions used when training the given RF model.
+
+        If the model has a training_set_id, queries training_set_fingerprints for the
+        distinct prolif_conditions_id values used for that snapshot:
+          - exactly one  → auto-selected, no prompt
+          - more than one → user picks from the list
+        If training_set_id is None (CSV-trained model), falls back to the interactive
+        _prompt_prolif_conditions() selector.
+
+        Returns (prolif_params_dict, condition_id) or (None, None) on cancel/error.
+        """
+        training_set_id = model_meta.get('training_set_id')
+
+        if training_set_id:
+            if not os.path.exists(self.__training_sets_db):
+                print("\n❌ Training sets database not found.")
+                return None, None
+
+            try:
+                conn = sqlite3.connect(self.__training_sets_db)
+                rows = conn.execute(
+                    "SELECT DISTINCT prolif_conditions_id FROM training_set_fingerprints "
+                    "WHERE training_set_id = ?",
+                    (training_set_id,)
+                ).fetchall()
+                conn.close()
+            except Exception as e:
+                print(f"\n❌ Error reading training set fingerprints: {e}")
+                return None, None
+
+            condition_ids = [r[0] for r in rows]
+
+            if not condition_ids:
+                print(f"\n⚠️  No fingerprints found for training set '{training_set_id}'. "
+                      "Falling back to manual ProLIF condition selection.")
+                return self._prompt_prolif_conditions()
+
+            if len(condition_ids) == 1:
+                selected_id = condition_ids[0]
+                print(f"\n✅ Auto-selected ProLIF condition ID {selected_id} "
+                      f"(used when training set '{training_set_id}' was featurized)")
+            else:
+                print(f"\n⚠️  Multiple ProLIF conditions found for training set '{training_set_id}':")
+                for i, cid in enumerate(condition_ids, 1):
+                    print(f"   {i}. Condition ID {cid}")
+                while True:
+                    try:
+                        sel = input("\nSelect conditions to match training (number or 'c' to cancel): ").strip()
+                        if sel.lower() == 'c':
+                            return None, None
+                        idx = int(sel) - 1
+                        if 0 <= idx < len(condition_ids):
+                            selected_id = condition_ids[idx]
+                            break
+                        print(f"❌ Enter a number between 1 and {len(condition_ids)}")
+                    except ValueError:
+                        print("❌ Enter a valid number")
+        else:
+            print("\n⚠️  Model has no linked training set (CSV-trained). "
+                  "Please select ProLIF conditions manually.")
+            return self._prompt_prolif_conditions()
+
+        # Load the prolif_params_dict for the resolved condition ID
+        if not os.path.exists(self.__docking_params_db):
+            print(f"\n❌ Docking params database not found: {self.__docking_params_db}")
+            return None, None
+
+        try:
+            conn = sqlite3.connect(self.__docking_params_db)
+            row = conn.execute(
+                "SELECT conditions FROM ProLIF_Conditions WHERE id = ?", (selected_id,)
+            ).fetchone()
+            conn.close()
+        except Exception as e:
+            print(f"\n❌ Error reading ProLIF conditions: {e}")
+            return None, None
+
+        if not row:
+            print(f"\n❌ ProLIF condition ID {selected_id} not found in params database.")
+            return None, None
+
+        return json.loads(row[0]), selected_id
+
     def _prompt_rf_model(self):
         """
         List trained RF models stored in the project and prompt the user to select one.
