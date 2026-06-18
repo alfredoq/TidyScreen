@@ -1234,7 +1234,20 @@ elif page == "ProLIF Conditions":
 
 
 elif page == "Analysis":
-    st.title("Analysis")
+    _analysis_col_title, _analysis_col_info = st.columns([2, 3])
+    with _analysis_col_title:
+        st.title("Analysis")
+    with _analysis_col_info:
+        st.markdown(
+            f"<div style='padding-top: 14px;'>"
+            f"<span style='color: grey;'>Project: </span>"
+            f"<span style='color: green; font-weight: bold;'>{active_project or 'None'}</span>"
+            f"&nbsp;&nbsp;|&nbsp;&nbsp;"
+            f"<span style='color: grey;'>Assay: </span>"
+            f"<span style='color: orange; font-weight: bold;'>{active_assay or 'None'}</span>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
     st.write("Welcome to the Analysis page.")
             
     if "selected_assay_name" not in st.session_state:
