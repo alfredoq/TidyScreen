@@ -14058,15 +14058,306 @@ class MolDock:
         except Exception as e:
             print(f"Error accessing PDB templates database: {e}. Stopping")
             sys.exit(1)
-    
-        
-        
-                                    
-                            
-                            
-                            
-                            
 
-        
-        
-        
+    def import_receptor_model(self, input_folder_path=None, receptor_model_name=None,
+                              charge_model='gasteiger', notes=None):
+        """
+        Import a precomputed receptor model (PDBQT + grid files) directly into the project.
+
+        Accepts a folder containing a prepared .pdbqt file, a .gpf file (used to parse the
+        docking box parameters), a .fld file, and one or more .map files.  Stub pdb_model and
+        pdb_template records are created so that downstream analyses (e.g. ProLIF fingerprints)
+        do not fail.  ProLIF residue labels will reflect the numbering in the imported PDBQT
+        directly (no remapping is applied).
+
+        Args:
+            input_folder_path (str, optional): Full path to folder containing receptor files.
+                If None, the user is prompted interactively.
+            receptor_model_name (str, optional): Name to register for this receptor model.
+                If None, the user is prompted interactively.
+            charge_model (str): Charge model label used to name the grid-files subfolder
+                (default: 'gasteiger').
+            notes (str, optional): Notes to store in the receptor_models record.
+
+        Returns:
+            int or None: The new receptor model ID on success, None on failure.
+        """
+        import sqlite3
+        import json
+        import shutil
+
+        # --- Step 1: Resolve and validate input folder ---
+        while not input_folder_path:
+            raw = input("\nEnter the full path to the folder containing the receptor files: ").strip().strip('"').strip("'")
+            if not raw:
+                print("Operation cancelled.")
+                return None
+            candidate = os.path.abspath(os.path.expanduser(raw))
+            if os.path.isdir(candidate):
+                input_folder_path = candidate
+            else:
+                print(f"  Directory not found: {candidate}")
+
+        all_files = os.listdir(input_folder_path)
+        pdbqt_files = [f for f in all_files if f.lower().endswith('.pdbqt')]
+        gpf_files   = [f for f in all_files if f.lower().endswith('.gpf')]
+        fld_files   = [f for f in all_files if f.lower().endswith('.fld')]
+        map_files   = [f for f in all_files if f.lower().endswith('.map')]
+
+        errors = []
+        if len(pdbqt_files) != 1:
+            errors.append(f"expected exactly 1 .pdbqt file, found {len(pdbqt_files)}")
+        if not gpf_files:
+            errors.append("no .gpf file found")
+        if not fld_files:
+            errors.append("no .fld file found")
+        if not map_files:
+            errors.append("no .map files found")
+        if errors:
+            print("  Validation errors in input folder:")
+            for err in errors:
+                print(f"    - {err}")
+            return None
+
+        pdbqt_src = os.path.join(input_folder_path, pdbqt_files[0])
+        gpf_src   = os.path.join(input_folder_path, gpf_files[0])
+
+        # --- Prompt for receptor_model_name if not provided ---
+        while not receptor_model_name:
+            raw_name = input("\nEnter a name for this receptor model: ").strip()
+            if raw_name:
+                receptor_model_name = raw_name
+            else:
+                print("  Name is required.")
+
+        # Check name uniqueness in receptors.db
+        receptors_db_path = os.path.join(self.path, 'docking', 'receptors', 'receptors.db')
+        os.makedirs(os.path.dirname(receptors_db_path), exist_ok=True)
+        conn_r = sqlite3.connect(receptors_db_path)
+        cur_r = conn_r.cursor()
+        cur_r.execute("""
+            CREATE TABLE IF NOT EXISTS receptor_models (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pdb_id INTEGER,
+                receptor_model_name TEXT,
+                template_name TEXT,
+                pdb_model_name TEXT,
+                pdb_to_convert TEXT,
+                pdbqt_file TEXT,
+                configs TEXT,
+                notes TEXT
+            )
+        """)
+        conn_r.commit()
+        cur_r.execute("SELECT COUNT(*) FROM receptor_models WHERE receptor_model_name = ?",
+                      (receptor_model_name,))
+        if cur_r.fetchone()[0] > 0:
+            print(f"  Error: receptor model '{receptor_model_name}' already exists.")
+            conn_r.close()
+            return None
+        conn_r.close()
+
+        # --- Step 2: Parse box parameters from .gpf ---
+        configs = self._parse_gpf_box_params(gpf_src)
+        if configs is None:
+            return None
+        configs['receptor_charge_model'] = charge_model
+
+        # --- Step 3: Copy PDBQT into project receptor folder ---
+        receptor_folder = os.path.join(self.__receptor_path, receptor_model_name)
+        os.makedirs(receptor_folder, exist_ok=True)
+        pdbqt_dest = os.path.join(receptor_folder, f"{receptor_model_name}.pdbqt")
+        shutil.copy2(pdbqt_src, pdbqt_dest)
+        print(f"  Copied PDBQT: {pdbqt_dest}")
+
+        # --- Step 4: Create stub pdb_model record ---
+        stub_name = f"stub_{receptor_model_name}"
+        pdbs_db_path = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
+        os.makedirs(os.path.dirname(pdbs_db_path), exist_ok=True)
+        conn_p = sqlite3.connect(pdbs_db_path)
+        cur_p = conn_p.cursor()
+
+        cur_p.execute('''
+            CREATE TABLE IF NOT EXISTS pdb_models (
+                file_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pdb_model_name TEXT UNIQUE NOT NULL,
+                project_name TEXT,
+                pdb_blob BLOB NOT NULL,
+                original_path TEXT,
+                filename TEXT,
+                file_size INTEGER,
+                description TEXT,
+                file_info TEXT,
+                created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_modified TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                notes TEXT
+            )
+        ''')
+        cur_p.execute('''
+            INSERT OR IGNORE INTO pdb_models
+                (pdb_model_name, project_name, pdb_blob, original_path, description, notes)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (
+            stub_name, self.name, b'',
+            input_folder_path,
+            'Auto-generated stub for imported receptor',
+            'Created by import_receptor_model()'
+        ))
+        conn_p.commit()
+
+        # --- Step 5: Create stub pdb_template record ---
+        columns_dict = {
+            'pdb_id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
+            'pdb_template_name': 'TEXT UNIQUE NOT NULL',
+            'pdb_model_name': 'TEXT NOT NULL',
+            'project_name': 'TEXT',
+            'original_pdb_path': 'TEXT NOT NULL',
+            'processed_pdb_path': 'TEXT NOT NULL',
+            'checked_pdb_path': 'TEXT NOT NULL',
+            'template_folder_path': 'TEXT NOT NULL',
+            'pdb_analysis': 'TEXT',
+            'his_names': 'TEXT',
+            'chains': 'TEXT',
+            'resolution': 'REAL',
+            'atom_count': 'INTEGER',
+            'has_ligands': 'BOOLEAN',
+            'renumbering_dict': 'TEXT',
+            'status': "TEXT DEFAULT 'created'",
+            'created_date': "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+            'last_modified': "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+            'notes': 'TEXT',
+        }
+        self._create_table_from_columns_dict(cur_p, 'pdb_templates', columns_dict, verbose=False)
+        self._update_legacy_table_columns(cur_p, 'pdb_templates', columns_dict, verbose=False)
+
+        cur_p.execute("SELECT COUNT(*) FROM pdb_templates WHERE pdb_template_name = ?", (stub_name,))
+        if cur_p.fetchone()[0] == 0:
+            cur_p.execute('''
+                INSERT INTO pdb_templates
+                    (pdb_template_name, pdb_model_name, project_name,
+                     original_pdb_path, processed_pdb_path, checked_pdb_path,
+                     template_folder_path, renumbering_dict, status, notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                stub_name, stub_name, self.name,
+                pdbqt_dest, pdbqt_dest, pdbqt_dest,
+                receptor_folder,
+                '{}', 'imported',
+                'Auto-generated stub for imported receptor'
+            ))
+        conn_p.commit()
+        cur_p.execute("SELECT pdb_id FROM pdb_templates WHERE pdb_template_name = ?", (stub_name,))
+        stub_pdb_id = cur_p.fetchone()[0]
+        conn_p.close()
+
+        # --- Step 6: Insert receptor_models record with placeholder configs ---
+        resolved_notes = notes if notes else f"Imported from {input_folder_path}"
+        conn_r = sqlite3.connect(receptors_db_path)
+        cur_r = conn_r.cursor()
+        cur_r.execute('''
+            INSERT INTO receptor_models
+                (pdb_id, receptor_model_name, template_name, pdb_model_name,
+                 pdb_to_convert, pdbqt_file, configs, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            stub_pdb_id,
+            receptor_model_name,
+            stub_name,
+            stub_name,
+            pdbqt_dest,
+            pdbqt_dest,
+            '{}',
+            resolved_notes
+        ))
+        new_id = cur_r.lastrowid
+        conn_r.commit()
+        conn_r.close()
+
+        # --- Step 7: Copy all input files into the properly named grid folder ---
+        grids_dest = os.path.join(receptor_folder,
+                                  f"RecMod_{new_id}_grid_files_{charge_model}")
+        os.makedirs(grids_dest, exist_ok=True)
+        for fname in all_files:
+            shutil.copy2(os.path.join(input_folder_path, fname),
+                         os.path.join(grids_dest, fname))
+        print(f"  Copied grid files to: {grids_dest}")
+        configs['grids_path'] = grids_dest
+
+        # --- Step 8: Update receptor_models with final configs ---
+        conn_r = sqlite3.connect(receptors_db_path)
+        cur_r = conn_r.cursor()
+        cur_r.execute("UPDATE receptor_models SET configs = ? WHERE id = ?",
+                      (json.dumps(configs, indent=2), new_id))
+        conn_r.commit()
+        conn_r.close()
+
+        print(f"\n{'=' * 80}")
+        print(f"RECEPTOR MODEL IMPORTED SUCCESSFULLY")
+        print(f"{'=' * 80}")
+        print(f"  Name:       {receptor_model_name}  (ID: {new_id})")
+        print(f"  PDBQT:      {pdbqt_dest}")
+        print(f"  Grid files: {grids_dest}")
+        print(f"  Center:     x={configs['center']['x']}, y={configs['center']['y']}, z={configs['center']['z']}")
+        print(f"  Size:       x={configs['size']['x']}, y={configs['size']['y']}, z={configs['size']['z']}")
+        print(f"  Spacing:    {configs['spacing']}")
+        print(f"  Note: ProLIF residue labels will use the imported PDBQT numbering directly.")
+        print(f"{'=' * 80}")
+        return new_id
+
+    def _parse_gpf_box_params(self, gpf_path):
+        """Parse gridcenter, npts, and spacing from an AutoGrid .gpf file."""
+        center = None
+        npts = None
+        spacing = 0.375  # AutoGrid default
+
+        try:
+            with open(gpf_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith('gridcenter'):
+                        parts = line.split()
+                        if len(parts) >= 4:
+                            if parts[1].lower() == 'auto':
+                                print("  Warning: gridcenter is 'auto' in .gpf — center set to 0.0, 0.0, 0.0.")
+                                center = {'x': 0.0, 'y': 0.0, 'z': 0.0}
+                            else:
+                                center = {
+                                    'x': float(parts[1]),
+                                    'y': float(parts[2]),
+                                    'z': float(parts[3])
+                                }
+                    elif line.startswith('npts'):
+                        parts = line.split()
+                        if len(parts) >= 4:
+                            npts = {
+                                'x': int(parts[1]),
+                                'y': int(parts[2]),
+                                'z': int(parts[3])
+                            }
+                    elif line.startswith('spacing'):
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            spacing = float(parts[1])
+
+            if center is None or npts is None:
+                print(f"  Error: could not parse 'gridcenter' or 'npts' from {gpf_path}.")
+                return None
+
+            size = {
+                'x': round(npts['x'] * spacing, 4),
+                'y': round(npts['y'] * spacing, 4),
+                'z': round(npts['z'] * spacing, 4),
+            }
+
+            return {
+                'center': center,
+                'size': size,
+                'spacing': spacing,
+                'dielectric': -0.1465,
+                'smooth': 0.5,
+                'biases': None,
+            }
+
+        except Exception as e:
+            print(f"  Error parsing .gpf file: {e}")
+            return None
