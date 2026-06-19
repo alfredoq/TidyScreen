@@ -1730,20 +1730,50 @@ class ChemSpace:
             print(f"❌ Error counting compounds in table '{table_name}': {e}")
             return 0
     
-    def export_to_csv(self, output_path: str, 
+    def export_to_csv(self, output_path: Optional[str] = None,
                      table_name: Optional[str] = None,
                      flag_filter: Optional[str] = None) -> bool:
         """
         Export compounds to a CSV file.
-        
+
         Args:
-            output_path (str): Path for the output CSV file
+            output_path (Optional[str]): Path for the output CSV file. Queried interactively if not provided.
             table_name (Optional[str]): Name of the table to export from. If None, exports all tables
             flag_filter (Optional[str]): Filter by specific flag value
-            
+
         Returns:
             bool: True if export was successful
         """
+        tables = self.get_all_tables()
+        if not tables:
+            print("No tables found in the database.")
+            return False
+        print("Available tables:")
+        for i, t in enumerate(tables, 1):
+            print(f"  {i}. {t}")
+
+        if table_name is None:
+            raw = input("Select a table by number or name: ").strip()
+            if not raw:
+                print("No table selected. Export cancelled.")
+                return False
+            if raw.isdigit():
+                idx = int(raw) - 1
+                if not (0 <= idx < len(tables)):
+                    print("Invalid selection. Export cancelled.")
+                    return False
+                table_name = tables[idx]
+            else:
+                if raw not in tables:
+                    print(f"Table '{raw}' not found. Export cancelled.")
+                    return False
+                table_name = raw
+
+        if output_path is None:
+            output_path = input("Enter the destination path for the CSV file: ").strip()
+            if not output_path:
+                print("No path provided. Export cancelled.")
+                return False
         try:
             compounds = self.get_compounds(table_name=table_name, flag_filter=flag_filter)
             
@@ -1754,6 +1784,10 @@ class ChemSpace:
             
             # Convert to DataFrame and save
             df = pd.DataFrame(compounds)
+            if 'sdf_blob' in df.columns:
+                keep = input("Retain the 'sdf_blob' column in the CSV? (y/N): ").strip().lower()
+                if keep != 'y':
+                    df = df.drop(columns=['sdf_blob'])
             df.to_csv(output_path, index=False)
             
             table_desc = f" from table '{table_name}'" if table_name else ""
