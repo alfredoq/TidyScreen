@@ -8284,27 +8284,25 @@ class MolDock:
                     print(f"   ❌ Error parsing add_atom_types for molecule {inchi_key}: {e}")
                     add_atom_types = []
 
-            # Ring double bonds cannot have meaningful E/Z stereo (both atoms are
-            # ring-constrained), but OpenFF perceives it from 3D coords and then
-            # fails to encode it back as bond directions. Strip it before espaloma.
-            # We also clear BondDir on adjacent single bonds so that a subsequent
-            # AssignStereochemistry call (inside OpenFF) cannot re-derive it.
-            # Do NOT call AssignStereochemistry here — it would re-perceive from
-            # those same BondDir markers and undo the clearing.
-            for bond in mol.GetBonds():
-                if bond.GetBondTypeAsDouble() == 2.0 and bond.IsInRing():
-                    bond.SetStereo(rdchem.BondStereo.STEREONONE)
-                    for atom in (bond.GetBeginAtom(), bond.GetEndAtom()):
-                        for nbr_bond in atom.GetBonds():
-                            if nbr_bond.GetIdx() != bond.GetIdx():
-                                nbr_bond.SetBondDir(rdchem.BondDir.NONE)
-
             mk_prep = MoleculePreparation(merge_these_atom_types=merge_atoms,
                                           charge_model=charge,
                                           hydrate=hydrate,
                                           add_atom_types=add_atom_types
                                          )
-            mol_setup_list = mk_prep.prepare(mol, rename_atoms=True)
+            try:
+                mol_setup_list = mk_prep.prepare(mol, rename_atoms=True)
+            except AssertionError as _ez_err:
+                if 'E/Z stereo' not in str(_ez_err):
+                    raise
+                # OpenFF failed to encode E/Z stereo as bond directions for at
+                # least one bond (typically a ring double bond stored in the DB
+                # with residual stereo flags). Strip ALL bond-level E/Z and
+                # BondDir — atom chirality (tetrahedral, [C@@H]) is unaffected —
+                # and retry. Charges are topology-based so they are unaffected.
+                for bond in mol.GetBonds():
+                    bond.SetStereo(rdchem.BondStereo.STEREONONE)
+                    bond.SetBondDir(rdchem.BondDir.NONE)
+                mol_setup_list = mk_prep.prepare(mol, rename_atoms=True)
             mol_setup = mol_setup_list[0]
 
             pdbqt_string = PDBQTWriterLegacy.write_string(mol_setup)
