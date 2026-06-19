@@ -358,7 +358,7 @@ elif page == "ChemSpace":
 
                         st.markdown("---")
                         st.markdown("**📦 Subset Table**")
-                        _subset_col1, _subset_col2 = st.columns([3, 1])
+                        _subset_col1, _subset_col2, _subset_col3 = st.columns([3, 1, 1])
                         with _subset_col1:
                             _new_table_name = st.text_input(
                                 "New table name:",
@@ -369,7 +369,7 @@ elif page == "ChemSpace":
                             st.write("")
                             st.write("")
                             if st.button(
-                                f"Create Subset ({_n_sel_display} rows)",
+                                f"Create Subset selected columns ({_n_sel_display} rows)",
                                 key=f"btn_subset_table_{display_selected_table}",
                                 disabled=(_n_sel_display == 0 or not _new_table_name.strip()),
                             ):
@@ -380,7 +380,27 @@ elif page == "ChemSpace":
                                     columns=selected_display_cols
                                 )
                                 if result == "created":
-                                    st.success(f"✅ Subset table **'{_new_table_name.strip()}'** created with {_n_sel_display} row(s).")
+                                    st.success(f"✅ Subset table **'{_new_table_name.strip()}'** created with {_n_sel_display} row(s) and {len(selected_display_cols)} column(s).")
+                                elif result == "duplicate":
+                                    st.error(f"A table named **'{_new_table_name.strip()}'** already exists. Choose a different name.")
+                                else:
+                                    st.error(f"Could not create subset: {result}")
+                        with _subset_col3:
+                            st.write("")
+                            st.write("")
+                            if st.button(
+                                f"Create Subset All columns ({_n_sel_display} rows)",
+                                key=f"btn_subset_all_cols_{display_selected_table}",
+                                disabled=(_n_sel_display == 0 or not _new_table_name.strip()),
+                            ):
+                                _row_indices = list(_selected_display_rows.index)
+                                result = st_funcs.create_subset_table(
+                                    db_path, display_selected_table,
+                                    _new_table_name.strip(), _row_indices,
+                                    columns=None
+                                )
+                                if result == "created":
+                                    st.success(f"✅ Subset table **'{_new_table_name.strip()}'** created with {_n_sel_display} row(s) and all {len(display_columns)} column(s).")
                                 elif result == "duplicate":
                                     st.error(f"A table named **'{_new_table_name.strip()}'** already exists. Choose a different name.")
                                 else:
