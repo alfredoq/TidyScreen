@@ -9258,31 +9258,30 @@ class MolDock:
         # Act according to user selection
         if selection == "1":
             print("You selected: lowest energy poses")
-            # Create output directory for most stable poses
             output_dir = os.path.join(os.path.dirname(os.path.abspath(db_path)), "most_stable_poses")
-            os.makedirs(output_dir, exist_ok=True)
-            
+            if not self._prepare_output_dir(output_dir):
+                return None
             df = self._select_most_stable_poses(db_path)
-        
+
         elif selection == "2":
             print("You selected: most populated poses")
-            # Create output directory for most populated poses
             output_dir = os.path.join(os.path.dirname(os.path.abspath(db_path)), "most_populated_poses")
-            os.makedirs(output_dir, exist_ok=True)
+            if not self._prepare_output_dir(output_dir):
+                return None
             df = self._select_most_populated_poses(db_path)
 
         elif selection == "3":
             print("You selected: most populated AND lowest energy poses")
-            # Create output directory for most populated and stable poses
             output_dir = os.path.join(os.path.dirname(os.path.abspath(db_path)), "most_populated_and_stable_poses")
-            os.makedirs(output_dir, exist_ok=True)
+            if not self._prepare_output_dir(output_dir):
+                return None
             df = self._select_most_populated_and_stable_poses(db_path)
 
         elif selection == "4":
             print("You selected: ALL poses")
-            # Create output directory for all poses
             output_dir = os.path.join(os.path.dirname(os.path.abspath(db_path)), "all_poses")
-            os.makedirs(output_dir, exist_ok=True)
+            if not self._prepare_output_dir(output_dir):
+                return None
             df = self._select_all_poses(db_path)
 
         # Continue processing the selected poses
@@ -9330,18 +9329,16 @@ class MolDock:
         # Act according to user selection
         if selection == "1":
             print("You selected: lowest energy poses")
-            # Create output directory for most stable poses
             output_dir = os.path.join(os.path.dirname(os.path.abspath(db_path)), "most_stable_poses")
-            os.makedirs(output_dir, exist_ok=True)
-
+            if not self._prepare_output_dir(output_dir):
+                return None
             df = self._select_most_stable_poses(db_path)
 
         elif selection == "2":
             print("You selected: all poses")
-            # Create output directory for all poses
             output_dir = os.path.join(os.path.dirname(os.path.abspath(db_path)), "all_poses")
-            os.makedirs(output_dir, exist_ok=True)
-
+            if not self._prepare_output_dir(output_dir):
+                return None
             df = self._select_all_poses(db_path)
 
         # Continue processing the selected poses
@@ -9357,28 +9354,121 @@ class MolDock:
         print(f"Docked poses extracted to {output_dir}")
         return output_dir
 
+    def _prepare_output_dir(self, output_dir):
+        """
+        Ensure output_dir is an empty, ready-to-use directory.
+
+        - If the directory does not exist it is created and True is returned.
+        - If it already exists the user is asked whether to delete it:
+            - 'y' / Enter  → directory is removed and recreated; True is returned.
+            - 'n' / Ctrl-C → operation is cancelled; False is returned (caller
+                             should abort and return None).
+        """
+        import os
+        import shutil
+
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+            return True
+
+        print(f"\n⚠️  Output directory already exists:\n   {output_dir}")
+        try:
+            answer = input("Delete it and proceed? [y/N]: ").strip().lower()
+        except KeyboardInterrupt:
+            print("\n❌ Operation cancelled.")
+            return False
+
+        if answer == 'y':
+            shutil.rmtree(output_dir)
+            os.makedirs(output_dir)
+            print("Directory cleared.")
+            return True
+
+        print("❌ Operation cancelled.")
+        return False
+
+    def _prompt_score_column(self, conn):
+        """
+        Inspect the Results table for available scoring columns and, when more than
+        one is populated, ask the user which one to use as the 'lowest energy' criterion.
+
+        Candidate columns (in priority order):
+            docking_score        — always present
+            mmgbsa_total_energy  — added after compute_fingerprints(write_mmgbsa=True)
+            mmgbsa_gas_energy    — same
+
+        A column is considered available only when it exists AND has at least one
+        non-NULL, non-(-1) value (-1 is the sentinel stored for failed MMGBSA runs).
+
+        Returns the chosen column name as a string.
+        """
+        import sqlite3
+
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(Results)")
+        existing = {row[1] for row in cursor.fetchall()}
+
+        candidates = []
+        for col in ['docking_score', 'mmgbsa_total_energy', 'mmgbsa_gas_energy']:
+            if col in existing:
+                cursor.execute(
+                    f"SELECT COUNT(*) FROM Results WHERE {col} IS NOT NULL AND {col} != -1"
+                )
+                if cursor.fetchone()[0] > 0:
+                    candidates.append(col)
+
+        if len(candidates) <= 1:
+            return candidates[0] if candidates else 'docking_score'
+
+        labels = {
+            'docking_score':       'Docking score  (AutoDock binding energy, kcal/mol)',
+            'mmgbsa_total_energy': 'MMGBSA total energy  (gas + solvation, kcal/mol)',
+            'mmgbsa_gas_energy':   'MMGBSA gas-phase energy  (kcal/mol)',
+        }
+
+        print("\nMultiple scoring columns are available in this assay:")
+        for i, col in enumerate(candidates, 1):
+            print(f"  {i}. {labels.get(col, col)}")
+
+        while True:
+            try:
+                choice = input("Select the column to use as lowest-energy criterion: ").strip()
+                idx = int(choice) - 1
+                if 0 <= idx < len(candidates):
+                    chosen = candidates[idx]
+                    print(f"Using: {chosen}")
+                    return chosen
+                print("Invalid selection. Try again.")
+            except (ValueError, KeyboardInterrupt):
+                print("Defaulting to docking_score.")
+                return 'docking_score'
+
     def _select_most_stable_poses(self, db_path):
         """
-        Select the most stable pose (lowest docking score) for each ligand
-        from the Ringtail database located at db_path.
-        Returns a DataFrame with LigName, Pose_ID, and docking_score.
+        Select the most stable pose (lowest score) for each ligand from the Ringtail
+        database at db_path.  When secondary scoring columns (mmgbsa_total_energy,
+        mmgbsa_gas_energy) are populated the user is asked which column to minimise.
+        Returns a DataFrame with LigName, Pose_ID, the chosen score column, and run_number.
         """
         import sqlite3
         import pandas as pd
-        
+
         conn = sqlite3.connect(db_path)
-        query = """
-        SELECT LigName, Pose_ID, docking_score, run_number
+        score_col = self._prompt_score_column(conn)
+
+        query = f"""
+        SELECT LigName, Pose_ID, {score_col}, run_number
         FROM Results AS R1
-        WHERE docking_score = (
-            SELECT MIN(docking_score)
+        WHERE {score_col} = (
+            SELECT MIN({score_col})
             FROM Results AS R2
             WHERE R1.LigName = R2.LigName
+              AND {score_col} IS NOT NULL AND {score_col} != -1
         )
         """
         df = pd.read_sql(query, conn)
         conn.close()
-        
+
         return df
 
     def _select_all_poses(self, db_path):
@@ -9430,34 +9520,39 @@ class MolDock:
         Selects the most populated and stable docking poses for each ligand from a SQLite database.
         This method connects to the specified SQLite database, queries the 'Results' table,
         and retrieves the pose(s) for each ligand that have the largest cluster size (most populated)
-        and the lowest docking score (most stable). The results are returned as a pandas DataFrame.
+        and the lowest score (most stable). When secondary scoring columns are populated the user
+        is asked which column to use for the stability criterion.
         Args:
             db_path (str): Path to the SQLite database file containing the docking results.
         Returns:
-            pandas.DataFrame: A DataFrame containing the ligand name, pose ID, cluster size, docking score, and run number for the selected poses.
+            pandas.DataFrame: A DataFrame containing the ligand name, pose ID, cluster size,
+                the chosen score column, and run number for the selected poses.
         """
 
         import sqlite3
         import pandas as pd
 
         conn = sqlite3.connect(db_path)
-        query = """
-        SELECT LigName, Pose_ID, cluster_size, docking_score, run_number
+        score_col = self._prompt_score_column(conn)
+
+        query = f"""
+        SELECT LigName, Pose_ID, cluster_size, {score_col}, run_number
         FROM Results AS R1
         WHERE cluster_size = (
             SELECT MAX(cluster_size)
             FROM Results AS R2
             WHERE R1.LigName = R2.LigName
         )
-        AND docking_score = (
-            SELECT MIN(docking_score)
+        AND {score_col} = (
+            SELECT MIN({score_col})
             FROM Results AS R3
             WHERE R1.LigName = R3.LigName
+              AND {score_col} IS NOT NULL AND {score_col} != -1
         )
         """
         df = pd.read_sql(query, conn)
-        conn.close()    
-        
+        conn.close()
+
         return df
 
     def _retrieve_pose_info(self, db_path, ligname, run_number):
