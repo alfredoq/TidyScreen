@@ -13,6 +13,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 import joblib
+from rdkit import Chem
+from rdkit.Chem import Draw, AllChem
 from rf_classifier import (
     evaluate_model,
     feature_importances,
@@ -122,7 +124,7 @@ st.set_page_config(page_title="TidyScreen App", layout="wide")
 st.sidebar.title("Navigation")
 page = st.sidebar.radio(
     "Go to",
-    ("TidyScreen", "ChemSpace", "Receptors", "MolDock", "MolDyn", "ProLIF Conditions", "Analysis", "ML features management", "RF model training")
+    ("TidyScreen", "ChemSpace", "Receptors", "MolDock", "MolDyn", "ProLIF Conditions", "Analysis", "ML features management", "RF model training", "Mol Viewer")
 )
 
 ## Persistent sidebar info: active project and assay
@@ -3794,3 +3796,80 @@ elif page == "RF model training":
 
                 except Exception as _exc:
                     st.error(f"Failed to load stored models: {_exc}")
+
+elif page == "Mol Viewer":
+    st.title("Molecular Viewer")
+
+    def _mv_draw_molecule(smiles, smarts=None):
+        try:
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is None:
+                return None, 0, None
+            highlight_atoms, highlight_bonds, match_count = [], [], 0
+            if smarts:
+                query = Chem.MolFromSmarts(smarts)
+                if query is None:
+                    return None, 0, "Invalid SMARTS pattern."
+                matches = mol.GetSubstructMatches(query)
+                match_count = len(matches)
+                if match_count > 0:
+                    atom_set, bond_set = set(), set()
+                    for match in matches:
+                        atom_set.update(match)
+                        for qbond in query.GetBonds():
+                            bond = mol.GetBondBetweenAtoms(match[qbond.GetBeginAtomIdx()], match[qbond.GetEndAtomIdx()])
+                            if bond is not None:
+                                bond_set.add(bond.GetIdx())
+                    highlight_atoms = sorted(atom_set)
+                    highlight_bonds = sorted(bond_set)
+            img = Draw.MolToImage(mol, highlightAtoms=highlight_atoms, highlightBonds=highlight_bonds)
+            return img, match_count, None
+        except Exception as e:
+            return None, 0, f"Error parsing input: {e}"
+
+    def _mv_draw_3d(smiles):
+        try:
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is None:
+                return None
+            mol = Chem.AddHs(mol)
+            if AllChem.EmbedMolecule(mol) != 0:
+                return "Embedding failed: RDKit could not generate 3D coordinates for this molecule."
+            return Chem.MolToPDBBlock(mol)
+        except Exception as e:
+            return f"3D generation error: {e}"
+
+    smiles_input = st.text_input("Enter a SMILES string:", key="mv_smiles")
+    smarts_input = st.text_input("Optional SMARTS to highlight:", key="mv_smarts")
+
+    if smiles_input:
+        col1, col2 = st.columns(2)
+        img, match_count, draw_error = _mv_draw_molecule(smiles_input, smarts_input.strip())
+        pdb_block = _mv_draw_3d(smiles_input)
+        with col1:
+            st.subheader("2D Structure")
+            if draw_error:
+                st.error(draw_error)
+            if img is not None:
+                st.image(img, use_container_width=True)
+                if smarts_input.strip():
+                    if match_count > 0:
+                        st.success(f"SMARTS matches found: {match_count}")
+                    else:
+                        st.warning("No SMARTS match found in this molecule.")
+            else:
+                st.error("Invalid SMILES string.")
+        with col2:
+            st.subheader("3D Structure")
+            if pdb_block is None:
+                st.error("Unable to render 3D molecule. Try a different SMILES string.")
+            elif isinstance(pdb_block, str) and (pdb_block.startswith("Embedding failed") or pdb_block.startswith("3D generation error")):
+                st.error(pdb_block)
+            else:
+                view = py3Dmol.view(width=400, height=400)
+                view.addModel(pdb_block, 'pdb')
+                view.setStyle({'stick': {}})
+                view.zoomTo()
+                st.components.v1.html(view.write_html(), height=420)
+    else:
+        st.info("Enter a SMILES string above to visualize the molecule.")
