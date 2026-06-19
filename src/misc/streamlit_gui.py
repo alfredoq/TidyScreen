@@ -315,6 +315,7 @@ elif page == "ChemSpace":
         st.session_state["show_tables_info"] = False
     if st.button(f"{'Hide' if st.session_state['show_tables_info'] else 'Show'} ChemSpace Tables Info", key="btn_chemspace_tables_info"):
         st.session_state["show_tables_info"] = not st.session_state["show_tables_info"]
+        st.rerun()
     if st.session_state["show_tables_info"]:
         st.dataframe(df)
 
@@ -326,8 +327,9 @@ elif page == "ChemSpace":
         st.session_state["show_display_table"] = False
 
     if df is not None and not df.empty:
-        if st.button(f"{'Hide' if st.session_state['show_display_table'] else 'Display'} Table", key="btn_display_table"):
+        if st.button(f"{'Hide' if st.session_state['show_display_table'] else 'Show'} Display Table", key="btn_display_table"):
             st.session_state["show_display_table"] = not st.session_state["show_display_table"]
+            st.rerun()
 
         if st.session_state["show_display_table"]:
             display_table_names = df["table"].tolist()
@@ -426,11 +428,12 @@ elif page == "ChemSpace":
         st.session_state["show_depict_options"] = False
 
     if df is not None and not df.empty:
-        if st.button(f"{'Hide' if st.session_state['show_depict_options'] else 'Depict'} Table", key="btn_depict_table"):
+        if st.button(f"{'Hide' if st.session_state['show_depict_options'] else 'Show'} Depict Table", key="btn_depict_table"):
             st.session_state["show_depict_options"] = not st.session_state["show_depict_options"]
             if not st.session_state["show_depict_options"]:
                 st.session_state["show_depiction"] = False
                 st.session_state["depiction_images"] = []
+            st.rerun()
 
         if st.session_state["show_depict_options"]:
             table_names = df["table"].tolist()
@@ -461,6 +464,7 @@ elif page == "ChemSpace":
                 if st.session_state["show_depiction"]:
                     st.session_state["show_depiction"] = False
                     st.session_state["depiction_images"] = []
+                    st.rerun()
                 else:
                     with st.spinner(f"Generating depictions for table '{selected_table}'…"):
                         try:
@@ -475,6 +479,7 @@ elif page == "ChemSpace":
                             if images:
                                 st.session_state["depiction_images"] = images
                                 st.session_state["show_depiction"] = True
+                                st.rerun()
                             else:
                                 st.warning(f"No valid molecules found in table '{selected_table}'.")
                         except Exception as e:
@@ -498,11 +503,12 @@ elif page == "ChemSpace":
         st.session_state["export_save_path"] = ""
 
     if df is not None and not df.empty:
-        if st.button(f"{'Hide' if st.session_state['show_export_options'] else 'Export'} Table", key="btn_export_table"):
+        if st.button(f"{'Hide' if st.session_state['show_export_options'] else 'Show'} Export Table", key="btn_export_table"):
             st.session_state["show_export_options"] = not st.session_state["show_export_options"]
             if not st.session_state["show_export_options"]:
                 st.session_state["export_save_path"] = ""
                 st.session_state["show_export_path_input"] = False
+            st.rerun()
 
         if st.session_state["show_export_options"]:
             export_table_names = df["table"].tolist()
