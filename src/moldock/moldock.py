@@ -8013,8 +8013,9 @@ class MolDock:
                 
                 ## Generate the ligand.pdbqt file
                 ligand_pdbqt_filepath = f"{docking_results_dir}/{inchi_key}.pdbqt"
-                self._pdbqt_from_mol(mol, ligand_pdbqt_filepath, inchi_key, ligand_prep_parameters)
-                
+                if not self._pdbqt_from_mol(mol, ligand_pdbqt_filepath, inchi_key, ligand_prep_parameters):
+                    continue
+
                 ## Execute autodockgpu
                 self._execute_autodockgpu(ligand_pdbqt_filepath, fld_file, method_params)
                 
@@ -8261,19 +8262,20 @@ class MolDock:
                 return None
             
     def _pdbqt_from_mol(self, mol, ligand_pdbqt_file, inchi_key, ligand_prep_params):
-        
+
         from meeko import MoleculePreparation
         from meeko import MoleculeSetup
         from meeko import PDBQTWriterLegacy
+        from rdkit.Chem import rdchem
         import ast
-        
+
         try:
             # Compose MoleculePreparation arguments from ligand_prep_params
             merge_atoms = eval(ligand_prep_params.get('merge_these_atom_types', '')) # The eval method is required to convert a string defining the atoms into a tuple as required by MoleculePreparation
             charge = ligand_prep_params.get('charge', '')
             hydrate = ligand_prep_params.get('hydrate', '')
             add_atom_types = ligand_prep_params.get('add_atom_types', '')
-            
+
             # evaluate the type of add_atom_types to end with a list type as required by MoleculePreparation
             if add_atom_types:
                 try:
@@ -8281,6 +8283,21 @@ class MolDock:
                 except Exception as e:
                     print(f"   ❌ Error parsing add_atom_types for molecule {inchi_key}: {e}")
                     add_atom_types = []
+
+            # Ring double bonds cannot have meaningful E/Z stereo (both atoms are
+            # ring-constrained), but OpenFF perceives it from 3D coords and then
+            # fails to encode it back as bond directions. Strip it before espaloma.
+            # We also clear BondDir on adjacent single bonds so that a subsequent
+            # AssignStereochemistry call (inside OpenFF) cannot re-derive it.
+            # Do NOT call AssignStereochemistry here — it would re-perceive from
+            # those same BondDir markers and undo the clearing.
+            for bond in mol.GetBonds():
+                if bond.GetBondTypeAsDouble() == 2.0 and bond.IsInRing():
+                    bond.SetStereo(rdchem.BondStereo.STEREONONE)
+                    for atom in (bond.GetBeginAtom(), bond.GetEndAtom()):
+                        for nbr_bond in atom.GetBonds():
+                            if nbr_bond.GetIdx() != bond.GetIdx():
+                                nbr_bond.SetBondDir(rdchem.BondDir.NONE)
 
             mk_prep = MoleculePreparation(merge_these_atom_types=merge_atoms,
                                           charge_model=charge,
@@ -8295,8 +8312,11 @@ class MolDock:
             with open(ligand_pdbqt_file, "w") as f:
                 f.write(pdbqt_string[0])
 
+            return True
+
         except Exception as e:
             print(f"   ❌ Error creating PDBQT for molecule {inchi_key}: {e}")
+            return False
             
     def _execute_autodockgpu(self, ligand_pdbqt_filepath, fld_file, method_params):
         import subprocess
@@ -8304,8 +8324,6 @@ class MolDock:
 
         fld_file_path = os.path.dirname(fld_file)
         fld_filename = fld_file.split('/')[-1]
-
-        print(fld_file_path)
 
         # Build AutoDockGPU command
         cmd = [
@@ -9687,8 +9705,9 @@ class MolDock:
                 
                 ## Generate the ligand.pdbqt file
                 ligand_pdbqt_filepath = f"{docking_results_dir}/{inchi_key}.pdbqt"
-                self._pdbqt_from_mol(mol, ligand_pdbqt_filepath, inchi_key, ligand_prep_parameters)
-                
+                if not self._pdbqt_from_mol(mol, ligand_pdbqt_filepath, inchi_key, ligand_prep_parameters):
+                    continue
+
                 ## Execute vina using ad4 scoring function
                 self._execute_vina(ligand_pdbqt_filepath, assay_registry, method_params, receptor_pdbqt_file, receptor_conditions, vina_rec_object)
                 
@@ -9804,7 +9823,8 @@ class MolDock:
                 
                 ## Generate the ligand.pdbqt file
                 ligand_pdbqt_filepath = f"{docking_results_dir}/{inchi_key}.pdbqt"
-                self._pdbqt_from_mol(mol, ligand_pdbqt_filepath, inchi_key, ligand_prep_parameters)
+                if not self._pdbqt_from_mol(mol, ligand_pdbqt_filepath, inchi_key, ligand_prep_parameters):
+                    continue
 
                 ## Execute unidock in single compound mode
                 self._execute_unidock(ligand_pdbqt_filepath, assay_registry, method_params, receptor_pdbqt_file, receptor_conditions, unidock_cmd)
@@ -14163,10 +14183,19 @@ class MolDock:
             return None
         configs['receptor_charge_model'] = charge_model
 
-        # --- Step 3: Copy PDBQT into project receptor folder ---
+        # --- Step 3: Build receptor folder tree matching the normal workflow ---
+        # Normal workflow produces:
+        #   receptors/{template_name}/
+        #     processed/receptor_checked_{charge_model}.pdbqt   ← pdbqt_file in DB
+        #     analysis/ grid_files/ logs/ original/             ← scaffolding
+        #     RecMod_{id}_grid_files_{charge_model}/            ← grid maps
+        canonical_stem = f"receptor_checked_{charge_model}"
         receptor_folder = os.path.join(self.__receptor_path, receptor_model_name)
-        os.makedirs(receptor_folder, exist_ok=True)
-        pdbqt_dest = os.path.join(receptor_folder, f"{receptor_model_name}.pdbqt")
+        processed_folder = os.path.join(receptor_folder, 'processed')
+        for subdir in ('processed', 'analysis', 'grid_files', 'logs', 'original'):
+            os.makedirs(os.path.join(receptor_folder, subdir), exist_ok=True)
+
+        pdbqt_dest = os.path.join(processed_folder, f"{canonical_stem}.pdbqt")
         shutil.copy2(pdbqt_src, pdbqt_dest)
         print(f"  Copied PDBQT: {pdbqt_dest}")
 
@@ -14274,12 +14303,33 @@ class MolDock:
         conn_r.close()
 
         # --- Step 7: Copy all input files into the properly named grid folder ---
+        # All docking callers expect the FLD and the receptor PDBQT inside the
+        # grids folder to follow the naming convention produced by the normal
+        # workflow (tleap → AutoGrid4):
+        #   receptor_checked_<charge_model>.maps.fld
+        #   receptor_checked_<charge_model>.pdbqt
+        # Files are copied verbatim first, then the FLD and PDBQT are renamed.
         grids_dest = os.path.join(receptor_folder,
                                   f"RecMod_{new_id}_grid_files_{charge_model}")
         os.makedirs(grids_dest, exist_ok=True)
         for fname in all_files:
             shutil.copy2(os.path.join(input_folder_path, fname),
                          os.path.join(grids_dest, fname))
+
+        # Rename the FLD file to the expected canonical name
+        for fname in fld_files:
+            src = os.path.join(grids_dest, fname)
+            dst = os.path.join(grids_dest, f"{canonical_stem}.maps.fld")
+            if src != dst:
+                os.rename(src, dst)
+                print(f"  Renamed FLD: {fname} → {canonical_stem}.maps.fld")
+
+        # Place the receptor PDBQT inside the grids folder under the canonical
+        # name so that the FLD reference and AutoDock/Vina lookups are consistent
+        canonical_pdbqt_in_grids = os.path.join(grids_dest, f"{canonical_stem}.pdbqt")
+        shutil.copy2(pdbqt_src, canonical_pdbqt_in_grids)
+        print(f"  Copied PDBQT into grids folder: {canonical_stem}.pdbqt")
+
         print(f"  Copied grid files to: {grids_dest}")
         configs['grids_path'] = grids_dest
 
