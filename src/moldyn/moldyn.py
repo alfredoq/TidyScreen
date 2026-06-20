@@ -846,7 +846,7 @@ class MolDyn:
             print(f"❌ Error retrieving last MD assay ID: {e}")
             sys.exit(1)
 
-    def _create_md_assay_register_entry(self, new_assay_id, new_assay_folder, assay_description, docking_assay_id=None, ligname=None, pose_id=None, md_parameters_dict=None):
+    def _create_md_assay_register_entry(self, new_assay_id, new_assay_folder, assay_description, docking_assay_id=None, ligname=None, pose_id=None, md_parameters_dict=None, receptor_template_name=None):
         """Create a new entry in the md_assays table for the newly created MD assay."""
         try:
             import sqlite3
@@ -863,12 +863,13 @@ class MolDyn:
                 'docking_assay_id': 'INTEGER',
                 'ligand_name': 'TEXT',
                 'pose_id': 'INTEGER',
+                'receptor_template_name': 'TEXT',
                 'md_parameters': 'TEXT',
             }
             # Create md_assays table if it doesn't exist
             dbm.create_table_from_columns_dict(cursor, 'md_assays', columns_dict, verbose=False)
 
-            # Update legacy table columns 
+            # Update legacy table columns
             dbm.update_legacy_table_columns(cursor, 'md_assays', columns_dict, verbose=False)
 
             # Remove legacy table columns
@@ -882,6 +883,7 @@ class MolDyn:
                 'docking_assay_id': f'assay_{docking_assay_id}',
                 'ligand_name': ligname,
                 'pose_id': pose_id,
+                'receptor_template_name': receptor_template_name,
                 'md_parameters': self._serialize_parameters(md_parameters_dict),
             }
             # Insert dinamically data into md_assays table
@@ -1239,6 +1241,177 @@ class MolDyn:
         except Exception as e:
             print(f"❌ Error starting MD simulation: {e}")
             
+    def perform_md_assay_on_receptor(self):
+        """
+        Configure a molecular dynamics simulation starting from a registered receptor
+        template (apo simulation, no ligand).  Mirrors perform_md_assay but replaces
+        the docking-pose source with a receptor template selected from pdb_templates.
+        """
+        try:
+            # Select receptor template from pdbs.db
+            template_dict = self._select_receptor_template()
+            if template_dict is None:
+                return
+
+            # Select a MD method
+            md_parameters_dict = self._select_md_method()
+            if md_parameters_dict is None:
+                return
+
+            # Query user for MD assay description
+            assay_description = input("\n📝 Enter MD assay description (optional): ").strip()
+            if not assay_description:
+                assay_description = f"Receptor-only MD assay for template '{template_dict['pdb_template_name']}'"
+
+            # Create MD assay folder
+            md_assay_id, md_assay_folder = self._create_md_assay_folder()
+            if md_assay_id is None:
+                return
+
+            # Prepare receptor-only prmtop and inpcrd via tleap
+            prmtop_file, inpcrd_file = self._prepare_receptor_only_prmtop_inpcrd_for_md(
+                template_dict['checked_pdb_path'], md_assay_folder, md_parameters_dict
+            )
+
+            # Prepare AMBER input files (min1, min2, heating, equilibration, production)
+            self._prepare_md_simulation_input_files(md_parameters_dict, md_assay_folder, prmtop_file, inpcrd_file)
+
+            # Prepare execution shell script
+            self._prepare_md_execution_script(md_assay_folder)
+
+            # Register the assay in md_assays table
+            self._create_md_assay_register_entry(
+                md_assay_id, md_assay_folder, assay_description,
+                receptor_template_name=template_dict['pdb_template_name'],
+                md_parameters_dict=md_parameters_dict,
+            )
+
+            # Optionally start simulation now
+            start_now = input("\n▶️  Do you want to start the MD simulation now? (yes/no) [default: no]: ").strip().lower() or 'no'
+            if start_now in ['yes', 'y']:
+                self._start_md_simulation(md_assay_folder)
+            else:
+                print("❌ MD simulation not started. You can start it later by running the execution script in the assay folder.")
+
+        except Exception as e:
+            print(f"❌ Error performing receptor MD assay: {e}")
+
+    def _select_receptor_template(self):
+        """
+        Prompt the user to select a receptor template registered in pdb_templates
+        (stored in docking/receptors/pdbs.db).
+
+        Returns a dict with pdb_template_name, checked_pdb_path, template_folder_path,
+        chains, and notes; or None if the user cancels or no templates exist.
+        """
+        import sqlite3
+
+        pdbs_db_path = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
+        if not os.path.exists(pdbs_db_path):
+            print(f"❌ No receptors database found at {pdbs_db_path}")
+            return None
+
+        try:
+            conn = sqlite3.connect(pdbs_db_path)
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT pdb_id, pdb_template_name, checked_pdb_path,
+                       template_folder_path, chains, notes
+                FROM pdb_templates
+                ORDER BY pdb_id ASC
+            """)
+            rows = cursor.fetchall()
+            conn.close()
+        except Exception as e:
+            print(f"❌ Error reading pdb_templates: {e}")
+            return None
+
+        if not rows:
+            print("❌ No receptor templates found in pdb_templates.")
+            return None
+
+        print(f"\n🧬 RECEPTOR TEMPLATES IN PROJECT '{self.name}':")
+        print("=" * 70)
+        for i, (pdb_id, name, checked_pdb, folder, chains, notes) in enumerate(rows, 1):
+            print(f"{i}. {name} (ID: {pdb_id})")
+            print(f"   Chains: {chains}")
+            print(f"   Checked PDB: {os.path.basename(checked_pdb) if checked_pdb else 'N/A'}")
+            print(f"   Notes: {notes}")
+            print("-" * 70)
+
+        while True:
+            try:
+                selection = input("\n🔎 Select template by number (or 'cancel'): ").strip()
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    print("❌ Template selection cancelled.")
+                    return None
+                idx = int(selection) - 1
+                if 0 <= idx < len(rows):
+                    row = rows[idx]
+                    print(f"✅ Selected template: '{row[1]}'")
+                    return {
+                        'pdb_id': row[0],
+                        'pdb_template_name': row[1],
+                        'checked_pdb_path': row[2],
+                        'template_folder_path': row[3],
+                        'chains': row[4],
+                        'notes': row[5],
+                    }
+                else:
+                    print(f"❌ Invalid selection. Enter a number between 1 and {len(rows)}.")
+            except ValueError:
+                print("❌ Please enter a valid number.")
+            except KeyboardInterrupt:
+                print("\n❌ Template selection cancelled.")
+                return None
+
+    def _prepare_receptor_only_prmtop_inpcrd_for_md(self, checked_pdb_path, output_dir, md_parameters_dict):
+        """
+        Build AMBER topology (prmtop) and coordinate (inpcrd) files for a receptor-only
+        (apo) system using tleap.  Output files are named complex.prmtop / complex.inpcrd
+        so that the shared execution script and input-file templates work unchanged.
+        """
+        import subprocess
+
+        tleap_params = md_parameters_dict.get('tleap_params', {})
+        protein_ff = tleap_params.get('force_field', 'ff14SB')
+        solvent_type = md_parameters_dict.get('solvent_type', 'explicit')
+
+        prmtop_file = os.path.join(output_dir, 'complex.prmtop')
+        inpcrd_file = os.path.join(output_dir, 'complex.inpcrd')
+        tleap_in_file = os.path.join(output_dir, 'complex.in')
+
+        with open(tleap_in_file, 'w') as f:
+            f.write(f"source leaprc.protein.{protein_ff}\n")
+            if solvent_type == 'explicit':
+                water_model = tleap_params.get('water_model', 'tip3p')
+                f.write(f"source leaprc.water.{water_model}\n")
+                f.write("HOH = WAT\n")
+            f.write(f"rec = loadpdb {checked_pdb_path}\n")
+            if solvent_type == 'explicit':
+                water_type = tleap_params.get('water_type', 'TIP3PBOX')
+                box_type = tleap_params.get('box_type', 'Box')
+                box_distance_nm = tleap_params.get('box_distance_nm', 10.0)
+                wat_closeness = tleap_params.get('wat_closeness', 1.0)
+                f.write(f"solvate{box_type} rec {water_type} {box_distance_nm} {wat_closeness}\n")
+                add_ions = tleap_params.get('add_ions', 'yes')
+                if add_ions in ['yes', 'y']:
+                    positive_ion = tleap_params.get('positive_ion', 'Na+')
+                    negative_ion = tleap_params.get('negative_ion', 'Cl-')
+                    f.write(f"addions rec {positive_ion} 0\n")
+                    f.write(f"addions rec {negative_ion} 0\n")
+            f.write(f"saveamberparm rec {prmtop_file} {inpcrd_file}\n")
+            f.write("quit\n")
+
+        try:
+            subprocess.run(f"tleap -f {tleap_in_file}", shell=True, check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            print(f"[ERROR] Failed to run tleap for receptor-only system: {e}")
+            sys.exit(1)
+
+        return prmtop_file, inpcrd_file
+
     def list_md_assays(self):
         """List all MD assays registered in the project."""
         try:

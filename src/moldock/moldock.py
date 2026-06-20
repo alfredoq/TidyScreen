@@ -3378,6 +3378,36 @@ class MolDock:
         except Exception as e:
             print(f"❌ Error showing table details: {e}")
     
+    def _strip_histidine_hydrogens(self, pdb_content: bytes) -> tuple:
+        """
+        Remove all hydrogen atoms belonging to histidine residues (HIS/HID/HIE/HIP)
+        from PDB content.  tleap re-adds the correct Hs based on the residue name.
+
+        Returns (cleaned_bytes, n_removed).
+        """
+        his_residues = {'HIS', 'HID', 'HIE', 'HIP'}
+        filtered, removed = [], 0
+        for raw_line in pdb_content.splitlines(keepends=True):
+            line = raw_line.decode('utf-8', errors='replace')
+            record = line[:6].strip()
+            if record in ('ATOM', 'HETATM'):
+                res_name = line[17:20].strip()
+                if res_name in his_residues:
+                    atom_name = line[12:16].strip()
+                    element = line[76:78].strip() if len(line) > 76 else ''
+                    is_hydrogen = (
+                        element == 'H'
+                        or (not element and (
+                            atom_name.startswith('H')
+                            or (len(atom_name) >= 2 and atom_name[0].isdigit() and atom_name[1] == 'H')
+                        ))
+                    )
+                    if is_hydrogen:
+                        removed += 1
+                        continue
+            filtered.append(raw_line)
+        return b''.join(filtered), removed
+
     def create_pdb_model(self) -> Optional[Dict[str, Any]]:
         """
         The user is prompted to select a PDB file, which will be stored as a blob object in a table named pdb_files in the pdbs.db located in the 
@@ -3480,10 +3510,14 @@ class MolDock:
             try:
                 with open(pdb_file, 'rb') as f:
                     pdb_blob = f.read()
-                
+
+                pdb_blob, his_h_removed = self._strip_histidine_hydrogens(pdb_blob)
+                if his_h_removed:
+                    print(f"   ✓ Removed {his_h_removed} hydrogen atom(s) from histidine residues")
+
                 file_size = len(pdb_blob)
                 print(f"   ✓ File read successfully ({file_size:,} bytes)")
-                
+
             except Exception as e:
                 print(f"❌ Error reading PDB file: {e}")
                 return None
