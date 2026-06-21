@@ -574,7 +574,11 @@ class MolDyn:
         """
         Will connect to the docking registers database and list available docking assays.
         """
-        
+        import traceback
+
+        md_assay_folder = None
+        md_assay_id = None
+
         try:
             import sqlite3
 
@@ -584,18 +588,29 @@ class MolDyn:
             # Show docking assays available
             docking_assay_params_dict = self._select_docking_assay(cursor)
             conn.close()
+            if docking_assay_params_dict is None:
+                return
 
             # Select unique ligand molecules in the selected docking assay
             docking_assay_params_dict = self._select_unique_ligands_in_docking_assay(docking_assay_params_dict)
+            if docking_assay_params_dict is None:
+                return
 
             # Select pose id for the selected ligand to perform MD assay
             docking_assay_params_dict = self._select_ligand_pose_for_md_assay(docking_assay_params_dict)
+            if docking_assay_params_dict is None:
+                return
 
             # Select a MD method to perform the MD assay
             md_parameters_dict = self._select_md_method()
+            if md_parameters_dict is None:
+                return
 
             # Restore the selected docked pose using ligand_management module
+            print(f"\n⚙️  Restoring docked pose...")
             pdb_dict = lm.restore_single_docked_pose(docking_assay_params_dict.get('docking_results_db'), docking_assay_params_dict.get('selected_ligand_name'), docking_assay_params_dict.get('selected_pose_id'))
+            if pdb_dict is None:
+                raise RuntimeError("Failed to restore docked pose — restore_single_docked_pose returned None")
 
             # Query user for MD assay description
             assay_description = input("\n📝 Enter MD assay description (optional): ").strip()
@@ -608,33 +623,46 @@ class MolDyn:
                 return
 
             # Save the docked pose PDB file in the MD assay folder
+            print(f"⚙️  Writing docked pose PDB...")
             selected_pose_pdb = lm.write_pdb_with_moldf(pdb_dict, docking_assay_params_dict.get('selected_ligand_name'), docking_assay_params_dict.get('selected_pose_id'), md_assay_folder)
+            if selected_pose_pdb is None:
+                raise RuntimeError("Failed to write docked pose PDB — write_pdb_with_moldf returned None")
 
             # Prepare the ligand tleap input file in the MD assay folder
+            print(f"⚙️  Preparing ligand force-field files...")
             mol2_file, frcmod_file = lm.prepare_ligand_tleap_input_files(self.__chemspace_db, docking_assay_params_dict.get('selected_ligand_name'), docking_assay_params_dict, md_assay_folder)
-            
+            if mol2_file is None or frcmod_file is None:
+                raise RuntimeError("Failed to prepare ligand tleap input files — prepare_ligand_tleap_input_files returned None")
+
             # Create complex .prmtop and .inpcrd files
+            print(f"⚙️  Preparing topology and coordinate files with tleap...")
             prmtop_file, inpcrd_file = self._prepare_complex_prmtop_inpcrd_for_md(mol2_file, frcmod_file, docking_assay_params_dict, md_assay_folder, md_assay_folder, md_parameters_dict, selected_pose_pdb)
-            
+
             # Prepare md simulation input files
+            print(f"⚙️  Writing AMBER simulation input files...")
             self._prepare_md_simulation_input_files(md_parameters_dict, md_assay_folder, prmtop_file, inpcrd_file)
-            
+
             # Prepare execution scripts for the MD assay
+            print(f"⚙️  Writing execution script...")
             self._prepare_md_execution_script(md_assay_folder)
-            
+
             # Create MD register entry in the md_assays table
             self._create_md_assay_register_entry(md_assay_id, md_assay_folder, assay_description, docking_assay_params_dict.get('assay_id'), docking_assay_params_dict.get('selected_ligand_name'), docking_assay_params_dict.get('selected_pose_id'), md_parameters_dict)
-            
+
+            print(f"\n✅ MD assay prepared successfully in: {md_assay_folder}")
+
             # Query if the user want to start the MD simulation now
             start_now = input("\n▶️  Do you want to start the MD simulation now? (yes/no) [default: no]: ").strip().lower() or 'no'
             if start_now in ['yes', 'y']:
                 self._start_md_simulation(md_assay_folder)
             else:
-                print("❌ MD simulation not started. You can start it later by running the execution script in the assay folder.")
-                
+                print("ℹ️  MD simulation not started. Run the execution script in the assay folder when ready.")
 
         except Exception as e:
-            print(f"❌ Error performing MD assay: {e}")
+            print(f"\n❌ Error performing MD assay: {e}")
+            traceback.print_exc()
+            if md_assay_folder and os.path.exists(md_assay_folder):
+                print(f"⚠️  Assay folder left on disk for inspection: {md_assay_folder}")
         
     def _select_docking_assay(self, cursor):
         
@@ -948,34 +976,71 @@ class MolDyn:
             box_distance_nm = tleap_params.get('box_distance_nm', 1.0)
             wat_closeness = tleap_params.get('wat_closeness', 1.0)
         
-        with open(tleap_in_file, 'w') as f:
-            f.write(f"source leaprc.protein.{protein_ff}\n")
-            f.write(f"source leaprc.{ligand_ff}\n")
-            if solvent_type == 'explicit':
-                f.write(f"source leaprc.water.{water_model}\n")
-                f.write(f"HOH = WAT\n")
-            f.write(f"rec = loadpdb {receptor_pdb_path}\n")
-            f.write(f"UNL = loadmol2 {mol2_file}\n")
-            f.write(f"loadamberparams {frcmod_file}\n")
-            f.write(f"lig = loadpdb {pdb_file}\n")
-            f.write(f"COM = combine {{rec lig}}\n")
-            if solvent_type == 'explicit':
-                f.write(f"solvate{box_type} COM {water_type} {box_distance_nm} {wat_closeness}\n")
-                if add_ions in ['yes', 'y']:
-                    f.write(f"addions COM {positive_ion} 0\n")
-                    f.write(f"addions COM {negative_ion} 0\n")
-            f.write(f"saveamberparm COM {prmtop_file} {inpcrd_file}\n")
-            f.write("quit\n")
+        tleap_log_file = os.path.join(output_dir, 'tleap.log')
+
+        try:
+            with open(tleap_in_file, 'w') as f:
+                f.write(f"source leaprc.protein.{protein_ff}\n")
+                f.write(f"loadamberparams frcmod.ions1lm_126_tip3p\n")
+                f.write(f"source leaprc.{ligand_ff}\n")
+                if solvent_type == 'explicit':
+                    f.write(f"source leaprc.water.{water_model}\n")
+                    f.write(f"HOH = WAT\n")
+                f.write(f"rec = loadpdb {receptor_pdb_path}\n")
+                f.write(f"UNL = loadmol2 {mol2_file}\n")
+                f.write(f"loadamberparams {frcmod_file}\n")
+                f.write(f"lig = loadpdb {pdb_file}\n")
+                f.write(f"COM = combine {{rec lig}}\n")
+                if solvent_type == 'explicit':
+                    f.write(f"solvate{box_type} COM {water_type} {box_distance_nm} {wat_closeness}\n")
+                    if add_ions in ['yes', 'y']:
+                        f.write(f"addions COM {positive_ion} 0\n")
+                        f.write(f"addions COM {negative_ion} 0\n")
+                f.write(f"saveamberparm COM {prmtop_file} {inpcrd_file}\n")
+                f.write("quit\n")
+        except OSError as e:
+            raise RuntimeError(f"Failed to write tleap input file '{tleap_in_file}': {e}") from e
 
         # Run tleap to generate prmtop and inpcrd files
-        tleap_command = f"tleap -f {tleap_in_file}"
         try:
-            subprocess.run(tleap_command, shell=True, check=True, stdout=subprocess.DEVNULL , stderr=subprocess.DEVNULL)
+            result = subprocess.run(
+                f"tleap -f {tleap_in_file}",
+                shell=True,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.SubprocessError as e:
+            raise RuntimeError(f"Failed to execute tleap: {e}") from e
 
-        except Exception as e:
-            print(f"[ERROR] Failed to run tleap for complex generation: {e}")
-            sys.exit(1)
+        # Always save tleap output for later inspection
+        try:
+            with open(tleap_log_file, 'w') as lf:
+                lf.write(result.stdout)
+                if result.stderr:
+                    lf.write("\n--- STDERR ---\n")
+                    lf.write(result.stderr)
+        except OSError:
+            pass
 
+        if result.returncode != 0:
+            tail = result.stdout[-3000:] if len(result.stdout) > 3000 else result.stdout
+            print(f"   tleap output (last lines):\n{tail}")
+            raise RuntimeError(
+                f"tleap exited with code {result.returncode}. "
+                f"Full log: {tleap_log_file}"
+            )
+
+        # tleap exits 0 even when it fails to write output files — verify explicitly
+        missing = [f for f in (prmtop_file, inpcrd_file) if not os.path.exists(f)]
+        if missing:
+            tail = result.stdout[-3000:] if len(result.stdout) > 3000 else result.stdout
+            print(f"   tleap output (last lines):\n{tail}")
+            raise RuntimeError(
+                f"tleap completed but did not produce: {', '.join(os.path.basename(f) for f in missing)}. "
+                f"Full log: {tleap_log_file}"
+            )
+
+        print(f"   ✓ tleap completed successfully (log: {tleap_log_file})")
         return prmtop_file, inpcrd_file
         
     def _select_md_method(self):
@@ -1061,7 +1126,7 @@ class MolDyn:
                 self._prepare_implicit_solvent_md_input_files(engine, md_parameters_dict, md_assay_folder, prmtop_file, inpcrd_file)
 
         except Exception as e:
-            print(f"❌ Error preparing MD simulation input files: {e}")
+            raise RuntimeError(f"Failed to prepare MD simulation input files: {e}") from e
 
     def _prepare_explicit_solvent_md_input_files(self, md_parameters_dict, md_assay_folder, prmtop_file, inpcrd_file):
 
@@ -1202,22 +1267,24 @@ class MolDyn:
             f.write(f"END\n")
 
     def _prepare_md_execution_script(self, md_assay_folder):
-        
-        execution_script_path = os.path.join(md_assay_folder, "run_md.sh")
-        with open(execution_script_path, 'w') as f:
-            f.write("#!/bin/bash\n")
-            f.write("echo 'Running min1'\n")
-            f.write("pmemd.cuda -O -i min1.in -o min1.out -p complex.prmtop -c complex.inpcrd -r min1.crd -ref complex.inpcrd\n")
-            f.write("echo 'Running min2'\n")
-            f.write("pmemd.cuda -O -i min2.in -o min2.out -p complex.prmtop -c complex.inpcrd -r min2.crd -ref min1.crd\n")
-            f.write("echo 'Running heating'\n")
-            f.write("pmemd.cuda -O -i heating.in -o heating.out -p complex.prmtop -c min2.crd -r heating.crd -ref min2.crd\n")
-            f.write("echo 'Running equilibration'\n")
-            f.write("pmemd.cuda -O -i equilibration.in -o equilibration.out -p complex.prmtop -c heating.crd -r equilibration.crd -ref heating.crd -x equilibration.nc\n")
-            f.write("echo 'Running production'\n")
-            f.write("pmemd.cuda -O -i production.in -o production.out -p complex.prmtop -c equilibration.crd -r production.crd -ref equilibration.crd -x production.nc\n")
 
-        os.chmod(execution_script_path, 0o755)
+        execution_script_path = os.path.join(md_assay_folder, "run_md.sh")
+        try:
+            with open(execution_script_path, 'w') as f:
+                f.write("#!/bin/bash\n")
+                f.write("echo 'Running min1'\n")
+                f.write("pmemd.cuda -O -i min1.in -o min1.out -p complex.prmtop -c complex.inpcrd -r min1.crd -ref complex.inpcrd\n")
+                f.write("echo 'Running min2'\n")
+                f.write("pmemd.cuda -O -i min2.in -o min2.out -p complex.prmtop -c complex.inpcrd -r min2.crd -ref min1.crd\n")
+                f.write("echo 'Running heating'\n")
+                f.write("pmemd.cuda -O -i heating.in -o heating.out -p complex.prmtop -c min2.crd -r heating.crd -ref min2.crd\n")
+                f.write("echo 'Running equilibration'\n")
+                f.write("pmemd.cuda -O -i equilibration.in -o equilibration.out -p complex.prmtop -c heating.crd -r equilibration.crd -ref heating.crd -x equilibration.nc\n")
+                f.write("echo 'Running production'\n")
+                f.write("pmemd.cuda -O -i production.in -o production.out -p complex.prmtop -c equilibration.crd -r production.crd -ref equilibration.crd -x production.nc\n")
+            os.chmod(execution_script_path, 0o755)
+        except OSError as e:
+            raise RuntimeError(f"Failed to write execution script '{execution_script_path}': {e}") from e
     
     def _start_md_simulation(self, md_assay_folder):
         
@@ -1247,6 +1314,11 @@ class MolDyn:
         template (apo simulation, no ligand).  Mirrors perform_md_assay but replaces
         the docking-pose source with a receptor template selected from pdb_templates.
         """
+        import traceback
+
+        md_assay_folder = None
+        md_assay_id = None
+
         try:
             # Select receptor template from pdbs.db
             template_dict = self._select_receptor_template()
@@ -1269,14 +1341,17 @@ class MolDyn:
                 return
 
             # Prepare receptor-only prmtop and inpcrd via tleap
+            print(f"\n⚙️  Preparing topology and coordinate files with tleap...")
             prmtop_file, inpcrd_file = self._prepare_receptor_only_prmtop_inpcrd_for_md(
                 template_dict['checked_pdb_path'], md_assay_folder, md_parameters_dict
             )
 
             # Prepare AMBER input files (min1, min2, heating, equilibration, production)
+            print(f"⚙️  Writing AMBER simulation input files...")
             self._prepare_md_simulation_input_files(md_parameters_dict, md_assay_folder, prmtop_file, inpcrd_file)
 
             # Prepare execution shell script
+            print(f"⚙️  Writing execution script...")
             self._prepare_md_execution_script(md_assay_folder)
 
             # Register the assay in md_assays table
@@ -1286,15 +1361,20 @@ class MolDyn:
                 md_parameters_dict=md_parameters_dict,
             )
 
+            print(f"\n✅ MD assay prepared successfully in: {md_assay_folder}")
+
             # Optionally start simulation now
             start_now = input("\n▶️  Do you want to start the MD simulation now? (yes/no) [default: no]: ").strip().lower() or 'no'
             if start_now in ['yes', 'y']:
                 self._start_md_simulation(md_assay_folder)
             else:
-                print("❌ MD simulation not started. You can start it later by running the execution script in the assay folder.")
+                print("ℹ️  MD simulation not started. Run the execution script in the assay folder when ready.")
 
         except Exception as e:
-            print(f"❌ Error performing receptor MD assay: {e}")
+            print(f"\n❌ Error performing receptor MD assay: {e}")
+            traceback.print_exc()
+            if md_assay_folder and os.path.exists(md_assay_folder):
+                print(f"⚠️  Assay folder left on disk for inspection: {md_assay_folder}")
 
     def _select_receptor_template(self):
         """
@@ -1370,6 +1450,9 @@ class MolDyn:
         Build AMBER topology (prmtop) and coordinate (inpcrd) files for a receptor-only
         (apo) system using tleap.  Output files are named complex.prmtop / complex.inpcrd
         so that the shared execution script and input-file templates work unchanged.
+
+        Raises RuntimeError on any failure so the caller can handle it with full context.
+        tleap stdout+stderr are always saved to tleap.log inside the assay folder.
         """
         import subprocess
 
@@ -1380,36 +1463,73 @@ class MolDyn:
         prmtop_file = os.path.join(output_dir, 'complex.prmtop')
         inpcrd_file = os.path.join(output_dir, 'complex.inpcrd')
         tleap_in_file = os.path.join(output_dir, 'complex.in')
-
-        with open(tleap_in_file, 'w') as f:
-            f.write(f"source leaprc.protein.{protein_ff}\n")
-            if solvent_type == 'explicit':
-                water_model = tleap_params.get('water_model', 'tip3p')
-                f.write(f"source leaprc.water.{water_model}\n")
-                f.write("HOH = WAT\n")
-            f.write(f"rec = loadpdb {checked_pdb_path}\n")
-            if solvent_type == 'explicit':
-                water_type = tleap_params.get('water_type', 'TIP3PBOX')
-                box_type = tleap_params.get('box_type', 'Box')
-                box_distance_nm = tleap_params.get('box_distance_nm', 10.0)
-                wat_closeness = tleap_params.get('wat_closeness', 1.0)
-                f.write(f"solvate{box_type} rec {water_type} {box_distance_nm} {wat_closeness}\n")
-                add_ions = tleap_params.get('add_ions', 'yes')
-                if add_ions in ['yes', 'y']:
-                    positive_ion = tleap_params.get('positive_ion', 'Na+')
-                    negative_ion = tleap_params.get('negative_ion', 'Cl-')
-                    f.write(f"addions rec {positive_ion} 0\n")
-                    f.write(f"addions rec {negative_ion} 0\n")
-            f.write(f"saveamberparm rec {prmtop_file} {inpcrd_file}\n")
-            f.write("quit\n")
+        tleap_log_file = os.path.join(output_dir, 'tleap.log')
 
         try:
-            subprocess.run(f"tleap -f {tleap_in_file}", shell=True, check=True,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception as e:
-            print(f"[ERROR] Failed to run tleap for receptor-only system: {e}")
-            sys.exit(1)
+            with open(tleap_in_file, 'w') as f:
+                f.write(f"source leaprc.protein.{protein_ff}\n")
+                f.write(f"loadamberparams frcmod.ions1lm_126_tip3p\n")
+                if solvent_type == 'explicit':
+                    water_model = tleap_params.get('water_model', 'tip3p')
+                    f.write(f"source leaprc.water.{water_model}\n")
+                    f.write("HOH = WAT\n")
+                f.write(f"rec = loadpdb {checked_pdb_path}\n")
+                if solvent_type == 'explicit':
+                    water_type = tleap_params.get('water_type', 'TIP3PBOX')
+                    box_type = tleap_params.get('box_type', 'Box')
+                    box_distance_nm = tleap_params.get('box_distance_nm', 10.0)
+                    wat_closeness = tleap_params.get('wat_closeness', 1.0)
+                    f.write(f"solvate{box_type} rec {water_type} {box_distance_nm} {wat_closeness}\n")
+                    add_ions = tleap_params.get('add_ions', 'yes')
+                    if add_ions in ['yes', 'y']:
+                        positive_ion = tleap_params.get('positive_ion', 'Na+')
+                        negative_ion = tleap_params.get('negative_ion', 'Cl-')
+                        f.write(f"addions rec {positive_ion} 0\n")
+                        f.write(f"addions rec {negative_ion} 0\n")
+                f.write(f"saveamberparm rec {prmtop_file} {inpcrd_file}\n")
+                f.write("quit\n")
+        except OSError as e:
+            raise RuntimeError(f"Failed to write tleap input file '{tleap_in_file}': {e}") from e
 
+        try:
+            result = subprocess.run(
+                f"tleap -f {tleap_in_file}",
+                shell=True,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.SubprocessError as e:
+            raise RuntimeError(f"Failed to execute tleap: {e}") from e
+
+        # Always save tleap output for later inspection
+        try:
+            with open(tleap_log_file, 'w') as lf:
+                lf.write(result.stdout)
+                if result.stderr:
+                    lf.write("\n--- STDERR ---\n")
+                    lf.write(result.stderr)
+        except OSError:
+            pass
+
+        if result.returncode != 0:
+            tail = result.stdout[-3000:] if len(result.stdout) > 3000 else result.stdout
+            print(f"   tleap output (last lines):\n{tail}")
+            raise RuntimeError(
+                f"tleap exited with code {result.returncode}. "
+                f"Full log: {tleap_log_file}"
+            )
+
+        # tleap exits 0 even when it fails to write output files — verify explicitly
+        missing = [f for f in (prmtop_file, inpcrd_file) if not os.path.exists(f)]
+        if missing:
+            tail = result.stdout[-3000:] if len(result.stdout) > 3000 else result.stdout
+            print(f"   tleap output (last lines):\n{tail}")
+            raise RuntimeError(
+                f"tleap completed but did not produce: {', '.join(os.path.basename(f) for f in missing)}. "
+                f"Full log: {tleap_log_file}"
+            )
+
+        print(f"   ✓ tleap completed successfully (log: {tleap_log_file})")
         return prmtop_file, inpcrd_file
 
     def list_md_assays(self):

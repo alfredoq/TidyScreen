@@ -6987,11 +6987,24 @@ class MolDock:
                 print("❌ tleap not found in PATH. Please install AmberTools and ensure tleap is available.")
                 return None
 
+            # Ensure water residues are labeled HETATM before tleap sees the file.
+            # ATOM-labeled HOH/WAT records cause tleap to treat waters as part of the
+            # main chain; without a TER separator this corrupts adjacent metal ion
+            # coordinates (e.g. ZN) in the savepdb output.
+            with open(receptor_file, 'rb') as _f:
+                _pdb_bytes = _f.read()
+            _pdb_bytes, _waters_fixed = self._fix_water_record_types(_pdb_bytes)
+            if _waters_fixed:
+                with open(receptor_file, 'wb') as _f:
+                    _f.write(_pdb_bytes)
+                print(f"   ✓ Corrected {_waters_fixed} water record(s) from ATOM to HETATM before tleap processing")
+
             tleap_file = f"{processed_dir}/add_missing_atoms_in_pdb.in"
             tleap_processed_file = receptor_file.replace(".pdb", "_checked.pdb")
             with open(tleap_file, "w") as f:
                 f.write(f"#Adding missing atoms\n")
                 f.write(f"source leaprc.protein.ff14SB\n")
+                f.write(f"loadamberparams frcmod.ions1lm_126_tip3p\n")
                 f.write(f"source leaprc.water.tip3p\n")
                 f.write(f"source leaprc.gaff2\n")
                 f.write(f"HOH = WAT\n")
@@ -10909,24 +10922,66 @@ class MolDock:
         return receptor_moldf_dict, renumbering_dict
         
     def _add_element_column_to_pdb_file(self, tleap_processed_file):
-        
-        from moldf import read_pdb
-        from moldf import write_pdb
+
         import pandas as pd
-        
-        # Create a df from the tleap_receptor file
-        df = pd.read_csv(tleap_processed_file, sep=r'\s+', engine='python', header=None)
-        
-        # Change the column names
-        df.columns = ['record_name', 'atom_number', 'atom_name', 'residue_name', 'residue_number', 'x_coord', 'y_coord', 'z_coord', 'occupancy', 'b_factor']
-        # Fill NaN values in the 'atom_number' column with forward fill and then add a cumulative sum to ensure unique atom numbers
-        df['atom_number'] = df['atom_number'].ffill().add(df['atom_number'].isna().astype(int).cumsum()).astype(int)
-        # Fill NaN values with a default value (e.g., 0) and change the residue_number column to integer type
-        df['residue_number'] = df['residue_number'].ffill().fillna(0).astype(int)
-        # Fill NaN atom names with an empty string
-        df['atom_name'] = df['atom_name'].fillna('')
-        # Fil NaN residue names with the same value as above
-        df['residue_name'] = df['residue_name'].ffill().fillna('')
+
+        # Use fixed-column PDB parsing instead of whitespace splitting.
+        # pd.read_csv(sep=r'\s+') breaks on PDB files because the REMARK/TER
+        # lines have different token counts than ATOM/HETATM lines, causing
+        # pandas (engine='python', regex delimiter) to raise ParserError or
+        # silently mis-assign coordinates when chain IDs are present.
+        records = []
+        with open(tleap_processed_file, 'r') as _fh:
+            for _line in _fh:
+                if _line.startswith(('ATOM', 'HETATM')):
+                    record_name = _line[0:6].strip()
+                    try:
+                        atom_number = int(_line[6:11])
+                    except ValueError:
+                        atom_number = 0
+                    atom_name = _line[12:16].strip()
+                    residue_name = _line[17:20].strip()
+                    try:
+                        residue_number = int(_line[22:26])
+                    except ValueError:
+                        residue_number = 0
+                    try:
+                        x_coord = float(_line[30:38])
+                        y_coord = float(_line[38:46])
+                        z_coord = float(_line[46:54])
+                    except ValueError:
+                        x_coord = y_coord = z_coord = float('nan')
+                    try:
+                        occupancy = float(_line[54:60])
+                    except ValueError:
+                        occupancy = 1.0
+                    try:
+                        b_factor = float(_line[60:66])
+                    except ValueError:
+                        b_factor = 0.0
+                    records.append([record_name, atom_number, atom_name, residue_name,
+                                    residue_number, x_coord, y_coord, z_coord,
+                                    occupancy, b_factor])
+                elif _line.startswith('TER'):
+                    # Include TER records so write_pdb emits chain delimiters.
+                    # Field mapping matches what old pd.read_csv(sep=r'\s+')
+                    # produced: TER serial → atom_number, TER resName → atom_name.
+                    _parts = _line.split()
+                    _sn = int(_parts[1]) if len(_parts) > 1 else 0
+                    _rn = _parts[2] if len(_parts) > 2 else ''
+                    try:
+                        _rnum = int(_parts[3]) if len(_parts) > 3 else 0
+                    except ValueError:
+                        _rnum = 0
+                    records.append(['TER', _sn, _rn, str(_rnum), _rnum,
+                                    float('nan'), float('nan'), float('nan'),
+                                    float('nan'), float('nan')])
+
+        df = pd.DataFrame(records, columns=[
+            'record_name', 'atom_number', 'atom_name', 'residue_name',
+            'residue_number', 'x_coord', 'y_coord', 'z_coord',
+            'occupancy', 'b_factor',
+        ])
 
         ## Add missing columns according to moldf format
         df.insert(3, 'alt_loc', '')
@@ -11023,6 +11078,7 @@ class MolDock:
         with open(tleap_in_file, 'w') as f:
             f.write(textwrap.dedent(f"""\
                 source leaprc.protein.ff14SB
+                loadamberparams frcmod.ions1lm_126_tip3p
                 source leaprc.water.tip3p
                 source leaprc.gaff2
                 HOH = WAT
