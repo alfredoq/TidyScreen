@@ -3882,26 +3882,63 @@ class MolDock:
             # Check for related docking assays
             docking_assays_count = 0
             docking_assay_names = []
+            docking_assay_ids = []
             try:
                 docking_assays_db_path = os.path.join(self.path, 'docking', 'docking_registers', 'docking_assays.db')
-                
+
                 if os.path.exists(docking_assays_db_path):
                     conn_assays = sqlite3.connect(docking_assays_db_path)
                     cursor_assays = conn_assays.cursor()
-                    
-                    # Check if there are related entries in docking_assays and get their names
+
+                    # Check if there are related entries in docking_assays and get their ids and names
                     cursor_assays.execute(
-                        "SELECT assay_name FROM docking_assays WHERE receptor_info LIKE ?",
+                        "SELECT assay_id, assay_name FROM docking_assays WHERE receptor_info LIKE ?",
                         (f'%"model_name": "{selected_model["pdb_model_name"]}"%',)
                     )
-                    docking_assay_names = [row[0] for row in cursor_assays.fetchall() if row[0]]
+                    rows = cursor_assays.fetchall()
+                    docking_assay_ids = [row[0] for row in rows if row[0] is not None]
+                    docking_assay_names = [row[1] for row in rows if row[1]]
                     docking_assays_count = len(docking_assay_names)
-                    
+
                     conn_assays.close()
-                    
+
             except sqlite3.Error as e:
-                print(f"❌ Database error while checking docking assays: {e}")
-                return None
+                print(f"⚠️  Warning: Could not check related docking assays: {e}")
+                docking_assay_ids = []
+                docking_assay_names = []
+                docking_assays_count = 0
+
+            # Check for related MD assays (linked through docking assays OR directly via receptor template)
+            md_assays_count = 0
+            md_assay_names = []
+            md_registers_db_path = os.path.join(self.path, 'dynamics', 'md_registers', 'md_registers.db')
+            try:
+                if os.path.exists(md_registers_db_path):
+                    conn_md = sqlite3.connect(md_registers_db_path)
+                    cursor_md = conn_md.cursor()
+                    seen_md_names = set()
+                    for dock_id in docking_assay_ids:
+                        cursor_md.execute(
+                            "SELECT md_assay FROM md_assays WHERE docking_assay_id = ?",
+                            (f'assay_{dock_id}',)
+                        )
+                        for row in cursor_md.fetchall():
+                            if row[0] and row[0] not in seen_md_names:
+                                md_assay_names.append(row[0])
+                                seen_md_names.add(row[0])
+                    for tmpl_name in template_names:
+                        cursor_md.execute(
+                            "SELECT md_assay FROM md_assays WHERE receptor_template_name = ?",
+                            (tmpl_name,)
+                        )
+                        for row in cursor_md.fetchall():
+                            if row[0] and row[0] not in seen_md_names:
+                                md_assay_names.append(row[0])
+                                seen_md_names.add(row[0])
+                    md_assays_count = len(md_assay_names)
+                    conn_md.close()
+            except sqlite3.Error as e:
+                print(f"⚠️  Warning: Could not check related MD assays: {e}")
             
             # Confirm deletion
             print(f"\n⚠️  CONFIRM DELETION")
@@ -3923,6 +3960,10 @@ class MolDock:
                 print(f"   ⚠️  Related docking assays to be deleted: {docking_assays_count}")
                 for assay_name in docking_assay_names:
                     print(f"       - {assay_name}")
+            if md_assays_count > 0:
+                print(f"   ⚠️  Related MD assays to be deleted: {md_assays_count}")
+                for md_name in md_assay_names:
+                    print(f"       - {md_name}")
             print("=" * 80)
             
             confirm = input(f"\n⚠️  Are you sure you want to delete this PDB model? (yes/no, default: no): ").strip().lower()
@@ -4029,11 +4070,60 @@ class MolDock:
                         
                         conn_assays.commit()
                         conn_assays.close()
-                        
+
                     except sqlite3.Error as e:
                         print(f"⚠️  Warning: Error deleting docking assays: {e}")
 
-                
+                # Delete related MD assays (via docking assay link OR receptor template link)
+                md_assays_deleted = 0
+                md_assay_folders_deleted = 0
+                if os.path.exists(md_registers_db_path):
+                    try:
+                        conn_md = sqlite3.connect(md_registers_db_path)
+                        cursor_md = conn_md.cursor()
+
+                        md_entries_to_delete = []
+                        seen_md_ids = set()
+
+                        for dock_id in docking_assay_ids:
+                            cursor_md.execute(
+                                "SELECT assay_id, assay_folder_path FROM md_assays WHERE docking_assay_id = ?",
+                                (f'assay_{dock_id}',)
+                            )
+                            for row in cursor_md.fetchall():
+                                if row[0] not in seen_md_ids:
+                                    md_entries_to_delete.append(row)
+                                    seen_md_ids.add(row[0])
+
+                        for tmpl_name in template_names:
+                            cursor_md.execute(
+                                "SELECT assay_id, assay_folder_path FROM md_assays WHERE receptor_template_name = ?",
+                                (tmpl_name,)
+                            )
+                            for row in cursor_md.fetchall():
+                                if row[0] not in seen_md_ids:
+                                    md_entries_to_delete.append(row)
+                                    seen_md_ids.add(row[0])
+
+                        for md_id, md_folder in md_entries_to_delete:
+                            cursor_md.execute("DELETE FROM md_assays WHERE assay_id = ?", (md_id,))
+                            md_assays_deleted += 1
+                            if md_folder and os.path.exists(md_folder):
+                                try:
+                                    shutil.rmtree(md_folder)
+                                    md_assay_folders_deleted += 1
+                                    print(f"   ✓ Deleted MD assay folder: {md_folder}")
+                                except Exception as e:
+                                    print(f"   ⚠️  Warning: Could not delete MD assay folder {md_folder}: {e}")
+                            elif md_folder:
+                                print(f"   ⚠️  MD assay folder not found (already deleted?): {md_folder}")
+
+                        conn_md.commit()
+                        conn_md.close()
+
+                    except sqlite3.Error as e:
+                        print(f"⚠️  Warning: Error deleting MD assays: {e}")
+
                 print(f"\n✓ PDB model '{selected_model['pdb_model_name']}' successfully deleted from database")
                 print(f"   File ID: {selected_model['file_id']}")
                 print(f"   Database: {pdbs_db_path}")
@@ -4047,7 +4137,11 @@ class MolDock:
                     print(f"   Related docking assays deleted: {docking_assays_deleted}")
                 if assay_folders_deleted > 0:
                     print(f"   Assay folders deleted: {assay_folders_deleted}")
-                
+                if md_assays_deleted > 0:
+                    print(f"   Related MD assays deleted: {md_assays_deleted}")
+                if md_assay_folders_deleted > 0:
+                    print(f"   MD assay folders deleted: {md_assay_folders_deleted}")
+
                 return {
                     'status': 'deleted',
                     'pdb_model_name': selected_model['pdb_model_name'],
@@ -4057,6 +4151,8 @@ class MolDock:
                     'folders_deleted': folders_deleted,
                     'docking_assays_deleted': docking_assays_deleted,
                     'assay_folders_deleted': assay_folders_deleted,
+                    'md_assays_deleted': md_assays_deleted,
+                    'md_assay_folders_deleted': md_assay_folders_deleted,
                     'deleted_date': datetime.now().isoformat()
                 }
                 
@@ -8607,9 +8703,37 @@ class MolDock:
                 docking_assays = cur_assays.fetchall()
                 conn_assays.close()
             except sqlite3.Error as e:
-                print(f"❌ Database error while checking docking assays: {e}")
-                conn.close()
-                return None
+                print(f"⚠️  Warning: Could not check related docking assays: {e}")
+                docking_assays = []
+
+        # Check related MD assays (via receptor template name OR via docking assay link)
+        md_assay_names = []
+        md_registers_db_path = os.path.join(self.path, 'dynamics', 'md_registers', 'md_registers.db')
+        if os.path.exists(md_registers_db_path):
+            try:
+                conn_md = sqlite3.connect(md_registers_db_path)
+                cursor_md = conn_md.cursor()
+                seen_md_names = set()
+                cursor_md.execute(
+                    "SELECT md_assay FROM md_assays WHERE receptor_template_name = ?",
+                    (selected_template['pdb_template_name'],)
+                )
+                for row in cursor_md.fetchall():
+                    if row[0] and row[0] not in seen_md_names:
+                        md_assay_names.append(row[0])
+                        seen_md_names.add(row[0])
+                for assay_id, _, _ in docking_assays:
+                    cursor_md.execute(
+                        "SELECT md_assay FROM md_assays WHERE docking_assay_id = ?",
+                        (f'assay_{assay_id}',)
+                    )
+                    for row in cursor_md.fetchall():
+                        if row[0] and row[0] not in seen_md_names:
+                            md_assay_names.append(row[0])
+                            seen_md_names.add(row[0])
+                conn_md.close()
+            except sqlite3.Error as e:
+                print(f"⚠️  Warning: Could not check related MD assays: {e}")
 
         # Confirm deletion
         print("\n⚠️  CONFIRM PDB TEMPLATE DELETION")
@@ -8625,6 +8749,10 @@ class MolDock:
             print(f"   ⚠️  Related docking assays to be deleted: {len(docking_assays)}")
             for _, assay_name, _ in docking_assays:
                 print(f"       - {assay_name}")
+        if md_assay_names:
+            print(f"   ⚠️  Related MD assays to be deleted: {len(md_assay_names)}")
+            for name in md_assay_names:
+                print(f"       - {name}")
         print("=" * 80)
 
         confirm = input("Are you sure you want to delete this PDB template? (yes/no, default: no): ").strip().lower()
@@ -8692,6 +8820,49 @@ class MolDock:
                 except sqlite3.Error as e:
                     print(f"⚠️  Warning: Error deleting docking assays: {e}")
 
+            # Delete related MD assays (via receptor template name OR via docking assay link)
+            md_assays_deleted = 0
+            md_assay_folders_deleted = 0
+            if os.path.exists(md_registers_db_path):
+                try:
+                    conn_md = sqlite3.connect(md_registers_db_path)
+                    cursor_md = conn_md.cursor()
+                    md_entries_to_delete = []
+                    seen_md_ids = set()
+                    cursor_md.execute(
+                        "SELECT assay_id, assay_folder_path FROM md_assays WHERE receptor_template_name = ?",
+                        (selected_template['pdb_template_name'],)
+                    )
+                    for row in cursor_md.fetchall():
+                        if row[0] not in seen_md_ids:
+                            md_entries_to_delete.append(row)
+                            seen_md_ids.add(row[0])
+                    for assay_id, _, _ in docking_assays:
+                        cursor_md.execute(
+                            "SELECT assay_id, assay_folder_path FROM md_assays WHERE docking_assay_id = ?",
+                            (f'assay_{assay_id}',)
+                        )
+                        for row in cursor_md.fetchall():
+                            if row[0] not in seen_md_ids:
+                                md_entries_to_delete.append(row)
+                                seen_md_ids.add(row[0])
+                    for md_id, md_folder in md_entries_to_delete:
+                        cursor_md.execute("DELETE FROM md_assays WHERE assay_id = ?", (md_id,))
+                        md_assays_deleted += 1
+                        if md_folder and os.path.exists(md_folder):
+                            try:
+                                shutil.rmtree(md_folder)
+                                md_assay_folders_deleted += 1
+                                print(f"   ✓ Deleted MD assay folder: {md_folder}")
+                            except Exception as e:
+                                print(f"   ⚠️  Warning: Could not delete MD assay folder {md_folder}: {e}")
+                        elif md_folder:
+                            print(f"   ⚠️  MD assay folder not found (already deleted?): {md_folder}")
+                    conn_md.commit()
+                    conn_md.close()
+                except sqlite3.Error as e:
+                    print(f"⚠️  Warning: Error deleting MD assays: {e}")
+
             print(f"\n✓ PDB template '{selected_template['pdb_template_name']}' deleted")
             print(f"   Database: {pdbs_db_path}")
             if template_deleted:
@@ -8704,6 +8875,10 @@ class MolDock:
                 print(f"   Related docking assays deleted: {docking_assays_deleted}")
             if assay_folders_deleted:
                 print(f"   Assay folders deleted: {assay_folders_deleted}")
+            if md_assays_deleted:
+                print(f"   Related MD assays deleted: {md_assays_deleted}")
+            if md_assay_folders_deleted:
+                print(f"   MD assay folders deleted: {md_assay_folders_deleted}")
 
             return {
                 'status': 'deleted',
@@ -8713,6 +8888,8 @@ class MolDock:
                 'receptor_models_deleted': receptor_models_deleted,
                 'docking_assays_deleted': docking_assays_deleted,
                 'assay_folders_deleted': assay_folders_deleted,
+                'md_assays_deleted': md_assays_deleted,
+                'md_assay_folders_deleted': md_assay_folders_deleted,
             }
 
         except sqlite3.Error as e:
