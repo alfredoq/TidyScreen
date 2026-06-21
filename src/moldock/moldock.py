@@ -3378,6 +3378,195 @@ class MolDock:
         except Exception as e:
             print(f"❌ Error showing table details: {e}")
     
+    def _check_pdb_format_integrity(self, pdb_file: str) -> Dict[str, Any]:
+        """
+        Check that ATOM/HETATM records conform to the fixed-column PDB v3.3 format.
+
+        Validated fields per record:
+          - Minimum line length to contain XYZ coordinates (≥ 54 chars)
+          - Residue sequence number (cols 23-26) parseable as integer
+          - X, Y, Z coordinates (cols 31-54) parseable as floats
+          - Occupancy (cols 55-60) and B-factor (cols 61-66) parseable as floats (warnings only)
+
+        Returns a dict with keys:
+          passed   (bool)   — False if any error-level issue found
+          errors   (list)   — list of {line, record, field, message} dicts
+          warnings (list)   — list of {line, record, field, message} dicts
+          stats    (dict)   — atom_records, hetatm_records, malformed_records counts
+        """
+        result: Dict[str, Any] = {
+            'passed': True,
+            'errors': [],
+            'warnings': [],
+            'stats': {'atom_records': 0, 'hetatm_records': 0, 'malformed_records': 0, 'has_end_record': False},
+        }
+
+        def _err(line_no, record, field, msg):
+            result['errors'].append({'line': line_no, 'record': record, 'field': field, 'message': msg})
+            result['stats']['malformed_records'] += 1
+            result['passed'] = False
+
+        def _warn(line_no, record, field, msg):
+            result['warnings'].append({'line': line_no, 'record': record, 'field': field, 'message': msg})
+
+        try:
+            with open(pdb_file, 'r', errors='replace') as f:
+                lines = f.readlines()
+        except OSError as e:
+            result['passed'] = False
+            result['errors'].append({'line': 0, 'record': '', 'field': '', 'message': f"Cannot read file: {e}"})
+            return result
+
+        for line_no, line in enumerate(lines, 1):
+            line = line.rstrip('\n')
+            record = line[:6].strip()
+
+            if record == 'END':
+                result['stats']['has_end_record'] = True
+                continue
+
+            if record not in ('ATOM', 'HETATM'):
+                continue
+
+            if record == 'ATOM':
+                result['stats']['atom_records'] += 1
+            else:
+                result['stats']['hetatm_records'] += 1
+
+            # Minimum length to contain Z coordinate (col 47-54, 0-based 46-54)
+            if len(line) < 54:
+                _err(line_no, record, 'XYZ', f"Line too short ({len(line)} chars); coordinates missing")
+                continue
+
+            # Residue sequence number (cols 23-26, 0-based 22-26)
+            resseq_raw = line[22:26]
+            try:
+                int(resseq_raw)
+            except ValueError:
+                _err(line_no, record, 'resSeq', f"Residue sequence number not an integer: {resseq_raw!r}")
+
+            # X coordinate (cols 31-38, 0-based 30-38)
+            x_raw = line[30:38]
+            try:
+                float(x_raw)
+            except ValueError:
+                _err(line_no, record, 'X', f"X coordinate not a float: {x_raw!r}")
+
+            # Y coordinate (cols 39-46, 0-based 38-46)
+            y_raw = line[38:46]
+            try:
+                float(y_raw)
+            except ValueError:
+                _err(line_no, record, 'Y', f"Y coordinate not a float: {y_raw!r}")
+
+            # Z coordinate (cols 47-54, 0-based 46-54)
+            z_raw = line[46:54]
+            try:
+                float(z_raw)
+            except ValueError:
+                _err(line_no, record, 'Z', f"Z coordinate not a float: {z_raw!r}")
+
+            # Occupancy (cols 55-60, 0-based 54-60) — warning only
+            if len(line) >= 60:
+                occ_raw = line[54:60]
+                try:
+                    float(occ_raw)
+                except ValueError:
+                    _warn(line_no, record, 'occupancy', f"Occupancy not a float: {occ_raw!r}")
+
+            # B-factor (cols 61-66, 0-based 60-66) — warning only
+            if len(line) >= 66:
+                bfac_raw = line[60:66]
+                try:
+                    float(bfac_raw)
+                except ValueError:
+                    _warn(line_no, record, 'tempFactor', f"B-factor not a float: {bfac_raw!r}")
+
+        total_coord = result['stats']['atom_records'] + result['stats']['hetatm_records']
+        if total_coord == 0:
+            result['passed'] = False
+            result['errors'].append({'line': 0, 'record': '', 'field': '', 'message': "No ATOM or HETATM records found"})
+
+        if not result['stats']['has_end_record']:
+            _warn(0, '', '', "Missing END record")
+
+        return result
+
+    def _validate_pdb_model_input(self, pdb_file: str) -> bool:
+        """
+        Run all input validation checks on a PDB file before registering it as a model.
+        Returns True if the file passes (or the user chooses to proceed despite warnings).
+        Returns False if errors are found and the user decides not to continue.
+        """
+        print(f"\n🔍 Validating PDB file...")
+
+        # --- Check 1: standard PDB format integrity ---
+        integrity = self._check_pdb_format_integrity(pdb_file)
+
+        stats = integrity['stats']
+        print(f"   ATOM records  : {stats['atom_records']}")
+        print(f"   HETATM records: {stats['hetatm_records']}")
+
+        if integrity['warnings']:
+            print(f"   ⚠️  Warnings ({len(integrity['warnings'])}):")
+            for w in integrity['warnings']:
+                loc = f"line {w['line']}" if w['line'] else "file"
+                print(f"       [{loc}] {w['field']}: {w['message']}" if w['field'] else f"       [{loc}] {w['message']}")
+
+        if not integrity['passed']:
+            print(f"   ❌ Format integrity check FAILED ({len(integrity['errors'])} error(s)):")
+            for e in integrity['errors']:
+                loc = f"line {e['line']}" if e['line'] else "file"
+                print(f"       [{loc}] {e['field']}: {e['message']}" if e['field'] else f"       [{loc}] {e['message']}")
+            try:
+                proceed = input(f"\n   Proceed anyway? (yes/no, default: no): ").strip().lower()
+            except KeyboardInterrupt:
+                return False
+            if proceed != 'yes':
+                print(f"❌ Import cancelled due to format errors")
+                return False
+            print(f"   ⚠️  Proceeding despite format errors")
+        else:
+            print(f"   ✓ Format integrity check passed")
+
+        # --- Check 2: water residues (HOH/WAT) labeled as ATOM instead of HETATM ---
+        water_atom_count = 0
+        water_residues = {'HOH', 'WAT'}
+        try:
+            with open(pdb_file, 'r', errors='replace') as f:
+                for line in f:
+                    if line[:6].strip() == 'ATOM' and len(line) >= 20:
+                        if line[17:20].strip() in water_residues:
+                            water_atom_count += 1
+        except OSError:
+            pass
+
+        if water_atom_count > 0:
+            print(f"   ⚠️  Water record type check: {water_atom_count} HOH/WAT record(s) labeled as ATOM — will be auto-corrected to HETATM")
+        else:
+            print(f"   ✓ Water record type check passed")
+
+        return True
+
+    def _fix_water_record_types(self, pdb_content: bytes) -> tuple:
+        """
+        Relabel water residues (HOH, WAT) incorrectly recorded as ATOM to HETATM.
+        Both record names are exactly 6 characters, so all column offsets are preserved.
+        Returns (corrected_bytes, n_fixed).
+        """
+        water_residues = {'HOH', 'WAT'}
+        result = []
+        n_fixed = 0
+        for raw_line in pdb_content.splitlines(keepends=True):
+            line = raw_line.decode('utf-8', errors='replace')
+            if line[:6].strip() == 'ATOM' and len(line) >= 20:
+                if line[17:20].strip() in water_residues:
+                    line = 'HETATM' + line[6:]
+                    raw_line = line.encode('utf-8')
+                    n_fixed += 1
+            result.append(raw_line)
+        return b''.join(result), n_fixed
+
     def _strip_histidine_hydrogens(self, pdb_content: bytes) -> tuple:
         """
         Remove all hydrogen atoms belonging to histidine residues (HIS/HID/HIE/HIP)
@@ -3505,6 +3694,10 @@ class MolDock:
                 print(f"\n   ⚠️  Description entry cancelled. Using empty description.")
                 description = ""
             
+            # Validate PDB file before storing
+            if not self._validate_pdb_model_input(pdb_file):
+                return None
+
             # Read PDB file content
             print(f"\n📖 Reading PDB file...")
             try:
@@ -3514,6 +3707,10 @@ class MolDock:
                 pdb_blob, his_h_removed = self._strip_histidine_hydrogens(pdb_blob)
                 if his_h_removed:
                     print(f"   ✓ Removed {his_h_removed} hydrogen atom(s) from histidine residues")
+
+                pdb_blob, waters_fixed = self._fix_water_record_types(pdb_blob)
+                if waters_fixed:
+                    print(f"   ✓ Corrected {waters_fixed} water record(s) from ATOM to HETATM")
 
                 file_size = len(pdb_blob)
                 print(f"   ✓ File read successfully ({file_size:,} bytes)")
