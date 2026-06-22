@@ -861,7 +861,13 @@ def get_pdbs_info(pdbs_db_path):
     
     try:
         conn = sqlite3.connect(pdbs_db_path)
-        query_pdb_models = "SELECT file_id, pdb_model_name, project_name, original_path, filename, description, notes FROM pdb_models"
+        query_pdb_models = """
+            SELECT m.file_id, m.pdb_model_name, m.project_name,
+                   t.checked_pdb_path AS pdb_receptor_path,
+                   m.filename, m.description, m.notes
+            FROM pdb_models m
+            LEFT JOIN pdb_templates t ON t.pdb_model_name = m.pdb_model_name
+        """
         df_pdb_models = pd.read_sql_query(query_pdb_models, conn)
         conn.close()
         return df_pdb_models
@@ -2051,18 +2057,38 @@ def export_pdb_model(pdbs_db_path, file_id, output_dir):
         conn = sqlite3.connect(pdbs_db_path)
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT filename, pdb_blob FROM pdb_models WHERE file_id = ?",
+            """SELECT m.filename, m.pdb_blob, m.pdb_model_name, t.checked_pdb_path
+               FROM pdb_models m
+               LEFT JOIN pdb_templates t ON t.pdb_model_name = m.pdb_model_name
+               WHERE m.file_id = ?""",
             (int(file_id),)
         )
         row = cursor.fetchone()
         conn.close()
 
-        if row is None or row[1] is None:
-            return False, f"No PDB blob found for file_id '{file_id}'"
+        if row is None:
+            return False, f"No PDB model found for file_id '{file_id}'"
 
-        filename, pdb_blob = row
+        filename, pdb_blob, pdb_model_name, checked_pdb_path = row
+
+        # Stub receptors (created by import_receptor_model) have an empty blob and no
+        # filename. Fall back to the receptor_checked.pdb stored on disk.
+        if not pdb_blob:
+            if checked_pdb_path and os.path.isfile(checked_pdb_path):
+                fallback_name = filename or f"{pdb_model_name}.pdb"
+                os.makedirs(output_dir, exist_ok=True)
+                output_path = os.path.join(output_dir, fallback_name)
+                import shutil
+                shutil.copy2(checked_pdb_path, output_path)
+                return True, output_path
+            return False, (
+                f"No PDB data available for stub receptor '{pdb_model_name}'. "
+                "The receptor was imported without a PDB file."
+            )
+
+        fallback_name = filename or f"{pdb_model_name}.pdb"
         os.makedirs(output_dir, exist_ok=True)
-        output_path = os.path.join(output_dir, filename)
+        output_path = os.path.join(output_dir, fallback_name)
 
         with open(output_path, "wb") as f:
             f.write(pdb_blob)
