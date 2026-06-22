@@ -1272,6 +1272,7 @@ class MolDyn:
         try:
             with open(execution_script_path, 'w') as f:
                 f.write("#!/bin/bash\n")
+                f.write('cd "$(dirname "$0")"\n')
                 f.write("echo 'Running min1'\n")
                 f.write("pmemd.cuda -O -i min1.in -o min1.out -p complex.prmtop -c complex.inpcrd -r min1.crd -ref complex.inpcrd\n")
                 f.write("echo 'Running min2'\n")
