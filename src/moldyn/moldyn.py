@@ -1267,22 +1267,26 @@ class MolDyn:
             f.write(f"END\n")
 
     def _prepare_md_execution_script(self, md_assay_folder):
+        import shutil as _shutil
+
+        pmemd = _shutil.which("pmemd.cuda") or "pmemd.cuda"
 
         execution_script_path = os.path.join(md_assay_folder, "run_md.sh")
         try:
             with open(execution_script_path, 'w') as f:
                 f.write("#!/bin/bash\n")
                 f.write('cd "$(dirname "$0")"\n')
+                f.write(f"export PATH={os.path.dirname(pmemd)}:$PATH\n")
                 f.write("echo 'Running min1'\n")
-                f.write("pmemd.cuda -O -i min1.in -o min1.out -p complex.prmtop -c complex.inpcrd -r min1.crd -ref complex.inpcrd\n")
+                f.write(f"{pmemd} -O -i min1.in -o min1.out -p complex.prmtop -c complex.inpcrd -r min1.crd -ref complex.inpcrd\n")
                 f.write("echo 'Running min2'\n")
-                f.write("pmemd.cuda -O -i min2.in -o min2.out -p complex.prmtop -c complex.inpcrd -r min2.crd -ref min1.crd\n")
+                f.write(f"{pmemd} -O -i min2.in -o min2.out -p complex.prmtop -c complex.inpcrd -r min2.crd -ref min1.crd\n")
                 f.write("echo 'Running heating'\n")
-                f.write("pmemd.cuda -O -i heating.in -o heating.out -p complex.prmtop -c min2.crd -r heating.crd -ref min2.crd\n")
+                f.write(f"{pmemd} -O -i heating.in -o heating.out -p complex.prmtop -c min2.crd -r heating.crd -ref min2.crd\n")
                 f.write("echo 'Running equilibration'\n")
-                f.write("pmemd.cuda -O -i equilibration.in -o equilibration.out -p complex.prmtop -c heating.crd -r equilibration.crd -ref heating.crd -x equilibration.nc\n")
+                f.write(f"{pmemd} -O -i equilibration.in -o equilibration.out -p complex.prmtop -c heating.crd -r equilibration.crd -ref heating.crd -x equilibration.nc\n")
                 f.write("echo 'Running production'\n")
-                f.write("pmemd.cuda -O -i production.in -o production.out -p complex.prmtop -c equilibration.crd -r production.crd -ref equilibration.crd -x production.nc\n")
+                f.write(f"{pmemd} -O -i production.in -o production.out -p complex.prmtop -c equilibration.crd -r production.crd -ref equilibration.crd -x production.nc\n")
             os.chmod(execution_script_path, 0o755)
         except OSError as e:
             raise RuntimeError(f"Failed to write execution script '{execution_script_path}': {e}") from e
