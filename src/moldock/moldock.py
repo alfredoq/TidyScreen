@@ -14917,6 +14917,7 @@ class MolDock:
         gpf_files   = [f for f in all_files if f.lower().endswith('.gpf')]
         fld_files   = [f for f in all_files if f.lower().endswith('.fld')]
         map_files   = [f for f in all_files if f.lower().endswith('.map')]
+        pdb_files   = [f for f in all_files if f.lower().endswith('.pdb')]
 
         errors = []
         if len(pdbqt_files) != 1:
@@ -14935,6 +14936,35 @@ class MolDock:
 
         pdbqt_src = os.path.join(input_folder_path, pdbqt_files[0])
         gpf_src   = os.path.join(input_folder_path, gpf_files[0])
+
+        # --- Resolve receptor PDB file ---
+        # perform_md_assay() expects receptor_checked.pdb alongside the PDBQT.
+        # If a single .pdb is present in the folder use it; otherwise ask the user.
+        if len(pdb_files) == 1:
+            pdb_src = os.path.join(input_folder_path, pdb_files[0])
+            print(f"  Found receptor PDB: {pdb_files[0]}")
+        elif len(pdb_files) > 1:
+            print(f"  Multiple .pdb files found in the input folder: {pdb_files}")
+            while True:
+                choice = input("  Enter the name of the PDB file to use as receptor_checked.pdb: ").strip()
+                if choice in pdb_files:
+                    pdb_src = os.path.join(input_folder_path, choice)
+                    break
+                print(f"  '{choice}' not found. Please enter one of: {pdb_files}")
+        else:
+            print("  No .pdb file found in the input folder.")
+            print("  A receptor PDB is required for MD assay preparation (perform_md_assay()).")
+            while True:
+                raw_pdb = input("  Enter the full path to the receptor PDB file (or 'skip' to omit): ").strip().strip('"').strip("'")
+                if raw_pdb.lower() == 'skip':
+                    pdb_src = None
+                    print("  Warning: no receptor PDB stored — perform_md_assay() will fail for this receptor.")
+                    break
+                candidate = os.path.abspath(os.path.expanduser(raw_pdb))
+                if os.path.isfile(candidate):
+                    pdb_src = candidate
+                    break
+                print(f"  File not found: {candidate}")
 
         # --- Prompt for receptor_model_name if not provided ---
         while not receptor_model_name:
@@ -14992,6 +15022,13 @@ class MolDock:
         pdbqt_dest = os.path.join(processed_folder, f"{canonical_stem}.pdbqt")
         shutil.copy2(pdbqt_src, pdbqt_dest)
         print(f"  Copied PDBQT: {pdbqt_dest}")
+
+        # Copy the receptor PDB as receptor_checked.pdb so that perform_md_assay()
+        # can load it via tleap (it constructs the path as dirname(pdbqt_file)/receptor_checked.pdb).
+        checked_pdb_dest = os.path.join(processed_folder, "receptor_checked.pdb")
+        if pdb_src is not None:
+            shutil.copy2(pdb_src, checked_pdb_dest)
+            print(f"  Copied receptor PDB: {checked_pdb_dest}")
 
         # --- Step 4: Create stub pdb_model record ---
         stub_name = f"stub_{receptor_model_name}"
@@ -15055,6 +15092,7 @@ class MolDock:
 
         cur_p.execute("SELECT COUNT(*) FROM pdb_templates WHERE pdb_template_name = ?", (stub_name,))
         if cur_p.fetchone()[0] == 0:
+            _checked_pdb_for_stub = checked_pdb_dest if pdb_src is not None else pdbqt_dest
             cur_p.execute('''
                 INSERT INTO pdb_templates
                     (pdb_template_name, pdb_model_name, project_name,
@@ -15063,7 +15101,7 @@ class MolDock:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 stub_name, stub_name, self.name,
-                pdbqt_dest, pdbqt_dest, pdbqt_dest,
+                pdb_src or pdbqt_dest, pdb_src or pdbqt_dest, _checked_pdb_for_stub,
                 receptor_folder,
                 '{}', 'imported',
                 'Auto-generated stub for imported receptor'
