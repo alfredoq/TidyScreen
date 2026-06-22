@@ -176,7 +176,212 @@ class MolDyn:
         except Exception as e:
             print(f"❌ Error in create_md_method: {e}")
             return None
-    
+
+    def create_md_method_using_tleap_template(self):
+        """
+        Create an MD method where system preparation (prmtop/inpcrd) is driven
+        by a user-supplied tleap input file rather than interactively-collected
+        tleap parameters.  Intended for non-standard systems (e.g. cyclodextrins,
+        glycans, cofactors) that require custom force-field loading or explicit
+        bond declarations not captured by the generic wizard.
+
+        The template file is stored verbatim in the method record.  At assay time
+        the template is replayed with path substitutions for the ligand/receptor
+        PDB and the output prmtop/inpcrd file names.
+
+        AMBER simulation parameters (minimization, heating, equilibration,
+        production) are still collected interactively — they are independent of
+        the system-preparation template.
+        """
+        try:
+            print("🧬 CREATE MD METHOD (TLEAP TEMPLATE)")
+            print("=" * 50)
+
+            md_registers_dir = os.path.dirname(self.__md_methods_db)
+            os.makedirs(md_registers_dir, exist_ok=True)
+
+            params = {}
+            params['engine'] = 'AMBER'
+            params['method_type'] = 'tleap_template'
+
+            # --- Method name ---
+            while True:
+                try:
+                    method_name = input("\n📝 Enter method name (or 'cancel'): ").strip()
+                    if method_name.lower() in ['cancel', 'quit', 'exit']:
+                        print("❌ MD method creation cancelled")
+                        return None
+                    if not method_name:
+                        print("❌ Method name cannot be empty")
+                        continue
+                    if not method_name.replace('_', '').replace('-', '').replace(' ', '').isalnum():
+                        print("❌ Method name can only contain letters, numbers, spaces, hyphens, and underscores")
+                        continue
+                    params['method_name'] = method_name
+                    break
+                except KeyboardInterrupt:
+                    print("\n❌ MD method creation cancelled")
+                    return None
+
+            # --- Description ---
+            description = input("\n📄 Enter method description (optional): ").strip()
+            if not description:
+                description = "AMBER MD method using tleap template"
+            params['description'] = description
+
+            # --- Tleap template file ---
+            print("\n📂 TLEAP TEMPLATE FILE")
+            print("-" * 70)
+            print("Provide the path to a working tleap input file for this system.")
+            print("The file will be stored verbatim and replayed at assay-setup time")
+            print("with the following substitution tokens replaced automatically:")
+            print("  {{RECEPTOR_PDB}} → receptor checked.pdb (apo or complex)")
+            print("  {{LIGAND_PDB}}   → docked-pose PDB written for this assay")
+            print("  {{MOL2_FILE}}    → GAFF2 mol2 file prepared for the ligand")
+            print("  {{FRCMOD_FILE}}  → frcmod file prepared for the ligand")
+            print("  {{PRMTOP_OUT}}   → output prmtop path inside the assay folder")
+            print("  {{INPCRD_OUT}}   → output inpcrd path inside the assay folder")
+            print("-" * 70)
+            while True:
+                try:
+                    tleap_template_path = input("\n📂 Path to tleap template file (or 'cancel'): ").strip()
+                    if tleap_template_path.lower() in ['cancel', 'quit', 'exit']:
+                        print("❌ MD method creation cancelled")
+                        return None
+                    tleap_template_path = os.path.expanduser(tleap_template_path)
+                    if not os.path.isfile(tleap_template_path):
+                        print(f"❌ File not found: {tleap_template_path}")
+                        continue
+                    with open(tleap_template_path, 'r') as fh:
+                        tleap_template_content = fh.read()
+                    params['tleap_template_path'] = tleap_template_path
+                    params['tleap_template_content'] = tleap_template_content
+                    n_lines = len(tleap_template_content.splitlines())
+                    print(f"✅ Template loaded: {os.path.basename(tleap_template_path)} ({n_lines} lines)")
+                    break
+                except KeyboardInterrupt:
+                    print("\n❌ MD method creation cancelled")
+                    return None
+
+            # --- Custom parameter files (.lib / .frcmod) ---
+            print("\n📦 CUSTOM PARAMETER FILES")
+            print("-" * 70)
+            print("Attach any .lib or .frcmod files required by the tleap template.")
+            print("They will be stored in the method record and restored to the assay")
+            print("folder before tleap runs, so the template can reference them by")
+            print("basename only (e.g.  loadoff HP2.lib  or  loadamberparams my.frcmod).")
+            print("-" * 70)
+            custom_parameter_files = []
+            try:
+                attach = input("\n➕ Attach custom parameter files? (yes/no) [default: no]: ").strip().lower() or 'no'
+                if attach in ['yes', 'y']:
+                    print("Enter file paths one at a time. Type 'done' when finished.")
+                    while True:
+                        try:
+                            file_path_input = input("  📎 File path (or 'done'): ").strip()
+                            if file_path_input.lower() in ['done', '']:
+                                break
+                            file_path_input = os.path.expanduser(file_path_input)
+                            if not os.path.isfile(file_path_input):
+                                print(f"  ❌ File not found: {file_path_input}")
+                                continue
+                            with open(file_path_input, 'r') as fh:
+                                file_content = fh.read()
+                            entry = {
+                                'filename': os.path.basename(file_path_input),
+                                'content': file_content,
+                            }
+                            custom_parameter_files.append(entry)
+                            print(f"  ✅ Attached: {entry['filename']}")
+                        except KeyboardInterrupt:
+                            print("\n❌ MD method creation cancelled")
+                            return None
+            except KeyboardInterrupt:
+                print("\n❌ MD method creation cancelled")
+                return None
+            params['custom_parameter_files'] = custom_parameter_files
+            if custom_parameter_files:
+                print(f"✅ {len(custom_parameter_files)} custom file(s) attached.")
+            else:
+                print("ℹ️  No custom parameter files attached.")
+
+            # --- Solvent type (needed to generate correct AMBER .in files) ---
+            solvent_type = input("\nSolvent type (implicit/explicit) [default: explicit]: ").strip().lower() or 'explicit'
+            if solvent_type not in ['implicit', 'explicit']:
+                print("⚠️  Invalid solvent type, defaulting to 'explicit'")
+                solvent_type = 'explicit'
+            params['solvent_type'] = solvent_type
+
+            # --- AMBER simulation parameters (independent of tleap template) ---
+            params = self._set_minimization_params(params)
+            params = self._set_heating_params(params)
+            params = self._set_equilibration_params(params)
+            params = self._set_production_params(params)
+
+            # --- Persist to DB ---
+            params = self._save_parameters_to_db(params)
+
+            # --- Summary ---
+            self._display_method_summary_tleap_template(params)
+
+        except Exception as e:
+            print(f"❌ Error in create_md_method_using_tleap_template: {e}")
+            return None
+
+    def _display_method_summary_tleap_template(self, params):
+        """Display summary for a tleap-template-based MD method."""
+        try:
+            print(f"\n🎯 MOLECULAR DYNAMICS METHOD CREATED SUCCESSFULLY")
+            print("=" * 60)
+            print(f"\n🏷️  Method ID   : {params.get('method_id', 'N/A')}")
+            print(f"🏷️  Method Name : {params.get('method_name', 'Unnamed_Method')}")
+            print(f"🧬 MD Engine   : {params.get('engine', '')}")
+            print(f"📝 Description : {params.get('description', '')}")
+            print(f"🔖 Method type : tleap template")
+
+            template_path = params.get('tleap_template_path', 'N/A')
+            template_content = params.get('tleap_template_content', '')
+            n_lines = len(template_content.splitlines()) if template_content else 0
+            print(f"\n📂 TLEAP TEMPLATE:")
+            print(f"  Source file : {template_path}")
+            print(f"  Lines stored: {n_lines}")
+
+            custom_files = params.get('custom_parameter_files', [])
+            print(f"\n📦 ATTACHED PARAMETER FILES ({len(custom_files)}):")
+            if custom_files:
+                for cf in custom_files:
+                    n = len(cf.get('content', '').splitlines())
+                    print(f"  - {cf['filename']} ({n} lines)")
+            else:
+                print("  (none)")
+
+            print(f"\n⚙️  SIMULATION PARAMETERS:")
+
+            min1 = params.get('first_minimization', {})
+            min2 = params.get('second_minimization', {})
+            general = params.get('general_params', {})
+            print(f"  🧪 MINIMIZATION:")
+            print(f"    🔹 Step 1 — maxcyc={min1.get('min1_maxcyc')}, ncyc={min1.get('min1_ncyc')}, "
+                  f"restraint_wt={min1.get('min1_restraint_wt')}")
+            print(f"    🔹 Step 2 — maxcyc={min2.get('min2_maxcyc')}, ncyc={min2.get('min2_ncyc')}, "
+                  f"restraint_wt={min2.get('min2_restraint_wt')}")
+
+            heating = params.get('heating_params', {})
+            print(f"  🔥 HEATING:")
+            print(f"    {heating.get('heating_steps')} steps, "
+                  f"{heating.get('initial_temp')} K → {general.get('target_temp')} K")
+
+            equil = params.get('equilibration_params', {})
+            print(f"  ❄️  EQUILIBRATION: {equil.get('equilibration_steps')} steps")
+
+            prod = params.get('production_params', {})
+            print(f"  🎬 PRODUCTION   : {prod.get('production_steps')} steps")
+
+            print("=" * 60)
+
+        except Exception as e:
+            print(f"⚠️  Error displaying method summary: {e}")
+
     def _get_system_preparation_parameters(self, params):
         """Get system preparation parameters for MD simulations."""
         
@@ -636,7 +841,16 @@ class MolDyn:
 
             # Create complex .prmtop and .inpcrd files
             print(f"⚙️  Preparing topology and coordinate files with tleap...")
-            prmtop_file, inpcrd_file = self._prepare_complex_prmtop_inpcrd_for_md(mol2_file, frcmod_file, docking_assay_params_dict, md_assay_folder, md_assay_folder, md_parameters_dict, selected_pose_pdb)
+            if md_parameters_dict.get('method_type') == 'tleap_template':
+                prmtop_file, inpcrd_file = self._prepare_complex_prmtop_inpcrd_from_template(
+                    selected_pose_pdb, md_assay_folder, md_parameters_dict,
+                    mol2_file=mol2_file, frcmod_file=frcmod_file,
+                )
+            else:
+                prmtop_file, inpcrd_file = self._prepare_complex_prmtop_inpcrd_for_md(
+                    mol2_file, frcmod_file, docking_assay_params_dict,
+                    md_assay_folder, md_assay_folder, md_parameters_dict, selected_pose_pdb,
+                )
 
             # Prepare md simulation input files
             print(f"⚙️  Writing AMBER simulation input files...")
@@ -1042,7 +1256,112 @@ class MolDyn:
 
         print(f"   ✓ tleap completed successfully (log: {tleap_log_file})")
         return prmtop_file, inpcrd_file
-        
+
+    def _prepare_complex_prmtop_inpcrd_from_template(self, selected_pose_pdb, output_dir, md_parameters_dict, mol2_file=None, frcmod_file=None, receptor_pdb=None):
+        """
+        Replay the tleap template stored in the MD method record, substituting
+        path tokens, then run tleap to produce prmtop/inpcrd.
+
+        Used by both perform_md_assay() (ligand+receptor) and
+        perform_md_assay_on_receptor() (receptor only; selected_pose_pdb=None).
+
+        Tokens replaced in the template:
+          {{RECEPTOR_PDB}} → absolute path to the receptor PDB (apo or complex setup)
+          {{LIGAND_PDB}}   → absolute path to the docked-pose PDB (skipped if None)
+          {{MOL2_FILE}}    → absolute path to the GAFF2 mol2 file for the ligand
+          {{FRCMOD_FILE}}  → absolute path to the frcmod file for the ligand
+          {{PRMTOP_OUT}}   → complex.prmtop inside output_dir
+          {{INPCRD_OUT}}   → complex.inpcrd inside output_dir
+
+        Raises RuntimeError on any failure; tleap stdout+stderr are always
+        saved to tleap.log inside output_dir for post-mortem inspection.
+        """
+        import subprocess
+
+        template_content = md_parameters_dict.get('tleap_template_content', '')
+        if not template_content:
+            raise RuntimeError(
+                "MD method has no 'tleap_template_content' stored. "
+                "Re-create the method with create_md_method_using_tleap_template()."
+            )
+
+        prmtop_file = os.path.join(output_dir, 'complex.prmtop')
+        inpcrd_file = os.path.join(output_dir, 'complex.inpcrd')
+        tleap_in_file = os.path.join(output_dir, 'complex.in')
+        tleap_log_file = os.path.join(output_dir, 'tleap.log')
+
+        # Restore custom parameter files (.lib, .frcmod) into the assay folder so
+        # tleap can find them by basename, as written in the template.
+        custom_parameter_files = md_parameters_dict.get('custom_parameter_files', [])
+        for cf in custom_parameter_files:
+            dest = os.path.join(output_dir, cf['filename'])
+            try:
+                with open(dest, 'w') as fh:
+                    fh.write(cf['content'])
+                print(f"   ✓ Restored parameter file: {cf['filename']}")
+            except OSError as e:
+                raise RuntimeError(
+                    f"Failed to restore parameter file '{cf['filename']}' to assay folder: {e}"
+                ) from e
+
+        content = template_content
+        if receptor_pdb:
+            content = content.replace('{{RECEPTOR_PDB}}', receptor_pdb)
+        if selected_pose_pdb:
+            content = content.replace('{{LIGAND_PDB}}', selected_pose_pdb)
+        content = content.replace('{{PRMTOP_OUT}}', prmtop_file)
+        content = content.replace('{{INPCRD_OUT}}', inpcrd_file)
+        if mol2_file:
+            content = content.replace('{{MOL2_FILE}}', mol2_file)
+        if frcmod_file:
+            content = content.replace('{{FRCMOD_FILE}}', frcmod_file)
+
+        try:
+            with open(tleap_in_file, 'w') as f:
+                f.write(content)
+        except OSError as e:
+            raise RuntimeError(f"Failed to write tleap input file '{tleap_in_file}': {e}") from e
+
+        try:
+            result = subprocess.run(
+                f"tleap -f {tleap_in_file}",
+                shell=True,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.SubprocessError as e:
+            raise RuntimeError(f"Failed to execute tleap: {e}") from e
+
+        try:
+            with open(tleap_log_file, 'w') as lf:
+                lf.write(result.stdout)
+                if result.stderr:
+                    lf.write("\n--- STDERR ---\n")
+                    lf.write(result.stderr)
+        except OSError:
+            pass
+
+        if result.returncode != 0:
+            tail = result.stdout[-3000:] if len(result.stdout) > 3000 else result.stdout
+            print(f"   tleap output (last lines):\n{tail}")
+            raise RuntimeError(
+                f"tleap exited with code {result.returncode}. "
+                f"Full log: {tleap_log_file}"
+            )
+
+        missing = [f for f in (prmtop_file, inpcrd_file) if not os.path.exists(f)]
+        if missing:
+            tail = result.stdout[-3000:] if len(result.stdout) > 3000 else result.stdout
+            print(f"   tleap output (last lines):\n{tail}")
+            raise RuntimeError(
+                f"tleap completed but did not produce: "
+                f"{', '.join(os.path.basename(f) for f in missing)}. "
+                f"Full log: {tleap_log_file}"
+            )
+
+        print(f"   ✓ tleap completed successfully via template (log: {tleap_log_file})")
+        return prmtop_file, inpcrd_file
+
     def _select_md_method(self):
         """Select a molecular dynamics method from the registered methods."""
         try:
@@ -1386,9 +1705,17 @@ class MolDyn:
 
                     # Prepare receptor-only prmtop and inpcrd via tleap
                     print(f"⚙️  Preparing topology and coordinate files with tleap...")
-                    prmtop_file, inpcrd_file = self._prepare_receptor_only_prmtop_inpcrd_for_md(
-                        template_dict['checked_pdb_path'], md_assay_folder, md_parameters_dict
-                    )
+                    if md_parameters_dict.get('method_type') == 'tleap_template':
+                        prmtop_file, inpcrd_file = self._prepare_complex_prmtop_inpcrd_from_template(
+                            selected_pose_pdb=None,
+                            output_dir=md_assay_folder,
+                            md_parameters_dict=md_parameters_dict,
+                            receptor_pdb=template_dict['checked_pdb_path'],
+                        )
+                    else:
+                        prmtop_file, inpcrd_file = self._prepare_receptor_only_prmtop_inpcrd_for_md(
+                            template_dict['checked_pdb_path'], md_assay_folder, md_parameters_dict
+                        )
 
                     # Prepare AMBER input files
                     print(f"⚙️  Writing AMBER simulation input files...")
