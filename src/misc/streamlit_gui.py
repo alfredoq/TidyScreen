@@ -1193,6 +1193,40 @@ elif page == "MolDyn":
                 unsafe_allow_html=True
             )
         else:
+            # Add receptor_template_name if not already present (query directly from DB)
+            if 'receptor_template_name' not in df_md_assays.columns:
+                try:
+                    _conn = sqlite3.connect(md_registers_db_path)
+                    _tpl = pd.read_sql_query(
+                        "SELECT assay_id, receptor_template_name FROM md_assays", _conn
+                    )
+                    _conn.close()
+                    df_md_assays = df_md_assays.merge(_tpl, on='assay_id', how='left')
+                except Exception:
+                    df_md_assays['receptor_template_name'] = None
+
+            # Add status column if not already present
+            if 'status' not in df_md_assays.columns:
+                def _md_status(folder):
+                    if not folder or not os.path.isdir(folder):
+                        return '⬜ Not started'
+                    out_files = ['min1.out', 'min2.out', 'heating.out', 'equilibration.out', 'production.out']
+                    if not any(os.path.exists(os.path.join(folder, f)) for f in out_files):
+                        return '⬜ Not started'
+                    prod = os.path.join(folder, 'production.out')
+                    if os.path.exists(prod):
+                        try:
+                            with open(prod, 'rb') as _fh:
+                                _fh.seek(0, 2)
+                                _fh.seek(max(0, _fh.tell() - 4096), 0)
+                                _tail = _fh.read().decode('utf-8', errors='replace')
+                                if 'Total wall time:' in _tail or 'FINAL RESULTS' in _tail:
+                                    return '✅ Completed'
+                        except OSError:
+                            pass
+                    return '🔄 Running'
+                df_md_assays['status'] = df_md_assays['assay_folder_path'].apply(_md_status)
+
             if "show_md_assays" not in st.session_state:
                 st.session_state["show_md_assays"] = False
 
@@ -1200,7 +1234,19 @@ elif page == "MolDyn":
                 st.session_state["show_md_assays"] = not st.session_state["show_md_assays"]
 
             if st.session_state["show_md_assays"]:
-                st.dataframe(df_md_assays, use_container_width=True, hide_index=True)
+                _display_cols = ['assay_id', 'md_assay', 'description', 'status',
+                                 'receptor_template_name', 'docking_assay_id',
+                                 'ligand_name', 'pose_id', 'assay_folder_path']
+                _display_cols = [c for c in _display_cols if c in df_md_assays.columns]
+                st.dataframe(
+                    df_md_assays[_display_cols],
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "status": st.column_config.TextColumn("Status", width="small"),
+                        "receptor_template_name": st.column_config.TextColumn("PDB Template"),
+                    },
+                )
 
 elif page == "ProLIF Conditions":
     st.title("ProLIF Conditions")

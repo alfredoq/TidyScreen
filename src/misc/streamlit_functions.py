@@ -92,6 +92,41 @@ def get_md_method_registers(db_path):
     except Exception:
         return None
 
+def get_md_assay_status(assay_folder_path):
+    """
+    Determine the run status of an MD assay by inspecting output files.
+
+    Returns one of:
+      "⬜ Not started"  — no AMBER output files exist yet
+      "🔄 Running"      — at least one output file exists but production has not finished
+      "✅ Completed"    — production.out exists and contains 'FINAL RESULTS'
+    """
+    if not assay_folder_path or not os.path.isdir(assay_folder_path):
+        return "⬜ Not started"
+
+    out_files = ['min1.out', 'min2.out', 'heating.out', 'equilibration.out', 'production.out']
+    any_out = any(os.path.exists(os.path.join(assay_folder_path, f)) for f in out_files)
+
+    if not any_out:
+        return "⬜ Not started"
+
+    production_out = os.path.join(assay_folder_path, 'production.out')
+    if os.path.exists(production_out):
+        # Read only the tail to avoid loading multi-GB files
+        try:
+            with open(production_out, 'rb') as fh:
+                fh.seek(0, 2)
+                size = fh.tell()
+                fh.seek(max(0, size - 4096), 0)
+                tail = fh.read().decode('utf-8', errors='replace')
+            if 'Total wall time:' in tail or 'FINAL RESULTS' in tail:
+                return "✅ Completed"
+        except OSError:
+            pass
+
+    return "🔄 Running"
+
+
 def get_md_assay_registers(db_path):
     """
     Retrieve all entries from the 'md_assays' table in md_registers.db.
@@ -100,18 +135,24 @@ def get_md_assay_registers(db_path):
         db_path (str): Path to the md_registers.db SQLite database.
 
     Returns:
-        pd.DataFrame: DataFrame with all MD assay records, or None on error.
+        pd.DataFrame: DataFrame with all MD assay records plus a 'status' column, or None on error.
     """
     columns = ['assay_id', 'md_assay', 'description', 'assay_folder_path',
-               'docking_assay_id', 'ligand_name', 'pose_id', 'md_parameters']
+               'docking_assay_id', 'ligand_name', 'pose_id',
+               'receptor_template_name', 'md_parameters']
     try:
         conn = sqlite3.connect(db_path)
         query = f"SELECT {', '.join(columns)} FROM md_assays"
         df = pd.read_sql_query(query, conn)
         conn.close()
-        return df
     except Exception:
         return None
+
+    try:
+        df['status'] = df['assay_folder_path'].apply(get_md_assay_status)
+    except Exception:
+        df['status'] = '⬜ Not started'
+    return df
 
 def get_docking_assay_registers(db_path):
     """

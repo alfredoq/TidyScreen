@@ -1310,71 +1310,120 @@ class MolDyn:
             
     def perform_md_assay_on_receptor(self):
         """
-        Configure a molecular dynamics simulation starting from a registered receptor
-        template (apo simulation, no ligand).  Mirrors perform_md_assay but replaces
-        the docking-pose source with a receptor template selected from pdb_templates.
+        Configure one or more replica MD simulations starting from a registered
+        receptor template (apo simulation, no ligand).  The user is asked how many
+        replicas to create; each gets its own assay folder and registry entry.
+        Auto-start is offered only for the first replica — remaining replicas
+        require manual execution of their respective run scripts.
         """
         import traceback
 
-        md_assay_folder = None
-        md_assay_id = None
-
         try:
-            # Select receptor template from pdbs.db
+            # Select receptor template from pdbs.db (shared across all replicas)
             template_dict = self._select_receptor_template()
             if template_dict is None:
                 return
 
-            # Select a MD method
+            # Select a MD method (shared across all replicas)
             md_parameters_dict = self._select_md_method()
             if md_parameters_dict is None:
                 return
 
-            # Query user for MD assay description
+            # Query user for MD assay description (shared base description)
             assay_description = input("\n📝 Enter MD assay description (optional): ").strip()
             if not assay_description:
                 assay_description = f"Receptor-only MD assay for template '{template_dict['pdb_template_name']}'"
 
-            # Create MD assay folder
-            md_assay_id, md_assay_folder = self._create_md_assay_folder()
-            if md_assay_id is None:
-                return
+            # Query number of replicas
+            while True:
+                try:
+                    n_replicas_input = input("\n🔁 How many replicas do you want to create? [default: 1]: ").strip()
+                    n_replicas = int(n_replicas_input) if n_replicas_input else 1
+                    if n_replicas < 1:
+                        print("❌ Number of replicas must be at least 1.")
+                        continue
+                    break
+                except ValueError:
+                    print("❌ Please enter a valid integer.")
+                except KeyboardInterrupt:
+                    print("\n❌ Cancelled.")
+                    return
 
-            # Prepare receptor-only prmtop and inpcrd via tleap
-            print(f"\n⚙️  Preparing topology and coordinate files with tleap...")
-            prmtop_file, inpcrd_file = self._prepare_receptor_only_prmtop_inpcrd_for_md(
-                template_dict['checked_pdb_path'], md_assay_folder, md_parameters_dict
-            )
+            # Optionally start the first replica automatically
+            start_first = 'no'
+            if n_replicas >= 1:
+                start_first = input("\n▶️  Start replica 1 automatically after setup? (yes/no) [default: no]: ").strip().lower() or 'no'
 
-            # Prepare AMBER input files (min1, min2, heating, equilibration, production)
-            print(f"⚙️  Writing AMBER simulation input files...")
-            self._prepare_md_simulation_input_files(md_parameters_dict, md_assay_folder, prmtop_file, inpcrd_file)
+            print(f"\n🔁 Creating {n_replicas} replica(s) for template '{template_dict['pdb_template_name']}'...")
 
-            # Prepare execution shell script
-            print(f"⚙️  Writing execution script...")
-            self._prepare_md_execution_script(md_assay_folder)
+            for replica_idx in range(1, n_replicas + 1):
+                md_assay_folder = None
+                md_assay_id = None
+                replica_label = f"replica {replica_idx}/{n_replicas}"
 
-            # Register the assay in md_assays table
-            self._create_md_assay_register_entry(
-                md_assay_id, md_assay_folder, assay_description,
-                receptor_template_name=template_dict['pdb_template_name'],
-                md_parameters_dict=md_parameters_dict,
-            )
+                print(f"\n{'─' * 60}")
+                print(f"  Setting up {replica_label}...")
+                print(f"{'─' * 60}")
 
-            print(f"\n✅ MD assay prepared successfully in: {md_assay_folder}")
+                try:
+                    # Each replica gets its own assay folder and ID
+                    md_assay_id, md_assay_folder = self._create_md_assay_folder()
+                    if md_assay_id is None:
+                        print(f"❌ Could not create assay folder for {replica_label}. Skipping.")
+                        continue
 
-            # Optionally start simulation now
-            start_now = input("\n▶️  Do you want to start the MD simulation now? (yes/no) [default: no]: ").strip().lower() or 'no'
-            if start_now in ['yes', 'y']:
-                self._start_md_simulation(md_assay_folder)
-            else:
-                print("ℹ️  MD simulation not started. Run the execution script in the assay folder when ready.")
+                    # Append replica tag to description when more than one replica
+                    replica_description = (
+                        f"{assay_description} (replica {replica_idx})"
+                        if n_replicas > 1
+                        else assay_description
+                    )
+
+                    # Prepare receptor-only prmtop and inpcrd via tleap
+                    print(f"⚙️  Preparing topology and coordinate files with tleap...")
+                    prmtop_file, inpcrd_file = self._prepare_receptor_only_prmtop_inpcrd_for_md(
+                        template_dict['checked_pdb_path'], md_assay_folder, md_parameters_dict
+                    )
+
+                    # Prepare AMBER input files
+                    print(f"⚙️  Writing AMBER simulation input files...")
+                    self._prepare_md_simulation_input_files(md_parameters_dict, md_assay_folder, prmtop_file, inpcrd_file)
+
+                    # Prepare execution shell script
+                    print(f"⚙️  Writing execution script...")
+                    self._prepare_md_execution_script(md_assay_folder)
+
+                    # Register the assay in md_assays table
+                    self._create_md_assay_register_entry(
+                        md_assay_id, md_assay_folder, replica_description,
+                        receptor_template_name=template_dict['pdb_template_name'],
+                        md_parameters_dict=md_parameters_dict,
+                    )
+
+                    print(f"✅ {replica_label.capitalize()} prepared in: {md_assay_folder}")
+
+                    # Auto-start only for the first replica if the user requested it
+                    if replica_idx == 1 and start_first in ['yes', 'y']:
+                        self._start_md_simulation(md_assay_folder)
+                    else:
+                        if replica_idx == 1:
+                            print(f"ℹ️  Replica 1 not started. Run the execution script manually when ready.")
+                        else:
+                            print(f"ℹ️  {replica_label.capitalize()} requires manual start: {md_assay_folder}")
+
+                except Exception as e:
+                    print(f"\n❌ Error setting up {replica_label}: {e}")
+                    traceback.print_exc()
+                    if md_assay_folder and os.path.exists(md_assay_folder):
+                        print(f"⚠️  Assay folder left on disk for inspection: {md_assay_folder}")
+
+            print(f"\n{'═' * 60}")
+            print(f"✅ Done — {n_replicas} replica(s) registered for template '{template_dict['pdb_template_name']}'.")
+            print(f"{'═' * 60}")
 
         except Exception as e:
             print(f"\n❌ Error performing receptor MD assay: {e}")
             traceback.print_exc()
-            if md_assay_folder and os.path.exists(md_assay_folder):
-                print(f"⚠️  Assay folder left on disk for inspection: {md_assay_folder}")
 
     def _select_receptor_template(self):
         """
