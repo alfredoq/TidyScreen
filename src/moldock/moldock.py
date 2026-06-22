@@ -3991,219 +3991,240 @@ class MolDock:
     
     def delete_pdb_model(self):
         """
-        Will list the available pdb models in the database and prompt the user to select one to delete.
+        List available pdb models and prompt the user to select one or more to delete.
+        Accepts comma-separated model numbers, e.g. '1' or '1,3,5'.
         """
         import sqlite3
         from datetime import datetime
 
         try:
-            # Path to pdbs database
             pdbs_db_path = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
-            
-            # Check if database exists
+            receptors_db_path = os.path.join(self.path, 'docking', 'receptors', 'receptors.db')
+            docking_assays_db_path = os.path.join(self.path, 'docking', 'docking_registers', 'docking_assays.db')
+            md_registers_db_path = os.path.join(self.path, 'dynamics', 'md_registers', 'md_registers.db')
+
             if not os.path.exists(pdbs_db_path):
                 print(f"❌ No PDB database found")
                 print(f"   Expected location: {pdbs_db_path}")
                 return None
-            
-            # List available PDB models
+
             print(f"\n🗑️  DELETE PDB MODEL FROM DATABASE")
             print("=" * 80)
-            
-            models_list = self.list_pdb_models()
-            
+
+            models_list = self.list_pdb_models(interactive=False)
+
             if not models_list:
                 print(f"❌ No PDB models available to delete")
                 return None
-            
-            # Prompt user to select a model
+
+            # Prompt for one or more model numbers (comma-separated)
             while True:
                 try:
-                    selection_input = input(f"\nEnter the model number to delete (or 'q' to quit): ").strip()
-                    
+                    selection_input = input(
+                        f"\nEnter model number(s) to delete, e.g. 1 or 1,3,5 or 2-4 (or 'q' to quit): "
+                    ).strip()
+
                     if selection_input.lower() == 'q':
                         print(f"❌ Operation cancelled by user")
                         return None
-                    
+
                     try:
-                        model_number = int(selection_input)
-                        if model_number < 1 or model_number > len(models_list):
-                            print(f"❌ Invalid model number. Choose between 1 and {len(models_list)}")
-                            continue
-                        
-                        selected_model = models_list[model_number - 1]
+                        seen_nums = []
+                        for part in selection_input.split(','):
+                            part = part.strip()
+                            if '-' in part:
+                                start, end = part.split('-', 1)
+                                start, end = int(start.strip()), int(end.strip())
+                                if start > end:
+                                    raise ValueError(f"Range {start}-{end} is invalid (start > end)")
+                                for n in range(start, end + 1):
+                                    if n < 1 or n > len(models_list):
+                                        raise ValueError(f"{n} is out of range (1-{len(models_list)})")
+                                    if n not in seen_nums:
+                                        seen_nums.append(n)
+                            else:
+                                n = int(part)
+                                if n < 1 or n > len(models_list):
+                                    raise ValueError(f"{n} is out of range (1-{len(models_list)})")
+                                if n not in seen_nums:
+                                    seen_nums.append(n)
+                        selected_models = [models_list[n - 1] for n in seen_nums]
                         break
-                        
-                    except ValueError:
-                        print(f"❌ Please enter a valid number or 'q' to quit")
+                    except ValueError as e:
+                        print(f"❌ Invalid input: {e}")
                         continue
-                        
+
                 except KeyboardInterrupt:
                     print(f"\n\n❌ Operation cancelled by user")
                     return None
-            
 
-            # Check for related entries in pdb_templates and receptor_models before confirming deletion
-            try:
-                conn = sqlite3.connect(pdbs_db_path)
-                cursor = conn.cursor()
-                # Check if there are related entries in pdb_templates and get their template names
-                cursor.execute("SELECT pdb_template_name FROM pdb_templates WHERE pdb_model_name = ?",(selected_model['pdb_model_name'],))
-                template_names = [row[0] for row in cursor.fetchall()]
-                template_count = len(template_names)
-                conn.close()
-            except sqlite3.Error as e:
-                print(f"⚠️  Warning: Could not check related templates in pdb_templates: {e}")
-                template_names = []
-                template_count = 0
-            
-            # Check for related entries in receptor_models
-            try:
-                receptors_db_path = os.path.join(self.path, 'docking', 'receptors', 'receptors.db')
-                receptor_model_names = []
-                receptor_model_count = 0
-                if os.path.exists(receptors_db_path):
-                    conn = sqlite3.connect(receptors_db_path)
+            # Gather dependencies for every selected model before asking for confirmation
+            model_data = []
+            for model in selected_models:
+                data = {'model': model}
+
+                # Templates
+                try:
+                    conn = sqlite3.connect(pdbs_db_path)
                     cursor = conn.cursor()
-                    # Check if there are related entries in receptor_models and get their names
-                    cursor.execute("SELECT receptor_model_name FROM receptor_models WHERE pdb_model_name = ?", 
-                                 (selected_model['pdb_model_name'],))
-                    receptor_model_names = [row[0] for row in cursor.fetchall() if row[0]]
-                    receptor_model_count = len(receptor_model_names)
-                    conn.close()
-            except sqlite3.Error as e:
-                print(f"⚠️  Warning: Could not check related receptor models: {e}")
-                receptor_model_names = []
-                receptor_model_count = 0
-            
-            # Check for related docking assays
-            docking_assays_count = 0
-            docking_assay_names = []
-            docking_assay_ids = []
-            try:
-                docking_assays_db_path = os.path.join(self.path, 'docking', 'docking_registers', 'docking_assays.db')
-
-                if os.path.exists(docking_assays_db_path):
-                    conn_assays = sqlite3.connect(docking_assays_db_path)
-                    cursor_assays = conn_assays.cursor()
-
-                    # Check if there are related entries in docking_assays and get their ids and names
-                    cursor_assays.execute(
-                        "SELECT assay_id, assay_name FROM docking_assays WHERE receptor_info LIKE ?",
-                        (f'%"model_name": "{selected_model["pdb_model_name"]}"%',)
+                    cursor.execute(
+                        "SELECT pdb_template_name, template_folder_path FROM pdb_templates WHERE pdb_model_name = ?",
+                        (model['pdb_model_name'],)
                     )
-                    rows = cursor_assays.fetchall()
-                    docking_assay_ids = [row[0] for row in rows if row[0] is not None]
-                    docking_assay_names = [row[1] for row in rows if row[1]]
-                    docking_assays_count = len(docking_assay_names)
+                    rows = cursor.fetchall()
+                    data['template_names'] = [r[0] for r in rows]
+                    data['template_folders'] = [r[1] for r in rows if r[1]]
+                    conn.close()
+                except sqlite3.Error as e:
+                    print(f"⚠️  Warning: Could not check templates for {model['pdb_model_name']}: {e}")
+                    data['template_names'] = []
+                    data['template_folders'] = []
 
-                    conn_assays.close()
-
-            except sqlite3.Error as e:
-                print(f"⚠️  Warning: Could not check related docking assays: {e}")
-                docking_assay_ids = []
-                docking_assay_names = []
-                docking_assays_count = 0
-
-            # Check for related MD assays (linked through docking assays OR directly via receptor template)
-            md_assays_count = 0
-            md_assay_names = []
-            md_registers_db_path = os.path.join(self.path, 'dynamics', 'md_registers', 'md_registers.db')
-            try:
-                if os.path.exists(md_registers_db_path):
-                    conn_md = sqlite3.connect(md_registers_db_path)
-                    cursor_md = conn_md.cursor()
-                    seen_md_names = set()
-                    for dock_id in docking_assay_ids:
-                        cursor_md.execute(
-                            "SELECT md_assay FROM md_assays WHERE docking_assay_id = ?",
-                            (f'assay_{dock_id}',)
+                # Receptor models
+                try:
+                    data['receptor_model_names'] = []
+                    if os.path.exists(receptors_db_path):
+                        conn = sqlite3.connect(receptors_db_path)
+                        cursor = conn.cursor()
+                        cursor.execute(
+                            "SELECT receptor_model_name FROM receptor_models WHERE pdb_model_name = ?",
+                            (model['pdb_model_name'],)
                         )
-                        for row in cursor_md.fetchall():
-                            if row[0] and row[0] not in seen_md_names:
-                                md_assay_names.append(row[0])
-                                seen_md_names.add(row[0])
-                    for tmpl_name in template_names:
-                        cursor_md.execute(
-                            "SELECT md_assay FROM md_assays WHERE receptor_template_name = ?",
-                            (tmpl_name,)
+                        data['receptor_model_names'] = [r[0] for r in cursor.fetchall() if r[0]]
+                        conn.close()
+                except sqlite3.Error as e:
+                    print(f"⚠️  Warning: Could not check receptor models for {model['pdb_model_name']}: {e}")
+                    data['receptor_model_names'] = []
+
+                # Docking assays
+                try:
+                    data['docking_assay_ids'] = []
+                    data['docking_assay_names'] = []
+                    data['docking_assays_to_delete'] = []  # (assay_id, folder_path)
+                    if os.path.exists(docking_assays_db_path):
+                        conn = sqlite3.connect(docking_assays_db_path)
+                        cursor = conn.cursor()
+                        cursor.execute(
+                            "SELECT assay_id, assay_name, assay_folder_path FROM docking_assays"
+                            " WHERE receptor_info LIKE ?",
+                            (f'%"model_name": "{model["pdb_model_name"]}"%',)
                         )
-                        for row in cursor_md.fetchall():
-                            if row[0] and row[0] not in seen_md_names:
-                                md_assay_names.append(row[0])
-                                seen_md_names.add(row[0])
-                    md_assays_count = len(md_assay_names)
-                    conn_md.close()
-            except sqlite3.Error as e:
-                print(f"⚠️  Warning: Could not check related MD assays: {e}")
-            
-            # Confirm deletion
-            print(f"\n⚠️  CONFIRM DELETION")
+                        rows = cursor.fetchall()
+                        data['docking_assay_ids'] = [r[0] for r in rows if r[0] is not None]
+                        data['docking_assay_names'] = [r[1] for r in rows if r[1]]
+                        data['docking_assays_to_delete'] = [(r[0], r[2]) for r in rows]
+                        conn.close()
+                except sqlite3.Error as e:
+                    print(f"⚠️  Warning: Could not check docking assays for {model['pdb_model_name']}: {e}")
+                    data['docking_assay_ids'] = []
+                    data['docking_assay_names'] = []
+                    data['docking_assays_to_delete'] = []
+
+                # MD assays (linked via docking assay ids or template names)
+                try:
+                    data['md_assay_names'] = []
+                    data['md_entries'] = []  # (assay_id, folder_path)
+                    if os.path.exists(md_registers_db_path):
+                        conn = sqlite3.connect(md_registers_db_path)
+                        cursor = conn.cursor()
+                        seen_md = set()
+                        for dock_id in data['docking_assay_ids']:
+                            cursor.execute(
+                                "SELECT assay_id, assay_folder_path, md_assay FROM md_assays"
+                                " WHERE docking_assay_id = ?",
+                                (f'assay_{dock_id}',)
+                            )
+                            for row in cursor.fetchall():
+                                if row[0] not in seen_md:
+                                    data['md_entries'].append((row[0], row[1]))
+                                    if row[2]:
+                                        data['md_assay_names'].append(row[2])
+                                    seen_md.add(row[0])
+                        for tmpl in data['template_names']:
+                            cursor.execute(
+                                "SELECT assay_id, assay_folder_path, md_assay FROM md_assays"
+                                " WHERE receptor_template_name = ?",
+                                (tmpl,)
+                            )
+                            for row in cursor.fetchall():
+                                if row[0] not in seen_md:
+                                    data['md_entries'].append((row[0], row[1]))
+                                    if row[2]:
+                                        data['md_assay_names'].append(row[2])
+                                    seen_md.add(row[0])
+                        conn.close()
+                except sqlite3.Error as e:
+                    print(f"⚠️  Warning: Could not check MD assays for {model['pdb_model_name']}: {e}")
+                    data['md_assay_names'] = []
+                    data['md_entries'] = []
+
+                model_data.append(data)
+
+            # Confirmation: list all models and their cascaded dependencies
+            print(f"\n⚠️  CONFIRM DELETION OF {len(selected_models)} MODEL(S)")
             print("=" * 80)
-            print(f"   PDB Name: {selected_model['pdb_model_name']}")
-            print(f"   Filename: {selected_model['filename']}")
-            print(f"   File Size: {selected_model['file_size']:,} bytes" if selected_model['file_size'] else "   File Size: Unknown")
-            print(f"   Created: {selected_model['created_date']}")
-            print(f"   Description: {selected_model['description'] or 'None'}")
-            if template_count > 0:
-                print(f"   ⚠️  Related templates to be deleted: {template_count}")
-                for template_name in template_names:
-                    print(f"       - {template_name}")
-            if receptor_model_count > 0:
-                print(f"   ⚠️  Related receptor models to be deleted: {receptor_model_count}")
-                for receptor_name in receptor_model_names:
-                    print(f"       - {receptor_name}")
-            if docking_assays_count > 0:
-                print(f"   ⚠️  Related docking assays to be deleted: {docking_assays_count}")
-                for assay_name in docking_assay_names:
-                    print(f"       - {assay_name}")
-            if md_assays_count > 0:
-                print(f"   ⚠️  Related MD assays to be deleted: {md_assays_count}")
-                for md_name in md_assay_names:
-                    print(f"       - {md_name}")
+            for data in model_data:
+                model = data['model']
+                print(f"\n  📦 {model['pdb_model_name']}")
+                print(f"     Filename : {model['filename']}")
+                if model['file_size']:
+                    print(f"     File Size: {model['file_size']:,} bytes")
+                print(f"     Created  : {model['created_date']}")
+                if data['template_names']:
+                    print(f"     ⚠️  Related templates to be deleted: {len(data['template_names'])}")
+                    for n in data['template_names']:
+                        print(f"         - {n}")
+                if data['receptor_model_names']:
+                    print(f"     ⚠️  Related receptor models to be deleted: {len(data['receptor_model_names'])}")
+                    for n in data['receptor_model_names']:
+                        print(f"         - {n}")
+                if data['docking_assay_names']:
+                    print(f"     ⚠️  Related docking assays to be deleted: {len(data['docking_assay_names'])}")
+                    for n in data['docking_assay_names']:
+                        print(f"         - {n}")
+                if data['md_assay_names']:
+                    print(f"     ⚠️  Related MD assays to be deleted: {len(data['md_assay_names'])}")
+                    for n in data['md_assay_names']:
+                        print(f"         - {n}")
             print("=" * 80)
-            
-            confirm = input(f"\n⚠️  Are you sure you want to delete this PDB model? (yes/no, default: no): ").strip().lower()
-            
+
+            confirm = input(
+                f"\n⚠️  Are you sure you want to delete {len(selected_models)} PDB model(s)? (yes/no, default: no): "
+            ).strip().lower()
+
             if confirm != 'yes':
                 print(f"❌ Deletion cancelled by user")
                 return None
-            
-            # Delete from database
-            try:
-                conn = sqlite3.connect(pdbs_db_path)
-                cursor = conn.cursor()
-                
-                # Retrieve template_folder_path values before deleting from pdb_templates
-                template_folders = []
-                if template_count > 0:
-                    cursor.execute("SELECT template_folder_path FROM pdb_templates WHERE pdb_model_name = ?", 
-                                 (selected_model['pdb_model_name'],))
-                    template_folders = [row[0] for row in cursor.fetchall() if row[0]]
-                
-                # Delete the record from pdb_models
-                cursor.execute("DELETE FROM pdb_models WHERE file_id = ?", (selected_model['file_id'],))
-                
-                if cursor.rowcount == 0:
-                    print(f"❌ Failed to delete PDB model from database")
-                    conn.close()
-                    return None
-                
-                # Delete related entries from pdb_templates
-                if template_count > 0:
-                    cursor.execute("DELETE FROM pdb_templates WHERE pdb_model_name = ?", 
-                                 (selected_model['pdb_model_name'],))
-                    templates_deleted = cursor.rowcount
-                else:
+
+            # Delete each model in sequence
+            results = []
+            for data in model_data:
+                model = data['model']
+                try:
+                    conn = sqlite3.connect(pdbs_db_path)
+                    cursor = conn.cursor()
+
+                    cursor.execute("DELETE FROM pdb_models WHERE file_id = ?", (model['file_id'],))
+                    if cursor.rowcount == 0:
+                        print(f"❌ Failed to delete '{model['pdb_model_name']}' from database")
+                        conn.close()
+                        results.append({'status': 'failed', 'pdb_model_name': model['pdb_model_name']})
+                        continue
+
                     templates_deleted = 0
-                
-                conn.commit()
-                conn.close()
-                
-                # Recursively delete template folders
-                folders_deleted = 0
-                if template_folders:
-                    for folder_path in template_folders:
+                    if data['template_names']:
+                        cursor.execute(
+                            "DELETE FROM pdb_templates WHERE pdb_model_name = ?",
+                            (model['pdb_model_name'],)
+                        )
+                        templates_deleted = cursor.rowcount
+
+                    conn.commit()
+                    conn.close()
+
+                    # Delete template folders on disk
+                    folders_deleted = 0
+                    for folder_path in data['template_folders']:
                         if os.path.exists(folder_path):
                             try:
                                 shutil.rmtree(folder_path)
@@ -4213,48 +4234,33 @@ class MolDock:
                                 print(f"   ⚠️  Warning: Could not delete folder {folder_path}: {e}")
                         else:
                             print(f"   ⚠️  Folder not found (already deleted?): {folder_path}")
-                
-                # Delete related entries from receptor_models
-                receptor_models_deleted = 0
-                if receptor_model_count > 0:
-                    try:
-                        conn_receptor = sqlite3.connect(receptors_db_path)
-                        cursor_receptor = conn_receptor.cursor()
-                        
-                        cursor_receptor.execute("DELETE FROM receptor_models WHERE pdb_model_name = ?", 
-                                              (selected_model['pdb_model_name'],))
-                        receptor_models_deleted = cursor_receptor.rowcount
-                        
-                        conn_receptor.commit()
-                        conn_receptor.close()
-                        
-                    except sqlite3.Error as e:
-                        print(f"⚠️  Warning: Error deleting receptor models: {e}")
-                
-                ## Delete all assay folder associated to the pdb_model
-                docking_assays_deleted = 0
-                assay_folders_deleted = 0
-                docking_assays_db_path = os.path.join(self.path, 'docking', 'docking_registers', 'docking_assays.db')
-                
-                if os.path.exists(docking_assays_db_path):
-                    try:
-                        conn_assays = sqlite3.connect(docking_assays_db_path)
-                        cursor_assays = conn_assays.cursor()
-                        
-                        # Retrieve assay_id and assay_folder_path for assays containing the model_name
-                        cursor_assays.execute(
-                            "SELECT assay_id, assay_folder_path FROM docking_assays WHERE receptor_info LIKE ?",
-                            (f'%"model_name": "{selected_model["pdb_model_name"]}"%',)
-                        )
-                        assays_to_delete = cursor_assays.fetchall()
-                        
-                        if assays_to_delete:
-                            # Delete the docking assays
-                            for assay_id, assay_folder_path in assays_to_delete:
-                                cursor_assays.execute("DELETE FROM docking_assays WHERE assay_id = ?", (assay_id,))
+
+                    # Delete receptor models
+                    receptor_models_deleted = 0
+                    if data['receptor_model_names'] and os.path.exists(receptors_db_path):
+                        try:
+                            conn = sqlite3.connect(receptors_db_path)
+                            cursor = conn.cursor()
+                            cursor.execute(
+                                "DELETE FROM receptor_models WHERE pdb_model_name = ?",
+                                (model['pdb_model_name'],)
+                            )
+                            receptor_models_deleted = cursor.rowcount
+                            conn.commit()
+                            conn.close()
+                        except sqlite3.Error as e:
+                            print(f"⚠️  Warning: Error deleting receptor models: {e}")
+
+                    # Delete docking assays and their folders
+                    docking_assays_deleted = 0
+                    assay_folders_deleted = 0
+                    if data['docking_assays_to_delete'] and os.path.exists(docking_assays_db_path):
+                        try:
+                            conn = sqlite3.connect(docking_assays_db_path)
+                            cursor = conn.cursor()
+                            for assay_id, assay_folder_path in data['docking_assays_to_delete']:
+                                cursor.execute("DELETE FROM docking_assays WHERE assay_id = ?", (assay_id,))
                                 docking_assays_deleted += 1
-                                
-                                # Delete assay folders if they exist
                                 if assay_folder_path and os.path.exists(assay_folder_path):
                                     try:
                                         shutil.rmtree(assay_folder_path)
@@ -4264,99 +4270,71 @@ class MolDock:
                                         print(f"   ⚠️  Warning: Could not delete assay folder {assay_folder_path}: {e}")
                                 elif assay_folder_path:
                                     print(f"   ⚠️  Assay folder not found (already deleted?): {assay_folder_path}")
-                        
-                        conn_assays.commit()
-                        conn_assays.close()
+                            conn.commit()
+                            conn.close()
+                        except sqlite3.Error as e:
+                            print(f"⚠️  Warning: Error deleting docking assays: {e}")
 
-                    except sqlite3.Error as e:
-                        print(f"⚠️  Warning: Error deleting docking assays: {e}")
+                    # Delete MD assays and their folders
+                    md_assays_deleted = 0
+                    md_assay_folders_deleted = 0
+                    if data['md_entries'] and os.path.exists(md_registers_db_path):
+                        try:
+                            conn = sqlite3.connect(md_registers_db_path)
+                            cursor = conn.cursor()
+                            for md_id, md_folder in data['md_entries']:
+                                cursor.execute("DELETE FROM md_assays WHERE assay_id = ?", (md_id,))
+                                md_assays_deleted += 1
+                                if md_folder and os.path.exists(md_folder):
+                                    try:
+                                        shutil.rmtree(md_folder)
+                                        md_assay_folders_deleted += 1
+                                        print(f"   ✓ Deleted MD assay folder: {md_folder}")
+                                    except Exception as e:
+                                        print(f"   ⚠️  Warning: Could not delete MD assay folder {md_folder}: {e}")
+                                elif md_folder:
+                                    print(f"   ⚠️  MD assay folder not found (already deleted?): {md_folder}")
+                            conn.commit()
+                            conn.close()
+                        except sqlite3.Error as e:
+                            print(f"⚠️  Warning: Error deleting MD assays: {e}")
 
-                # Delete related MD assays (via docking assay link OR receptor template link)
-                md_assays_deleted = 0
-                md_assay_folders_deleted = 0
-                if os.path.exists(md_registers_db_path):
-                    try:
-                        conn_md = sqlite3.connect(md_registers_db_path)
-                        cursor_md = conn_md.cursor()
+                    print(f"\n✓ PDB model '{model['pdb_model_name']}' successfully deleted")
+                    if templates_deleted > 0:
+                        print(f"   Related templates deleted    : {templates_deleted}")
+                    if receptor_models_deleted > 0:
+                        print(f"   Receptor models deleted      : {receptor_models_deleted}")
+                    if folders_deleted > 0:
+                        print(f"   Template folders deleted     : {folders_deleted}")
+                    if docking_assays_deleted > 0:
+                        print(f"   Docking assays deleted       : {docking_assays_deleted}")
+                    if assay_folders_deleted > 0:
+                        print(f"   Assay folders deleted        : {assay_folders_deleted}")
+                    if md_assays_deleted > 0:
+                        print(f"   MD assays deleted            : {md_assays_deleted}")
+                    if md_assay_folders_deleted > 0:
+                        print(f"   MD assay folders deleted     : {md_assay_folders_deleted}")
 
-                        md_entries_to_delete = []
-                        seen_md_ids = set()
+                    results.append({
+                        'status': 'deleted',
+                        'pdb_model_name': model['pdb_model_name'],
+                        'file_id': model['file_id'],
+                        'templates_deleted': templates_deleted,
+                        'receptor_models_deleted': receptor_models_deleted,
+                        'folders_deleted': folders_deleted,
+                        'docking_assays_deleted': docking_assays_deleted,
+                        'assay_folders_deleted': assay_folders_deleted,
+                        'md_assays_deleted': md_assays_deleted,
+                        'md_assay_folders_deleted': md_assay_folders_deleted,
+                        'deleted_date': datetime.now().isoformat()
+                    })
 
-                        for dock_id in docking_assay_ids:
-                            cursor_md.execute(
-                                "SELECT assay_id, assay_folder_path FROM md_assays WHERE docking_assay_id = ?",
-                                (f'assay_{dock_id}',)
-                            )
-                            for row in cursor_md.fetchall():
-                                if row[0] not in seen_md_ids:
-                                    md_entries_to_delete.append(row)
-                                    seen_md_ids.add(row[0])
+                except sqlite3.Error as e:
+                    print(f"❌ Database error while deleting '{model['pdb_model_name']}': {e}")
+                    results.append({'status': 'failed', 'pdb_model_name': model['pdb_model_name']})
 
-                        for tmpl_name in template_names:
-                            cursor_md.execute(
-                                "SELECT assay_id, assay_folder_path FROM md_assays WHERE receptor_template_name = ?",
-                                (tmpl_name,)
-                            )
-                            for row in cursor_md.fetchall():
-                                if row[0] not in seen_md_ids:
-                                    md_entries_to_delete.append(row)
-                                    seen_md_ids.add(row[0])
+            return results[0] if len(results) == 1 else results
 
-                        for md_id, md_folder in md_entries_to_delete:
-                            cursor_md.execute("DELETE FROM md_assays WHERE assay_id = ?", (md_id,))
-                            md_assays_deleted += 1
-                            if md_folder and os.path.exists(md_folder):
-                                try:
-                                    shutil.rmtree(md_folder)
-                                    md_assay_folders_deleted += 1
-                                    print(f"   ✓ Deleted MD assay folder: {md_folder}")
-                                except Exception as e:
-                                    print(f"   ⚠️  Warning: Could not delete MD assay folder {md_folder}: {e}")
-                            elif md_folder:
-                                print(f"   ⚠️  MD assay folder not found (already deleted?): {md_folder}")
-
-                        conn_md.commit()
-                        conn_md.close()
-
-                    except sqlite3.Error as e:
-                        print(f"⚠️  Warning: Error deleting MD assays: {e}")
-
-                print(f"\n✓ PDB model '{selected_model['pdb_model_name']}' successfully deleted from database")
-                print(f"   File ID: {selected_model['file_id']}")
-                print(f"   Database: {pdbs_db_path}")
-                if templates_deleted > 0:
-                    print(f"   Related templates deleted: {templates_deleted}")
-                if receptor_models_deleted > 0:
-                    print(f"   Related receptor models deleted: {receptor_models_deleted}")
-                if folders_deleted > 0:
-                    print(f"   Template folders deleted: {folders_deleted}")
-                if docking_assays_deleted > 0:
-                    print(f"   Related docking assays deleted: {docking_assays_deleted}")
-                if assay_folders_deleted > 0:
-                    print(f"   Assay folders deleted: {assay_folders_deleted}")
-                if md_assays_deleted > 0:
-                    print(f"   Related MD assays deleted: {md_assays_deleted}")
-                if md_assay_folders_deleted > 0:
-                    print(f"   MD assay folders deleted: {md_assay_folders_deleted}")
-
-                return {
-                    'status': 'deleted',
-                    'pdb_model_name': selected_model['pdb_model_name'],
-                    'file_id': selected_model['file_id'],
-                    'templates_deleted': templates_deleted,
-                    'receptor_models_deleted': receptor_models_deleted,
-                    'folders_deleted': folders_deleted,
-                    'docking_assays_deleted': docking_assays_deleted,
-                    'assay_folders_deleted': assay_folders_deleted,
-                    'md_assays_deleted': md_assays_deleted,
-                    'md_assay_folders_deleted': md_assay_folders_deleted,
-                    'deleted_date': datetime.now().isoformat()
-                }
-                
-            except sqlite3.Error as e:
-                print(f"❌ Database error while deleting PDB model: {e}")
-                return None
-                
         except Exception as e:
             print(f"❌ Error deleting PDB model: {e}")
             return None
@@ -4494,8 +4472,169 @@ class MolDock:
             import traceback
             traceback.print_exc()
             return None
-    
-    def list_pdb_models(self, print_models: bool = True) -> Optional[List[Dict[str, Any]]]:
+
+    def write_pdb_template(self):
+        """
+        List available PDB templates and prompt the user to select one. The
+        checked (fully-processed) PDB file is copied to the project's
+        docking/receptors directory using the template name as filename.
+
+        Returns:
+            Optional[Dict[str, Any]]: Information about the written file or None if failed
+        """
+        import sqlite3
+        import shutil as _shutil
+        from datetime import datetime
+
+        try:
+            pdbs_db_path = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
+
+            if not os.path.exists(pdbs_db_path):
+                print(f"❌ No PDB database found")
+                print(f"   Expected location: {pdbs_db_path}")
+                return None
+
+            print(f"\n📁 RETRIEVE PDB TEMPLATE FROM DATABASE")
+            print("=" * 80)
+
+            conn = sqlite3.connect(pdbs_db_path)
+            cursor = conn.cursor()
+
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pdb_templates'")
+            if not cursor.fetchone():
+                print(f"❌ No PDB templates table found in database")
+                conn.close()
+                return None
+
+            cursor.execute('''
+                SELECT pdb_id, pdb_template_name, pdb_model_name, chains,
+                       atom_count, checked_pdb_path, template_folder_path,
+                       created_date, notes
+                FROM pdb_templates
+                ORDER BY created_date ASC
+            ''')
+            rows = cursor.fetchall()
+            conn.close()
+
+            if not rows:
+                print(f"❌ No PDB templates available")
+                print(f"   Create one first using create_pdb_template()")
+                return None
+
+            # Display numbered list
+            print(f"   Found {len(rows)} PDB template(s) in database")
+            print(f"   Database: {pdbs_db_path}")
+            print("=" * 80)
+            templates_list = []
+            for idx, (pdb_id, tmpl_name, model_name, chains, atom_count,
+                      checked_path, folder_path, created_date, notes) in enumerate(rows, 1):
+                tmpl = {
+                    'pdb_id': pdb_id,
+                    'pdb_template_name': tmpl_name,
+                    'pdb_model_name': model_name,
+                    'chains': chains,
+                    'atom_count': atom_count,
+                    'checked_pdb_path': checked_path,
+                    'template_folder_path': folder_path,
+                    'created_date': created_date,
+                    'notes': notes,
+                }
+                templates_list.append(tmpl)
+                print(f"\n{idx}. 🧬 {tmpl_name}")
+                print(f"   {'─' * 76}")
+                print(f"   📋 ID      : {pdb_id}")
+                print(f"   📦 Model   : {model_name}")
+                print(f"   🔗 Chains  : {chains or 'N/A'}")
+                print(f"   ⚛️  Atoms   : {atom_count or 'N/A'}")
+                print(f"   📅 Created : {created_date}")
+                print(f"   {'─' * 76}")
+            print("=" * 80)
+
+            # Selection prompt
+            while True:
+                try:
+                    selection_input = input(
+                        f"\nEnter the template number to retrieve (or 'q' to quit): "
+                    ).strip()
+
+                    if selection_input.lower() == 'q':
+                        print(f"❌ Operation cancelled by user")
+                        return None
+
+                    try:
+                        tmpl_number = int(selection_input)
+                        if tmpl_number < 1 or tmpl_number > len(templates_list):
+                            print(f"❌ Invalid number. Choose between 1 and {len(templates_list)}")
+                            continue
+                        selected = templates_list[tmpl_number - 1]
+                        break
+                    except ValueError:
+                        print(f"❌ Invalid input. Please enter a number or 'q' to quit")
+                        continue
+
+                except KeyboardInterrupt:
+                    print(f"\n\n❌ Operation cancelled by user")
+                    return None
+
+            # Verify source file exists
+            source_path = selected['checked_pdb_path']
+            if not source_path or not os.path.exists(source_path):
+                print(f"❌ Checked PDB file not found on disk: {source_path}")
+                return None
+
+            print(f"\n{'=' * 80}")
+            print(f"✓ Selected Template: {selected['pdb_template_name']}")
+            print(f"  Source file      : {source_path}")
+            print(f"{'=' * 80}")
+
+            # Determine output path
+            receptors_dir = os.path.join(self.path, 'docking', 'receptors')
+            output_filename = f"{selected['pdb_template_name']}.pdb"
+            output_path = os.path.join(receptors_dir, output_filename)
+
+            if os.path.exists(output_path):
+                print(f"⚠️  File already exists: {output_path}")
+                overwrite = input(f"   Overwrite? (y/n, default: n): ").strip().lower()
+                if overwrite != 'y':
+                    print(f"❌ Operation cancelled by user")
+                    return None
+
+            print(f"\n💾 Writing PDB template to disk...")
+            os.makedirs(receptors_dir, exist_ok=True)
+            _shutil.copy2(source_path, output_path)
+            written_size = os.path.getsize(output_path)
+            print(f"   ✓ File written successfully ({written_size:,} bytes)")
+
+            print(f"\n{'=' * 80}")
+            print(f"✅ PDB TEMPLATE RETRIEVED AND WRITTEN SUCCESSFULLY")
+            print(f"{'=' * 80}")
+            print(f"   📋 Template ID  : {selected['pdb_id']}")
+            print(f"   🏷️  Template Name: {selected['pdb_template_name']}")
+            print(f"   📁 Output file  : {output_filename}")
+            print(f"   📍 Output path  : {output_path}")
+            print(f"   📊 File size    : {written_size:,} bytes")
+            print(f"   📅 Retrieved    : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"{'=' * 80}")
+
+            return {
+                'pdb_id': selected['pdb_id'],
+                'template_name': selected['pdb_template_name'],
+                'filename': output_filename,
+                'output_path': output_path,
+                'file_size': written_size,
+                'retrieved_date': datetime.now().isoformat()
+            }
+
+        except sqlite3.Error as e:
+            print(f"❌ Database error: {e}")
+            return None
+        except Exception as e:
+            print(f"❌ Error retrieving PDB template: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def list_pdb_models(self, print_models: bool = True, interactive: bool = True) -> Optional[List[Dict[str, Any]]]:
         """
         List the PDB models saved in the pdbs.db located in the 
         project_path/docking/receptors directory.
@@ -4597,8 +4736,8 @@ class MolDock:
                 print(f"💡 Type 'details <number>' to view full information about a model")
             
             
-            if print_models:
-            
+            if print_models and interactive:
+
                 # Interactive details viewing
                 while True:
                     try:
@@ -5361,16 +5500,23 @@ class MolDock:
                 else:
                     print("   🧹 Will remove all water molecules.")
 
-            # Create processed PDB file with selected chains, ligands, and waters
+            # Create processed PDB file with selected chains, ligands, and waters.
+            # _create_filtered_pdb must also run when structural gaps exist, because
+            # it is the only place that inserts TER records between discontinuous
+            # segments (e.g. protein→metal ion). Without TER records tleap tries to
+            # form a peptide bond across the gap and fails to write the output PDB.
+            _has_gaps = any(gaps for gaps in analysis.get('gaps', {}).values())
             if (selected_chains != analysis['chains'] or
                 selected_ligands != list(analysis['ligand_residues']) or
-                (water_details and selected_waters != list(water_details.keys()))):
+                (water_details and selected_waters != list(water_details.keys())) or
+                _has_gaps or
+                water_details is not None):
                 print(f"   🔄 Applying filters to processed PDB (chains, ligands, waters)...")
-                
+
                 filtered_pdb_path = self._create_filtered_pdb(
                     processed_pdb_path, selected_chains, selected_ligands, selected_waters, analysis
                 )
-                
+
                 if not filtered_pdb_path:
                     print("   ❌ Failed to create filtered PDB file")
                     return None
@@ -5395,10 +5541,14 @@ class MolDock:
                                   
             # Process tleap_processed_file to add the element name column if missing
             receptor_moldf_dict, renumbering_dict = self._refine_receptor_model(tleap_processed_file, processed_pdb_path, analysis)
-            
+
+            if receptor_moldf_dict is None:
+                print(f"❌ Receptor refinement failed — aborting template creation.")
+                return None
+
             # Write (overwrite) the tleap_processed_file
             from moldf import write_pdb
-            
+
             write_pdb(receptor_moldf_dict, tleap_processed_file)
             
             
@@ -5589,16 +5739,23 @@ class MolDock:
                 else:
                     print("   🧹 Will remove all water molecules.")
 
-            # Create processed PDB file with selected chains, ligands, and waters
+            # Create processed PDB file with selected chains, ligands, and waters.
+            # _create_filtered_pdb must also run when structural gaps exist, because
+            # it is the only place that inserts TER records between discontinuous
+            # segments (e.g. protein→metal ion). Without TER records tleap tries to
+            # form a peptide bond across the gap and fails to write the output PDB.
+            _has_gaps = any(gaps for gaps in analysis.get('gaps', {}).values())
             if (selected_chains != analysis['chains'] or
                 selected_ligands != list(analysis['ligand_residues']) or
-                (water_details and selected_waters != list(water_details.keys()))):
+                (water_details and selected_waters != list(water_details.keys())) or
+                _has_gaps or
+                water_details is not None):
                 print(f"   🔄 Applying filters to processed PDB (chains, ligands, waters)...")
-                
+
                 filtered_pdb_path = self._create_filtered_pdb(
                     processed_pdb_path, selected_chains, selected_ligands, selected_waters, analysis
                 )
-                
+
                 if not filtered_pdb_path:
                     print("   ❌ Failed to create filtered PDB file")
                     return None
@@ -5623,10 +5780,14 @@ class MolDock:
                                   
             # Process tleap_processed_file to add the element name column if missing
             receptor_moldf_dict, renumbering_dict = self._refine_receptor_model(tleap_processed_file, processed_pdb_path, analysis)
-            
+
+            if receptor_moldf_dict is None:
+                print(f"❌ Receptor refinement failed — aborting template creation.")
+                return None
+
             # Write (overwrite) the tleap_processed_file
             from moldf import write_pdb
-            
+
             write_pdb(receptor_moldf_dict, tleap_processed_file)
             
             print(f"✅ tleap processing complete. Output: {tleap_processed_file}")
@@ -7048,15 +7209,6 @@ class MolDock:
             )
            
 
-            ## Rename 'WAT' residues to 'HOH' in the tleap_processed_file
-            with open(tleap_file, 'r') as file:
-                filedata = file.read()
-
-            filedata = filedata.replace(' WAT ', ' HOH ')
-
-            with open(tleap_file, 'w') as file:
-                file.write(filedata)
-        
             # Check for errors
             if result.returncode != 0:
                 print("❌ tleap failed to process the receptor file.")
@@ -7068,13 +7220,45 @@ class MolDock:
                 print("❌ tleap did not produce the expected output file.")
                 return None
 
+            # Rename 'WAT' residues to 'HOH' in the tleap output PDB.
+            # tleap renames HOH→WAT when 'HOH = WAT' is set; rename them back
+            # so downstream tools see the canonical water residue name.
+            with open(tleap_processed_file, 'r') as _f:
+                _pdb_data = _f.read()
+            _pdb_data = _pdb_data.replace(' WAT ', ' HOH ')
+            with open(tleap_processed_file, 'w') as _f:
+                _f.write(_pdb_data)
+
+            # Validate that tleap wrote real coordinates. A known silent failure
+            # mode is tleap exiting 0 but producing a PDB where every coordinate
+            # field is blank (e.g. when it encounters ATOM-labeled water records
+            # or other formatting issues). Detect this before continuing.
+            _atom_count = 0
+            _blank_count = 0
+            with open(tleap_processed_file, 'r') as _fv:
+                for _vline in _fv:
+                    if _vline.startswith(('ATOM', 'HETATM')):
+                        _atom_count += 1
+                        try:
+                            float(_vline[30:38])
+                        except ValueError:
+                            _blank_count += 1
+            if _atom_count == 0:
+                print(f"❌ tleap produced an empty PDB file (no ATOM/HETATM records).")
+                return None
+            if _blank_count == _atom_count:
+                print(f"❌ tleap produced {_atom_count} atoms but ALL coordinate fields are blank.")
+                print(f"   This is a known silent tleap failure. Check the PDB for ATOM-labeled")
+                print(f"   water records or other formatting issues in: {receptor_file}")
+                return None
+
             return tleap_processed_file
-                    
+
         except Exception as e:
             print(f"Failed processing: {receptor_file} with tleap")
             print(e)
             return None
-    
+
     def _reassign_chain_and_resnums(self, reference_pdb, target_pdb):
         """
         Create a dictionary in which the key is formed by residue name, the chain and the residue number in the reference pdb_file, and the value is formed by the residue name and residue number in the target pdb file.
@@ -10898,9 +11082,13 @@ class MolDock:
             return False
     
     def _refine_receptor_model(self, tleap_processed_file, processed_pdb_path, analysis):
-        
+
         # Minize the receptor model as processed with tleap
         minimized_pdb_file = self._minimize_receptor(tleap_processed_file, analysis)
+
+        if minimized_pdb_file is None:
+            print(f"❌ Receptor minimization failed — cannot refine model.")
+            return None, None
 
         ## Create residue number matching dictionary
         renumbering_dict = self._construct_resnumbers_matching_dictionary(processed_pdb_path, minimized_pdb_file)
@@ -11111,22 +11299,58 @@ class MolDock:
                 
         # Run tleap to generate prmtop and inpcrd files
         tleap_command = f"tleap -f {tleap_in_file}"
-        subprocess.run(tleap_command, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        tleap_min_result = subprocess.run(tleap_command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if tleap_min_result.returncode != 0:
+            print(f"❌ tleap (minimize.in) failed with return code {tleap_min_result.returncode}")
+            print(tleap_min_result.stderr)
+            return None
 
         # Set file to run sander to minimize the receptor
         prmtop_file = os.path.join(os.path.dirname(tleap_processed_file), "receptor.prmtop")
         inpcrd_file = os.path.join(os.path.dirname(tleap_processed_file), "receptor.inpcrd")
         min_out_file = os.path.join(os.path.dirname(tleap_processed_file), "min.out")
         min_rst_file = os.path.join(os.path.dirname(tleap_processed_file), "min.rst")
-        
+
+        if not os.path.exists(prmtop_file) or os.path.getsize(prmtop_file) == 0:
+            print(f"❌ tleap did not produce a valid prmtop file: {prmtop_file}")
+            return None
+        if not os.path.exists(inpcrd_file) or os.path.getsize(inpcrd_file) == 0:
+            print(f"❌ tleap did not produce a valid inpcrd file: {inpcrd_file}")
+            return None
+
         # Run sander to minimize the receptor
         sander_command = f"sander -O -i {min_in_file} -o {min_out_file} -p {prmtop_file} -c {inpcrd_file} -r {min_rst_file}"
-        subprocess.run(sander_command, shell=True, check=True)   
+        sander_result = subprocess.run(sander_command, shell=True)
+        if sander_result.returncode != 0:
+            print(f"❌ sander minimization failed with return code {sander_result.returncode}")
+            return None
 
-        # Convert minimized restart file back to PDB format
+        # Detect NaN energies in sander output — a sign that input coordinates
+        # were invalid (e.g. all-zero from a blank-coord inpcrd).
+        with open(min_out_file, 'r') as _mout:
+            _min_out_content = _mout.read()
+        if 'NaN' in _min_out_content:
+            print(f"❌ AMBER minimization produced NaN energies in {min_out_file}.")
+            print(f"   This indicates the input coordinates (inpcrd) are invalid,")
+            print(f"   most likely because tleap received a PDB with blank coordinates.")
+            return None
+
+        # Convert minimized restart file back to PDB format using subprocess stdout
+        # (avoid shell redirect which masks ambpdb exit codes).
         minimized_pdb_file = tleap_processed_file.replace('.pdb', '_minimized.pdb')
-        ambpdb_min_command = f"ambpdb -p {prmtop_file} -c {min_rst_file} > {minimized_pdb_file}"
-        subprocess.run(ambpdb_min_command, shell=True, check=True)
+        with open(minimized_pdb_file, 'w') as _ambpdb_out:
+            ambpdb_result = subprocess.run(
+                ['ambpdb', '-p', prmtop_file, '-c', min_rst_file],
+                stdout=_ambpdb_out,
+                stderr=subprocess.PIPE
+            )
+        if ambpdb_result.returncode != 0:
+            print(f"❌ ambpdb failed to convert minimized restart to PDB (return code {ambpdb_result.returncode})")
+            print(ambpdb_result.stderr.decode(errors='replace'))
+            return None
+        if not os.path.exists(minimized_pdb_file) or os.path.getsize(minimized_pdb_file) == 0:
+            print(f"❌ ambpdb produced an empty output file: {minimized_pdb_file}")
+            return None
 
         # Rename 'WAT' residues to 'HOH' in the minimized PDB file
         with open(minimized_pdb_file, 'r') as file:
@@ -11236,34 +11460,47 @@ class MolDock:
         
         try:
             import shutil
-            
+            import re as _re
+
             # Create temporary output file
             temp_out = minimized_pdb_file + ".renumbered"
-            
+
             with open(minimized_pdb_file, 'r') as infile, open(temp_out, 'w') as outfile:
                 for line in infile:
                     if line.startswith('ATOM') or line.startswith('HETATM'):
                         # Extract residue name and number from the minimized file
                         res_name = line[17:20].strip()
-                        res_num = int(line[22:26].strip())
-                        
-                        # Construct the key to search in renumbering_dict
-                        key = f"{res_name}_{res_num}"
-                        
+                        try:
+                            res_num = int(line[22:26].strip())
+                        except ValueError:
+                            outfile.write(line)
+                            continue
+
+                        # Construct the key to search in renumbering_dict.
+                        # Key format must match _construct_resnumbers_matching_dictionary
+                        # which builds tleap_key_list entries as f"{res_name}{res_num}"
+                        # (no underscore separator).
+                        key = f"{res_name}{res_num}"
+
                         # Look up the crystallographic numbering
                         if key in renumbering_dict:
-                            # Parse the value to get the new residue number
+                            # Value format from _construct_resnumbers_matching_dictionary:
+                            #   "{res_name}{res_num}_{chain_id}"  e.g. "ARG8_B"
+                            # or "{res_name}{res_num}"             e.g. "ARG8" (no chain)
+                            # Extract the residue number: trailing integer before _{chain_id}
                             crystal_value = renumbering_dict[key]
-                            # The value format is "ResName_ResNum"
-                            crystal_res_name, crystal_res_num = crystal_value.rsplit('_', 1)
-                            new_res_num = int(crystal_res_num)
-                            
-                            # Reconstruct the line with the new residue number
-                            # PDB format: columns 23-26 are residue number (right-justified, 4 characters)
+                            _base = crystal_value.rsplit('_', 1)[0]  # strip chain suffix
+                            _m = _re.search(r'(\d+)$', _base)
+                            if not _m:
+                                outfile.write(line)
+                                continue
+                            new_res_num = int(_m.group(1))
+
+                            # PDB format: columns 23-26 are residue number (right-justified, 4 chars)
                             new_line = line[:22] + f"{new_res_num:4d}" + line[26:]
                             outfile.write(new_line)
                         else:
-                            # If key not found in dictionary, keep original line
+                            # Key not found — keep original line
                             outfile.write(line)
                     else:
                         # Non-ATOM/HETATM lines are written as-is
