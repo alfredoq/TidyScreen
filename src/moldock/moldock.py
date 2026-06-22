@@ -14878,8 +14878,10 @@ class MolDock:
         """
         Import a precomputed receptor model (PDBQT + grid files) directly into the project.
 
-        Accepts a folder containing a prepared .pdbqt file, a .gpf file (used to parse the
-        docking box parameters), a .fld file, and one or more .map files.  Stub pdb_model and
+        Accepts a folder containing a prepared .pdbqt file, a .fld file, and one or more .map
+        files.  A .gpf file is used to parse the docking box parameters when present; when absent
+        (e.g. ensemble-derived maps) the parameters are read from the header of a .map file instead.
+        Stub pdb_model and
         pdb_template records are created so that downstream analyses (e.g. ProLIF fingerprints)
         do not fail.  ProLIF residue labels will reflect the numbering in the imported PDBQT
         directly (no remapping is applied).
@@ -14922,8 +14924,6 @@ class MolDock:
         errors = []
         if len(pdbqt_files) != 1:
             errors.append(f"expected exactly 1 .pdbqt file, found {len(pdbqt_files)}")
-        if not gpf_files:
-            errors.append("no .gpf file found")
         if not fld_files:
             errors.append("no .fld file found")
         if not map_files:
@@ -14935,10 +14935,13 @@ class MolDock:
             return None
 
         pdbqt_src = os.path.join(input_folder_path, pdbqt_files[0])
-        gpf_src   = os.path.join(input_folder_path, gpf_files[0])
+        gpf_src   = os.path.join(input_folder_path, gpf_files[0]) if gpf_files else None
+        if gpf_src is None:
+            print("  No .gpf file found — box parameters will be read from a .map file header.")
 
         # --- Resolve receptor PDB file ---
-        # perform_md_assay() expects receptor_checked.pdb alongside the PDBQT.
+        # receptor_checked.pdb is required for both docking (ProLIF fingerprints) and
+        # MD assay preparation (perform_md_assay() tleap setup).
         # If a single .pdb is present in the folder use it; otherwise ask the user.
         if len(pdb_files) == 1:
             pdb_src = os.path.join(input_folder_path, pdb_files[0])
@@ -14953,12 +14956,12 @@ class MolDock:
                 print(f"  '{choice}' not found. Please enter one of: {pdb_files}")
         else:
             print("  No .pdb file found in the input folder.")
-            print("  A receptor PDB is required for MD assay preparation (perform_md_assay()).")
+            print("  A receptor PDB is required for docking (ProLIF fingerprints) and MD assay preparation.")
             while True:
                 raw_pdb = input("  Enter the full path to the receptor PDB file (or 'skip' to omit): ").strip().strip('"').strip("'")
                 if raw_pdb.lower() == 'skip':
                     pdb_src = None
-                    print("  Warning: no receptor PDB stored — perform_md_assay() will fail for this receptor.")
+                    print("  Warning: no receptor PDB stored — docking fingerprints and perform_md_assay() will fail for this receptor.")
                     break
                 candidate = os.path.abspath(os.path.expanduser(raw_pdb))
                 if os.path.isfile(candidate):
@@ -15001,8 +15004,12 @@ class MolDock:
             return None
         conn_r.close()
 
-        # --- Step 2: Parse box parameters from .gpf ---
-        configs = self._parse_gpf_box_params(gpf_src)
+        # --- Step 2: Parse box parameters from .gpf (preferred) or .map header (fallback) ---
+        if gpf_src is not None:
+            configs = self._parse_gpf_box_params(gpf_src)
+        else:
+            map_src = os.path.join(input_folder_path, map_files[0])
+            configs = self._parse_map_box_params(map_src)
         if configs is None:
             return None
         configs['receptor_charge_model'] = charge_model
@@ -15242,4 +15249,65 @@ class MolDock:
 
         except Exception as e:
             print(f"  Error parsing .gpf file: {e}")
+            return None
+
+    def _parse_map_box_params(self, map_path):
+        """Parse SPACING, NELEMENTS, and CENTER from an AutoGrid .map file header.
+
+        Used as a fallback when no .gpf file is available (e.g. ensemble-derived maps).
+        AutoGrid .map headers contain lines like:
+            SPACING 0.375
+            NELEMENTS 40 40 40
+            CENTER -5.000 10.000 3.000
+        """
+        center = None
+        npts = None
+        spacing = 0.375
+
+        try:
+            with open(map_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith('SPACING'):
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            spacing = float(parts[1])
+                    elif line.startswith('NELEMENTS'):
+                        parts = line.split()
+                        if len(parts) >= 4:
+                            npts = {
+                                'x': int(parts[1]),
+                                'y': int(parts[2]),
+                                'z': int(parts[3])
+                            }
+                    elif line.startswith('CENTER'):
+                        parts = line.split()
+                        if len(parts) >= 4:
+                            center = {
+                                'x': float(parts[1]),
+                                'y': float(parts[2]),
+                                'z': float(parts[3])
+                            }
+
+            if center is None or npts is None:
+                print(f"  Error: could not parse 'CENTER' or 'NELEMENTS' from {map_path}.")
+                return None
+
+            size = {
+                'x': round(npts['x'] * spacing, 4),
+                'y': round(npts['y'] * spacing, 4),
+                'z': round(npts['z'] * spacing, 4),
+            }
+
+            return {
+                'center': center,
+                'size': size,
+                'spacing': spacing,
+                'dielectric': -0.1465,
+                'smooth': 0.5,
+                'biases': None,
+            }
+
+        except Exception as e:
+            print(f"  Error parsing .map file '{map_path}': {e}")
             return None
