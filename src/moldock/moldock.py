@@ -876,6 +876,185 @@ class MolDock:
             print(f"❌ Error listing docking assays: {e}")
             return None
 
+    def delete_docking_assays(self):
+        """
+        Interactively delete one or more docking assays, removing their registry entries
+        from docking_assays.db and their associated folders on disk.
+        """
+        import sqlite3
+        import shutil
+
+        assays_db_path = os.path.join(os.path.dirname(self.__docking_registers_db), 'docking_assays.db')
+
+        if not os.path.exists(assays_db_path):
+            print("❌ No docking assays database found.")
+            print(f"   Expected location: {assays_db_path}")
+            return None
+
+        try:
+            conn = sqlite3.connect(assays_db_path)
+            cursor = conn.cursor()
+
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='docking_assays'")
+            if not cursor.fetchone():
+                print("❌ Docking assays table not found in database.")
+                conn.close()
+                return None
+
+            cursor.execute(
+                """
+                SELECT assay_id, assay_name, table_name, docking_method_name,
+                       docking_engine, status, docking_status, compound_count,
+                       created_date, assay_folder_path
+                FROM docking_assays
+                WHERE project_name = ?
+                ORDER BY assay_id ASC
+                """,
+                (self.name,)
+            )
+            rows = cursor.fetchall()
+        except sqlite3.Error as e:
+            print(f"❌ Database error: {e}")
+            return None
+
+        if not rows:
+            print(f"📋 No docking assays found for project '{self.name}'.")
+            conn.close()
+            return None
+
+        print(f"\n🗑️  DELETE DOCKING ASSAY(S) — PROJECT: {self.name}")
+        print("=" * 120)
+        print(f"{'#':<4} {'ID':<5} {'Assay Name':<20} {'Table':<18} {'Method':<18} {'Engine':<14} {'Compounds':<10} {'Created':<20}")
+        print("=" * 120)
+        for i, (assay_id, assay_name, table_name, method_name, engine,
+                status, docking_status, compound_count, created_date, assay_folder_path) in enumerate(rows, 1):
+            effective_status = status or docking_status or 'unknown'
+            print(
+                f"{i:<4} {assay_id:<5} {assay_name[:19]:<20} {table_name[:17]:<18} "
+                f"{method_name[:17]:<18} {engine[:13]:<14} {compound_count or 0:<10} {created_date or '':<20}"
+            )
+            if assay_folder_path:
+                folder_exists = os.path.exists(assay_folder_path)
+                print(f"      📁 {assay_folder_path} ({'exists' if folder_exists else 'missing'})")
+        print("=" * 120)
+
+        # Multi-selection prompt
+        print("\nEnter assay number(s) to delete — supports: individual ('1,3'), ranges ('2-5'), or mixed ('1,3-5,7'); 'all' to delete all; 'cancel' to abort.")
+        try:
+            raw = input("Selection: ").strip()
+        except KeyboardInterrupt:
+            print("\n❌ Deletion cancelled.")
+            conn.close()
+            return None
+
+        if raw.lower() in ('cancel', 'quit', 'q', ''):
+            print("❌ Deletion cancelled.")
+            conn.close()
+            return None
+
+        if raw.lower() == 'all':
+            selected_indices = list(range(len(rows)))
+        else:
+            selected_indices = []
+            for token in raw.split(','):
+                token = token.strip()
+                if '-' in token:
+                    parts = token.split('-', 1)
+                    try:
+                        start = int(parts[0].strip()) - 1
+                        end = int(parts[1].strip()) - 1
+                        if start > end:
+                            start, end = end, start
+                        if start < 0 or end >= len(rows):
+                            print(f"⚠️  Range '{token}' partially or fully out of bounds (valid: 1-{len(rows)}), skipping.")
+                            continue
+                        selected_indices.extend(range(start, end + 1))
+                    except ValueError:
+                        print(f"⚠️  Skipping invalid range token: '{token}'")
+                else:
+                    try:
+                        idx = int(token) - 1
+                        if 0 <= idx < len(rows):
+                            selected_indices.append(idx)
+                        else:
+                            print(f"⚠️  Skipping out-of-range number: {token}")
+                    except ValueError:
+                        print(f"⚠️  Skipping invalid token: '{token}'")
+            selected_indices = list(dict.fromkeys(selected_indices))  # deduplicate, preserve order
+
+        if not selected_indices:
+            print("❌ No valid assays selected. Deletion cancelled.")
+            conn.close()
+            return None
+
+        selected_rows = [rows[i] for i in selected_indices]
+
+        # Confirmation summary
+        print(f"\n⚠️  THE FOLLOWING {len(selected_rows)} ASSAY(S) WILL BE PERMANENTLY DELETED:")
+        print("=" * 80)
+        for assay_id, assay_name, table_name, method_name, engine, status, docking_status, compound_count, created_date, assay_folder_path in selected_rows:
+            print(f"   • [{assay_id}] {assay_name}  (table: {table_name}, engine: {engine})")
+            if assay_folder_path:
+                folder_exists = os.path.exists(assay_folder_path)
+                print(f"     📁 Folder: {assay_folder_path} ({'will be removed' if folder_exists else 'already missing'})")
+        print("=" * 80)
+
+        try:
+            confirm = input("Confirm deletion? (yes/no, default: no): ").strip().lower()
+        except KeyboardInterrupt:
+            print("\n❌ Deletion cancelled.")
+            conn.close()
+            return None
+
+        if confirm != 'yes':
+            print("❌ Deletion cancelled.")
+            conn.close()
+            return None
+
+        # Perform deletion
+        deleted_registries = 0
+        deleted_folders = 0
+        missing_folders = 0
+
+        try:
+            for assay_id, assay_name, _, _, _, _, _, _, _, assay_folder_path in selected_rows:
+                cursor.execute("DELETE FROM docking_assays WHERE assay_id = ?", (assay_id,))
+                deleted_registries += cursor.rowcount
+
+                if assay_folder_path:
+                    if os.path.exists(assay_folder_path):
+                        try:
+                            shutil.rmtree(assay_folder_path)
+                            deleted_folders += 1
+                            print(f"   ✓ Removed folder: {assay_folder_path}")
+                        except Exception as e:
+                            print(f"   ⚠️  Could not remove folder {assay_folder_path}: {e}")
+                    else:
+                        missing_folders += 1
+                        print(f"   ⚠️  Folder already missing: {assay_folder_path}")
+
+            conn.commit()
+        except sqlite3.Error as e:
+            conn.rollback()
+            print(f"❌ Database error during deletion: {e}")
+            conn.close()
+            return None
+        finally:
+            conn.close()
+
+        print(f"\n✅ Deletion complete.")
+        print(f"   Registry entries deleted : {deleted_registries}")
+        print(f"   Assay folders removed    : {deleted_folders}")
+        if missing_folders:
+            print(f"   Folders already missing  : {missing_folders}")
+
+        return {
+            'status': 'deleted',
+            'deleted_registries': deleted_registries,
+            'deleted_folders': deleted_folders,
+            'missing_folders': missing_folders,
+        }
+
     def _get_engine_specific_parameters(self, engine_name: str) -> Optional[Dict[str, Any]]:
         """
         Get engine-specific parameters from user input.
