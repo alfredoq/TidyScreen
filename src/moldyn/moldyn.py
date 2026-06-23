@@ -177,6 +177,83 @@ class MolDyn:
             print(f"❌ Error in create_md_method: {e}")
             return None
 
+    def show_tleap_template_guide(self):
+        """Print guidance on how to write a tleap template file for create_md_method_using_tleap_template()."""
+        print("\n📂 TLEAP TEMPLATE FILE")
+        print("=" * 70)
+        print("Provide the path to a working tleap input file for this system.")
+        print("The file will be stored verbatim and replayed at assay-setup time")
+        print("with the following substitution tokens replaced automatically:")
+        print()
+        print("  REQUIRED tokens (must appear exactly once each):")
+        print("  {{RECEPTOR_PDB}}  → absolute path to receptor_checked.pdb")
+        print("                      do NOT hardcode the receptor filename")
+        print("  {{LIGAND_PDB}}    → absolute path to the docked-pose PDB for this assay")
+        print("  {{MOL2_FILE}}     → absolute path to the GAFF2 mol2 file for the ligand")
+        print("  {{FRCMOD_FILE}}   → absolute path to the frcmod file for the ligand")
+        print("  {{PRMTOP_OUT}}    → absolute path where tleap writes the output .prmtop")
+        print("  {{INPCRD_OUT}}    → absolute path where tleap writes the output .inpcrd")
+        print()
+        print("  HOW TO WRITE THE TEMPLATE:")
+        print("  • Load the protein force field first (e.g. source leaprc.protein.ff19SB)")
+        print("  • Load the water/ion model matching the solvent type you will choose")
+        print("    (e.g. source leaprc.water.tip3p  for explicit solvent)")
+        print("  • Load any custom .lib files with:  loadoff <basename>.lib")
+        print("    (attach those files when prompted; reference by basename only)")
+        print("  • Load any custom .frcmod files with:  loadamberparams <basename>.frcmod")
+        print("  • Load the ligand mol2 and frcmod with:")
+        print("      lig = loadmol2 {{MOL2_FILE}}")
+        print("      loadamberparams {{FRCMOD_FILE}}")
+        print("  • Load the receptor and ligand PDBs and form the complex:")
+        print("      rec = loadpdb {{RECEPTOR_PDB}}")
+        print("      pose = loadpdb {{LIGAND_PDB}}")
+        print("      complex = combine { rec lig }")
+        print("    (or combine { rec pose } if the ligand comes from the PDB)")
+        print("  • Add solvent box and ions as needed, e.g.:")
+        print("      solvatebox complex TIP3PBOX 12.0")
+        print("      addions complex Na+ 0")
+        print("      addions complex Cl- 0")
+        print("  • Write output using the tokens (NOT literal filenames):")
+        print("      saveamberparm complex {{PRMTOP_OUT}} {{INPCRD_OUT}}")
+        print("  • End the file with:  quit")
+        print()
+        print("  MINIMAL EXAMPLE (protein + small-molecule ligand, TIP3P explicit solvent):")
+        print("  ─" * 35)
+        print("  source leaprc.protein.ff19SB")
+        print("  source leaprc.gaff2")
+        print("  source leaprc.water.tip3p")
+        print("  loadmol2 {{MOL2_FILE}}")
+        print("  loadamberparams {{FRCMOD_FILE}}")
+        print("  rec = loadpdb {{RECEPTOR_PDB}}")
+        print("  pose = loadpdb {{LIGAND_PDB}}")
+        print("  complex = combine { rec pose }")
+        print("  solvatebox complex TIP3PBOX 12.0")
+        print("  addions complex Na+ 0")
+        print("  addions complex Cl- 0")
+        print("  saveamberparm complex {{PRMTOP_OUT}} {{INPCRD_OUT}}")
+        print("  quit")
+        print("  ─" * 35)
+        print()
+        print("  CYCLODEXTRIN / CUSTOM FF EXAMPLE (add extra loadoff / loadamberparams):")
+        print("  ─" * 35)
+        print("  source leaprc.GLYCAM_06j-1")
+        print("  source leaprc.gaff2")
+        print("  source leaprc.water.tip3p")
+        print("  loadoff HP2.lib")
+        print("  loadamberparams HP2.frcmod")
+        print("  UNL = loadmol2 {{MOL2_FILE}}")
+        print("  loadamberparams {{FRCMOD_FILE}}")
+        print("  rec = loadpdb {{RECEPTOR_PDB}}")
+        print("  pose = loadpdb {{LIGAND_PDB}}")
+        print("  complex = combine { rec pose }")
+        print("  solvatebox complex TIP3PBOX 12.0")
+        print("  addions complex Na+ 0")
+        print("  addions complex Cl- 0")
+        print("  saveamberparm complex {{PRMTOP_OUT}} {{INPCRD_OUT}}")
+        print("  quit")
+        print("  ─" * 35)
+        print("=" * 70)
+
     def create_md_method_using_tleap_template(self):
         """
         Create an MD method where system preparation (prmtop/inpcrd) is driven
@@ -230,18 +307,7 @@ class MolDyn:
             params['description'] = description
 
             # --- Tleap template file ---
-            print("\n📂 TLEAP TEMPLATE FILE")
-            print("-" * 70)
-            print("Provide the path to a working tleap input file for this system.")
-            print("The file will be stored verbatim and replayed at assay-setup time")
-            print("with the following substitution tokens replaced automatically:")
-            print("  {{RECEPTOR_PDB}} → receptor checked.pdb (apo or complex)")
-            print("  {{LIGAND_PDB}}   → docked-pose PDB written for this assay")
-            print("  {{MOL2_FILE}}    → GAFF2 mol2 file prepared for the ligand")
-            print("  {{FRCMOD_FILE}}  → frcmod file prepared for the ligand")
-            print("  {{PRMTOP_OUT}}   → output prmtop path inside the assay folder")
-            print("  {{INPCRD_OUT}}   → output inpcrd path inside the assay folder")
-            print("-" * 70)
+            self.show_tleap_template_guide()
             while True:
                 try:
                     tleap_template_path = input("\n📂 Path to tleap template file (or 'cancel'): ").strip()
@@ -842,9 +908,21 @@ class MolDyn:
             # Create complex .prmtop and .inpcrd files
             print(f"⚙️  Preparing topology and coordinate files with tleap...")
             if md_parameters_dict.get('method_type') == 'tleap_template':
+                import json as _json
+                _receptor_info = docking_assay_params_dict.get('receptor_info', {})
+                if isinstance(_receptor_info, str):
+                    try:
+                        _receptor_info = _json.loads(_receptor_info)
+                    except Exception:
+                        _receptor_info = {}
+                _pdbqt = _receptor_info.get('pdbqt_file', '')
+                if _pdbqt and 'docking/receptors' in _pdbqt:
+                    _pdbqt = os.path.join(self.path, _pdbqt[_pdbqt.index('docking/receptors'):])
+                receptor_pdb_for_template = os.path.join(os.path.dirname(_pdbqt), 'receptor_checked.pdb') if _pdbqt else None
                 prmtop_file, inpcrd_file = self._prepare_complex_prmtop_inpcrd_from_template(
                     selected_pose_pdb, md_assay_folder, md_parameters_dict,
                     mol2_file=mol2_file, frcmod_file=frcmod_file,
+                    receptor_pdb=receptor_pdb_for_template,
                 )
             else:
                 prmtop_file, inpcrd_file = self._prepare_complex_prmtop_inpcrd_for_md(
@@ -858,7 +936,7 @@ class MolDyn:
 
             # Prepare execution scripts for the MD assay
             print(f"⚙️  Writing execution script...")
-            self._prepare_md_execution_script(md_assay_folder)
+            self._prepare_md_execution_script(md_assay_folder, md_parameters_dict)
 
             # Create MD register entry in the md_assays table
             self._create_md_assay_register_entry(md_assay_id, md_assay_folder, assay_description, docking_assay_params_dict.get('assay_id'), docking_assay_params_dict.get('selected_ligand_name'), docking_assay_params_dict.get('selected_pose_id'), md_parameters_dict)
@@ -1266,7 +1344,7 @@ class MolDyn:
         perform_md_assay_on_receptor() (receptor only; selected_pose_pdb=None).
 
         Tokens replaced in the template:
-          {{RECEPTOR_PDB}} → absolute path to the receptor PDB (apo or complex setup)
+          {{RECEPTOR_PDB}} → full path to receptor_checked.pdb inside output_dir (file is copied there; surrounding single quotes in the template are also stripped)
           {{LIGAND_PDB}}   → absolute path to the docked-pose PDB (skipped if None)
           {{MOL2_FILE}}    → absolute path to the GAFF2 mol2 file for the ligand
           {{FRCMOD_FILE}}  → absolute path to the frcmod file for the ligand
@@ -1304,9 +1382,27 @@ class MolDyn:
                     f"Failed to restore parameter file '{cf['filename']}' to assay folder: {e}"
                 ) from e
 
+        # Copy the receptor PDB into the assay folder and resolve its full path
+        # so that complex.in can reference it unambiguously without quotes.
+        receptor_pdb_dest = None
+        if receptor_pdb and os.path.exists(receptor_pdb):
+            import shutil as _shutil
+            receptor_pdb_dest = os.path.join(output_dir, os.path.basename(receptor_pdb))
+            try:
+                _shutil.copy2(receptor_pdb, receptor_pdb_dest)
+                print(f"   ✓ Copied receptor PDB to assay folder: {receptor_pdb_dest}")
+            except OSError as e:
+                raise RuntimeError(
+                    f"Failed to copy receptor PDB '{receptor_pdb}' to assay folder: {e}"
+                ) from e
+        elif receptor_pdb:
+            raise RuntimeError(f"Receptor PDB not found: {receptor_pdb}")
+
         content = template_content
-        if receptor_pdb:
-            content = content.replace('{{RECEPTOR_PDB}}', receptor_pdb)
+        if receptor_pdb_dest:
+            # Replace quoted token first, then unquoted — both map to the full path without quotes.
+            content = content.replace("'{{RECEPTOR_PDB}}'", receptor_pdb_dest)
+            content = content.replace('{{RECEPTOR_PDB}}', receptor_pdb_dest)
         if selected_pose_pdb:
             content = content.replace('{{LIGAND_PDB}}', selected_pose_pdb)
         content = content.replace('{{PRMTOP_OUT}}', prmtop_file)
@@ -1328,6 +1424,7 @@ class MolDyn:
                 shell=True,
                 capture_output=True,
                 text=True,
+                cwd=output_dir,
             )
         except subprocess.SubprocessError as e:
             raise RuntimeError(f"Failed to execute tleap: {e}") from e
@@ -1467,7 +1564,7 @@ class MolDyn:
             f.write(f"  iwrap=1,\n")
             f.write(f"  ntr=1,\n")
             f.write(f"  restraint_wt={md_parameters_dict.get('first_minimization').get('min1_restraint_wt')},\n")
-            f.write(f"  restraintmask='{md_parameters_dict.get('first_minimization').get('min1_restraint_selector')}',\n")
+            f.write(f"  restraintmask={md_parameters_dict.get('first_minimization').get('min1_restraint_selector')},\n")
             f.write(f"/\n")
             f.write(f"END\n")
             
@@ -1489,7 +1586,7 @@ class MolDyn:
             f.write(f"  iwrap=1,\n")
             f.write(f"  ntr=1,\n")
             f.write(f"  restraint_wt={md_parameters_dict.get('second_minimization').get('min2_restraint_wt')},\n")
-            f.write(f"  restraintmask='{md_parameters_dict.get('second_minimization').get('min2_restraint_selector')}',\n")
+            f.write(f"  restraintmask={md_parameters_dict.get('second_minimization').get('min2_restraint_selector')},\n")
             f.write(f"/\n")
             f.write(f"END\n")
 
@@ -1518,7 +1615,7 @@ class MolDyn:
             f.write(f"  ntwx={md_parameters_dict.get('heating_params').get('heating_trajectory_write')},\n")
             f.write(f"  ntwr={md_parameters_dict.get('heating_params').get('heating_restart_write')},\n")
             f.write(f"  restraint_wt={md_parameters_dict.get('heating_params').get('heating_restraint_wt')},\n")
-            f.write(f"  restraintmask='{md_parameters_dict.get('heating_params').get('heating_restraint_selector')}',\n")
+            f.write(f"  restraintmask={md_parameters_dict.get('heating_params').get('heating_restraint_selector')},\n")
             f.write(f"  iwrap=1,\n")
             f.write(f"  nmropt=1,\n")
             f.write(f"&end\n")
@@ -1535,6 +1632,7 @@ class MolDyn:
 
         # Prepare the equilibration input file
         equilibration_in_file = os.path.join(md_assay_folder, "equilibration.in")
+        eq_restraint_selector = md_parameters_dict.get('equilibration_params').get('equilibration_restraint_selector', '')
         with open(equilibration_in_file, 'w') as f:
             f.write(f"Equilibration stage\n")
             f.write(f"&cntrl\n")
@@ -1544,7 +1642,6 @@ class MolDyn:
             f.write(f"  ntb=1,\n")
             f.write(f"  ntp=0,\n")
             f.write(f"  cut={md_parameters_dict.get('general_params').get('cutoff')},\n")
-            f.write(f"  ntr=1,\n")
             f.write(f"  ntc=2,\n")
             f.write(f"  ntf=2,\n")
             f.write(f"  temp0={md_parameters_dict.get('general_params').get('target_temp')},\n")
@@ -1557,11 +1654,16 @@ class MolDyn:
             f.write(f"  ntwx={md_parameters_dict.get('equilibration_params').get('equilibration_trajectory_write')},\n")
             f.write(f"  ntwr={md_parameters_dict.get('equilibration_params').get('equilibration_restart_write')},\n")
             f.write(f"  iwrap=1,\n")
+            if eq_restraint_selector:
+                f.write(f"  ntr=1,\n")
+                f.write(f"  restraint_wt={md_parameters_dict.get('equilibration_params').get('equilibration_restraint_wt')},\n")
+                f.write(f"  restraintmask={eq_restraint_selector},\n")
             f.write(f"/\n")
             f.write(f"END\n")
 
         # Prepare the production MD input file
         production_in_file = os.path.join(md_assay_folder, "production.in")
+        prod_restraint_selector = md_parameters_dict.get('production_params').get('production_restraint_selector', '')
         with open(production_in_file, 'w') as f:
             f.write(f"Production MD stage\n")
             f.write(f"&cntrl\n")
@@ -1582,30 +1684,173 @@ class MolDyn:
             f.write(f"  ntwx={md_parameters_dict.get('production_params').get('production_trajectory_write')},\n")
             f.write(f"  ntwr={md_parameters_dict.get('production_params').get('production_restart_write')},\n")
             f.write(f"  iwrap=1,\n")
+            if prod_restraint_selector:
+                f.write(f"  ntr=1,\n")
+                f.write(f"  restraint_wt={md_parameters_dict.get('production_params').get('production_restraint_wt')},\n")
+                f.write(f"  restraintmask={prod_restraint_selector},\n")
             f.write(f"/\n")
             f.write(f"END\n")
 
-    def _prepare_md_execution_script(self, md_assay_folder):
+    def _prepare_md_execution_script(self, md_assay_folder, md_parameters_dict):
         import shutil as _shutil
 
         pmemd = _shutil.which("pmemd.cuda") or "pmemd.cuda"
 
+        min1_ref = md_parameters_dict.get('first_minimization', {}).get('min1_restraint_selector', '')
+        min2_ref = md_parameters_dict.get('second_minimization', {}).get('min2_restraint_selector', '')
+        heat_ref = md_parameters_dict.get('heating_params', {}).get('heating_restraint_selector', '')
+        eq_ref   = md_parameters_dict.get('equilibration_params', {}).get('equilibration_restraint_selector', '')
+        prod_ref = md_parameters_dict.get('production_params', {}).get('production_restraint_selector', '')
+
+        gp = md_parameters_dict.get('general_params', {})
+        hp = md_parameters_dict.get('heating_params', {})
+
+        # -ref <file> is a coordinate file path, not the mask.
+        # Empty string means no -ref flag (no restraints for that stage).
+        ref_file_min1 = '"complex.inpcrd"' if min1_ref else '""'
+        ref_file_min2 = '"${min1_out}"'    if min2_ref else '""'
+        ref_file_heat = '"${min2_out}"'    if heat_ref else '""'
+        ref_file_eq   = '"${heating_out}"' if eq_ref   else '""'
+        ref_file_prod = '"${eq_out}"'      if prod_ref else '""'
+
         execution_script_path = os.path.join(md_assay_folder, "run_md.sh")
         try:
             with open(execution_script_path, 'w') as f:
+
+                # --- Header ---
                 f.write("#!/bin/bash\n")
+                f.write("set -uo pipefail\n")
                 f.write('cd "$(dirname "$0")"\n')
-                f.write(f"export PATH={os.path.dirname(pmemd)}:$PATH\n")
-                f.write("echo 'Running min1'\n")
-                f.write(f"{pmemd} -O -i min1.in -o min1.out -p complex.prmtop -c complex.inpcrd -r min1.crd -ref complex.inpcrd\n")
-                f.write("echo 'Running min2'\n")
-                f.write(f"{pmemd} -O -i min2.in -o min2.out -p complex.prmtop -c complex.inpcrd -r min2.crd -ref min1.crd\n")
-                f.write("echo 'Running heating'\n")
-                f.write(f"{pmemd} -O -i heating.in -o heating.out -p complex.prmtop -c min2.crd -r heating.crd -ref min2.crd\n")
-                f.write("echo 'Running equilibration'\n")
-                f.write(f"{pmemd} -O -i equilibration.in -o equilibration.out -p complex.prmtop -c heating.crd -r equilibration.crd -ref heating.crd -x equilibration.nc\n")
-                f.write("echo 'Running production'\n")
-                f.write(f"{pmemd} -O -i production.in -o production.out -p complex.prmtop -c equilibration.crd -r production.crd -ref equilibration.crd -x production.nc\n")
+                f.write(f"export PATH={os.path.dirname(pmemd)}:$PATH\n\n")
+                f.write("MAX_RESTARTS=5\n")
+                f.write("STAGE_OUT=\n\n")
+
+                # --- Engine selection ---
+                f.write("if command -v pmemd.cuda &>/dev/null; then\n")
+                f.write("    MD_ENGINE=pmemd.cuda\n")
+                f.write('    echo "Using pmemd.cuda"\n')
+                f.write("else\n")
+                f.write("    MD_ENGINE=sander\n")
+                f.write('    echo "pmemd.cuda not found, falling back to sander"\n')
+                f.write("fi\n\n")
+
+                # --- run_stage function ---
+                f.write("# run_stage STAGE BASE_IN RESTART_IN COORD_IN REF_COORD WRITE_TRAJ\n")
+                f.write("#   Runs one MD stage.  On failure retries from the ntwr checkpoint\n")
+                f.write("#   (written to the -r file) up to MAX_RESTARTS times.\n")
+                f.write("#   REF_COORD=\"\" for stages without positional restraints.\n")
+                f.write("#   WRITE_TRAJ=\"yes\" to emit -x <stage>.nc.\n")
+                f.write("#   On success sets STAGE_OUT to the final .crd path.\n")
+                f.write("run_stage() {\n")
+                f.write('    local stage="$1" base_in="$2" restart_in="$3"\n')
+                f.write('    local coord_in="$4" ref_coord="$5" write_traj="$6"\n')
+                f.write("    local attempt=0 md_status suffix cur_in coord_out\n\n")
+                f.write('    while [[ $attempt -le $MAX_RESTARTS ]]; do\n')
+                f.write('        if [[ $attempt -eq 0 ]]; then\n')
+                f.write('            suffix="${stage}"; cur_in="${base_in}"\n')
+                f.write("        else\n")
+                f.write('            suffix="${stage}_restart${attempt}"; cur_in="${restart_in}"\n')
+                f.write("        fi\n")
+                f.write('        coord_out="${suffix}.crd"\n\n')
+                f.write("        md_status=0\n")
+                f.write('        if [[ -n "${ref_coord}" && "${write_traj}" == "yes" ]]; then\n')
+                f.write('            "${MD_ENGINE}" -O -i "${cur_in}" -o "${suffix}.out" \\\n')
+                f.write('                -p complex.prmtop -c "${coord_in}" \\\n')
+                f.write('                -ref "${ref_coord}" -r "${coord_out}" -x "${suffix}.nc" \\\n')
+                f.write("                || md_status=$?\n")
+                f.write('        elif [[ -n "${ref_coord}" ]]; then\n')
+                f.write('            "${MD_ENGINE}" -O -i "${cur_in}" -o "${suffix}.out" \\\n')
+                f.write('                -p complex.prmtop -c "${coord_in}" \\\n')
+                f.write('                -ref "${ref_coord}" -r "${coord_out}" \\\n')
+                f.write("                || md_status=$?\n")
+                f.write('        elif [[ "${write_traj}" == "yes" ]]; then\n')
+                f.write('            "${MD_ENGINE}" -O -i "${cur_in}" -o "${suffix}.out" \\\n')
+                f.write('                -p complex.prmtop -c "${coord_in}" \\\n')
+                f.write('                -r "${coord_out}" -x "${suffix}.nc" \\\n')
+                f.write("                || md_status=$?\n")
+                f.write("        else\n")
+                f.write('            "${MD_ENGINE}" -O -i "${cur_in}" -o "${suffix}.out" \\\n')
+                f.write('                -p complex.prmtop -c "${coord_in}" \\\n')
+                f.write('                -r "${coord_out}" \\\n')
+                f.write("                || md_status=$?\n")
+                f.write("        fi\n\n")
+                f.write('        if [[ $md_status -eq 0 ]]; then\n')
+                f.write('            echo "  ${stage} done (attempt $((attempt+1))) → ${coord_out}"\n')
+                f.write('            STAGE_OUT="${coord_out}"\n')
+                f.write("            return 0\n")
+                f.write("        fi\n\n")
+                f.write('        if [[ -f "${coord_out}" && -s "${coord_out}" ]]; then\n')
+                f.write('            echo "  ${stage} attempt $((attempt+1)) failed — checkpoint found, restarting"\n')
+                f.write('            coord_in="${coord_out}"\n')
+                f.write("            (( attempt++ )) || true\n")
+                f.write("        else\n")
+                f.write('            echo "  ${stage} attempt $((attempt+1)) failed — no checkpoint written, giving up"\n')
+                f.write("            return 1\n")
+                f.write("        fi\n")
+                f.write("    done\n\n")
+                f.write('    echo "  ${stage} exhausted ${MAX_RESTARTS} restart(s) — giving up"\n')
+                f.write("    return 1\n")
+                f.write("}\n\n")
+
+                # --- heating_restart.in heredoc ---
+                # heating.in uses irest=0/ntx=1 (fresh start from min2).
+                # A restart resumes velocities from the checkpoint at target temp.
+                f.write("# Restart variant of heating.in: resumes from checkpoint at target temp.\n")
+                f.write("cat > heating_restart.in << 'HEATR'\n")
+                f.write("Heating stage restart\n")
+                f.write("&cntrl\n")
+                f.write("  imin=0,\n")
+                f.write("  irest=1,\n")
+                f.write("  ntx=5,\n")
+                f.write("  ntb=2,\n")
+                f.write("  ntp=1,\n")
+                f.write(f"  cut={gp.get('cutoff')},\n")
+                f.write("  ntc=2,\n")
+                f.write("  ntf=2,\n")
+                f.write(f"  temp0={gp.get('target_temp')},\n")
+                f.write(f"  tempi={gp.get('target_temp')},\n")
+                f.write(f"  ntt={gp.get('thermostat')},\n")
+                f.write(f"  gamma_ln={gp.get('collision_freq')},\n")
+                f.write(f"  nstlim={hp.get('heating_steps')},\n")
+                f.write("  dt=0.002,\n")
+                f.write(f"  ntpr={hp.get('heating_output_write')},\n")
+                f.write(f"  ntwx={hp.get('heating_trajectory_write')},\n")
+                f.write(f"  ntwr={hp.get('heating_restart_write')},\n")
+                if heat_ref:
+                    f.write("  ntr=1,\n")
+                    f.write(f"  restraint_wt={hp.get('heating_restraint_wt')},\n")
+                    f.write(f"  restraintmask={heat_ref},\n")
+                f.write("  iwrap=1,\n")
+                f.write("/\n")
+                f.write("END\n")
+                f.write("HEATR\n\n")
+
+                # --- Stage calls ---
+                f.write('echo "--- min1 ---"\n')
+                f.write(f'run_stage min1 min1.in min1.in complex.inpcrd {ref_file_min1} "" \\\n')
+                f.write('    || { echo "FAILED: min1 — aborting"; exit 1; }\n')
+                f.write('min1_out="${STAGE_OUT}"\n\n')
+
+                f.write('echo "--- min2 ---"\n')
+                f.write(f'run_stage min2 min2.in min2.in complex.inpcrd {ref_file_min2} "" \\\n')
+                f.write('    || { echo "FAILED: min2 — aborting"; exit 1; }\n')
+                f.write('min2_out="${STAGE_OUT}"\n\n')
+
+                f.write('echo "--- heating ---"\n')
+                f.write(f'run_stage heating heating.in heating_restart.in "${{min2_out}}" {ref_file_heat} "" \\\n')
+                f.write('    || { echo "FAILED: heating — aborting"; exit 1; }\n')
+                f.write('heating_out="${STAGE_OUT}"\n\n')
+
+                f.write('echo "--- equilibration ---"\n')
+                f.write(f'run_stage equilibration equilibration.in equilibration.in "${{heating_out}}" {ref_file_eq} yes \\\n')
+                f.write('    || { echo "FAILED: equilibration — aborting"; exit 1; }\n')
+                f.write('eq_out="${STAGE_OUT}"\n\n')
+
+                f.write('echo "--- production ---"\n')
+                f.write(f'run_stage production production.in production.in "${{eq_out}}" {ref_file_prod} yes \\\n')
+                f.write('    || { echo "FAILED: production — aborting"; exit 1; }\n')
+                f.write('echo "MD completed successfully → ${STAGE_OUT}"\n')
+
             os.chmod(execution_script_path, 0o755)
         except OSError as e:
             raise RuntimeError(f"Failed to write execution script '{execution_script_path}': {e}") from e
@@ -1723,7 +1968,7 @@ class MolDyn:
 
                     # Prepare execution shell script
                     print(f"⚙️  Writing execution script...")
-                    self._prepare_md_execution_script(md_assay_folder)
+                    self._prepare_md_execution_script(md_assay_folder, md_parameters_dict)
 
                     # Register the assay in md_assays table
                     self._create_md_assay_register_entry(
