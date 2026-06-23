@@ -4286,7 +4286,7 @@ class MolDock:
                         cursor.execute(
                             "SELECT assay_id, assay_name, assay_folder_path FROM docking_assays"
                             " WHERE receptor_info LIKE ?",
-                            (f'%"model_name": "{model["pdb_model_name"]}"%',)
+                            (f'%"pdb_model_name": "{model["pdb_model_name"]}"%',)
                         )
                         rows = cursor.fetchall()
                         data['docking_assay_ids'] = [r[0] for r in rows if r[0] is not None]
