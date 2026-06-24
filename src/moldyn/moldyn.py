@@ -65,7 +65,48 @@ class MolDyn:
 
         # Set up molecular dynamics params folder path within the project directory
         self.__md_params_folder = os.path.join(self.path, 'dynamics/md_params')
-    
+
+    @staticmethod
+    def _prompt(message):
+        """
+        Clipboard-safe replacement for input() for prompts that contain emoji.
+
+        Problems with plain input(emoji_prompt):
+        1. Bracketed-paste mode: terminals wrap pasted text with ESC[200~/ESC[201~
+           which appear as literal characters when readline does not strip them.
+        2. Emoji in the prompt string: readline counts each emoji as 1 column but
+           they render as 2, so its cursor model drifts — backspace and arrow keys
+           land in the wrong position.
+        3. Writing terminal escape sequences (e.g. \\x1b[?2004l) to stdout before
+           input() can interfere with readline's own terminal initialisation and
+           prevent it from recognising arrow-key sequences, causing ^[[D etc. to
+           be inserted as literal text.
+
+        Fix:
+        - Print the emoji-containing message on its own line so the cursor is at
+          column 0 before readline starts, giving it an accurate starting position.
+        - Use readline.parse_and_bind() to suppress the bracketed-paste sentinels
+          inside readline itself rather than fighting the terminal directly.
+          This keeps readline's terminal setup intact and arrow keys work normally.
+        - Strip any residual escape sequences from the result as a safety net.
+        """
+        import re as _re
+        print(message)
+        try:
+            import readline as _rl
+            # readline ≥ 8.1 exposes this variable directly; fall back to
+            # binding the two sentinel sequences to a no-op on older versions.
+            try:
+                _rl.parse_and_bind('set enable-bracketed-paste off')
+            except Exception:
+                _rl.parse_and_bind(r'"\e[200~": ""')
+                _rl.parse_and_bind(r'"\e[201~": ""')
+        except ImportError:
+            pass  # no readline — residual-strip below is the only defence
+        raw = input('> ')
+        raw = _re.sub(r'\x1b\[\d+~', '', raw)
+        return raw.strip()
+
     def create_md_method(self):
         """
         Uses a similar approach to docking methods creation in moldock.py
@@ -110,7 +151,7 @@ class MolDyn:
             # Get user selection
             while True:
                 try:
-                    selection = input(f"\n🧬 Select MD engine or 'cancel': ").strip()
+                    selection = self._prompt(f"\n🧬 Select MD engine or 'cancel': ")
                     
                     if selection.lower() in ['cancel', 'quit', 'exit']:
                         print("❌ MD method creation cancelled")
@@ -133,32 +174,31 @@ class MolDyn:
             ## Set the method method name
             while True:
                 try:
-                    method_name = input(f"\n📝 Enter method name (or 'cancel'): ").strip()
-                    
+                    method_name = self._prompt(f"\n📝 Enter method name (or 'cancel'): ")
+
                     if method_name.lower() in ['cancel', 'quit', 'exit']:
                         print("❌ MD method creation cancelled")
                         return None
-                    
+
                     if not method_name:
                         print("❌ Method name cannot be empty")
                         continue
-                    
+
                     # Validate method name (no special characters) in order to store in DB
                     if not method_name.replace('_', '').replace('-', '').replace(' ', '').isalnum():
                         print("❌ Method name can only contain letters, numbers, spaces, hyphens, and underscores")
                         continue
-                    
+
                     params['method_name'] = method_name
-                    
+
                     break
-                    
+
                 except KeyboardInterrupt:
                     print("\n❌ MD method creation cancelled")
                     return None
-            
+
             # Get optional description
-            
-            description = input(f"\n📄 Enter method description (optional): ").strip()
+            description = self._prompt(f"\n📄 Enter method description (optional): ")
             if not description:
                 description = f"Molecular dynamics method using {selected_engine['name']}"
             
@@ -284,7 +324,7 @@ class MolDyn:
             # --- Method name ---
             while True:
                 try:
-                    method_name = input("\n📝 Enter method name (or 'cancel'): ").strip()
+                    method_name = self._prompt("\n📝 Enter method name (or 'cancel'): ")
                     if method_name.lower() in ['cancel', 'quit', 'exit']:
                         print("❌ MD method creation cancelled")
                         return None
@@ -301,7 +341,7 @@ class MolDyn:
                     return None
 
             # --- Description ---
-            description = input("\n📄 Enter method description (optional): ").strip()
+            description = self._prompt("\n📄 Enter method description (optional): ")
             if not description:
                 description = "AMBER MD method using tleap template"
             params['description'] = description
@@ -310,7 +350,7 @@ class MolDyn:
             self.show_tleap_template_guide()
             while True:
                 try:
-                    tleap_template_path = input("\n📂 Path to tleap template file (or 'cancel'): ").strip()
+                    tleap_template_path = self._prompt("\n📂 Path to tleap template file (or 'cancel'): ")
                     if tleap_template_path.lower() in ['cancel', 'quit', 'exit']:
                         print("❌ MD method creation cancelled")
                         return None
@@ -339,12 +379,12 @@ class MolDyn:
             print("-" * 70)
             custom_parameter_files = []
             try:
-                attach = input("\n➕ Attach custom parameter files? (yes/no) [default: no]: ").strip().lower() or 'no'
+                attach = self._prompt("\n➕ Attach custom parameter files? (yes/no) [default: no]: ").lower() or 'no'
                 if attach in ['yes', 'y']:
                     print("Enter file paths one at a time. Type 'done' when finished.")
                     while True:
                         try:
-                            file_path_input = input("  📎 File path (or 'done'): ").strip()
+                            file_path_input = self._prompt("  📎 File path (or 'done'): ")
                             if file_path_input.lower() in ['done', '']:
                                 break
                             file_path_input = os.path.expanduser(file_path_input)
@@ -899,7 +939,7 @@ class MolDyn:
                 raise RuntimeError("Failed to restore docked pose — restore_single_docked_pose returned None")
 
             # Query user for MD assay description
-            assay_description = input("\n📝 Enter MD assay description (optional): ").strip()
+            assay_description = self._prompt("\n📝 Enter MD assay description (optional): ")
             if not assay_description:
                 assay_description = f"MD assay for ligand {docking_assay_params_dict.get('selected_ligand_name')} (pose {docking_assay_params_dict.get('selected_pose_id')})"
 

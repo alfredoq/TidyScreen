@@ -99,6 +99,47 @@ class MolDock:
         os.makedirs(data_dir, exist_ok=True)
         return instance
 
+    @staticmethod
+    def _prompt(message):
+        """
+        Clipboard-safe replacement for input() for prompts that contain emoji.
+
+        Problems with plain input(emoji_prompt):
+        1. Bracketed-paste mode: terminals wrap pasted text with ESC[200~/ESC[201~
+           which appear as literal characters when readline does not strip them.
+        2. Emoji in the prompt string: readline counts each emoji as 1 column but
+           they render as 2, so its cursor model drifts — backspace and arrow keys
+           land in the wrong position.
+        3. Writing terminal escape sequences (e.g. \\x1b[?2004l) to stdout before
+           input() can interfere with readline's own terminal initialisation and
+           prevent it from recognising arrow-key sequences, causing ^[[D etc. to
+           be inserted as literal text.
+
+        Fix:
+        - Print the emoji-containing message on its own line so the cursor is at
+          column 0 before readline starts, giving it an accurate starting position.
+        - Use readline.parse_and_bind() to suppress the bracketed-paste sentinels
+          inside readline itself rather than fighting the terminal directly.
+          This keeps readline's terminal setup intact and arrow keys work normally.
+        - Strip any residual escape sequences from the result as a safety net.
+        """
+        import re as _re
+        print(message)
+        try:
+            import readline as _rl
+            # readline ≥ 8.1 exposes this variable directly; fall back to
+            # binding the two sentinel sequences to a no-op on older versions.
+            try:
+                _rl.parse_and_bind('set enable-bracketed-paste off')
+            except Exception:
+                _rl.parse_and_bind(r'"\e[200~": ""')
+                _rl.parse_and_bind(r'"\e[201~": ""')
+        except ImportError:
+            pass  # no readline — residual-strip below is the only defence
+        raw = input('> ')
+        raw = _re.sub(r'\x1b\[\d+~', '', raw)
+        return raw.strip()
+
     def create_docking_method(self):
         """
         Will prompt the user for the following method parameters:
@@ -156,7 +197,7 @@ class MolDock:
             # Get user selection
             while True:
                 try:
-                    selection = input(f"\n🧬 Select docking engine (1-3) or 'cancel': ").strip()
+                    selection = self._prompt(f"\n🧬 Select docking engine (1-3) or 'cancel': ")
                     
                     if selection.lower() in ['cancel', 'quit', 'exit']:
                         print("❌ Docking method creation cancelled")
@@ -177,7 +218,7 @@ class MolDock:
             # Get method name
             while True:
                 try:
-                    method_name = input(f"\n📝 Enter method name (or 'cancel'): ").strip()
+                    method_name = self._prompt(f"\n📝 Enter method name (or 'cancel'): ")
                     
                     if method_name.lower() in ['cancel', 'quit', 'exit']:
                         print("❌ Docking method creation cancelled")
@@ -199,7 +240,7 @@ class MolDock:
                     return None
             
             # Get optional description
-            description = input(f"\n📄 Enter method description (optional): ").strip()
+            description = self._prompt(f"\n📄 Enter method description (optional): ")
             if not description:
                 description = f"Docking method using {selected_engine['name']}"
             
@@ -516,7 +557,7 @@ class MolDock:
         docking_registers_dir = os.path.dirname(self.__docking_registers_db)
         default_output = os.path.join(docking_registers_dir, f"{selected['method_name']}.json")
 
-        output_path = input(f"\n📁 Enter output file path\n   (default: {default_output}): ").strip()
+        output_path = self._prompt(f"\n📁 Enter output file path\n   (default: {default_output}): ")
         if not output_path:
             output_path = default_output
 
@@ -548,7 +589,7 @@ class MolDock:
 
         # Ask for the JSON file path
         while True:
-            json_path = input("📁 Enter path to the JSON file (or 'cancel'): ").strip()
+            json_path = self._prompt("📁 Enter path to the JSON file (or 'cancel'): ")
 
             if json_path.lower() in ['cancel', 'quit', 'exit']:
                 print("❌ Import cancelled.")
@@ -731,7 +772,7 @@ class MolDock:
                 except ValueError:
                     print("❌ Please enter a valid number or 'q' to cancel.")
 
-            confirm = input(f"⚠️  Are you sure you want to delete docking method ID {method_id}? (yes/no): ").strip().lower()
+            confirm = self._prompt(f"⚠️  Are you sure you want to delete docking method ID {method_id}? (yes/no): ").lower()
             if confirm != 'yes':
                 print("❌ Deletion cancelled by user.")
                 conn.close()
@@ -1493,7 +1534,7 @@ class MolDock:
         """Get integer parameter from user with validation."""
         while True:
             try:
-                value_str = input(f"📊 {param_name} ({min_val}-{max_val}, default: {default}): ").strip()
+                value_str = self._prompt(f"📊 {param_name} ({min_val}-{max_val}, default: {default}): ")
                 
                 if not value_str:
                     return default
@@ -1516,7 +1557,7 @@ class MolDock:
         """Get float parameter from user with validation."""
         while True:
             try:
-                value_str = input(f"📊 {param_name} ({min_val}-{max_val}, default: {default}): ").strip()
+                value_str = self._prompt(f"📊 {param_name} ({min_val}-{max_val}, default: {default}): ")
                 
                 if not value_str:
                     return default
@@ -1707,7 +1748,7 @@ class MolDock:
                         
                         while True:
                             try:
-                                choice = input(f"\n🧬 Choose option (1/2): ").strip()
+                                choice = self._prompt(f"\n🧬 Choose option (1/2): ")
                                 
                                 if choice == '1':
                                     print(f"\n📋 Showing all {total_analyzed} tables (including not ready)...")
@@ -1774,7 +1815,7 @@ class MolDock:
                 note_text = notes
                 if note_text is None:
                     try:
-                        note_text = input(f"\n📝 Enter notes for this docking assay (press Enter to leave blank): ")
+                        note_text = self._prompt(f"\n📝 Enter notes for this docking assay (press Enter to leave blank): ")
                     except KeyboardInterrupt:
                         print("\n❌ Docking preparation cancelled")
                         return None
@@ -1868,7 +1909,7 @@ class MolDock:
         
         while True:
             try:
-                choice = input(f"\n🧬 Choose execution mode (1/2, or 'cancel'): ").strip().lower()
+                choice = self._prompt(f"\n🧬 Choose execution mode (1/2, or 'cancel'): ").lower()
                 
                 if choice in ['1', 'foreground', 'fg']:
                     print(f"✅ Selected: FOREGROUND execution")
@@ -2655,7 +2696,7 @@ class MolDock:
             # Method selection loop
             while True:
                 try:
-                    selection = input(f"\n🎯 Select docking method: ").strip()
+                    selection = self._prompt(f"\n🎯 Select docking method: ")
                     
                     if selection.lower() in ['cancel', 'quit', 'exit']:
                         return None
@@ -2834,7 +2875,7 @@ class MolDock:
             # Get user choice
             while True:
                 try:
-                    choice = input("🎯 Select next step (1/2): ").strip()
+                    choice = self._prompt("🎯 Select next step (1/2): ")
                     
                     if choice == '1':
                         print("🧪 Will load molecules for immediate docking preparation")
@@ -2895,7 +2936,7 @@ class MolDock:
             # Get user choice
             while True:
                 try:
-                    choice = input("🧬 Select preparation option (1/2/3): ").strip()
+                    choice = self._prompt("🧬 Select preparation option (1/2/3): ")
                     
                     if choice == '1':
                         print("✅ Will return table name for later processing")
@@ -3427,7 +3468,7 @@ class MolDock:
             # Rest of the selection logic remains the same...
             while True:
                 try:
-                    selection = input(f"\n🧬 Select table for docking preparation: ").strip()
+                    selection = self._prompt(f"\n🧬 Select table for docking preparation: ")
                     
                     if selection.lower() in ['cancel', 'quit', 'exit']:
                         return None
@@ -3799,7 +3840,7 @@ class MolDock:
             # Get PDB file path
             while True:
                 try:
-                    pdb_file_temp = input(f"\n📁 Enter path to PDB model file: ").strip()
+                    pdb_file_temp = self._prompt(f"\n📁 Enter path to PDB model file: ")
                     pdb_file = os.path.abspath(os.path.expanduser(pdb_file_temp))
                     
                     
@@ -3835,7 +3876,7 @@ class MolDock:
             default_name = os.path.splitext(os.path.basename(pdb_file))[0]
             while True:
                 try:
-                    pdb_model_name = input(f"\n🏷️  Enter name for this PDB model (default: {default_name}): ").strip()
+                    pdb_model_name = self._prompt(f"\n🏷️  Enter name for this PDB model (default: {default_name}): ")
                     
                     if not pdb_model_name:
                         pdb_model_name = default_name
@@ -3868,7 +3909,7 @@ class MolDock:
             
             # Get optional description
             try:
-                description = input(f"\n📝 Enter description (optional, press Enter to skip): ").strip()
+                description = self._prompt(f"\n📝 Enter description (optional, press Enter to skip): ")
             except KeyboardInterrupt:
                 print(f"\n   ⚠️  Description entry cancelled. Using empty description.")
                 description = ""
@@ -5049,7 +5090,7 @@ class MolDock:
                 while True:
                     try:
                         default_name = f"{selected_model['pdb_model_name']}_template"
-                        pdb_template_name = input(f"\n🏷️  Enter PDB template name (default: {default_name}): ").strip()
+                        pdb_template_name = self._prompt(f"\n🏷️  Enter PDB template name (default: {default_name}): ")
                         
                         if not pdb_template_name:
                             pdb_template_name = default_name
@@ -5566,7 +5607,7 @@ class MolDock:
                 print(f"   🔗 Multi-chain structure detected: {', '.join(analysis['chains'])}")
                 while True:
                     try:
-                        choice = input(f"   🧬 Keep all chains or select specific chain(s)? (all/select): ").strip().lower()
+                        choice = self._prompt(f"   🧬 Keep all chains or select specific chain(s)? (all/select): ").lower()
                         if choice in ['all', 'a']:
                             print("   ✅ Keeping all chains")
                             selected_chains = analysis['chains']
@@ -5614,7 +5655,7 @@ class MolDock:
                             print("   2. Keep all ligands")
                             print("   3. Select specific ligands to keep")
                             print("   4. Keep only co-crystallized ligands (exclude waters)")
-                            ligand_choice = input("   💊 Select ligand handling (1-4): ").strip()
+                            ligand_choice = self._prompt("   💊 Select ligand handling (1-4): ")
                             if ligand_choice == '1':
                                 print("   🧹 Will remove all ligands from processed PDB")
                                 selected_ligands = []
@@ -5797,7 +5838,7 @@ class MolDock:
                 choice = 'all'
                 while True:
                     try:
-                        #choice = input(f"   🧬 Keep all chains or select specific chain(s)? (all/select): ").strip().lower()
+                        #choice = self._prompt(f"   🧬 Keep all chains or select specific chain(s)? (all/select): ").lower()
                         if choice in ['all', 'a']:
                             print("   ✅ Keeping all chains")
                             selected_chains = analysis['chains']
@@ -5850,7 +5891,7 @@ class MolDock:
                                 print("   2. Keep all ligands")
                                 print("   3. Select specific ligands to keep")
                                 print("   4. Keep only co-crystallized ligands (exclude waters)")
-                                ligand_choice = input("   💊 Select ligand handling (1-4): ").strip()
+                                ligand_choice = self._prompt("   💊 Select ligand handling (1-4): ")
                                 if ligand_choice == '1':
                                     print("   🧹 Will remove all ligands from processed PDB")
                                     selected_ligands = []
@@ -6049,7 +6090,7 @@ class MolDock:
             print("   • Comma-separated ResNums (e.g., 101,202) to select by residue number (all chains)")
             print("   • 'cancel' to abort water selection")
             while True:
-                selection = input("   💧 Select waters to keep: ").strip().lower()
+                selection = self._prompt("   💧 Select waters to keep: ").lower()
                 if selection in ['all', 'a']:
                     return [wid for wid, _ in water_list]
                 elif selection in ['none', 'n']:
@@ -6636,7 +6677,7 @@ class MolDock:
                 
                 while True:
                     try:
-                        selection = input(f"\n   💊 Select ligands to keep: ").strip().lower()
+                        selection = self._prompt(f"\n   💊 Select ligands to keep: ").lower()
                         
                         if selection in ['cancel', 'quit', 'exit']:
                             return None
@@ -6905,7 +6946,7 @@ class MolDock:
             
             while True:
                 try:
-                    selection = input(f"   🔗 Select chain(s) ({'/'.join(chains)} or comma-separated): ").strip().upper()
+                    selection = self._prompt(f"   🔗 Select chain(s) ({'/'.join(chains)} or comma-separated): ").upper()
                     
                     if selection.lower() in ['cancel', 'quit', 'exit']:
                         return None
@@ -15411,7 +15452,7 @@ Example — cyclodextrin receptor:
 
         template_content = None
         while True:
-            path = input("\n📂 Path to tleap template file (or 'cancel'): ").strip()
+            path = self._prompt("\n📂 Path to tleap template file (or 'cancel'): ")
             if path.lower() in ('cancel', 'quit', 'exit'):
                 return None
             path = os.path.expanduser(path)
@@ -15787,7 +15828,7 @@ Example — cyclodextrin receptor:
             self._show_tleap_template_guide_for_fps()
             template_content = None
             while True:
-                tpath = input("\n📂 Path to tleap template file (or 'skip'): ").strip()
+                tpath = self._prompt("\n📂 Path to tleap template file (or 'skip'): ")
                 if tpath.lower() in ('skip', ''):
                     print("⚠️  Template skipped — will be requested on first use.")
                     break
