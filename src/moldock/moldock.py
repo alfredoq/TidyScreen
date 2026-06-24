@@ -11865,11 +11865,39 @@ class MolDock:
         
         ## Loop over dataframe to process each docked pose
         processed_ligands = []
-        
+
+        pdbs_db_path = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
+
+        # Detect whether the assay receptor is a stub (created by import_receptor_model)
+        is_stub_receptor = False
+        fps_tleap_config = None
+        _template_name = assay_info.get('receptor_info', {}).get('template_name')
+        if _template_name:
+            try:
+                conn = sqlite3.connect(pdbs_db_path)
+                _status_row = conn.execute(
+                    "SELECT status FROM pdb_templates WHERE pdb_template_name = ?",
+                    (_template_name,)
+                ).fetchone()
+                conn.close()
+                if _status_row and _status_row[0] == 'imported':
+                    is_stub_receptor = True
+            except Exception:
+                pass
+
+        if is_stub_receptor:
+            _receptor_model_name = assay_info.get('receptor_info', {}).get('receptor_model_name')
+            fps_tleap_config = self._get_or_store_receptor_tleap_template(_receptor_model_name)
+            if not fps_tleap_config:
+                print("❌ No tleap template available for this stub receptor. Cannot proceed.")
+                return None
+
         ## If ProLIF fingerprints are requested, retrieve the computation parameters
         if prolif == True:
             prolif_params_dict, condition_selection = self._get_prolif_params()
             self._check_table_in_db(results_db, f'processed_prolif_fps_json_condition_{condition_selection}')
+
+        renumbering_dict = {}
 
         for idx, row in df.iterrows():
             pose_id = row['Pose_ID']
@@ -11881,12 +11909,30 @@ class MolDock:
             # per-ligand sequential number used when PDB filenames are constructed.
             output_dir, output_file = self._restore_single_docked_pose(results_db, ligname, run_number)
         
-            # Create ligand .mol2 and .frcmod files
+            # Create ligand parameter files.
+            # Stub receptors use mol2 format so {{MOL2_FILE}} in the tleap template
+            # is substituted correctly; standard receptors keep prepin format.
             if ligname not in processed_ligands:
-                prepin_file, frcmod_file  = self._prepare_ligand_tleap_files(ligname, assay_info, output_dir)
-        
+                if is_stub_receptor:
+                    ligand_params_file, frcmod_file = self._prepare_ligand_mol2_files(ligname, assay_info, output_dir)
+                else:
+                    ligand_params_file, frcmod_file = self._prepare_ligand_tleap_files(ligname, assay_info, output_dir)
+
             # Create complex .prmtop and .inpcrd files
-            prmtop_file, inpcrd_file, output_pdb_file = self._prepare_complex_prmtop_inpcrd(prepin_file, frcmod_file, assay_info, output_dir, output_file, pose_id, ligname=ligname)
+            if is_stub_receptor:
+                _receptor_pdb = os.path.join(
+                    os.path.dirname(self._remap_project_path(
+                        assay_info.get('receptor_info', {}).get('pdbqt_file', '')
+                    )),
+                    'receptor_checked.pdb'
+                )
+                prmtop_file, inpcrd_file, output_pdb_file = self._prepare_complex_prmtop_inpcrd_from_template_fps(
+                    output_file, output_dir, fps_tleap_config, ligand_params_file, frcmod_file, _receptor_pdb
+                )
+            else:
+                prmtop_file, inpcrd_file, output_pdb_file = self._prepare_complex_prmtop_inpcrd(
+                    ligand_params_file, frcmod_file, assay_info, output_dir, output_file, pose_id, ligname=ligname
+                )
             
             if minimize:
                 # Minimize complex
@@ -11910,7 +11956,6 @@ class MolDock:
 
             # Retrieve renumbering_dict and rename df columns
             template_name = assay_info.get('receptor_info', None).get('template_name', None)
-            pdbs_db_path = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
             if template_name:
                 try:
                     conn = sqlite3.connect(pdbs_db_path)
@@ -12089,6 +12134,42 @@ class MolDock:
             return None
 
         return prepin_file, frcmod_file
+
+    def _prepare_ligand_mol2_files(self, ligname, assay_info, output_dir):
+        """
+        Prepare GAFF2 mol2 + frcmod files for the ligand using antechamber (mol2 output)
+        with espaloma charges.  Used by the template-based fingerprint workflow for stub
+        receptors so the {{MOL2_FILE}} token is consistent with perform_md_assay().
+        """
+        import subprocess
+
+        pdb_file = self._convert_ligand_sdf_into_pdb(ligname, assay_info, output_dir)
+        if pdb_file is None:
+            print(f"[ERROR] Could not convert ligand {ligname} SDF to PDB")
+            return None, None
+
+        mol2_file = os.path.join(output_dir, f"{ligname}.mol2")
+        frcmod_file = os.path.join(output_dir, f"{ligname}.frcmod")
+
+        espaloma_output_file = self._compute_ligand_espaloma_charges(pdb_file)
+
+        antechamber_command = f"antechamber -i {pdb_file} -fi pdb -o {mol2_file} -fo mol2 -c rc -cf {espaloma_output_file}"
+        try:
+            subprocess.run(antechamber_command, shell=True, check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            print(f"[ERROR] Failed to run antechamber: {e}")
+            return None, None
+
+        parmchk2_command = f"parmchk2 -i {mol2_file} -f mol2 -o {frcmod_file}"
+        try:
+            subprocess.run(parmchk2_command, shell=True, check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            print(f"[ERROR] Failed to run parmchk2: {e}")
+            return None, None
+
+        return mol2_file, frcmod_file
 
     def _convert_ligand_sdf_into_pdb(self, ligname, assay_info, output_dir):
         """
@@ -12332,6 +12413,111 @@ class MolDock:
 
         except Exception as e:
             print(f"[ERROR] Failed to run tleap for complex generation: {e}")
+
+        return prmtop_file, inpcrd_file, output_pdb_file
+
+    def _strip_solvation_from_template(self, template_content):
+        """
+        Comment out explicit solvation commands from a tleap template so the
+        resulting topology is a gas-phase (unsolvated) complex.  Used before
+        running tleap for fingerprint / MMGBSA computation; the original template
+        (with solvation intact) is kept for molecular dynamics via
+        _prepare_complex_prmtop_inpcrd_from_template() in MolDyn.
+
+        Stripped command prefixes (case-insensitive, leading whitespace ignored):
+          solvate   → solvateBox, solvateOct, solvateShell, …
+          addions   → addions, addions2, addIons, addIons2, …
+        """
+        solvation_prefixes = ('solvate', 'addions')
+        out = []
+        for line in template_content.splitlines():
+            keyword = line.lstrip().lower()
+            if any(keyword.startswith(p) for p in solvation_prefixes):
+                out.append(f"# [gas-phase strip] {line}")
+            else:
+                out.append(line)
+        return '\n'.join(out)
+
+    def _prepare_complex_prmtop_inpcrd_from_template_fps(self, ligand_pdb, output_dir, fps_tleap_config, mol2_file, frcmod_file, receptor_pdb):
+        """
+        Build an unsolvated complex prmtop/inpcrd for fingerprint computation
+        using a user-supplied tleap template (for stub/non-protein receptors).
+
+        Solvation commands (solvateBox, addions, …) are automatically stripped
+        before tleap runs so the topology is always gas-phase, regardless of
+        whether the stored template includes solvation for MD use.
+
+        Tokens substituted in the template:
+          {{RECEPTOR_PDB}} → receptor_pdb
+          {{LIGAND_PDB}}   → ligand_pdb
+          {{MOL2_FILE}}    → mol2_file  (antechamber mol2, GAFF2 + espaloma charges)
+          {{FRCMOD_FILE}}  → frcmod_file  (parmchk2 .frcmod)
+          {{PRMTOP_OUT}}   → complex.prmtop inside output_dir
+          {{INPCRD_OUT}}   → complex.inpcrd inside output_dir
+
+        Returns (prmtop_file, inpcrd_file, output_pdb_file).
+        output_pdb_file is a placeholder path that _compute_prolif_fingerprints3()
+        overwrites via ambpdb using the generated prmtop/inpcrd.
+        """
+        import subprocess
+
+        template_content = fps_tleap_config.get('template_content', '')
+        if not template_content:
+            raise RuntimeError("fps_tleap_config has no 'template_content'.")
+
+        # Strip solvation so this workflow always produces a gas-phase complex.
+        template_content = self._strip_solvation_from_template(template_content)
+
+        prmtop_file = os.path.join(output_dir, 'complex.prmtop')
+        inpcrd_file = os.path.join(output_dir, 'complex.inpcrd')
+        tleap_in_file = os.path.join(output_dir, 'complex_fps.in')
+        tleap_log_file = os.path.join(output_dir, 'tleap_fps.log')
+        output_pdb_file = ligand_pdb.replace('.pdb', '_withH.pdb')
+
+        for cf in fps_tleap_config.get('custom_parameter_files', []):
+            dest = os.path.join(output_dir, cf['filename'])
+            with open(dest, 'w') as fh:
+                fh.write(cf['content'])
+            print(f"   ✓ Restored custom parameter file: {cf['filename']}")
+
+        content = template_content
+        content = content.replace("'{{RECEPTOR_PDB}}'", receptor_pdb)
+        content = content.replace('{{RECEPTOR_PDB}}', receptor_pdb)
+        content = content.replace('{{LIGAND_PDB}}', ligand_pdb)
+        content = content.replace('{{MOL2_FILE}}', mol2_file)
+        content = content.replace('{{FRCMOD_FILE}}', frcmod_file)
+        content = content.replace('{{PRMTOP_OUT}}', prmtop_file)
+        content = content.replace('{{INPCRD_OUT}}', inpcrd_file)
+
+        with open(tleap_in_file, 'w') as f:
+            f.write(content)
+
+        result = subprocess.run(
+            f"tleap -f {tleap_in_file}",
+            shell=True, capture_output=True, text=True, cwd=output_dir,
+        )
+        with open(tleap_log_file, 'w') as lf:
+            lf.write(result.stdout)
+            if result.stderr:
+                lf.write("\n--- STDERR ---\n")
+                lf.write(result.stderr)
+
+        if result.returncode != 0:
+            tail = result.stdout[-3000:] if len(result.stdout) > 3000 else result.stdout
+            print(f"   tleap output (last lines):\n{tail}")
+            raise RuntimeError(
+                f"tleap exited with code {result.returncode}. Full log: {tleap_log_file}"
+            )
+
+        missing = [f for f in (prmtop_file, inpcrd_file) if not os.path.exists(f)]
+        if missing:
+            tail = result.stdout[-3000:] if len(result.stdout) > 3000 else result.stdout
+            print(f"   tleap output (last lines):\n{tail}")
+            raise RuntimeError(
+                f"tleap completed but did not produce: "
+                f"{', '.join(os.path.basename(f) for f in missing)}. "
+                f"Full log: {tleap_log_file}"
+            )
 
         return prmtop_file, inpcrd_file, output_pdb_file
 
@@ -15035,6 +15221,8 @@ class MolDock:
                 return
             else:
                 pdb_analysis_json = result[0]
+                if pdb_analysis_json is None:
+                    return False, [], [], []
                 import json
                 pdb_analysis = json.loads(pdb_analysis_json)
                 ligands_in_template = pdb_analysis.get('has_ligands', []) # Will return either True or False
@@ -15051,6 +15239,171 @@ class MolDock:
         except Exception as e:
             print(f"Error accessing PDB templates database: {e}. Stopping")
             sys.exit(1)
+
+    def _show_tleap_template_guide_for_fps(self):
+        """Print guidance for writing a tleap template for stub receptors."""
+        print("\n" + "=" * 70)
+        print("TLEAP TEMPLATE GUIDE — stub receptor (fingerprints + MD)")
+        print("=" * 70)
+        print("""
+This template is used for ALL workflows involving this imported receptor:
+
+  • compute_fingerprints() — MMGBSA/ProLIF (gas-phase complex)
+  • perform_md_assay()     — molecular dynamics (solvated complex)
+
+SOLVATION COMMANDS (solvateBox, addions, …) are automatically STRIPPED
+when the template is used for fingerprints/MMGBSA, and KEPT AS-IS when
+used for molecular dynamics.  You may therefore write a single template
+that includes solvation — it will behave correctly in both contexts.
+
+Tokens substituted automatically at runtime:
+
+  {{RECEPTOR_PDB}}  → absolute path to receptor_checked.pdb
+  {{LIGAND_PDB}}    → absolute path to the docked-pose PDB
+  {{MOL2_FILE}}     → absolute path to the ligand .mol2 file (antechamber/GAFF2)
+  {{FRCMOD_FILE}}   → absolute path to the ligand .frcmod file (parmchk2)
+  {{PRMTOP_OUT}}    → output path where tleap writes complex.prmtop
+  {{INPCRD_OUT}}    → output path where tleap writes complex.inpcrd
+
+Rules:
+  • Load the receptor force field first
+  • For proteins use leaprc.protein.ff14SB (or ff19SB)
+  • For cyclodextrins use leaprc.GLYCAM_06j-1
+  • Use loadmol2 to load the ligand mol2; loadamberparams loads the frcmod
+  • Include solvateBox / addions if you want explicit-solvent MD;
+    they will be ignored automatically for fingerprint computation
+
+Example — protein receptor (solvated template, safe for both workflows):
+  source leaprc.protein.ff14SB
+  source leaprc.gaff2
+  source leaprc.water.tip3p
+  HOH = WAT
+  rec = loadpdb {{RECEPTOR_PDB}}
+  UNL = loadmol2 {{MOL2_FILE}}
+  loadamberparams {{FRCMOD_FILE}}
+  lig = loadpdb {{LIGAND_PDB}}
+  complex = combine {rec lig}
+  solvateBox complex TIP3PBOX 10.0 iso 1.0
+  addions complex Na+ 0
+  addions complex Cl- 0
+  saveamberparm complex {{PRMTOP_OUT}} {{INPCRD_OUT}}
+  quit
+
+Example — cyclodextrin receptor:
+  source leaprc.GLYCAM_06j-1
+  source leaprc.gaff2
+  source leaprc.water.tip3p
+  HOH = WAT
+  rec = loadpdb {{RECEPTOR_PDB}}
+  UNL = loadmol2 {{MOL2_FILE}}
+  loadamberparams {{FRCMOD_FILE}}
+  lig = loadpdb {{LIGAND_PDB}}
+  complex = combine {rec lig}
+  solvateBox complex TIP3PBOX 10.0 iso 1.0
+  addions complex Na+ 0
+  addions complex Cl- 0
+  saveamberparm complex {{PRMTOP_OUT}} {{INPCRD_OUT}}
+  quit
+""")
+        print("=" * 70)
+
+    def _get_or_store_receptor_tleap_template(self, receptor_model_name):
+        """
+        Return the tleap_config dict (template + custom param files) for a stub
+        receptor.  Reads receptor_models.tleap_config; if absent (receptor was
+        imported before this feature was added), prompts once and persists the
+        result so it is never requested again.
+
+        The stored template is shared between compute_fingerprints() (solvation
+        commands are stripped automatically) and perform_md_assay() (solvation
+        commands are kept).
+        """
+        import sqlite3
+        import json
+
+        receptors_db_path = os.path.join(self.path, 'docking', 'receptors', 'receptors.db')
+
+        conn = sqlite3.connect(receptors_db_path)
+        cur = conn.cursor()
+        # Ensure both the current column and the legacy column exist
+        for col in ('tleap_config', 'fps_tleap_config'):
+            try:
+                cur.execute(f"ALTER TABLE receptor_models ADD COLUMN {col} TEXT")
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass  # column already exists
+
+        # Prefer tleap_config; fall back to fps_tleap_config (migration path)
+        cur.execute(
+            "SELECT tleap_config, fps_tleap_config FROM receptor_models WHERE receptor_model_name = ?",
+            (receptor_model_name,)
+        )
+        row = cur.fetchone()
+        conn.close()
+
+        if row:
+            raw = row[0] or row[1]  # tleap_config takes priority
+            if raw:
+                try:
+                    config = json.loads(raw)
+                    if config.get('template_content'):
+                        print(f"✅ Using stored tleap template for receptor '{receptor_model_name}'.")
+                        return config
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+
+        # No stored template — prompt the user (lazy fallback for old imports)
+        self._show_tleap_template_guide_for_fps()
+
+        template_content = None
+        while True:
+            path = input("\n📂 Path to tleap template file (or 'cancel'): ").strip()
+            if path.lower() in ('cancel', 'quit', 'exit'):
+                return None
+            path = os.path.expanduser(path)
+            if not os.path.isfile(path):
+                print(f"❌ File not found: {path}")
+                continue
+            with open(path, 'r') as fh:
+                template_content = fh.read()
+            n_lines = len(template_content.splitlines())
+            print(f"✅ Template loaded: {os.path.basename(path)} ({n_lines} lines)")
+            break
+
+        print("\nAttach any custom .lib or .frcmod files required by the template.")
+        print("They will be copied to the working folder before each tleap run.")
+        print("Enter 'done' when finished.")
+        custom_parameter_files = []
+        while True:
+            raw = input("  Path to custom file (or 'done'): ").strip()
+            if raw.lower() in ('done', 'skip', ''):
+                break
+            raw = os.path.expanduser(raw)
+            if not os.path.isfile(raw):
+                print(f"  ❌ File not found: {raw}")
+                continue
+            with open(raw, 'r') as fh:
+                content = fh.read()
+            filename = os.path.basename(raw)
+            custom_parameter_files.append({'filename': filename, 'content': content})
+            print(f"  ✓ Attached: {filename}")
+
+        config = {
+            'template_content': template_content,
+            'custom_parameter_files': custom_parameter_files,
+        }
+
+        conn = sqlite3.connect(receptors_db_path)
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE receptor_models SET tleap_config = ? WHERE receptor_model_name = ?",
+            (json.dumps(config), receptor_model_name)
+        )
+        conn.commit()
+        conn.close()
+        print(f"✅ tleap template stored for receptor '{receptor_model_name}' — will not be requested again.")
+
+        return config
 
     def import_receptor_model(self, input_folder_path=None, receptor_model_name=None,
                               charge_model='gasteiger', notes=None):
@@ -15358,6 +15711,71 @@ class MolDock:
                       (json.dumps(configs, indent=2), new_id))
         conn_r.commit()
         conn_r.close()
+
+        # --- Step 9: Collect tleap template (shared by fingerprints and MD) ---
+        print(f"\n{'=' * 70}")
+        print("TLEAP TEMPLATE SETUP")
+        print(f"{'=' * 70}")
+        print("A tleap template is needed for compute_fingerprints() (MMGBSA/ProLIF)")
+        print("and for perform_md_assay() when using this imported receptor.")
+        print("Providing it now avoids prompts during later analyses.")
+        print("Solvation commands in the template are stripped automatically for")
+        print("fingerprints/MMGBSA and kept intact for molecular dynamics.")
+        print()
+        setup_now = input("Set up tleap template now? (yes/skip) [yes]: ").strip().lower()
+        if setup_now not in ('skip', 'no', 'n'):
+            self._show_tleap_template_guide_for_fps()
+            template_content = None
+            while True:
+                tpath = input("\n📂 Path to tleap template file (or 'skip'): ").strip()
+                if tpath.lower() in ('skip', ''):
+                    print("⚠️  Template skipped — will be requested on first use.")
+                    break
+                tpath = os.path.expanduser(tpath)
+                if not os.path.isfile(tpath):
+                    print(f"❌ File not found: {tpath}")
+                    continue
+                with open(tpath, 'r') as fh:
+                    template_content = fh.read()
+                n_lines = len(template_content.splitlines())
+                print(f"✅ Template loaded: {os.path.basename(tpath)} ({n_lines} lines)")
+                break
+
+            if template_content is not None:
+                print("\nAttach any custom .lib or .frcmod files required by the template.")
+                print("Enter 'done' when finished.")
+                custom_parameter_files = []
+                while True:
+                    raw = input("  Path to custom file (or 'done'): ").strip()
+                    if raw.lower() in ('done', ''):
+                        break
+                    raw = os.path.expanduser(raw)
+                    if not os.path.isfile(raw):
+                        print(f"  ❌ File not found: {raw}")
+                        continue
+                    with open(raw, 'r') as fh:
+                        content = fh.read()
+                    filename = os.path.basename(raw)
+                    custom_parameter_files.append({'filename': filename, 'content': content})
+                    print(f"  ✓ Attached: {filename}")
+
+                tleap_config_to_store = {
+                    'template_content': template_content,
+                    'custom_parameter_files': custom_parameter_files,
+                }
+                conn_r = sqlite3.connect(receptors_db_path)
+                cur_r = conn_r.cursor()
+                try:
+                    cur_r.execute("ALTER TABLE receptor_models ADD COLUMN tleap_config TEXT")
+                except sqlite3.OperationalError:
+                    pass
+                cur_r.execute(
+                    "UPDATE receptor_models SET tleap_config = ? WHERE id = ?",
+                    (json.dumps(tleap_config_to_store), new_id)
+                )
+                conn_r.commit()
+                conn_r.close()
+                print(f"✅ tleap template stored — will not be requested again.")
 
         print(f"\n{'=' * 80}")
         print(f"RECEPTOR MODEL IMPORTED SUCCESSFULLY")

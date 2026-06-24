@@ -462,9 +462,24 @@ class MolDyn:
             return None
         
         params['solvent_type'] = solvent_type
-        
-        ## Set tleap parameters for system preparation
-        params = self._set_tleap_params(params)
+
+        # For stub receptors the tleap topology setup (force field, water model,
+        # box, ions) is already encoded in the template stored at import time.
+        # Only the AMBER simulation parameters (minimisation, heating, etc.) are needed.
+        stub_answer = input(
+            "\nIs this method for a stub receptor imported via import_receptor_model()? (yes/no) [default: no]: "
+        ).strip().lower() or 'no'
+        uses_receptor_template = stub_answer in ('yes', 'y')
+
+        if uses_receptor_template:
+            print(
+                "ℹ️  Tleap topology parameters will be skipped — "
+                "they are provided by the receptor's stored template."
+            )
+            params['tleap_params'] = {'uses_receptor_template': True}
+        else:
+            ## Set tleap parameters for system preparation
+            params = self._set_tleap_params(params)
 
         ## Set minimization parameters
         params = self._set_minimization_params(params)
@@ -907,28 +922,98 @@ class MolDyn:
 
             # Create complex .prmtop and .inpcrd files
             print(f"⚙️  Preparing topology and coordinate files with tleap...")
+
+            # Resolve receptor_info (may be a raw JSON string in older records)
+            import json as _json
+            _receptor_info = docking_assay_params_dict.get('receptor_info', {})
+            if isinstance(_receptor_info, str):
+                try:
+                    _receptor_info = _json.loads(_receptor_info)
+                except Exception:
+                    _receptor_info = {}
+
+            # Derive receptor PDB path (needed by both template branches)
+            _pdbqt = _receptor_info.get('pdbqt_file', '')
+            if _pdbqt and 'docking/receptors' in _pdbqt:
+                _pdbqt = os.path.join(self.path, _pdbqt[_pdbqt.index('docking/receptors'):])
+            _receptor_pdb = os.path.join(os.path.dirname(_pdbqt), 'receptor_checked.pdb') if _pdbqt else None
+
             if md_parameters_dict.get('method_type') == 'tleap_template':
-                import json as _json
-                _receptor_info = docking_assay_params_dict.get('receptor_info', {})
-                if isinstance(_receptor_info, str):
-                    try:
-                        _receptor_info = _json.loads(_receptor_info)
-                    except Exception:
-                        _receptor_info = {}
-                _pdbqt = _receptor_info.get('pdbqt_file', '')
-                if _pdbqt and 'docking/receptors' in _pdbqt:
-                    _pdbqt = os.path.join(self.path, _pdbqt[_pdbqt.index('docking/receptors'):])
-                receptor_pdb_for_template = os.path.join(os.path.dirname(_pdbqt), 'receptor_checked.pdb') if _pdbqt else None
+                # MD method carries its own tleap template (explicit user choice)
                 prmtop_file, inpcrd_file = self._prepare_complex_prmtop_inpcrd_from_template(
                     selected_pose_pdb, md_assay_folder, md_parameters_dict,
                     mol2_file=mol2_file, frcmod_file=frcmod_file,
-                    receptor_pdb=receptor_pdb_for_template,
+                    receptor_pdb=_receptor_pdb,
                 )
             else:
-                prmtop_file, inpcrd_file = self._prepare_complex_prmtop_inpcrd_for_md(
-                    mol2_file, frcmod_file, docking_assay_params_dict,
-                    md_assay_folder, md_assay_folder, md_parameters_dict, selected_pose_pdb,
-                )
+                # Check if the receptor is a stub (created by import_receptor_model).
+                # If so, use the receptor's stored tleap_config with solvation intact.
+                _stub_tleap_config = None
+                _is_stub = False
+                _template_name = _receptor_info.get('template_name', '')
+                if _template_name:
+                    import sqlite3 as _sqlite3
+                    _pdbs_db = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
+                    try:
+                        _conn = _sqlite3.connect(_pdbs_db)
+                        _row = _conn.execute(
+                            "SELECT status FROM pdb_templates WHERE pdb_template_name = ?",
+                            (_template_name,)
+                        ).fetchone()
+                        _conn.close()
+                        if _row and _row[0] == 'imported':
+                            _is_stub = True
+                            _receptors_db = os.path.join(self.path, 'docking', 'receptors', 'receptors.db')
+                            _model_name = _receptor_info.get('receptor_model_name', '')
+                            _conn2 = _sqlite3.connect(_receptors_db)
+                            _row2 = _conn2.execute(
+                                "SELECT tleap_config, fps_tleap_config FROM receptor_models "
+                                "WHERE receptor_model_name = ?",
+                                (_model_name,)
+                            ).fetchone()
+                            _conn2.close()
+                            if _row2:
+                                _raw = _row2[0] or _row2[1]
+                                if _raw:
+                                    try:
+                                        _stub_tleap_config = _json.loads(_raw)
+                                    except Exception:
+                                        pass
+                    except Exception:
+                        pass
+
+                if _stub_tleap_config:
+                    print(f"   ℹ️  Stub receptor detected — using stored tleap template "
+                          f"(solvation commands kept for MD).")
+                    _stub_md_params = {
+                        'tleap_template_content': _stub_tleap_config.get('template_content', ''),
+                        'custom_parameter_files': _stub_tleap_config.get('custom_parameter_files', []),
+                    }
+                    prmtop_file, inpcrd_file = self._prepare_complex_prmtop_inpcrd_from_template(
+                        selected_pose_pdb, md_assay_folder, _stub_md_params,
+                        mol2_file=mol2_file, frcmod_file=frcmod_file,
+                        receptor_pdb=_receptor_pdb,
+                    )
+                else:
+                    # Compatibility check: method created for stub receptors but receptor is standard.
+                    _uses_receptor_template = md_parameters_dict.get('tleap_params', {}).get('uses_receptor_template', False)
+                    if _uses_receptor_template and not _is_stub:
+                        print("❌ Incompatible MD method and receptor:")
+                        print("   The selected MD method was created for an imported stub receptor")
+                        print("   (tleap topology parameters were not collected).")
+                        print("   The selected docking assay uses a standard receptor that requires")
+                        print("   explicit tleap parameters (force field, water model, box, ions).")
+                        print("   Solution: create a new MD method with create_md_method() and")
+                        print("   answer 'no' when asked about stub receptors.")
+                        return
+                    if _is_stub:
+                        print("⚠️  Stub receptor detected but no tleap template stored.")
+                        print("   Re-run import_receptor_model() to provide a template,")
+                        print("   or use create_md_method_using_tleap_template() for this assay.")
+                    prmtop_file, inpcrd_file = self._prepare_complex_prmtop_inpcrd_for_md(
+                        mol2_file, frcmod_file, docking_assay_params_dict,
+                        md_assay_folder, md_assay_folder, md_parameters_dict, selected_pose_pdb,
+                    )
 
             # Prepare md simulation input files
             print(f"⚙️  Writing AMBER simulation input files...")
