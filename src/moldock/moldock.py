@@ -10682,7 +10682,7 @@ class MolDock:
 
             # Append the maps prefix to the command
             maps_path = grids_path
-            maps_prefix = f"{maps_path}/receptor_checked_{charge_model} "
+            maps_prefix = f"{maps_path}/receptor_checked_{charge_model}.maps "
             unidock_cmd += f"--maps {maps_prefix} "
 
         # Iterate and dock each compound
@@ -10796,7 +10796,7 @@ class MolDock:
 
             # Append the maps prefix to the command
             maps_path = grids_path
-            maps_prefix = f"{maps_path}/receptor_checked_{charge_model} "
+            maps_prefix = f"{maps_path}/receptor_checked_{charge_model}.maps "
             unidock_cmd += f"--maps {maps_prefix} "
 
         # Iterate and dock each compound
@@ -10859,7 +10859,55 @@ class MolDock:
         vina_rec_object.compute_vina_maps(center=box_center, box_size=box_size)        
         
         return vina_rec_object
-    
+
+    def _normalize_grid_maps(self, grids_path, canonical_stem):
+        """
+        Rename all map/xyz files in grids_path from their original AutoGrid4 prefix
+        to canonical_stem, then rewrite the .maps.fld internal file references to match.
+
+        Vina's load_maps(prefix) derives BOTH the fld filename and the individual .map
+        filenames directly from the prefix, so all files must share the same stem.
+        This method is idempotent: it is a no-op when the files are already canonical.
+        """
+        import glob as _glob
+        canonical_fld = os.path.join(grids_path, f"{canonical_stem}.maps.fld")
+        if not os.path.exists(canonical_fld):
+            print(f"⚠️  Canonical FLD not found, cannot normalize: {canonical_fld}")
+            return False
+
+        # Detect the current map stem from the electrostatics map (.e.map), which is
+        # always present in AD4 grids. Globbing avoids regex ambiguity with dots in
+        # the receptor name (e.g. HP_beta_CD_MS_0.70_model...) that would truncate
+        # the stem at the first dot.
+        e_maps = _glob.glob(os.path.join(grids_path, '*.e.map'))
+        if not e_maps:
+            print(f"⚠️  No .e.map file found in {grids_path}, cannot normalize.")
+            return False
+
+        original_stem = os.path.basename(e_maps[0])[:-len('.e.map')]
+
+        if original_stem == canonical_stem:
+            return True  # Already normalized
+
+        # Rename all .map and .xyz files from the original stem to the canonical stem
+        for fname in os.listdir(grids_path):
+            if fname.startswith(original_stem + '.') and (fname.endswith('.map') or fname.endswith('.xyz')):
+                suffix = fname[len(original_stem):]  # e.g. '.A.map', '.maps.xyz'
+                dst = os.path.join(grids_path, canonical_stem + suffix)
+                src = os.path.join(grids_path, fname)
+                if not os.path.exists(dst):
+                    os.rename(src, dst)
+
+        # Rewrite fld internal references to use the canonical stem
+        with open(canonical_fld) as _f:
+            fld_content = _f.read()
+        new_content = fld_content.replace(original_stem + '.', canonical_stem + '.')
+        with open(canonical_fld, 'w') as _f:
+            _f.write(new_content)
+
+        print(f"  Normalized grid maps: '{original_stem}.*' → '{canonical_stem}.*'")
+        return True
+
     def _execute_vina(self, ligand_pdbqt_filepath, assay_registry, method_params, receptor_pdbqt_file, receptor_conditions, vina_rec_object):
         """
         Execute molecular docking using AutoDock Vina with specified scoring function.
@@ -10924,13 +10972,19 @@ class MolDock:
             # This will apply docking using the 'ad4' scoring function
             elif method_params['sf_name'] == 'ad4':
                 vina_rec_object = Vina(sf_name = method_params['sf_name'])
-                
+
                 # Determine the grids files path
                 grid_maps_path = self._remap_project_path(receptor_conditions.get('configs', None).get('grids_path', None))
                 receptor_charge_model = receptor_conditions.get('configs', None).get('receptor_charge_model', None)
-                grid_files_prefix = f"{grid_maps_path}/receptor_checked_{receptor_charge_model}"
+                canonical_stem = f"receptor_checked_{receptor_charge_model}"
 
-                vina_rec_object.load_maps(grid_files_prefix)
+                # Ensure all map files and the fld's internal references share the
+                # canonical stem — required by Vina which derives map filenames from
+                # the prefix directly (unlike AutoDock GPU which uses CWD + fld refs).
+                self._normalize_grid_maps(grid_maps_path, canonical_stem)
+
+                maps_prefix = os.path.join(grid_maps_path, canonical_stem)
+                vina_rec_object.load_maps(maps_prefix)
                 
                 vina_rec_object.set_ligand_from_file(ligand_pdbqt_filepath)
                 
@@ -15700,6 +15754,12 @@ Example — cyclodextrin receptor:
         canonical_pdbqt_in_grids = os.path.join(grids_dest, f"{canonical_stem}.pdbqt")
         shutil.copy2(pdbqt_src, canonical_pdbqt_in_grids)
         print(f"  Copied PDBQT into grids folder: {canonical_stem}.pdbqt")
+
+        # Rename all .map/.xyz files to the canonical stem and update the fld's
+        # internal references. Required so Vina (which derives map filenames from
+        # the prefix directly) can find them; AutoDock GPU is unaffected because
+        # it runs from the grid directory and uses the fld's internal references.
+        self._normalize_grid_maps(grids_dest, canonical_stem)
 
         print(f"  Copied grid files to: {grids_dest}")
         configs['grids_path'] = grids_dest
