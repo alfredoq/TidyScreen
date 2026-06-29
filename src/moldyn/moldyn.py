@@ -2283,6 +2283,672 @@ class MolDyn:
         print(f"   ✓ tleap completed successfully (log: {tleap_log_file})")
         return prmtop_file, inpcrd_file
 
+    def compute_mmgbsa_on_trajectory(self):
+        """
+        Compute MM-GBSA binding free energy on completed production MD trajectories
+        using AMBER's MMPBSA.py (single-trajectory approach).
+
+        Workflow:
+          1. Select a completed ligand-receptor MD assay
+          2. Collect MM-GBSA parameters interactively
+          3. Run ante-MMPBSA.py to generate gas-phase receptor/ligand/complex topologies
+          4. Write the MMPBSA.py input namelist
+          5. Write run_mmgbsa.sh execution script
+          6. Query user: run now (fg/bg) or leave for manual execution
+          7. If fg: parse, store, and display results immediately after completion
+        """
+        import traceback
+
+        try:
+            print("\n🔬 COMPUTE MM-GBSA ON MD TRAJECTORY")
+            print("=" * 60)
+
+            assay_info = self._select_completed_md_assay_for_mmgbsa()
+            if assay_info is None:
+                return
+
+            assay_folder = assay_info['assay_folder_path']
+            assay_id = assay_info['assay_id']
+            ligand_name = assay_info.get('ligand_name', '')
+
+            prmtop_file = os.path.join(assay_folder, 'complex.prmtop')
+            trajectory_file = os.path.join(assay_folder, 'production.nc')
+            for req_file in [prmtop_file, trajectory_file]:
+                if not os.path.exists(req_file):
+                    print(f"❌ Required file not found: {req_file}")
+                    return
+
+            mmgbsa_params = self._collect_mmgbsa_parameters(ligand_name)
+            if mmgbsa_params is None:
+                return
+
+            mmgbsa_folder = os.path.join(assay_folder, 'mmgbsa')
+            if os.path.exists(mmgbsa_folder):
+                print(f"\n⚠️  MM-GBSA folder already exists: {mmgbsa_folder}")
+                confirm = input("🗑️  Delete existing folder and continue? (yes/no) [default: no]: ").strip().lower() or 'no'
+                if confirm not in ['yes', 'y']:
+                    print("❌ MM-GBSA computation cancelled.")
+                    return
+                import shutil as _shutil
+                _shutil.rmtree(mmgbsa_folder)
+            os.makedirs(mmgbsa_folder)
+            print(f"\n📂 MM-GBSA output folder: {mmgbsa_folder}")
+
+            print(f"\n⚙️  Running ante-MMPBSA.py to generate gas-phase topologies...")
+            com_prmtop, rec_prmtop, lig_prmtop = self._run_ante_mmpbsa(
+                prmtop_file, mmgbsa_folder, mmgbsa_params
+            )
+            if com_prmtop is None:
+                return
+
+            print(f"\n⚙️  Writing MM-GBSA input file...")
+            mmgbsa_in_file = self._write_mmgbsa_input_file(mmgbsa_folder, mmgbsa_params)
+
+            print(f"\n⚙️  Writing MM-GBSA execution script...")
+            script_path = self._prepare_mmgbsa_execution_script(
+                mmgbsa_folder, com_prmtop, rec_prmtop, lig_prmtop,
+                trajectory_file, mmgbsa_in_file,
+                prmtop_file, mmgbsa_params
+            )
+            print(f"✅ MM-GBSA assay prepared successfully.")
+            print(f"   Script: {script_path}")
+
+            start_now = input(
+                "\n▶️  Do you want to start the MM-GBSA computation now? (yes/no) [default: no]: "
+            ).strip().lower() or 'no'
+            if start_now in ['yes', 'y']:
+                self._start_mmgbsa_computation(
+                    mmgbsa_folder, script_path, assay_id, mmgbsa_params, assay_info
+                )
+            else:
+                print(f"ℹ️  MM-GBSA computation not started.")
+                print(f"   Run the script manually when ready: {script_path}")
+
+        except Exception as e:
+            print(f"\n❌ Error computing MM-GBSA: {e}")
+            traceback.print_exc()
+
+    def _select_completed_md_assay_for_mmgbsa(self):
+        """
+        List completed ligand-receptor MD assays and prompt the user to pick one.
+        Completion is determined by the presence of 'Total wall time:' or
+        'FINAL RESULTS' in production.out.
+        Returns a dict with assay metadata or None if the user cancels.
+        """
+        import sqlite3
+
+        try:
+            conn = sqlite3.connect(self.__md_registers_db)
+            cursor = conn.cursor()
+
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='md_assays';")
+            if not cursor.fetchone():
+                print("❌ No MD assays found (md_assays table does not exist).")
+                conn.close()
+                return None
+
+            cursor.execute("""
+                SELECT assay_id, md_assay, description, assay_folder_path,
+                       ligand_name, pose_id
+                FROM md_assays
+                WHERE ligand_name IS NOT NULL
+                ORDER BY assay_id ASC
+            """)
+            rows = cursor.fetchall()
+            conn.close()
+
+            if not rows:
+                print("❌ No ligand-receptor MD assays found.")
+                return None
+
+            completed = []
+            for assay_id, md_assay, description, folder, ligname, pose_id in rows:
+                if not folder or not os.path.exists(folder):
+                    continue
+                prod_out = os.path.join(folder, 'production.out')
+                if not os.path.exists(prod_out):
+                    continue
+                try:
+                    with open(prod_out, 'r') as fh:
+                        content = fh.read()
+                except OSError:
+                    continue
+                if 'Total wall time:' not in content and 'FINAL RESULTS' not in content:
+                    continue
+                completed.append({
+                    'assay_id': assay_id,
+                    'md_assay': md_assay,
+                    'description': description,
+                    'assay_folder_path': folder,
+                    'ligand_name': ligname,
+                    'pose_id': pose_id,
+                })
+
+            if not completed:
+                print("❌ No completed ligand-receptor MD assays found.")
+                print("   (production.out must contain 'Total wall time:' or 'FINAL RESULTS')")
+                return None
+
+            print(f"\n🧬 COMPLETED LIGAND-RECEPTOR MD ASSAYS:")
+            print("=" * 70)
+            for a in completed:
+                print(f"  Assay ID    : {a['assay_id']}")
+                print(f"  Name        : {a['md_assay']}")
+                print(f"  Ligand      : {a['ligand_name']}  (pose {a['pose_id']})")
+                print(f"  Description : {a['description']}")
+                print(f"  Folder      : {a['assay_folder_path']}")
+                print("-" * 70)
+
+            assay_ids = [str(a['assay_id']) for a in completed]
+            while True:
+                selection = input("\n🔎 Enter the Assay ID to compute MM-GBSA (or 'cancel'): ").strip()
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    print("❌ Operation cancelled.")
+                    return None
+                if selection in assay_ids:
+                    selected = next(a for a in completed if str(a['assay_id']) == selection)
+                    print(f"✅ Selected assay: {selected['md_assay']} (ID {selected['assay_id']})")
+                    return selected
+                print("❌ Invalid Assay ID. Please try again.")
+
+        except Exception as e:
+            print(f"❌ Error selecting MD assay: {e}")
+            return None
+
+    def _collect_mmgbsa_parameters(self, ligand_name):
+        """
+        Interactively collect MM-GBSA parameters from the user.
+        Returns a dict of parameters, or None if the user cancels.
+        """
+        try:
+            print(f"\n⚙️  MM-GBSA CONFIGURATION")
+            print("-" * 60)
+
+            params = {}
+
+            # Ligand residue mask in the AMBER topology.
+            # antechamber preserves the residue name from the input PDB (usually 'LIG'
+            # for AutoDock-derived poses or whatever moldf wrote).  Ask the user to
+            # confirm, defaulting to :LIG.
+            default_lig_mask = ':UNL'
+            print(f"\nThe ligand residue name in the AMBER topology is set by antechamber")
+            print(f"from the input PDB residue name (commonly 'UNL' for docked poses).")
+            lig_mask = input(
+                "Ligand residue mask (e.g. :UNL, :LIG) [default: " + default_lig_mask + "]: "
+            ).strip() or default_lig_mask
+            params['ligand_mask'] = lig_mask
+
+            # Residues to strip — must include water and ions but NOT the ligand.
+            # Every residue name needs its own : prefix so ante-MMPBSA.py identifies
+            # each as a residue selector (e.g. :WAT,:Na+,:Cl-).
+            strip_mask = input(
+                "Mask for residues to strip (solvent/ions) [default: :WAT,:Na+,:Cl-]: "
+            ).strip() or ':WAT,:Na+,:Cl-'
+            params['strip_mask'] = strip_mask
+
+            # GB model
+            print("\nGB model options:")
+            print("  2 = Onufriev et al. (2000) model I")
+            print("  5 = Onufriev et al. (2000) model II  (recommended for proteins)")
+            print("  7 = Mongan et al. (2007)")
+            print("  8 = Nguyen et al. (2013)")
+            igb_str = input("GB model (igb) [default: 5]: ").strip() or '5'
+            try:
+                igb = int(igb_str)
+                if igb not in [1, 2, 5, 7, 8]:
+                    print("⚠️  Unsupported igb value, defaulting to 5")
+                    igb = 5
+            except ValueError:
+                igb = 5
+            params['igb'] = igb
+
+            # Salt concentration
+            saltcon_str = input("\nSalt concentration (M) [default: 0.15]: ").strip() or '0.15'
+            try:
+                params['saltcon'] = float(saltcon_str)
+            except ValueError:
+                params['saltcon'] = 0.15
+
+            # Frame selection
+            print("\nTrajectory frame selection:")
+            try:
+                params['startframe'] = int(input("  Start frame [default: 1]: ").strip() or '1')
+                params['endframe'] = int(input("  End frame [default: 9999]: ").strip() or '9999')
+                params['interval'] = int(input("  Interval (every Nth frame) [default: 1]: ").strip() or '1')
+            except ValueError:
+                params['startframe'] = 1
+                params['endframe'] = 9999
+                params['interval'] = 1
+
+            # Whether to keep MMPBSA.py temporary files
+            keep_str = input(
+                "\nKeep MMPBSA.py intermediate files? (yes/no) [default: no]: "
+            ).strip().lower() or 'no'
+            params['keep_files'] = keep_str in ['yes', 'y']
+
+            print(f"\n✅ MM-GBSA parameters configured:")
+            print(f"   Ligand mask : {params['ligand_mask']}")
+            print(f"   Strip mask  : {params['strip_mask']}")
+            print(f"   GB model    : igb={params['igb']}")
+            print(f"   Salt conc.  : {params['saltcon']} M")
+            print(f"   Frames      : {params['startframe']} to {params['endframe']}, every {params['interval']}")
+            return params
+
+        except KeyboardInterrupt:
+            print("\n❌ MM-GBSA parameter collection cancelled.")
+            return None
+        except Exception as e:
+            print(f"❌ Error collecting MM-GBSA parameters: {e}")
+            return None
+
+    def _run_ante_mmpbsa(self, prmtop_file, mmgbsa_folder, mmgbsa_params):
+        """
+        Run ante-MMPBSA.py to produce gas-phase topology files for the complex,
+        receptor, and ligand (solvent + ions stripped).
+        Returns (com_prmtop, rec_prmtop, lig_prmtop) paths, or (None, None, None)
+        on failure.
+        """
+        import subprocess
+        import shutil
+
+        amber_bin = os.path.expanduser('~/Programas/Amber26/ambertools26/bin')
+        ante_mmpbsa = (
+            shutil.which('ante-MMPBSA.py')
+            or os.path.join(amber_bin, 'ante-MMPBSA.py')
+            or 'ante-MMPBSA.py'
+        )
+
+        com_prmtop = os.path.join(mmgbsa_folder, 'com.prmtop')
+        rec_prmtop = os.path.join(mmgbsa_folder, 'rec.prmtop')
+        lig_prmtop = os.path.join(mmgbsa_folder, 'lig.prmtop')
+        ante_log   = os.path.join(mmgbsa_folder, 'ante_mmpbsa.log')
+
+        cmd = [
+            ante_mmpbsa,
+            '-p', prmtop_file,
+            '-c', com_prmtop,
+            '-r', rec_prmtop,
+            '-l', lig_prmtop,
+            '-s', mmgbsa_params['strip_mask'],
+            '-n', mmgbsa_params['ligand_mask'],
+        ]
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, cwd=mmgbsa_folder)
+        except subprocess.SubprocessError as e:
+            print(f"❌ Failed to execute ante-MMPBSA.py: {e}")
+            return None, None, None
+
+        try:
+            with open(ante_log, 'w') as lf:
+                lf.write(result.stdout)
+                if result.stderr:
+                    lf.write("\n--- STDERR ---\n")
+                    lf.write(result.stderr)
+        except OSError:
+            pass
+
+        if result.returncode != 0:
+            print(f"❌ ante-MMPBSA.py failed (exit code {result.returncode})")
+            print(f"   Log: {ante_log}")
+            tail = (result.stdout + result.stderr)[-2000:]
+            print(f"   Output:\n{tail}")
+            return None, None, None
+
+        missing = [f for f in [com_prmtop, rec_prmtop, lig_prmtop] if not os.path.exists(f)]
+        if missing:
+            print(f"❌ ante-MMPBSA.py did not produce: {', '.join(os.path.basename(f) for f in missing)}")
+            print(f"   Log: {ante_log}")
+            return None, None, None
+
+        print(f"   ✓ ante-MMPBSA.py completed (log: {ante_log})")
+
+        # Report atom counts and sanity-check the topology split.
+        # com.prmtop must have more atoms than rec.prmtop and lig.prmtop individually,
+        # and ideally com = rec + lig (single-trajectory approach).
+        # Identical counts mean the ligand mask did not match any residue.
+        n_com = self._get_prmtop_natom(com_prmtop)
+        n_rec = self._get_prmtop_natom(rec_prmtop)
+        n_lig = self._get_prmtop_natom(lig_prmtop)
+        print(f"\n   Topology atom counts:")
+        print(f"     com.prmtop (complex, gas phase) : {n_com if n_com is not None else 'unknown'} atoms")
+        print(f"     rec.prmtop (receptor only)       : {n_rec if n_rec is not None else 'unknown'} atoms")
+        print(f"     lig.prmtop (ligand only)         : {n_lig if n_lig is not None else 'unknown'} atoms")
+
+        if None not in (n_com, n_rec, n_lig):
+            if n_com == n_rec or n_com == n_lig or n_rec == n_lig:
+                print(f"\n   ⚠️  WARNING: two or more topology files share the same atom count.")
+                print(f"   This almost always means the ligand mask '{mmgbsa_params['ligand_mask']}'")
+                print(f"   did not match any residue in the topology, so ante-MMPBSA.py could")
+                print(f"   not separate receptor from ligand.")
+                print(f"   Fix: inspect the residue names in the complex topology with")
+                print(f"     cpptraj {prmtop_file}")
+                print(f"     parminfo :*")
+                print(f"   then re-run with the correct mask (e.g. ':LIG', ':UNL', ':MOL').")
+                return None, None, None
+            elif n_com == n_rec + n_lig:
+                print(f"   ✓ Atom counts are consistent: {n_com} = {n_rec} (rec) + {n_lig} (lig)")
+            else:
+                print(f"\n   ⚠️  Atom counts do not satisfy com = rec + lig "
+                      f"({n_com} ≠ {n_rec} + {n_lig}).")
+                print(f"   This can happen when the strip mask also removes atoms that")
+                print(f"   ante-MMPBSA.py needs to account for (e.g. crystal waters kept")
+                print(f"   in the receptor).  Check {ante_log} for details.")
+
+        return com_prmtop, rec_prmtop, lig_prmtop
+
+    def _get_prmtop_natom(self, prmtop_file):
+        """Read NATOM from the %FLAG NATOM section of an AMBER prmtop file."""
+        try:
+            with open(prmtop_file, 'r') as fh:
+                lines = fh.readlines()
+            for i, line in enumerate(lines):
+                if '%FLAG NATOM' in line:
+                    for j in range(i + 1, min(i + 4, len(lines))):
+                        if lines[j].startswith('%FORMAT'):
+                            continue
+                        stripped = lines[j].strip()
+                        if stripped:
+                            return int(stripped.split()[0])
+        except Exception:
+            pass
+        return None
+
+    def _write_mmgbsa_input_file(self, mmgbsa_folder, mmgbsa_params):
+        """Write the MMPBSA.py input namelist file and return its path."""
+        mmgbsa_in = os.path.join(mmgbsa_folder, 'mmgbsa.in')
+        with open(mmgbsa_in, 'w') as f:
+            f.write("MM-GBSA calculation\n")
+            f.write("&general\n")
+            f.write(f"  startframe={mmgbsa_params['startframe']},\n")
+            f.write(f"  endframe={mmgbsa_params['endframe']},\n")
+            f.write(f"  interval={mmgbsa_params['interval']},\n")
+            f.write("  verbose=2,\n")
+            f.write("  netcdf=1,\n")
+            f.write("/\n")
+            f.write("&gb\n")
+            f.write(f"  igb={mmgbsa_params['igb']},\n")
+            f.write(f"  saltcon={mmgbsa_params['saltcon']},\n")
+            f.write("/\n")
+        print(f"   ✓ MM-GBSA input file written: {os.path.basename(mmgbsa_in)}")
+        return mmgbsa_in
+
+    def _prepare_mmgbsa_execution_script(self, mmgbsa_folder, com_prmtop, rec_prmtop,
+                                           lig_prmtop, traj_file, mmgbsa_in,
+                                           solvated_prmtop, mmgbsa_params):
+        """
+        Write run_mmgbsa.sh inside mmgbsa_folder and return its path.
+
+        The script is fully self-contained and reproduces the complete pipeline:
+          Step 1 — ante-MMPBSA.py: strips solvent/ions and splits the solvated
+                   complex topology into gas-phase complex, receptor, and ligand
+                   topology files.
+          Step 2 — MMPBSA.py: computes MM-GBSA energies frame by frame and
+                   writes the results summary and per-frame CSV.
+
+        Including ante-MMPBSA.py in the script means the script can be re-run
+        from scratch without needing any Python setup step.
+        """
+        import shutil as _shutil
+
+        amber_bin = os.path.expanduser('~/Programas/Amber26/ambertools26/bin')
+        amber_path_export = f"export PATH={amber_bin}:$PATH"
+
+        ante_bin = _shutil.which('ante-MMPBSA.py') or os.path.join(amber_bin, 'ante-MMPBSA.py')
+        mmpbsa_bin = _shutil.which('MMPBSA.py') or os.path.join(amber_bin, 'MMPBSA.py')
+
+        script_path      = os.path.join(mmgbsa_folder, 'run_mmgbsa.sh')
+        ante_log         = os.path.join(mmgbsa_folder, 'ante_mmpbsa.log')
+        cpptraj_in       = os.path.join(mmgbsa_folder, 'strip_traj.in')
+        cpptraj_log      = os.path.join(mmgbsa_folder, 'strip_traj.log')
+        stripped_traj    = os.path.join(mmgbsa_folder, 'production_stripped.nc')
+        results_dat      = os.path.join(mmgbsa_folder, 'mmgbsa_results.dat')
+        energies_csv     = os.path.join(mmgbsa_folder, 'mmgbsa_energies.csv')
+        mmpbsa_log       = os.path.join(mmgbsa_folder, 'mmpbsa.log')
+
+        try:
+            with open(script_path, 'w') as f:
+                f.write("#!/bin/bash\n")
+                f.write("set -uo pipefail\n")
+                f.write('cd "$(dirname "$0")"\n')
+                f.write(f"{amber_path_export}\n\n")
+
+                # --- Step 1: ante-MMPBSA.py ---
+                strip_mask = mmgbsa_params['strip_mask']
+                lig_mask   = mmgbsa_params['ligand_mask']
+                f.write('echo "--- Step 1: ante-MMPBSA.py (gas-phase topology split) ---"\n')
+                f.write("ante-MMPBSA.py \\\n")
+                f.write(f"    -p {solvated_prmtop} \\\n")
+                f.write(f"    -c {com_prmtop} \\\n")
+                f.write(f"    -r {rec_prmtop} \\\n")
+                f.write(f"    -l {lig_prmtop} \\\n")
+                f.write(f"    -s {strip_mask} \\\n")
+                f.write(f"    -n {lig_mask} \\\n")
+                f.write(f"    > {ante_log} 2>&1\n\n")
+                f.write('echo "   ante-MMPBSA.py done"\n\n')
+
+                # --- Step 2: cpptraj — autoimage, center, and strip trajectory ---
+                # The production trajectory contains the full solvated system; it must
+                # be stripped with the same mask used for the topology so that frame
+                # atom counts match com.prmtop when MMPBSA.py reads them.
+                # autoimage fixes molecules broken across periodic boundaries.
+                # center translates the solute (everything that is NOT stripped) to the
+                # origin by center of mass before stripping the solvent.
+                solute_mask = '!(' + strip_mask + ')'
+                f.write('echo "--- Step 2: cpptraj (autoimage, center, strip trajectory) ---"\n')
+                f.write(f"cat > {cpptraj_in} << 'CPPTRAJ_EOF'\n")
+                f.write(f"parm {solvated_prmtop}\n")
+                f.write(f"trajin {traj_file}\n")
+                f.write("autoimage\n")
+                f.write(f"center {solute_mask} mass origin\n")
+                f.write("image origin center familiar\n")
+                f.write(f"strip {strip_mask}\n")
+                f.write(f"trajout {stripped_traj} netcdf\n")
+                f.write("run\n")
+                f.write("quit\n")
+                f.write("CPPTRAJ_EOF\n\n")
+                f.write(f"cpptraj -i {cpptraj_in} > {cpptraj_log} 2>&1\n")
+                f.write('echo "   cpptraj trajectory processing done"\n\n')
+
+                # --- Step 3: MMPBSA.py ---
+                f.write('echo "--- Step 3: MMPBSA.py (MM-GBSA calculation) ---"\n')
+                f.write(f"MMPBSA.py -O \\\n")
+                f.write(f"    -i  {mmgbsa_in} \\\n")
+                f.write(f"    -o  {results_dat} \\\n")
+                f.write(f"    -eo {energies_csv} \\\n")
+                f.write(f"    -cp {com_prmtop} \\\n")
+                f.write(f"    -rp {rec_prmtop} \\\n")
+                f.write(f"    -lp {lig_prmtop} \\\n")
+                f.write(f"    -y  {stripped_traj} \\\n")
+                f.write(f"    2>&1 | tee {mmpbsa_log}\n\n")
+                f.write('echo "--- MM-GBSA computation finished ---"\n')
+
+            os.chmod(script_path, 0o755)
+        except OSError as e:
+            raise RuntimeError(f"Failed to write MM-GBSA execution script: {e}") from e
+
+        print(f"   ✓ Execution script written: {os.path.basename(script_path)}")
+        return script_path
+
+    def _start_mmgbsa_computation(self, mmgbsa_folder, script_path, assay_id,
+                                   mmgbsa_params, assay_info):
+        """
+        Ask the user whether to run the MM-GBSA script in the foreground or background,
+        then launch it accordingly.
+
+        Foreground: blocks until completion, then parses mmgbsa_results.dat and stores
+        results in the database.
+        Background: launches the script detached; results must be collected manually.
+        """
+        import subprocess
+
+        run_mode = input(
+            "\n⚙️  Run in foreground or background? (fg/bg) [default: fg]: "
+        ).strip().lower() or 'fg'
+
+        results_dat  = os.path.join(mmgbsa_folder, 'mmgbsa_results.dat')
+        energies_csv = os.path.join(mmgbsa_folder, 'mmgbsa_energies.csv')
+
+        if run_mode in ['fg', 'foreground']:
+            print("\n▶️  Starting MM-GBSA computation in the foreground...")
+            try:
+                proc = subprocess.run([script_path], cwd=mmgbsa_folder)
+            except Exception as e:
+                print(f"❌ Error running MM-GBSA script: {e}")
+                return
+
+            if proc.returncode != 0:
+                print(f"❌ MM-GBSA script exited with code {proc.returncode}.")
+                mmpbsa_log = os.path.join(mmgbsa_folder, 'mmpbsa.log')
+                print(f"   Inspect the log for details: {mmpbsa_log}")
+                return
+
+            if not os.path.exists(results_dat):
+                print(f"❌ MM-GBSA results file not found after run: {results_dat}")
+                return
+
+            # Parse, store, and display results only available after fg completion
+            parsed = self._parse_mmpbsa_output(results_dat)
+            if parsed is None:
+                print(f"⚠️  Could not parse MMPBSA.py output — raw results in: {results_dat}")
+                return
+
+            parsed['results_file'] = results_dat
+            parsed['energies_file'] = energies_csv if os.path.exists(energies_csv) else None
+            self._store_mmgbsa_results(assay_id, parsed, mmgbsa_params, mmgbsa_folder)
+            self._display_mmgbsa_results(parsed, assay_info)
+
+        elif run_mode in ['bg', 'background']:
+            print("\n▶️  Starting MM-GBSA computation in the background...")
+            try:
+                subprocess.Popen(
+                    [script_path],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    cwd=mmgbsa_folder,
+                )
+            except Exception as e:
+                print(f"❌ Error launching MM-GBSA script: {e}")
+                return
+            print(f"ℹ️  MM-GBSA running in background.")
+            print(f"   Results will be written to: {results_dat}")
+            print(f"   Log: {os.path.join(mmgbsa_folder, 'mmpbsa.log')}")
+            print(f"   Re-run compute_mmgbsa_on_trajectory() after completion to parse and store results.")
+
+        else:
+            print("❌ Invalid option. Please choose 'fg' or 'bg'.")
+
+    def _parse_mmpbsa_output(self, results_file):
+        """
+        Parse the MMPBSA.py summary output file.
+        Returns a dict mapping energy component names to {average, std_dev} dicts,
+        plus a 'DELTA_G_binding' key for the total binding free energy.
+        Returns None if parsing fails entirely.
+        """
+        import re
+
+        results = {}
+        try:
+            with open(results_file, 'r') as fh:
+                content = fh.read()
+
+            # Each line in the DELTA section looks like:
+            #   COMPONENT    AVERAGE    STD_DEV    [STD_ERR_OF_MEAN]
+            component_pattern = re.compile(
+                r'^\s*(VDWAALS|EEL|EGB|ESURF|EPOL|ENPOLAR|EDISPER|EPB|ENPB|ECAVITY'
+                r'|DELTA G gas|DELTA G solv|DELTA TOTAL)\s+'
+                r'(-?\d+\.\d+)\s+(\d+\.\d+)',
+                re.MULTILINE,
+            )
+            for m in component_pattern.finditer(content):
+                results[m.group(1).strip()] = {
+                    'average': float(m.group(2)),
+                    'std_dev': float(m.group(3)),
+                }
+
+            # Some MMPBSA.py versions emit a dedicated "DELTA G binding" line.
+            binding_match = re.search(
+                r'DELTA G binding\s*=\s*(-?\d+\.\d+)\s+\+/-\s+(\d+\.\d+)',
+                content,
+            )
+            if binding_match:
+                results['DELTA_G_binding'] = {
+                    'average': float(binding_match.group(1)),
+                    'std_dev': float(binding_match.group(2)),
+                }
+            elif 'DELTA TOTAL' in results:
+                # In single-trajectory MMGBSA, DELTA TOTAL IS the binding free energy.
+                results['DELTA_G_binding'] = results['DELTA TOTAL']
+
+            return results if results else None
+
+        except Exception as e:
+            print(f"⚠️  Error parsing MMPBSA.py output: {e}")
+            return None
+
+    def _store_mmgbsa_results(self, assay_id, results, mmgbsa_params, mmgbsa_folder):
+        """
+        Store MM-GBSA results as a JSON blob in the mmgbsa_results column of md_assays.
+        The column is created if it does not yet exist.
+        """
+        import sqlite3
+        import json
+
+        try:
+            payload = {
+                'parameters': mmgbsa_params,
+                'results': results,
+                'mmgbsa_folder': mmgbsa_folder,
+            }
+            conn = sqlite3.connect(self.__md_registers_db)
+            cursor = conn.cursor()
+            try:
+                cursor.execute("ALTER TABLE md_assays ADD COLUMN mmgbsa_results TEXT")
+            except Exception:
+                pass  # column already exists
+            cursor.execute(
+                "UPDATE md_assays SET mmgbsa_results = ? WHERE assay_id = ?",
+                (json.dumps(payload, indent=2), assay_id),
+            )
+            conn.commit()
+            conn.close()
+            print(f"   ✓ MM-GBSA results stored in database (assay_id={assay_id})")
+        except Exception as e:
+            print(f"⚠️  Error storing MM-GBSA results in database: {e}")
+
+    def _display_mmgbsa_results(self, results, assay_info):
+        """Print a formatted MM-GBSA results summary to the terminal."""
+        print(f"\n{'=' * 60}")
+        print(f"🔬 MM-GBSA RESULTS SUMMARY")
+        print(f"{'=' * 60}")
+        print(f"  Assay  : {assay_info.get('md_assay', 'N/A')} (ID {assay_info.get('assay_id', 'N/A')})")
+        print(f"  Ligand : {assay_info.get('ligand_name', 'N/A')} (pose {assay_info.get('pose_id', 'N/A')})")
+        print()
+
+        for comp in ('VDWAALS', 'EEL', 'EGB', 'ESURF', 'DELTA G gas', 'DELTA G solv', 'DELTA TOTAL'):
+            if comp in results:
+                avg = results[comp]['average']
+                std = results[comp]['std_dev']
+                print(f"  {comp:<18} : {avg:>10.2f} ± {std:>7.2f} kcal/mol")
+
+        binding = results.get('DELTA_G_binding')
+        if binding:
+            print()
+            print(f"  {'─' * 48}")
+            avg = binding['average']
+            std = binding['std_dev']
+            print(f"  {'ΔG binding':<18} : {avg:>10.2f} ± {std:>7.2f} kcal/mol")
+            print(f"  {'─' * 48}")
+
+        print()
+        results_file = results.get('results_file', '')
+        if results_file:
+            print(f"  Full results   : {results_file}")
+        energies_file = results.get('energies_file', '')
+        if energies_file:
+            print(f"  Per-frame data : {energies_file}")
+        print(f"{'=' * 60}")
+
     def list_md_assays(self):
         """List all MD assays registered in the project."""
         try:
