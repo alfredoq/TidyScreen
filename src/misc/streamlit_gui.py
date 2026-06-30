@@ -1265,6 +1265,37 @@ elif page == "MolDyn":
                     },
                 )
 
+                _sp, _col_desc_edit = st.columns([1, 9])
+                with _col_desc_edit:
+                    with st.expander("✏️ Edit Assay Description", expanded=False):
+                        _assay_options = df_md_assays['md_assay'].tolist()
+                        _selected_assay_name = st.selectbox(
+                            "Select assay to edit description:",
+                            options=_assay_options,
+                            key="md_assay_desc_select",
+                        )
+                        if _selected_assay_name:
+                            _sel_row = df_md_assays[df_md_assays['md_assay'] == _selected_assay_name].iloc[0]
+                            _current_desc = _sel_row.get('description') or ''
+                            _new_desc = st.text_area(
+                                "Description:",
+                                value=_current_desc,
+                                key=f"md_assay_desc_text_{_selected_assay_name}",
+                            )
+                            if st.button("💾 Save description", key="btn_save_md_assay_desc"):
+                                try:
+                                    _conn = sqlite3.connect(md_registers_db_path)
+                                    _conn.execute(
+                                        "UPDATE md_assays SET description = ? WHERE md_assay = ?",
+                                        (_new_desc, _selected_assay_name),
+                                    )
+                                    _conn.commit()
+                                    _conn.close()
+                                    st.success(f"Description updated for '{_selected_assay_name}'.")
+                                    st.rerun()
+                                except Exception as _e:
+                                    st.error(f"Failed to update description: {_e}")
+
 elif page == "ProLIF Conditions":
     st.title("ProLIF Conditions")
 
