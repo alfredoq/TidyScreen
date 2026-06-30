@@ -1547,6 +1547,461 @@ elif page == "MolDyn analysis":
                                         f"Mean: {_mean_rmsd:.3f} Å"
                                     )
 
+                        with st.expander("📈 Structural analysis (RMSF)", expanded=False):
+                            _prmtop = os.path.join(_assay_folder, "complex.prmtop")
+                            _traj   = os.path.join(_assay_folder, "production.nc")
+                            _cpptraj_bin = "/home/fredy/Programas/Amber26/ambertools26/bin/cpptraj"
+
+                            for _req, _label in [(_prmtop, "complex.prmtop"), (_traj, "production.nc")]:
+                                if not os.path.exists(_req):
+                                    st.error(f"Required file not found: {_label}")
+                                    st.stop()
+
+                            _rmsf_mask = st.text_input(
+                                "cpptraj atom mask for RMSF (e.g. :1-100, !:WAT):",
+                                value=":1-100",
+                                key="rmsf_mask_input",
+                            )
+
+                            # Mask atom/residue count (reuse same cache pattern as RMSD)
+                            _rmsf_cache_key = f"rmsf_mask_info_{_assay_folder}_{_rmsf_mask}"
+                            if _rmsf_cache_key not in st.session_state:
+                                import subprocess as _sp_rmsf, tempfile as _tf_rmsf
+                                _rmsf_check = f"parmstrip !{_rmsf_mask}\nparminfo\nquit\n"
+                                try:
+                                    with _tf_rmsf.NamedTemporaryFile(mode="w", suffix=".in", delete=False) as _tmp_r:
+                                        _tmp_r.write(_rmsf_check)
+                                        _tmp_r_path = _tmp_r.name
+                                    _chk_r = _sp_rmsf.run(
+                                        [_cpptraj_bin, _prmtop, "-i", _tmp_r_path],
+                                        capture_output=True, text=True,
+                                    )
+                                    import os as _os_r; _os_r.unlink(_tmp_r_path)
+                                    import re as _re_r
+                                    _m_r = _re_r.search(r"Stripped parm:.*?(\d+)\s+atoms,\s*(\d+)\s+res", _chk_r.stdout + _chk_r.stderr)
+                                    st.session_state[_rmsf_cache_key] = (int(_m_r.group(1)), int(_m_r.group(2))) if _m_r else None
+                                except Exception:
+                                    st.session_state[_rmsf_cache_key] = None
+
+                            _rmsf_info = st.session_state.get(_rmsf_cache_key)
+                            if _rmsf_info:
+                                st.caption(f"Mask matches **{_rmsf_info[0]} atoms** across **{_rmsf_info[1]} residues**")
+                            elif _rmsf_info is None and _rmsf_mask:
+                                st.warning("Mask matched no atoms — check the syntax.")
+
+                            def _toggle_rmsf_visibility():
+                                st.session_state["rmsf_plot_visible"] = not st.session_state.get("rmsf_plot_visible", True)
+
+                            _rmsf_btn_col, _rmsf_hide_col = st.columns([2, 2])
+                            with _rmsf_btn_col:
+                                _run_rmsf = st.button("▶️ Run RMSF", key="btn_run_rmsf")
+                            with _rmsf_hide_col:
+                                _rmsf_visible = st.session_state.get("rmsf_plot_visible", True)
+                                st.button(
+                                    "🙈 Hide RMSF plot" if _rmsf_visible else "👁 Show RMSF plot",
+                                    key="btn_toggle_rmsf",
+                                    on_click=_toggle_rmsf_visibility,
+                                )
+
+                            if _run_rmsf:
+                                import subprocess as _sp_rmsf2, tempfile as _tf_rmsf2
+                                _rmsf_out = os.path.join(_assay_folder, "rmsf_analysis.dat")
+                                _rmsf_script = (
+                                    f"parm {_prmtop}\n"
+                                    f"trajin {_traj}\n"
+                                    f"atomicfluct out {_rmsf_out} {_rmsf_mask} byres\n"
+                                    f"run\n"
+                                    f"quit\n"
+                                )
+                                with _tf_rmsf2.NamedTemporaryFile(mode="w", suffix=".in", delete=False) as _tmp_r2:
+                                    _tmp_r2.write(_rmsf_script)
+                                    _tmp_r2_path = _tmp_r2.name
+                                try:
+                                    _res_r = _sp_rmsf2.run(
+                                        [_cpptraj_bin, "-i", _tmp_r2_path],
+                                        capture_output=True, text=True,
+                                    )
+                                    if _res_r.returncode != 0:
+                                        st.error(f"cpptraj error:\n{_res_r.stderr}")
+                                        st.session_state.pop("rmsf_plot_data", None)
+                                    else:
+                                        _res_nums, _rmsf_vals = [], []
+                                        with open(_rmsf_out) as _fh_r:
+                                            for _line in _fh_r:
+                                                _line = _line.strip()
+                                                if _line.startswith("#") or not _line:
+                                                    continue
+                                                _parts = _line.split()
+                                                if len(_parts) >= 2:
+                                                    _res_nums.append(float(_parts[0]))
+                                                    _rmsf_vals.append(float(_parts[1]))
+                                        st.session_state["rmsf_plot_data"] = {
+                                            "residues": _res_nums, "rmsf": _rmsf_vals,
+                                            "mask": _rmsf_mask, "assay": _selected_md_assay,
+                                        }
+                                        st.session_state["rmsf_plot_visible"] = True
+                                except Exception as _e:
+                                    st.error(f"Failed to run cpptraj: {_e}")
+                                    st.session_state.pop("rmsf_plot_data", None)
+                                finally:
+                                    import os as _os_r2; _os_r2.unlink(_tmp_r2_path)
+
+                            _rmsf_data = st.session_state.get("rmsf_plot_data")
+                            if _rmsf_data and _rmsf_data.get("assay") == _selected_md_assay and st.session_state.get("rmsf_plot_visible", True):
+                                import matplotlib.pyplot as _plt
+                                _res_nums = _rmsf_data["residues"]
+                                _rmsf_vals = _rmsf_data["rmsf"]
+                                if _res_nums:
+                                    _fig, _ax = _plt.subplots(figsize=(10, 4))
+                                    _ax.plot(_res_nums, _rmsf_vals, linewidth=0.8, color="seagreen")
+                                    _mean_rmsf = sum(_rmsf_vals) / len(_rmsf_vals)
+                                    _ax.axhline(_mean_rmsf, color="tomato", linestyle="--",
+                                                linewidth=1, label=f"Mean: {_mean_rmsf:.3f} Å")
+                                    _ax.set_xlabel("Residue")
+                                    _ax.set_ylabel("RMSF (Å)")
+                                    _ax.set_title(
+                                        f"RMSF — {_selected_md_assay}  |  mask: {_rmsf_data['mask']}"
+                                    )
+                                    _ax.legend(fontsize=9)
+                                    _plt.tight_layout()
+                                    st.pyplot(_fig)
+                                    _plt.close(_fig)
+                                    st.caption(
+                                        f"Residues: {len(_res_nums)}  |  "
+                                        f"Min: {min(_rmsf_vals):.3f}  |  "
+                                        f"Max: {max(_rmsf_vals):.3f}  |  "
+                                        f"Mean: {_mean_rmsf:.3f} Å"
+                                    )
+
+                        with st.expander("🔬 Display MMGBSA results", expanded=False):
+                            import json as _json, re as _re_mmgbsa
+
+                            # --- source 1: DB JSON blob ---
+                            _mmgbsa_json = _assay_row.get('mmgbsa_results')
+                            _mmgbsa_results = None
+                            _mmgbsa_params  = None
+                            if _mmgbsa_json:
+                                try:
+                                    _payload = _json.loads(_mmgbsa_json)
+                                    _mmgbsa_results = _payload.get('results', {})
+                                    _mmgbsa_params  = _payload.get('parameters', {})
+                                except Exception:
+                                    pass
+
+                            # --- source 2: mmgbsa_results.dat file ---
+                            if not _mmgbsa_results:
+                                _dat_path = os.path.join(_assay_folder, 'mmgbsa', 'mmgbsa_results.dat')
+                                if os.path.exists(_dat_path):
+                                    try:
+                                        with open(_dat_path) as _fh_m:
+                                            _dat_content = _fh_m.read()
+                                        _comp_pat = _re_mmgbsa.compile(
+                                            r'^\s*(VDWAALS|EEL|EGB|ESURF|EPOL|ENPOLAR|EDISPER|EPB|ENPB|ECAVITY'
+                                            r'|DELTA G gas|DELTA G solv|DELTA TOTAL)\s+(-?\d+\.\d+)\s+(\d+\.\d+)',
+                                            _re_mmgbsa.MULTILINE,
+                                        )
+                                        _mmgbsa_results = {}
+                                        for _m in _comp_pat.finditer(_dat_content):
+                                            _mmgbsa_results[_m.group(1).strip()] = {
+                                                'average': float(_m.group(2)),
+                                                'std_dev': float(_m.group(3)),
+                                            }
+                                        _bind = _re_mmgbsa.search(
+                                            r'DELTA G binding\s*=\s*(-?\d+\.\d+)\s+\+/-\s+(\d+\.\d+)',
+                                            _dat_content,
+                                        )
+                                        if _bind:
+                                            _mmgbsa_results['DELTA_G_binding'] = {
+                                                'average': float(_bind.group(1)),
+                                                'std_dev': float(_bind.group(2)),
+                                            }
+                                        elif 'DELTA TOTAL' in _mmgbsa_results:
+                                            _mmgbsa_results['DELTA_G_binding'] = _mmgbsa_results['DELTA TOTAL']
+                                        if not _mmgbsa_results:
+                                            _mmgbsa_results = None
+                                    except Exception:
+                                        _mmgbsa_results = None
+
+                            if not _mmgbsa_results:
+                                st.info("No MMGBSA results found for this assay.")
+                            else:
+                                # Parameters summary
+                                if _mmgbsa_params:
+                                    st.caption(
+                                        f"GB model: igb={_mmgbsa_params.get('igb', '?')}  |  "
+                                        f"Salt: {_mmgbsa_params.get('saltcon', '?')} M  |  "
+                                        f"Ligand mask: {_mmgbsa_params.get('ligand_mask', '?')}  |  "
+                                        f"Frames: {_mmgbsa_params.get('startframe', '?')}–"
+                                        f"{_mmgbsa_params.get('endframe', '?')} "
+                                        f"(every {_mmgbsa_params.get('interval', '?')})"
+                                    )
+
+                                # Energy components table
+                                _component_order = [
+                                    'VDWAALS', 'EEL', 'EGB', 'ESURF', 'EPOL',
+                                    'DELTA G gas', 'DELTA G solv', 'DELTA TOTAL',
+                                ]
+                                _rows = []
+                                for _comp in _component_order:
+                                    if _comp in _mmgbsa_results:
+                                        _v = _mmgbsa_results[_comp]
+                                        _rows.append({
+                                            'Component': _comp,
+                                            'Average (kcal/mol)': f"{_v['average']:.3f}",
+                                            'Std Dev':            f"{_v['std_dev']:.3f}",
+                                        })
+                                if _rows:
+                                    st.dataframe(
+                                        pd.DataFrame(_rows),
+                                        use_container_width=True,
+                                        hide_index=True,
+                                    )
+
+                                # Binding free energy highlight
+                                _dg = _mmgbsa_results.get('DELTA_G_binding')
+                                if _dg:
+                                    st.markdown(
+                                        f"**ΔG binding = {_dg['average']:.3f} ± {_dg['std_dev']:.3f} kcal/mol**"
+                                    )
+
+                        with st.expander("⚙️ Execute custom analysis", expanded=False):
+                            _scripts_db = os.path.join(
+                                project_path, "dynamics", "md_registers", "md_analysis_scripts.db"
+                            )
+                            _cpptraj_bin = "/home/fredy/Programas/Amber26/ambertools26/bin/cpptraj"
+                            _prmtop = os.path.join(_assay_folder, "complex.prmtop")
+                            _traj   = os.path.join(_assay_folder, "production.nc")
+                            _inpcrd = os.path.join(_assay_folder, "complex.inpcrd")
+
+                            # Ensure scripts table exists
+                            _conn_s = sqlite3.connect(_scripts_db)
+                            _conn_s.execute("""
+                                CREATE TABLE IF NOT EXISTS analysis_scripts (
+                                    script_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+                                    script_name TEXT UNIQUE NOT NULL,
+                                    script_type TEXT NOT NULL DEFAULT 'cpptraj',
+                                    script_code TEXT NOT NULL,
+                                    description TEXT,
+                                    created_date TEXT
+                                )
+                            """)
+                            _conn_s.commit()
+                            _existing = pd.read_sql_query(
+                                "SELECT script_id, script_name, script_type, script_code, description FROM analysis_scripts ORDER BY script_name",
+                                _conn_s,
+                            )
+                            _conn_s.close()
+
+                            # Script selector
+                            _script_options = ["-- New script --"] + _existing['script_name'].tolist()
+                            _sel_script_name = st.selectbox(
+                                "Load existing script:",
+                                options=_script_options,
+                                key="custom_script_select",
+                            )
+
+                            # Pre-fill fields when an existing script is selected
+                            if _sel_script_name != "-- New script --" and not _existing.empty:
+                                _sel_row_s = _existing[_existing['script_name'] == _sel_script_name].iloc[0]
+                                _default_name  = _sel_row_s['script_name']
+                                _default_type  = _sel_row_s['script_type']
+                                _default_code  = _sel_row_s['script_code']
+                                _default_desc  = _sel_row_s['description'] or ''
+                            else:
+                                _default_name  = ''
+                                _default_type  = 'cpptraj'
+                                _default_code  = ''
+                                _default_desc  = ''
+
+                            # When selection changes to an existing script, sync type and code
+                            _prev_select_key = "custom_script_prev_select"
+                            if (
+                                _sel_script_name != "-- New script --"
+                                and st.session_state.get(_prev_select_key) != _sel_script_name
+                            ):
+                                st.session_state["custom_script_name"] = _default_name
+                                st.session_state["custom_script_type"] = _default_type
+                                st.session_state["custom_script_code"] = _default_code
+                            st.session_state[_prev_select_key] = _sel_script_name
+
+                            _script_name_in = st.text_input(
+                                "Script name:", value=_default_name, key="custom_script_name"
+                            )
+                            _script_type_in = st.radio(
+                                "Script type:", options=["cpptraj", "python"],
+                                index=0 if _default_type == "cpptraj" else 1,
+                                horizontal=True, key="custom_script_type",
+                            )
+
+                            _cpptraj_hint = (
+                                f"# Available variables (auto-substituted):\n"
+                                f"# {{prmtop}}       = {_prmtop}\n"
+                                f"# {{traj}}         = {_traj}\n"
+                                f"# {{inpcrd}}       = {_inpcrd}\n"
+                                f"# {{assay_folder}} = {_assay_folder}\n\n"
+                                f"parm {{prmtop}}\n"
+                                f"trajin {{traj}}\n"
+                                f"# ... add cpptraj commands ...\n"
+                                f"run\n"
+                                f"quit\n"
+                            )
+                            _python_hint = (
+                                "# Auto-substituted variables (read-only, pre-bound):\n"
+                                f"# prmtop      = '{_prmtop}'\n"
+                                f"# traj        = '{_traj}'\n"
+                                f"# inpcrd      = '{_inpcrd}'\n"
+                                f"# assay_folder = '{_assay_folder}'\n"
+                                f"# assay_name  = '{_selected_md_assay}'\n"
+                                "# st, pd, os  — Streamlit, pandas, os modules\n\n"
+                                "import MDAnalysis as mda\n"
+                                "import matplotlib.pyplot as plt\n"
+                                "from MDAnalysis.analysis import rms\n\n"
+                                "# Load topology and trajectory\n"
+                                "u = mda.Universe(prmtop, traj)\n\n"
+                                "# Select atoms\n"
+                                "sel = u.select_atoms('protein and name CA')\n\n"
+                                "# Compute RMSD relative to first frame\n"
+                                "R = rms.RMSD(sel, select='protein and name CA')\n"
+                                "R.run()\n\n"
+                                "# Plot\n"
+                                "fig, ax = plt.subplots(figsize=(10, 4))\n"
+                                "ax.plot(R.results.rmsd[:, 1], R.results.rmsd[:, 2],\n"
+                                "        linewidth=0.8, color='steelblue')\n"
+                                "ax.set_xlabel('Frame')\n"
+                                "ax.set_ylabel('RMSD (Å)')\n"
+                                "ax.set_title(f'RMSD — {assay_name}')\n"
+                                "st.pyplot(fig)\n"
+                                "plt.close(fig)\n"
+                            )
+
+                            # When the type radio changes on a new script, reset the code box
+                            _prev_type_key = "custom_script_prev_type"
+                            _is_new_script = (_sel_script_name == "-- New script --")
+                            if _is_new_script and st.session_state.get(_prev_type_key) != _script_type_in:
+                                st.session_state["custom_script_code"] = (
+                                    _cpptraj_hint if _script_type_in == "cpptraj" else _python_hint
+                                )
+                            st.session_state[_prev_type_key] = _script_type_in
+
+                            _hint = _cpptraj_hint if _script_type_in == "cpptraj" else _python_hint
+                            _script_code_in = st.text_area(
+                                "Script code:",
+                                value=_default_code if _default_code else _hint,
+                                height=220,
+                                key="custom_script_code",
+                            )
+                            _script_desc_in = st.text_input(
+                                "Description (optional):", value=_default_desc, key="custom_script_desc"
+                            )
+
+                            # Action buttons
+                            _cs_col_save, _cs_col_del, _cs_col_run = st.columns(3)
+
+                            with _cs_col_save:
+                                if st.button("💾 Save script", key="btn_save_custom_script"):
+                                    if not _script_name_in.strip():
+                                        st.warning("Enter a script name before saving.")
+                                    else:
+                                        try:
+                                            _conn_s2 = sqlite3.connect(_scripts_db)
+                                            _conn_s2.execute("""
+                                                INSERT INTO analysis_scripts
+                                                    (script_name, script_type, script_code, description, created_date)
+                                                VALUES (?, ?, ?, ?, datetime('now'))
+                                                ON CONFLICT(script_name) DO UPDATE SET
+                                                    script_type  = excluded.script_type,
+                                                    script_code  = excluded.script_code,
+                                                    description  = excluded.description,
+                                                    created_date = datetime('now')
+                                            """, (_script_name_in.strip(), _script_type_in,
+                                                  _script_code_in, _script_desc_in.strip()))
+                                            _conn_s2.commit()
+                                            _conn_s2.close()
+                                            st.success(f"Script '{_script_name_in.strip()}' saved.")
+                                            st.rerun()
+                                        except Exception as _e:
+                                            st.error(f"Error saving script: {_e}")
+
+                            with _cs_col_del:
+                                _del_confirmed = st.checkbox(
+                                    "Confirm deletion", key="chk_del_custom_script"
+                                )
+                                if st.button(
+                                    "🗑️ Delete script", key="btn_del_custom_script",
+                                    disabled=not _del_confirmed,
+                                ):
+                                    _del_name = _script_name_in.strip()
+                                    if not _del_name:
+                                        st.warning("Enter the script name to delete.")
+                                    else:
+                                        try:
+                                            _conn_s3 = sqlite3.connect(_scripts_db)
+                                            _cur_del = _conn_s3.execute(
+                                                "DELETE FROM analysis_scripts WHERE script_name = ?",
+                                                (_del_name,)
+                                            )
+                                            _conn_s3.commit()
+                                            _conn_s3.close()
+                                            if _cur_del.rowcount:
+                                                st.success(f"Script '{_del_name}' deleted.")
+                                            else:
+                                                st.warning(f"No script named '{_del_name}' found.")
+                                            st.rerun()
+                                        except Exception as _e:
+                                            st.error(f"Error deleting script: {_e}")
+
+                            with _cs_col_run:
+                                if st.button("▶️ Run script", key="btn_run_custom_script"):
+                                    if not _script_code_in.strip():
+                                        st.warning("No code to run.")
+                                    else:
+                                        if _script_type_in == "cpptraj":
+                                            import tempfile as _tf_cs, subprocess as _sp_cs
+                                            _resolved = _script_code_in.format(
+                                                prmtop=_prmtop, traj=_traj,
+                                                inpcrd=_inpcrd, assay_folder=_assay_folder,
+                                            )
+                                            with _tf_cs.NamedTemporaryFile(mode="w", suffix=".in", delete=False) as _tmp_cs:
+                                                _tmp_cs.write(_resolved)
+                                                _tmp_cs_path = _tmp_cs.name
+                                            try:
+                                                _res_cs = _sp_cs.run(
+                                                    [_cpptraj_bin, "-i", _tmp_cs_path],
+                                                    capture_output=True, text=True,
+                                                )
+                                                _out_cs = _res_cs.stdout + ("\n" + _res_cs.stderr if _res_cs.stderr else "")
+                                                st.session_state["custom_script_output"] = _out_cs
+                                                st.session_state["custom_script_rc"] = _res_cs.returncode
+                                            except Exception as _e:
+                                                st.session_state["custom_script_output"] = str(_e)
+                                                st.session_state["custom_script_rc"] = -1
+                                            finally:
+                                                import os as _os_cs; _os_cs.unlink(_tmp_cs_path)
+                                        else:
+                                            import io as _io_cs
+                                            _stdout_cap = _io_cs.StringIO()
+                                            _exec_ns = {
+                                                "prmtop": _prmtop, "traj": _traj,
+                                                "inpcrd": _inpcrd, "assay_folder": _assay_folder,
+                                                "assay_name": _selected_md_assay,
+                                                "st": st, "pd": pd, "os": os,
+                                            }
+                                            try:
+                                                exec(_script_code_in, _exec_ns)
+                                                st.session_state["custom_script_output"] = "✅ Python script executed."
+                                                st.session_state["custom_script_rc"] = 0
+                                            except Exception as _e:
+                                                st.session_state["custom_script_output"] = f"❌ {type(_e).__name__}: {_e}"
+                                                st.session_state["custom_script_rc"] = -1
+
+                            # Output display
+                            _cs_out = st.session_state.get("custom_script_output")
+                            if _cs_out:
+                                _cs_rc = st.session_state.get("custom_script_rc", 0)
+                                if _cs_rc != 0:
+                                    st.error("Script exited with errors:")
+                                st.code(_cs_out, language="bash")
+
 elif page == "ProLIF Conditions":
     st.title("ProLIF Conditions")
 
