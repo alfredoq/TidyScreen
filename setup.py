@@ -14,6 +14,7 @@ setup(name='tidyscreen',
       package_data={
           'tidyscreen.config': ['*'],
           'tidyscreen.misc': ['*'],
+          'tidyscreen.images': ['*'],
       },
       install_requires=[
         'pandas==2.2.1',
@@ -39,7 +40,7 @@ setup(name='tidyscreen',
         'py3Dmol',
 	'sqlite_web'
       ],
-      packages=['tidyscreen', 'tidyscreen.chemspace', 'tidyscreen.config', 'tidyscreen.databases', 'tidyscreen.projects', 'tidyscreen.moldock', 'tidyscreen.misc', 'tidyscreen.moldyn', 'tidyscreen.molecule_management', 'tidyscreen.config', 'tidyscreen.ml'],
+      packages=['tidyscreen', 'tidyscreen.chemspace', 'tidyscreen.config', 'tidyscreen.databases', 'tidyscreen.projects', 'tidyscreen.moldock', 'tidyscreen.misc', 'tidyscreen.moldyn', 'tidyscreen.molecule_management', 'tidyscreen.config', 'tidyscreen.ml', 'tidyscreen.images'],
       keywords='drug-discovery',
       classifiers=[
           "Programming Language :: Python :: 3.10",

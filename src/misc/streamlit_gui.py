@@ -121,10 +121,12 @@ def _gs_cb_feat():
 st.set_page_config(page_title="TidyScreen App", layout="wide")
 
 # Sidebar navigation
-st.sidebar.title("Navigation")
+_logo_path = os.path.join(tidyscreen_package_path, "images", "tidyscreen_logo.png")
+if os.path.exists(_logo_path):
+    st.sidebar.image(_logo_path, use_container_width=True)
 page = st.sidebar.radio(
     "Go to",
-    ("TidyScreen", "ChemSpace", "Receptors", "MolDock", "MolDyn", "ProLIF Conditions", "Analysis", "ML features management", "RF model training", "Mol Viewer")
+    ("Project selection", "ChemSpace", "Receptors", "MolDock", "ProLIF Conditions", "Docking analysis", "MolDyn", "ML features management", "RF model training", "Mol Viewer")
 )
 
 ## Persistent sidebar info: active project and assay
@@ -136,8 +138,8 @@ st.sidebar.info(active_project if active_project else "None selected")
 st.sidebar.markdown("**Active docking assay:**")
 st.sidebar.info(active_assay if active_assay else "None selected")
 
-if page == "TidyScreen":
-    st.title("TidyScreen")
+if page == "Project selection":
+    st.title("Project selection")
     st.write("Welcome to the TidyScreen main page.")
 
     db_path = os.path.join(tidyscreen_package_path, "projects_db", "projects_database.db")
@@ -1355,10 +1357,10 @@ elif page == "ProLIF Conditions":
                         st.error(f"❌ {_result[6:]}")
 
 
-elif page == "Analysis":
+elif page == "Docking analysis":
     _analysis_col_title, _analysis_col_info = st.columns([2, 3])
     with _analysis_col_title:
-        st.title("Analysis")
+        st.title("Docking analysis")
     with _analysis_col_info:
         st.markdown(
             f"<div style='padding-top: 14px;'>"
