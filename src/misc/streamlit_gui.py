@@ -126,7 +126,7 @@ if os.path.exists(_logo_path):
     st.sidebar.image(_logo_path, use_container_width=True)
 page = st.sidebar.radio(
     "Go to",
-    ("Project selection", "ChemSpace", "Receptors", "MolDock", "ProLIF Conditions", "Docking analysis", "MolDyn", "ML features management", "RF model training", "Mol Viewer")
+    ("Project selection", "ChemSpace", "Receptors", "MolDock", "ProLIF Conditions", "Docking analysis", "MolDyn", "MolDyn analysis", "ML features management", "RF model training", "Mol Viewer")
 )
 
 ## Persistent sidebar info: active project and assay
@@ -1297,6 +1297,255 @@ elif page == "MolDyn":
                                     st.rerun()
                                 except Exception as _e:
                                     st.error(f"Failed to update description: {_e}")
+
+elif page == "MolDyn analysis":
+    st.title("MolDyn analysis")
+
+    if "active_project_path" not in st.session_state:
+        st.warning("No active project. Please select a project first.")
+    else:
+        project_path = st.session_state["active_project_path"]
+        md_registers_db_path = os.path.join(project_path, "dynamics", "md_registers", "md_registers.db")
+
+        try:
+            df_all_assays = st_funcs.get_md_assay_registers(md_registers_db_path)
+        except Exception:
+            df_all_assays = None
+
+        if df_all_assays is None or df_all_assays.empty:
+            st.markdown(
+                f"<span style='font-size: 24px; color: orange;'>No MD assays registered for project: </span>"
+                f"<span style='font-size: 30px; color: green; font-weight: bold;'><b>{st.session_state.get('selected_project', 'Unknown')}</b></span>",
+                unsafe_allow_html=True
+            )
+        else:
+            df_completed = df_all_assays[df_all_assays.get('status', pd.Series(dtype=str)) == '✅ Completed']
+            if 'status' in df_all_assays.columns:
+                df_completed = df_all_assays[df_all_assays['status'] == '✅ Completed']
+            else:
+                df_completed = df_all_assays
+
+            if df_completed.empty:
+                st.info("No completed MD assays found for the active project.")
+            else:
+                _completed_names = df_completed['md_assay'].tolist()
+                _selected_md_assay = st.selectbox(
+                    "Select completed MD assay:",
+                    options=_completed_names,
+                    key="moldyn_analysis_assay_select",
+                )
+
+                if _selected_md_assay:
+                    _assay_row = df_completed[df_completed['md_assay'] == _selected_md_assay].iloc[0]
+                    _assay_folder = _assay_row.get('assay_folder_path', '')
+                    _ligand_name = _assay_row.get('ligand_name', '')
+                    _pose_id = _assay_row.get('pose_id', '')
+                    _description = _assay_row.get('description', '') or ''
+
+                    if _description:
+                        st.markdown(f"**Description:** {_description}")
+                    st.markdown(f"**Assay folder:** `{_assay_folder}`")
+                    if _ligand_name:
+                        st.markdown(f"**Ligand:** {_ligand_name} &nbsp; **Pose:** {_pose_id}", unsafe_allow_html=True)
+
+                    st.divider()
+                    st.subheader("Analysis")
+
+                    _sp, _col_btns = st.columns([1, 9])
+                    with _col_btns:
+                        with st.expander("📊 QC on trajectory", expanded=False):
+                            _prod_out = os.path.join(_assay_folder, "production.out")
+                            if not os.path.exists(_prod_out):
+                                st.error(f"production.out not found: {_prod_out}")
+                            else:
+                                import re as _re
+                                _times, _etots, _ektots, _eptots, _temps = [], [], [], [], []
+                                try:
+                                    with open(_prod_out, "r") as _fh:
+                                        _lines = _fh.readlines()
+                                    for _i, _line in enumerate(_lines):
+                                        if "A V E R A G E S" in _line and "S T E P S" in _line:
+                                            break
+                                        if "NSTEP" in _line and "TIME(PS)" in _line:
+                                            _m_time = _re.search(r"TIME\(PS\)\s*=\s*([\-\d.]+)", _line)
+                                            _m_temp = _re.search(r"TEMP\(K\)\s*=\s*([\-\d.]+)", _line)
+                                            if _m_time and _m_temp and _i + 1 < len(_lines):
+                                                _eline = _lines[_i + 1]
+                                                _m_etot = _re.search(r"Etot\s*=\s*([\-\d.]+)", _eline)
+                                                _m_ektot = _re.search(r"EKtot\s*=\s*([\-\d.]+)", _eline)
+                                                _m_ep = _re.search(r"EPtot\s*=\s*([\-\d.]+)", _eline)
+                                                if _m_etot and _m_ektot and _m_ep:
+                                                    _times.append(float(_m_time.group(1)))
+                                                    _temps.append(float(_m_temp.group(1)))
+                                                    _etots.append(float(_m_etot.group(1)))
+                                                    _ektots.append(float(_m_ektot.group(1)))
+                                                    _eptots.append(float(_m_ep.group(1)))
+                                except Exception as _e:
+                                    st.error(f"Error reading production.out: {_e}")
+
+                                if _times:
+                                    import matplotlib.pyplot as _plt
+
+                                    def _mean(v): return sum(v) / len(v)
+
+                                    _plots = [
+                                        (_eptots, "EPtot (kcal/mol)", "steelblue"),
+                                        (_etots,  "Etot (kcal/mol)",  "seagreen"),
+                                        (_ektots, "EKtot (kcal/mol)", "darkorange"),
+                                        (_temps,  "TEMP (K)",         "mediumpurple"),
+                                    ]
+                                    _fig, _axes = _plt.subplots(2, 2, figsize=(14, 8))
+                                    for _ax, (_vals, _ylabel, _color) in zip(_axes.flat, _plots):
+                                        _ax.plot(_times, _vals, linewidth=0.8, color=_color)
+                                        _ax.axhline(_mean(_vals), color="tomato", linestyle="--",
+                                                    linewidth=1, label=f"Mean: {_mean(_vals):.2f}")
+                                        _ax.set_xlabel("Time (ps)")
+                                        _ax.set_ylabel(_ylabel)
+                                        _ax.legend(fontsize=8)
+                                    _fig.suptitle(f"Trajectory QC — {_selected_md_assay}", fontsize=12)
+                                    _plt.tight_layout()
+                                    st.pyplot(_fig)
+                                    _plt.close(_fig)
+                                    st.caption(f"Frames parsed: {len(_times)}")
+                                else:
+                                    st.warning("No energy data found in production.out.")
+
+                        with st.expander("📐 Structural analysis (RMSD)", expanded=False):
+                            _prmtop = os.path.join(_assay_folder, "complex.prmtop")
+                            _traj   = os.path.join(_assay_folder, "production.nc")
+                            _inpcrd = os.path.join(_assay_folder, "complex.inpcrd")
+                            _cpptraj_bin = "/home/fredy/Programas/Amber26/ambertools26/bin/cpptraj"
+
+                            for _req, _label in [(_prmtop, "complex.prmtop"), (_traj, "production.nc"), (_inpcrd, "complex.inpcrd")]:
+                                if not os.path.exists(_req):
+                                    st.error(f"Required file not found: {_label}")
+                                    st.stop()
+
+                            _mask = st.text_input(
+                                "cpptraj atom mask for RMSD (e.g. @CA, :1-100@CA, :MOL):",
+                                value=":1-100",
+                                key="rmsd_mask_input",
+                            )
+
+                            # Check mask atom/residue count (cached by assay + mask)
+                            _mask_cache_key = f"rmsd_mask_info_{_assay_folder}_{_mask}"
+                            if _mask_cache_key not in st.session_state:
+                                import subprocess as _sp_mod2, tempfile as _tf2
+                                _check_script = (
+                                    f"parmstrip !{_mask}\n"
+                                    f"parminfo\n"
+                                    f"quit\n"
+                                )
+                                try:
+                                    with _tf2.NamedTemporaryFile(mode="w", suffix=".in", delete=False) as _tmp2:
+                                        _tmp2.write(_check_script)
+                                        _tmp2_path = _tmp2.name
+                                    _chk = _sp_mod2.run(
+                                        [_cpptraj_bin, _prmtop, "-i", _tmp2_path],
+                                        capture_output=True, text=True,
+                                    )
+                                    import os as _os2; _os2.unlink(_tmp2_path)
+                                    _out = _chk.stdout + _chk.stderr
+                                    import re as _re2
+                                    _m_atoms = _re2.search(r"Stripped parm:.*?(\d+)\s+atoms,\s*(\d+)\s+res", _out)
+                                    if _m_atoms:
+                                        st.session_state[_mask_cache_key] = (int(_m_atoms.group(1)), int(_m_atoms.group(2)))
+                                    else:
+                                        st.session_state[_mask_cache_key] = None
+                                except Exception:
+                                    st.session_state[_mask_cache_key] = None
+
+                            _mask_info = st.session_state.get(_mask_cache_key)
+                            if _mask_info:
+                                st.caption(f"Mask matches **{_mask_info[0]} atoms** across **{_mask_info[1]} residues**")
+                            elif _mask_info is None and _mask:
+                                st.warning("Mask matched no atoms — check the syntax.")
+
+                            def _toggle_rmsd_visibility():
+                                st.session_state["rmsd_plot_visible"] = not st.session_state.get("rmsd_plot_visible", True)
+
+                            _rmsd_btn_col, _rmsd_hide_col = st.columns([2, 2])
+                            with _rmsd_btn_col:
+                                _run_rmsd = st.button("▶️ Run RMSD", key="btn_run_rmsd")
+                            with _rmsd_hide_col:
+                                _rmsd_visible = st.session_state.get("rmsd_plot_visible", True)
+                                _toggle_label = "🙈 Hide RMSD plot" if _rmsd_visible else "👁 Show RMSD plot"
+                                st.button(_toggle_label, key="btn_toggle_rmsd", on_click=_toggle_rmsd_visibility)
+
+                            if _run_rmsd:
+                                import subprocess as _sp_mod
+                                import tempfile as _tf
+
+                                _rmsd_out = os.path.join(_assay_folder, "rmsd_analysis.dat")
+                                _cpptraj_in = (
+                                    f"parm {_prmtop}\n"
+                                    f"trajin {_traj}\n"
+                                    f"reference {_inpcrd} parm {_prmtop}\n"
+                                    f"rms reference {_mask} out {_rmsd_out} mass\n"
+                                    f"run\n"
+                                    f"quit\n"
+                                )
+                                with _tf.NamedTemporaryFile(mode="w", suffix=".in", delete=False) as _tmp:
+                                    _tmp.write(_cpptraj_in)
+                                    _tmp_path = _tmp.name
+
+                                try:
+                                    _result = _sp_mod.run(
+                                        [_cpptraj_bin, "-i", _tmp_path],
+                                        capture_output=True, text=True,
+                                    )
+                                    if _result.returncode != 0:
+                                        st.error(f"cpptraj error:\n{_result.stderr}")
+                                        st.session_state.pop("rmsd_plot_data", None)
+                                    else:
+                                        _frames, _rmsds = [], []
+                                        with open(_rmsd_out) as _fh:
+                                            for _line in _fh:
+                                                _line = _line.strip()
+                                                if _line.startswith("#") or not _line:
+                                                    continue
+                                                _parts = _line.split()
+                                                if len(_parts) >= 2:
+                                                    _frames.append(float(_parts[0]))
+                                                    _rmsds.append(float(_parts[1]))
+                                        st.session_state["rmsd_plot_data"] = {
+                                            "frames": _frames, "rmsds": _rmsds,
+                                            "mask": _mask, "assay": _selected_md_assay,
+                                        }
+                                        st.session_state["rmsd_plot_visible"] = True
+                                except Exception as _e:
+                                    st.error(f"Failed to run cpptraj: {_e}")
+                                    st.session_state.pop("rmsd_plot_data", None)
+                                finally:
+                                    import os as _os
+                                    _os.unlink(_tmp_path)
+
+                            _rmsd_data = st.session_state.get("rmsd_plot_data")
+                            if _rmsd_data and _rmsd_data.get("assay") == _selected_md_assay and st.session_state.get("rmsd_plot_visible", True):
+                                import matplotlib.pyplot as _plt
+                                _frames = _rmsd_data["frames"]
+                                _rmsds  = _rmsd_data["rmsds"]
+                                if _frames:
+                                    _mean_rmsd = sum(_rmsds) / len(_rmsds)
+                                    _fig, _ax = _plt.subplots(figsize=(10, 4))
+                                    _ax.plot(_frames, _rmsds, linewidth=0.8, color="steelblue")
+                                    _ax.axhline(_mean_rmsd, color="tomato", linestyle="--",
+                                                linewidth=1, label=f"Mean: {_mean_rmsd:.3f} Å")
+                                    _ax.set_xlabel("Frame")
+                                    _ax.set_ylabel("RMSD (Å)")
+                                    _ax.set_title(
+                                        f"RMSD — {_selected_md_assay}  |  mask: {_rmsd_data['mask']}"
+                                    )
+                                    _ax.legend(fontsize=9)
+                                    _plt.tight_layout()
+                                    st.pyplot(_fig)
+                                    _plt.close(_fig)
+                                    st.caption(
+                                        f"Frames: {len(_frames)}  |  "
+                                        f"Min: {min(_rmsds):.3f}  |  "
+                                        f"Max: {max(_rmsds):.3f}  |  "
+                                        f"Mean: {_mean_rmsd:.3f} Å"
+                                    )
 
 elif page == "ProLIF Conditions":
     st.title("ProLIF Conditions")
