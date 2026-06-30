@@ -127,6 +127,27 @@ def get_md_assay_status(assay_folder_path):
     return "🔄 Running"
 
 
+def get_md_mmgbsa_status(folder, mmgbsa_results_json):
+    """
+    Return an emoji string indicating MM-GBSA computation status for an MD assay.
+
+    Priority:
+      - DB column populated → completed (parsed and stored)
+      - mmgbsa_results.dat exists → background run finished, pending parse
+      - mmgbsa/ folder exists → running in background
+      - otherwise → not computed
+    """
+    if mmgbsa_results_json is not None and str(mmgbsa_results_json).strip():
+        return '✅ Completed'
+    if folder and os.path.isdir(folder):
+        mmgbsa_folder = os.path.join(folder, 'mmgbsa')
+        if os.path.isdir(mmgbsa_folder):
+            if os.path.exists(os.path.join(mmgbsa_folder, 'mmgbsa_results.dat')):
+                return '✅ Completed'
+            return '🔄 Running'
+    return '⬜ Not computed'
+
+
 def get_md_assay_registers(db_path):
     """
     Retrieve all entries from the 'md_assays' table in md_registers.db.
@@ -142,16 +163,31 @@ def get_md_assay_registers(db_path):
                'receptor_template_name', 'md_parameters']
     try:
         conn = sqlite3.connect(db_path)
-        query = f"SELECT {', '.join(columns)} FROM md_assays"
+        # mmgbsa_results column is added lazily by _store_mmgbsa_results(); handle absence gracefully
+        existing_cols = [r[1] for r in conn.execute("PRAGMA table_info(md_assays)").fetchall()]
+        fetch_cols = columns + (['mmgbsa_results'] if 'mmgbsa_results' in existing_cols else [])
+        query = f"SELECT {', '.join(fetch_cols)} FROM md_assays"
         df = pd.read_sql_query(query, conn)
         conn.close()
     except Exception:
         return None
 
+    if 'mmgbsa_results' not in df.columns:
+        df['mmgbsa_results'] = None
+
     try:
         df['status'] = df['assay_folder_path'].apply(get_md_assay_status)
     except Exception:
         df['status'] = '⬜ Not started'
+
+    try:
+        df['mmgbsa'] = df.apply(
+            lambda r: get_md_mmgbsa_status(r['assay_folder_path'], r['mmgbsa_results']),
+            axis=1,
+        )
+    except Exception:
+        df['mmgbsa'] = '⬜ Not computed'
+
     return df
 
 def get_docking_assay_registers(db_path):

@@ -1227,6 +1227,22 @@ elif page == "MolDyn":
                     return '🔄 Running'
                 df_md_assays['status'] = df_md_assays['assay_folder_path'].apply(_md_status)
 
+            # Add mmgbsa column if not already present (inline fallback, no st_funcs dependency)
+            if 'mmgbsa' not in df_md_assays.columns:
+                def _mmgbsa_status(row):
+                    mmgbsa_json = row.get('mmgbsa_results')
+                    folder = row.get('assay_folder_path')
+                    if mmgbsa_json is not None and str(mmgbsa_json).strip():
+                        return '✅ Completed'
+                    if folder and os.path.isdir(str(folder)):
+                        mmgbsa_dir = os.path.join(folder, 'mmgbsa')
+                        if os.path.isdir(mmgbsa_dir):
+                            if os.path.exists(os.path.join(mmgbsa_dir, 'mmgbsa_results.dat')):
+                                return '✅ Completed'
+                            return '🔄 Running'
+                    return '⬜ Not computed'
+                df_md_assays['mmgbsa'] = df_md_assays.apply(_mmgbsa_status, axis=1)
+
             if "show_md_assays" not in st.session_state:
                 st.session_state["show_md_assays"] = False
 
@@ -1234,7 +1250,7 @@ elif page == "MolDyn":
                 st.session_state["show_md_assays"] = not st.session_state["show_md_assays"]
 
             if st.session_state["show_md_assays"]:
-                _display_cols = ['assay_id', 'md_assay', 'description', 'status',
+                _display_cols = ['assay_id', 'md_assay', 'description', 'status', 'mmgbsa',
                                  'receptor_template_name', 'docking_assay_id',
                                  'ligand_name', 'pose_id', 'assay_folder_path']
                 _display_cols = [c for c in _display_cols if c in df_md_assays.columns]
@@ -1244,6 +1260,7 @@ elif page == "MolDyn":
                     hide_index=True,
                     column_config={
                         "status": st.column_config.TextColumn("Status", width="small"),
+                        "mmgbsa": st.column_config.TextColumn("MMGBSA", width="small"),
                         "receptor_template_name": st.column_config.TextColumn("PDB Template"),
                     },
                 )
