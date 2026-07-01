@@ -4,7 +4,7 @@ import sqlite3
 import pandas as pd
 import re
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Tuple, Optional, Any, Callable
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import cpu_count
@@ -645,26 +645,39 @@ class ChemSpace:
             print(f"❌ Error creating table '{table_name}': {e}")
             return False
 
-    def get_all_tables(self) -> List[str]:
+    @staticmethod
+    def list_tables(chemspace_db_path: str) -> List[str]:
         """
-        Get list of all compound tables in the database.
-        
+        Get list of all tables in a chemspace database.
+
+        Args:
+            chemspace_db_path (str): Path to the chemspace.db file
+
         Returns:
             List[str]: List of table names
         """
         try:
-            conn = sqlite3.connect(self.__chemspace_db)
+            conn = sqlite3.connect(chemspace_db_path)
             cursor = conn.cursor()
-            
+
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
             tables = [row[0] for row in cursor.fetchall()]
-            
+
             conn.close()
             return tables
-            
+
         except Exception as e:
             print(f"❌ Error retrieving table list: {e}")
             return []
+
+    def get_all_tables(self) -> List[str]:
+        """
+        Get list of all compound tables in the database.
+
+        Returns:
+            List[str]: List of table names
+        """
+        return self.list_tables(self.__chemspace_db)
     
     def rename_table(self, old_name: str, new_name: str) -> bool:
         """
@@ -729,28 +742,95 @@ class ChemSpace:
             print(f"❌ Error renaming table '{old_name}' to '{new_name}': {e}")
             return False
     
+    @staticmethod
+    def _detect_delimiter_mismatch(csv_file_path: str, df: pd.DataFrame) -> Optional[str]:
+        """
+        Heuristic check for the "everything landed in one column" failure mode: a file
+        that is actually delimited by something other than a comma (pipe, tab, semicolon)
+        gets read by `pd.read_csv` as a single column, silently using the first data row
+        as the header and dropping it from the data.
+
+        Args:
+            csv_file_path (str): Path to the CSV file that was read
+            df (pd.DataFrame): The DataFrame produced by `pd.read_csv(csv_file_path)`
+
+        Returns:
+            Optional[str]: A warning message describing the likely delimiter if a mismatch
+                is detected, otherwise None.
+        """
+        if len(df.columns) != 1:
+            return None
+
+        try:
+            with open(csv_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                first_line = f.readline()
+        except Exception:
+            return None
+
+        candidates = {'|': 'pipe', '\t': 'tab', ';': 'semicolon'}
+        found = [name for char, name in candidates.items() if char in first_line]
+        if not found:
+            return None
+
+        return (f"The file parsed as a single column ('{df.columns[0][:60]}'), but its first "
+                f"line contains {', '.join(found)} character(s). This usually means the file "
+                f"is not comma-delimited and pandas silently used the first data row as the "
+                f"header, dropping that row. Re-check the delimiter before loading.")
+
+    @staticmethod
+    def _validate_smiles_column_sample(df: pd.DataFrame, smiles_column: str,
+                                        sample_size: int = 200,
+                                        min_valid_fraction: float = 0.5) -> Tuple[bool, float]:
+        """
+        Sanity-check that a resolved "SMILES" column actually contains parseable SMILES,
+        catching cases where a delimiter/header mismatch produced a column that merely
+        happens to carry the expected name while containing garbage (e.g. several
+        pipe-joined fields glued together).
+
+        Args:
+            df (pd.DataFrame): DataFrame to check
+            smiles_column (str): Column name expected to contain SMILES strings
+            sample_size (int): Maximum number of non-null values to sample
+            min_valid_fraction (float): Minimum fraction of the sample that must parse
+                successfully with RDKit for the column to be considered valid
+
+        Returns:
+            Tuple[bool, float]: (is_valid, valid_fraction)
+        """
+        from rdkit import Chem, RDLogger
+        RDLogger.DisableLog('rdApp.*')
+
+        sample = df[smiles_column].dropna().astype(str)
+        if sample.empty:
+            return False, 0.0
+        sample = sample.sample(n=min(sample_size, len(sample)), random_state=0)
+
+        valid_count = sum(1 for smi in sample if Chem.MolFromSmiles(smi) is not None)
+        valid_fraction = valid_count / len(sample)
+        return valid_fraction >= min_valid_fraction, valid_fraction
+
     def load_csv_file_as_table(self, csv_file_path: str = None):
-        
-        # Will query the user for the .csv file path if not provided, and load it as a table in the chemspace database, with the table name being queried to the the user. No default is possible. Will check if the table name already exists and ask the user if they want to replace it or not. If not, the process is cancelled.        
-        
+
+        # Will query the user for the .csv file path if not provided, and load it as a table in the chemspace database, with the table name being queried to the the user. No default is possible. Will check if the table name already exists and ask the user if they want to replace it or not. If not, the process is cancelled.
+
         # Prompt for CSV file path if not provided
         if not csv_file_path:
             csv_file_path = input("Enter the path to the CSV file: ").strip()
             while not csv_file_path:
                 print("❌ CSV file path cannot be empty.")
                 csv_file_path = input("Enter the path to the CSV file: ").strip()
-        
+
         # Validate file exists
         if not os.path.exists(csv_file_path):
             print(f"❌ CSV file not found: {csv_file_path}")
             return False
-        
+
         # Prompt for table name
         table_name = input("Enter the desired table name: ").strip()
         while not table_name:
             print("❌ Table name cannot be empty.")
             table_name = input("Enter the desired table name: ").strip()
-        
+
         # Check if table already exists
         existing_tables = self.get_all_tables()
         if table_name in existing_tables:
@@ -758,14 +838,24 @@ class ChemSpace:
             if response not in ['y', 'yes']:
                 print("❌ Process cancelled.")
                 return False
-        
+
         # Load the csv as a dataframe using the first row as header
         try:
             df = pd.read_csv(csv_file_path)
         except Exception as e:
             print(f"❌ Error reading CSV file: {e}")
             return False
-        
+
+        # Safety check: catch the "wrong delimiter collapsed everything into one column,
+        # and the first data row got silently used as the header" failure mode.
+        delimiter_warning = self._detect_delimiter_mismatch(csv_file_path, df)
+        if delimiter_warning:
+            print(f"⚠️  {delimiter_warning}")
+            proceed = input("Load it anyway as a single column? (y/N): ").strip().lower()
+            if proceed not in ['y', 'yes']:
+                print("❌ Process cancelled. Re-run with the correct delimiter.")
+                return False
+
         # Load the dataframe into the database table
         try:
             conn = sqlite3.connect(self.__chemspace_db)
@@ -888,7 +978,19 @@ class ChemSpace:
             
             # Read the .csv file to be inputed
             df = pd.read_csv(csv_file_path)
-            
+
+            # Safety check: catch the "wrong delimiter collapsed everything into one
+            # column, and the first data row got silently used as the header" failure mode.
+            delimiter_warning = self._detect_delimiter_mismatch(csv_file_path, df)
+            if delimiter_warning:
+                return {
+                    'success': False,
+                    'message': f"Possible delimiter mismatch: {delimiter_warning}",
+                    'compounds_added': 0,
+                    'duplicates_skipped': 0,
+                    'errors': 1
+                }
+
             # Parse the df to check columns and information
             df = self._parse_df_from_csv_file(df, smiles_column, name_column, flag_column)
 
@@ -901,7 +1003,21 @@ class ChemSpace:
                     'duplicates_skipped': 0,
                     'errors': 1
                 }
-            
+
+            # Safety check: the resolved SMILES column must actually contain parseable
+            # SMILES, not garbage produced by a delimiter/column mismatch.
+            smiles_valid, smiles_valid_fraction = self._validate_smiles_column_sample(df, smiles_column)
+            if not smiles_valid:
+                return {
+                    'success': False,
+                    'message': (f"Column '{smiles_column}' does not look like it contains valid SMILES "
+                                f"(only {smiles_valid_fraction:.0%} of a sample parsed with RDKit). "
+                                f"Check the file's delimiter and column mapping before loading."),
+                    'compounds_added': 0,
+                    'duplicates_skipped': 0,
+                    'errors': 1
+                }
+
             # Check if optional columns exist and warn if they don't
             name_available = name_column and name_column in df.columns
             flag_available = flag_column and flag_column in df.columns
@@ -3009,16 +3125,17 @@ class ChemSpace:
         
         return chunks
 
-    def filter_using_workflow(self, table_name: Optional[str] = None, workflow_name: Optional[str] = None, 
-                    save_results: Optional[bool] = None, 
+    def filter_using_workflow(self, table_name: Optional[str] = None, workflow_name: Optional[str] = None,
+                    save_results: Optional[bool] = None,
                     result_table_name: Optional[str] = None,
                     parallel_threshold: int = 10000,
                     max_workers: Optional[int] = None,
-                    chunk_size: Optional[int] = None) -> pd.DataFrame:
+                    chunk_size: Optional[int] = None,
+                    progress_callback: Optional[Callable[[int, int], None]] = None) -> pd.DataFrame:
         """
         Apply a chemical filtering workflow to compounds in a table with parallel processing support.
         Shows available tables and workflows for interactive selection if not provided. The filtering will match compounds complying with ALL the filter provided
-        
+
         Args:
             table_name (Optional[str]): Name of the table containing compounds to filter. If None, shows selection.
             workflow_name (Optional[str]): Name of the workflow to apply. If None, shows selection.
@@ -3027,7 +3144,11 @@ class ChemSpace:
             parallel_threshold (int): Minimum number of compounds to trigger parallel processing
             max_workers (Optional[int]): Maximum number of worker processes (default: min(cpu_count(), 8))
             chunk_size (Optional[int]): Size of chunks for parallel processing (auto-calculated if None)
-            
+            progress_callback (Optional[Callable[[int, int], None]]): Optional callback invoked as
+                progress_callback(done, total) while filtering is in progress, e.g. to drive a GUI
+                progress bar. `done`/`total` are compounds for sequential processing or chunks for
+                parallel processing.
+
         Returns:
             pd.DataFrame: DataFrame containing filtered compounds with match information
         """
@@ -3094,11 +3215,14 @@ class ChemSpace:
                 print(f"      📦 Chunk size: {chunk_size:,}")
             
                 filtered_df = self._apply_filters_parallel(
-                    compounds_df, workflow_filters, max_workers, chunk_size
+                    compounds_df, workflow_filters, max_workers, chunk_size,
+                    progress_callback=progress_callback
                 )
             else:
                 print(f"   🔄 Using sequential processing")
-                filtered_df = self._apply_filters_sequential(compounds_df, workflow_filters)
+                filtered_df = self._apply_filters_sequential(
+                    compounds_df, workflow_filters, progress_callback=progress_callback
+                )
             
             if filtered_df.empty:
                 print("❌ No compounds passed the filtering workflow")
@@ -3606,30 +3730,32 @@ class ChemSpace:
             print(f"❌ Error loading workflow filters for '{workflow_name}': {e}")
             return []
 
-    def _apply_filters_parallel(self, compounds_df: pd.DataFrame, 
-                                    workflow_filters: List[Tuple[str, str]], 
-                                    max_workers: int, chunk_size: int) -> pd.DataFrame:
+    def _apply_filters_parallel(self, compounds_df: pd.DataFrame,
+                                    workflow_filters: List[Tuple[str, str]],
+                                    max_workers: int, chunk_size: int,
+                                    progress_callback: Optional[Callable[[int, int], None]] = None) -> pd.DataFrame:
         """
         Ultra-memory-efficient version that streams results to temporary files with progress tracking.
         """
         import tempfile
         import os
-        
+        import csv
+
         # Import tqdm locally to avoid multiprocessing issues
         try:
             from tqdm import tqdm
             tqdm_available = True
         except ImportError:
             tqdm_available = False
-        
+
         try:
             # Create temporary file for results
             temp_dir = tempfile.mkdtemp(prefix='chemspace_filter_')
             temp_file = os.path.join(temp_dir, 'filtered_results.csv')
-            
-            # Write header
-            with open(temp_file, 'w') as f:
-                f.write('id,smiles,name,flag,inchi_key\n')
+
+            # Write header (proper CSV quoting: compound names commonly contain commas)
+            with open(temp_file, 'w', newline='') as f:
+                csv.writer(f).writerow(['id', 'smiles', 'name', 'flag', 'inchi_key'])
             
             # Process in batches and append to file
             compound_data = [(row.get('id', 0), row['smiles'], row.get('name', 'unknown'),
@@ -3665,19 +3791,22 @@ class ChemSpace:
                     progress_bar = None
                     print(f"   🔄 Started processing {len(chunks)} chunks...")
                 
-                with open(temp_file, 'a') as f:
+                with open(temp_file, 'a', newline='') as f:
+                    csv_writer = csv.writer(f)
                     while future_to_chunk:
                         for future in as_completed(list(future_to_chunk.keys())):
                             chunk_idx = future_to_chunk.pop(future)
-                            
+
                             try:
                                 chunk_results = future.result()
-                                
+
                                 # Write results immediately to disk
                                 chunk_passed = 0
                                 for result in chunk_results:
-                                    f.write(f"{result['id']},{result['smiles']},{result['name']},"
-                                        f"{result['flag']},{result.get('inchi_key', '')}\n")
+                                    csv_writer.writerow([
+                                        result['id'], result['smiles'], result['name'],
+                                        result['flag'], result.get('inchi_key', '')
+                                    ])
                                     chunk_passed += 1
                                 
                                 total_passed += chunk_passed
@@ -3703,13 +3832,18 @@ class ChemSpace:
                                         _filter_chunk_worker_by_instances, next_chunk, workflow_filters
                                     )
                                     future_to_chunk[new_future] = len(chunks) - len(remaining_chunks) - 1
-                                    
+
+                                if progress_callback:
+                                    progress_callback(processed_chunks, len(chunks))
+
                             except Exception as e:
                                 processed_chunks += 1
                                 if progress_bar:
                                     progress_bar.update(1)
                                 print(f"   ❌ Chunk {chunk_idx} error: {e}")
-                
+                                if progress_callback:
+                                    progress_callback(processed_chunks, len(chunks))
+
                 if progress_bar:
                     progress_bar.close()
             
@@ -3719,8 +3853,7 @@ class ChemSpace:
                 if tqdm_available:
                     # Use tqdm for reading large files with local import
                     from tqdm import tqdm
-                    import pandas as pd
-                    
+
                     # Get file size for progress bar
                     file_size = os.path.getsize(temp_file)
                     
@@ -3745,8 +3878,9 @@ class ChemSpace:
             print(f"❌ Error in streaming parallel filtering: {e}")
             return pd.DataFrame()
    
-    def _apply_filters_sequential(self, compounds_df: pd.DataFrame, 
-                                workflow_filters: List[Tuple[str, str]]) -> pd.DataFrame:
+    def _apply_filters_sequential(self, compounds_df: pd.DataFrame,
+                                workflow_filters: List[Tuple[str, str]],
+                                progress_callback: Optional[Callable[[int, int], None]] = None) -> pd.DataFrame:
         """
         Apply SMARTS filters using sequential processing with enhanced progress tracking.
         """
@@ -3766,7 +3900,8 @@ class ChemSpace:
             total_compounds = len(compounds_df)
             processed_count = 0
             compounds_passed = 0
-            
+            callback_interval = max(1, total_compounds // 100)
+
             print(f"   🔄 Processing {total_compounds:,} compounds sequentially...")
             
             # Initialize progress tracking with enhanced information
@@ -3793,25 +3928,26 @@ class ChemSpace:
                     if mol is None:
                         continue
                     
-                    # Apply each filter
-                    for filter_name, smarts_pattern in workflow_filters:
+                    # Apply each filter: compound must match each SMARTS exactly
+                    # `required_instances` times (same semantics as the parallel path).
+                    for filter_idx, (smarts_pattern, required_instances) in enumerate(workflow_filters):
                         try:
                             pattern = Chem.MolFromSmarts(smarts_pattern)
                             if pattern is None:
-                                match_counts[f"{filter_name}_matches"] = 0
-                                continue
-                            
-                            matches = mol.GetSubstructMatches(pattern)
-                            match_count = len(matches)
-                            match_counts[f"{filter_name}_matches"] = match_count
-                            
-                            # If any filter has matches, compound fails (exclusion filters)
-                            if match_count > 0:
                                 passes_all_filters = False
                                 break
-                        
+
+                            matches = mol.GetSubstructMatches(pattern)
+                            match_count = len(matches)
+                            match_counts[f"filter_{filter_idx}_matches"] = match_count
+
+                            if match_count != required_instances:
+                                passes_all_filters = False
+                                break
+
                         except Exception:
-                            match_counts[f"{filter_name}_matches"] = 0
+                            passes_all_filters = False
+                            break
                     
                     if passes_all_filters:
                         compound_data = {
@@ -3829,14 +3965,17 @@ class ChemSpace:
                 
                 # Update progress display
                 if tqdm_available:
-                    progress_bar.set_postfix(str(compounds_passed))
+                    progress_bar.set_postfix(passed=compounds_passed)
                 else:
                     if processed_count % print_interval == 0 or processed_count == total_compounds:
                         progress_pct = (processed_count / total_compounds) * 100
                         retention_rate = (compounds_passed / processed_count) * 100 if processed_count > 0 else 0
                         print(f"      📊 Progress: {progress_pct:.1f}% ({processed_count:,}/{total_compounds:,}) | "
                             f"Passed: {compounds_passed:,} ({retention_rate:.1f}%)")
-            
+
+                if progress_callback and (processed_count % callback_interval == 0 or processed_count == total_compounds):
+                    progress_callback(processed_count, total_compounds)
+
             if tqdm_available and hasattr(progress_bar, 'close'):
                 progress_bar.close()
             
@@ -5956,7 +6095,8 @@ class ChemSpace:
             print(f"❌ Error retrieving filter ID {filter_id}: {e}")
             return None
     
-    def _validate_smarts_pattern(self, smarts_pattern: str) -> bool:
+    @staticmethod
+    def _validate_smarts_pattern(smarts_pattern: str) -> bool:
         """
         Validate a SMARTS pattern using RDKit.
         
@@ -6054,29 +6194,36 @@ class ChemSpace:
         print(f"   • Moderate patterns: {moderate_patterns}")
         print(f"   • Complex patterns: {complex_patterns}")
     
-    def _save_filtering_workflow(self, workflow_filters: Dict[str, int]) -> None:
+    @staticmethod
+    def save_filtering_workflow(chemspace_db_path: str, workflow_name: str,
+                                 workflow_filters: Dict[str, int],
+                                 description: Optional[str] = None,
+                                 overwrite: bool = False) -> Dict[str, Any]:
         """
-        Save a filtering workflow to the chemspace database.
-        
+        Persist a filtering workflow to a chemspace database.
+
         Args:
+            chemspace_db_path (str): Path to the project's chemspace.db
+            workflow_name (str): Desired workflow name
             workflow_filters (Dict[str, int]): Dictionary mapping filter names to required instances
+            description (Optional[str]): Optional description; a default is generated if omitted
+            overwrite (bool): If a workflow with the same name exists, overwrite it when True;
+                otherwise a unique suffixed name is generated automatically.
+
+        Returns:
+            Dict[str, Any]: On success: {'success': True, 'workflow_name', 'filter_count',
+                'total_instances', 'creation_date', 'description'}. On failure:
+                {'success': False, 'message'}.
         """
+        if not workflow_filters:
+            return {'success': False, 'message': 'No workflow filters to save'}
+
         try:
-            if not workflow_filters:
-                print("⚠️  No workflow filters to save")
-                return
-            
-            # Get workflow name from user
-            workflow_name = input("📝 Enter a name for this filtering workflow: ").strip()
-            if not workflow_name:
-                workflow_name = f"filtering_workflow_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-                print(f"📋 Using default name: {workflow_name}")
-            
-            conn = sqlite3.connect(self.__chemspace_db)
+            conn = sqlite3.connect(chemspace_db_path)
             cursor = conn.cursor()
-            
+
             # Create filtering_workflows table if it doesn't exist
-            create_table_query = """
+            cursor.execute("""
             CREATE TABLE IF NOT EXISTS filtering_workflows (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 workflow_name TEXT NOT NULL UNIQUE,
@@ -6086,32 +6233,25 @@ class ChemSpace:
                 filter_count INTEGER DEFAULT 0,
                 total_instances INTEGER DEFAULT 0
             )
-            """
-            
-            cursor.execute(create_table_query)
-            
+            """)
+
             # Create indexes for faster searches
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_filtering_workflows_name ON filtering_workflows(workflow_name)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_filtering_workflows_date ON filtering_workflows(creation_date)")
-            
-            # Get current timestamp
-            creation_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            
-            # Get optional description from user
-            description = input("📄 Enter a description for this filtering workflow (optional): ").strip()
+
+            filter_count = len(workflow_filters)
+            total_instances = sum(workflow_filters.values())
+
             if not description:
-                filter_count = len(workflow_filters)
-                total_instances = sum(workflow_filters.values())
                 description = f"Filtering workflow with {filter_count} filters and {total_instances} total instances"
-            
+
+            workflow_name = workflow_name.strip() or f"filtering_workflow_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
             # Check if workflow name already exists
             cursor.execute("SELECT COUNT(*) FROM filtering_workflows WHERE workflow_name = ?", (workflow_name,))
             if cursor.fetchone()[0] > 0:
-                overwrite = input(f"⚠️  Filtering workflow '{workflow_name}' already exists. Overwrite? (y/n): ").strip().lower()
-                if overwrite in ['y', 'yes']:
-                    # Delete existing workflow
+                if overwrite:
                     cursor.execute("DELETE FROM filtering_workflows WHERE workflow_name = ?", (workflow_name,))
-                    print(f"🔄 Overwriting existing filtering workflow '{workflow_name}'")
                 else:
                     # Generate unique name
                     counter = 1
@@ -6123,108 +6263,170 @@ class ChemSpace:
                             workflow_name = new_name
                             break
                         counter += 1
-                    print(f"📝 Using name: {workflow_name}")
-            
-            # Calculate statistics
-            filter_count = len(workflow_filters)
-            total_instances = sum(workflow_filters.values())
-            
-            # Convert workflow to JSON string for storage
+
+            creation_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             filters_json = json.dumps(workflow_filters, sort_keys=True)
-            
-            # Insert workflow
-            insert_query = """
-            INSERT INTO filtering_workflows 
+
+            cursor.execute("""
+            INSERT INTO filtering_workflows
             (workflow_name, filters_dict, creation_date, description, filter_count, total_instances)
             VALUES (?, ?, ?, ?, ?, ?)
-            """
-            
-            cursor.execute(insert_query, (
-                workflow_name, 
-                filters_json, 
-                creation_date, 
-                description,
-                filter_count,
-                total_instances
-            ))
-            
+            """, (workflow_name, filters_json, creation_date, description, filter_count, total_instances))
+
             conn.commit()
             conn.close()
-            
-            print(f"✅ Successfully saved filtering workflow!")
-            print(f"   📋 Workflow name: '{workflow_name}'")
-            print(f"   🔍 Filters saved: {filter_count}")
-            print(f"   🔢 Total instances: {total_instances}")
-            print(f"   📅 Created: {creation_date}")
-            print(f"   📄 Description: {description}")
-            
-        except sqlite3.IntegrityError as e:
-            print(f"❌ Database integrity error saving filtering workflow: {e}")
+
+            return {
+                'success': True,
+                'workflow_name': workflow_name,
+                'filter_count': filter_count,
+                'total_instances': total_instances,
+                'creation_date': creation_date,
+                'description': description,
+            }
+
         except Exception as e:
-            print(f"❌ Error saving filtering workflow: {e}")
-    
+            return {'success': False, 'message': f"Error saving filtering workflow: {e}"}
+
+    def _save_filtering_workflow(self, workflow_filters: Dict[str, int]) -> None:
+        """
+        Save a filtering workflow to the chemspace database, prompting the user for
+        the workflow name, description, and an overwrite decision if needed.
+
+        Args:
+            workflow_filters (Dict[str, int]): Dictionary mapping filter names to required instances
+        """
+        if not workflow_filters:
+            print("⚠️  No workflow filters to save")
+            return
+
+        # Get workflow name from user
+        workflow_name = input("📝 Enter a name for this filtering workflow: ").strip()
+        if not workflow_name:
+            workflow_name = f"filtering_workflow_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            print(f"📋 Using default name: {workflow_name}")
+
+        # Get optional description from user
+        description = input("📄 Enter a description for this filtering workflow (optional): ").strip()
+
+        overwrite = False
+        conn = sqlite3.connect(self.__chemspace_db)
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='filtering_workflows'")
+        if cursor.fetchone():
+            cursor.execute("SELECT COUNT(*) FROM filtering_workflows WHERE workflow_name = ?", (workflow_name,))
+            if cursor.fetchone()[0] > 0:
+                answer = input(f"⚠️  Filtering workflow '{workflow_name}' already exists. Overwrite? (y/n): ").strip().lower()
+                overwrite = answer in ['y', 'yes']
+        conn.close()
+
+        result = self.save_filtering_workflow(self.__chemspace_db, workflow_name, workflow_filters,
+                                               description or None, overwrite)
+
+        if result['success']:
+            print(f"✅ Successfully saved filtering workflow!")
+            print(f"   📋 Workflow name: '{result['workflow_name']}'")
+            print(f"   🔍 Filters saved: {result['filter_count']}")
+            print(f"   🔢 Total instances: {result['total_instances']}")
+            print(f"   📅 Created: {result['creation_date']}")
+            print(f"   📄 Description: {result['description']}")
+        else:
+            print(f"❌ {result['message']}")
+
+    @staticmethod
+    def get_filtering_workflows(chemspace_db_path: str) -> List[Dict[str, Any]]:
+        """
+        Retrieve all saved filtering workflows from a chemspace database.
+
+        Args:
+            chemspace_db_path (str): Path to the project's chemspace.db
+
+        Returns:
+            List[Dict[str, Any]]: One dict per workflow (workflow_name, creation_date,
+                description, filters_dict, filter_count, total_instances), ordered by
+                creation_date descending. Empty list if none found or on error.
+        """
+        try:
+            if not os.path.exists(chemspace_db_path):
+                return []
+
+            conn = sqlite3.connect(chemspace_db_path)
+            cursor = conn.cursor()
+
+            # Check if filtering_workflows table exists
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='filtering_workflows'")
+            if not cursor.fetchone():
+                conn.close()
+                return []
+
+            # Get all workflows with summary information
+            cursor.execute("""
+            SELECT workflow_name, creation_date, description, filters_dict, filter_count, total_instances
+            FROM filtering_workflows
+            ORDER BY creation_date DESC
+            """)
+
+            rows = cursor.fetchall()
+            conn.close()
+
+            workflows = []
+            for name, date, desc, filters_dict_str, filter_count, total_instances in rows:
+                try:
+                    filters_dict = json.loads(filters_dict_str)
+                    actual_filter_count = len(filters_dict) if filters_dict else filter_count
+                except json.JSONDecodeError:
+                    filters_dict = {}
+                    actual_filter_count = filter_count or 0
+
+                workflows.append({
+                    'workflow_name': name,
+                    'creation_date': date,
+                    'description': desc,
+                    'filters_dict': filters_dict,
+                    'filter_count': actual_filter_count,
+                    'total_instances': total_instances or 0,
+                })
+
+            return workflows
+
+        except Exception as e:
+            print(f"❌ Error listing filtering workflows: {e}")
+            return []
+
     def list_filtering_workflows(self) -> None:
         """
         Display all saved filtering workflows in a formatted table.
         """
-        try:
-            conn = sqlite3.connect(self.__chemspace_db)
-            cursor = conn.cursor()
-            
-            # Check if filtering_workflows table exists
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='filtering_workflows'")
-            if not cursor.fetchone():
-                print("📝 No filtering workflows table found")
-                conn.close()
-                return
-            
-            # Get all workflows with summary information
-            cursor.execute("""
-            SELECT workflow_name, creation_date, description, filters_dict, filter_count, total_instances
-            FROM filtering_workflows 
-            ORDER BY creation_date DESC
-            """)
-            
-            workflows = cursor.fetchall()
-            conn.close()
-            
-            if not workflows:
-                print("📝 No saved filtering workflows found")
-                return
-            
-            print("\n" + "="*100)
-            print(f"SAVED FILTERING WORKFLOWS - Project: {self.name}")
-            print("="*100)
-            
-            for i, (name, date, desc, filters_dict_str, filter_count, total_instances) in enumerate(workflows, 1):
-                try:
-                    filters_dict = json.loads(filters_dict_str)
-                    actual_filter_count = len(filters_dict) if filters_dict else filter_count
-                    
-                    # Get filter names for summary
-                    filter_names = list(filters_dict.keys()) if filters_dict else []
-                    filters_summary = ', '.join(filter_names[:3])
-                    if len(filter_names) > 3:
-                        filters_summary += f" and {len(filter_names) - 3} more..."
-                    elif not filters_summary:
-                        filters_summary = "No filters available"
-                    
-                except json.JSONDecodeError:
-                    actual_filter_count = filter_count or 0
-                    filters_summary = "Error parsing filters"
-                
-                print(f"\n🔍 Workflow {i}: '{name}'")
-                print(f"   📅 Created: {date}")
-                print(f"   🔬 Filters: {actual_filter_count}")
-                print(f"   🔢 Total instances: {total_instances or 0}")
-                print(f"   📄 Description: {desc}")
-                print(f"   🔍 Filters: {filters_summary}")
-                print(f"   🔍 Filters dictionary: {filters_dict}")
-            
-            print("="*100)
-            
-        except Exception as e:
-            print(f"❌ Error listing filtering workflows: {e}")
+        workflows = self.get_filtering_workflows(self.__chemspace_db)
+
+        if not workflows:
+            print("📝 No saved filtering workflows found")
+            return
+
+        print("\n" + "="*100)
+        print(f"SAVED FILTERING WORKFLOWS - Project: {self.name}")
+        print("="*100)
+
+        for i, workflow in enumerate(workflows, 1):
+            filters_dict = workflow['filters_dict']
+
+            # Get filter names for summary
+            filter_names = list(filters_dict.keys()) if filters_dict else []
+            filters_summary = ', '.join(filter_names[:3])
+            if len(filter_names) > 3:
+                filters_summary += f" and {len(filter_names) - 3} more..."
+            elif not filters_summary:
+                filters_summary = "No filters available"
+
+            print(f"\n🔍 Workflow {i}: '{workflow['workflow_name']}'")
+            print(f"   📅 Created: {workflow['creation_date']}")
+            print(f"   🔬 Filters: {workflow['filter_count']}")
+            print(f"   🔢 Total instances: {workflow['total_instances']}")
+            print(f"   📄 Description: {workflow['description']}")
+            print(f"   🔍 Filters: {filters_summary}")
+            print(f"   🔍 Filters dictionary: {filters_dict}")
+
+        print("="*100)
 
     def check_duplicates(self, table_name: str, 
                     duplicate_by: str = 'smiles',

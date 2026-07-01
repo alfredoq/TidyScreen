@@ -1,6 +1,8 @@
 import streamlit as st
 from tidyscreen import tidyscreen
+from tidyscreen.chemspace.chemspace import ChemSpace
 import io
+import contextlib
 import sys
 import os
 import glob
@@ -126,7 +128,7 @@ if os.path.exists(_logo_path):
     st.sidebar.image(_logo_path, use_container_width=True)
 page = st.sidebar.radio(
     "Go to",
-    ("Project selection", "ChemSpace", "Receptors", "MolDock", "ProLIF Conditions", "Docking analysis", "MolDyn", "MolDyn analysis", "ML features management", "RF model training", "Mol Viewer")
+    ("Project selection", "ChemSpace Inspection", "ChemSpace Actions", "Receptors", "MolDock", "ProLIF Conditions", "Docking analysis", "MolDyn", "MolDyn analysis", "ML features management", "RF model training", "Mol Viewer")
 )
 
 ## Persistent sidebar info: active project and assay
@@ -307,8 +309,8 @@ if page == "Project selection":
                             st.session_state[_del_key] = False
                             st.rerun()
 
-elif page == "ChemSpace":
-    st.title("ChemSpace")
+elif page == "ChemSpace Inspection":
+    st.title("ChemSpace Inspection")
     st.write("Welcome to the ChemSpace page.")
     
     db_path = os.path.join(st.session_state["active_project_path"], "chemspace", "processed_data", "chemspace.db")
@@ -556,6 +558,160 @@ elif page == "ChemSpace":
                 st.warning(f"No columns found for table '{export_selected_table}'.")
     else:
         st.info("No tables found in the ChemSpace database for the active project.")
+
+elif page == "ChemSpace Actions":
+    st.title("ChemSpace Actions")
+    st.write("Welcome to the ChemSpace Actions page.")
+
+    with st.expander("🧪 Available Chemical Filters"):
+        chem_filters = tidyscreen.get_chemical_filters()
+        if chem_filters:
+            chem_filters_df = pd.DataFrame(chem_filters, columns=["ID", "Filter Name", "SMARTS Pattern"])
+            st.dataframe(chem_filters_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No chemical filters found in database.")
+
+    with st.expander("📋 List Filtering Workflows"):
+        chemspace_db_path = os.path.join(st.session_state["active_project_path"], "chemspace", "processed_data", "chemspace.db")
+        filtering_workflows = ChemSpace.get_filtering_workflows(chemspace_db_path)
+        if filtering_workflows:
+            filtering_workflows_df = pd.DataFrame(filtering_workflows)
+            st.dataframe(filtering_workflows_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No saved filtering workflows found.")
+
+    with st.expander("🛠️ Create Filtering Workflow"):
+        if "cfw_filters" not in st.session_state:
+            st.session_state["cfw_filters"] = {}
+
+        all_filters = tidyscreen.get_chemical_filters()
+
+        if not all_filters:
+            st.info("No chemical filters found in database. Add some first.")
+        else:
+            filters_by_name = {name: (filter_id, smarts) for filter_id, name, smarts in all_filters}
+            available_names = [name for name in filters_by_name if name not in st.session_state["cfw_filters"]]
+
+            st.markdown("**Add a filter to the workflow**")
+            col1, col2, col3 = st.columns([3, 1, 1])
+            with col1:
+                cfw_selected_name = st.selectbox(
+                    "Filter", available_names, key="cfw_selected_filter"
+                ) if available_names else None
+            with col2:
+                cfw_instances = st.number_input(
+                    "Required instances", min_value=0, value=1, step=1, key="cfw_instances"
+                )
+            with col3:
+                st.markdown("<br>", unsafe_allow_html=True)
+                if st.button("Add Filter", key="btn_cfw_add_filter", disabled=not available_names):
+                    filter_id, smarts = filters_by_name[cfw_selected_name]
+                    if ChemSpace._validate_smarts_pattern(smarts):
+                        st.session_state["cfw_filters"][cfw_selected_name] = {
+                            "instances": int(cfw_instances),
+                            "smarts": smarts,
+                            "filter_id": filter_id,
+                        }
+                        st.rerun()
+                    else:
+                        st.error(f"Invalid SMARTS pattern for filter '{cfw_selected_name}'")
+
+        st.markdown("**Current workflow**")
+        if st.session_state["cfw_filters"]:
+            cfw_df = pd.DataFrame([
+                {"Filter Name": name, "Required Instances": info["instances"], "SMARTS": info["smarts"]}
+                for name, info in st.session_state["cfw_filters"].items()
+            ])
+            st.dataframe(cfw_df, use_container_width=True, hide_index=True)
+
+            cfw_remove_name = st.selectbox(
+                "Remove a filter", list(st.session_state["cfw_filters"].keys()), key="cfw_remove_filter"
+            )
+            if st.button("Remove Filter", key="btn_cfw_remove_filter"):
+                del st.session_state["cfw_filters"][cfw_remove_name]
+                st.rerun()
+        else:
+            st.info("No filters added to the workflow yet.")
+
+        st.markdown("**Save workflow**")
+        cfw_workflow_name = st.text_input("Workflow name (optional)", key="cfw_workflow_name")
+        cfw_description = st.text_area("Description (optional)", key="cfw_description")
+        cfw_overwrite = st.checkbox("Overwrite if a workflow with this name already exists", key="cfw_overwrite")
+
+        if st.button("Save Workflow", key="btn_cfw_save_workflow", disabled=not st.session_state["cfw_filters"]):
+            chemspace_db_path = os.path.join(st.session_state["active_project_path"], "chemspace", "processed_data", "chemspace.db")
+            workflow_filters = {name: info["instances"] for name, info in st.session_state["cfw_filters"].items()}
+            result = ChemSpace.save_filtering_workflow(
+                chemspace_db_path, cfw_workflow_name, workflow_filters,
+                cfw_description or None, cfw_overwrite
+            )
+            if result["success"]:
+                st.success(f"Saved filtering workflow '{result['workflow_name']}' "
+                           f"({result['filter_count']} filters, {result['total_instances']} total instances).")
+                st.session_state["cfw_filters"] = {}
+                st.rerun()
+            else:
+                st.error(result["message"])
+
+    with st.expander("🔬 Filter Using Workflow"):
+        chemspace_db_path = os.path.join(st.session_state["active_project_path"], "chemspace", "processed_data", "chemspace.db")
+        fuw_tables = [t for t in ChemSpace.list_tables(chemspace_db_path) if t != "filtering_workflows"]
+        fuw_workflows = [w["workflow_name"] for w in ChemSpace.get_filtering_workflows(chemspace_db_path)]
+
+        if not fuw_tables:
+            st.info("No compound tables found in the ChemSpace database.")
+        elif not fuw_workflows:
+            st.info("No saved filtering workflows found. Create one first.")
+        else:
+            fuw_table_name = st.selectbox("Compound table", fuw_tables, key="fuw_table_name")
+            fuw_workflow_name = st.selectbox("Filtering workflow", fuw_workflows, key="fuw_workflow_name")
+            fuw_save_results = st.checkbox("Save filtered results to a new table", key="fuw_save_results")
+
+            fuw_result_table_name = ""
+            if fuw_save_results:
+                fuw_result_table_name = st.text_input("Result table name", key="fuw_result_table_name")
+
+            fuw_run_disabled = fuw_save_results and not fuw_result_table_name.strip()
+            if fuw_run_disabled:
+                st.caption("Enter a result table name to save the filtered results.")
+
+            if st.button("Run Filtering", key="btn_fuw_run", disabled=fuw_run_disabled):
+                # ActivateProject(name) looks up the project in this conda env's own
+                # projects_database.db, which is separate from (and can be out of sync
+                # with) the one the project was actually created in. Build a bare
+                # ActivateProject carrying only what ChemSpace needs, using the path
+                # already resolved by the Project selection page, instead of re-querying.
+                project_obj = tidyscreen.ActivateProject.__new__(tidyscreen.ActivateProject)
+                project_obj.name = st.session_state["selected_project"]
+                project_obj.path = st.session_state["active_project_path"]
+                project_obj._project_exists = True
+                chemspace_obj = ChemSpace(project_obj)
+
+                fuw_progress_bar = st.progress(0.0, text="Starting filtering workflow...")
+
+                def _fuw_update_progress(done, total):
+                    fraction = min(done / total, 1.0) if total else 1.0
+                    fuw_progress_bar.progress(fraction, text=f"Filtering... {done}/{total}")
+
+                fuw_log = io.StringIO()
+                with contextlib.redirect_stdout(fuw_log):
+                    filtered_df = chemspace_obj.filter_using_workflow(
+                        table_name=fuw_table_name,
+                        workflow_name=fuw_workflow_name,
+                        save_results=fuw_save_results,
+                        result_table_name=fuw_result_table_name.strip() if fuw_save_results else None,
+                        progress_callback=_fuw_update_progress,
+                    )
+                fuw_progress_bar.progress(1.0, text="Filtering complete.")
+
+                if filtered_df is not None and not filtered_df.empty:
+                    st.success(f"Filtering complete: {len(filtered_df):,} compounds passed the workflow.")
+                    st.dataframe(filtered_df, use_container_width=True, hide_index=True)
+                else:
+                    st.warning("No compounds passed the filtering workflow.")
+
+                with st.expander("Execution log", expanded=filtered_df is None or filtered_df.empty):
+                    st.code(fuw_log.getvalue() or "(no output)")
 
 elif page == "Receptors":
     st.title("Receptors")

@@ -45,25 +45,28 @@ def refresh_reactions():
     
     return success
 
-def list_chemical_filters(pattern=None):
+def get_chemical_filters(pattern=None):
     """
-    List all chemical filters available in the database.
+    Retrieve chemical filters available in the database.
     This can be called independently without activating a specific project.
-    
+
     Args:
         pattern (str, optional): Filter names containing this pattern
+
+    Returns:
+        list[tuple]: (id, filter_name, smarts) tuples, empty list if none found or on error.
     """
     db_manager = DatabaseManager()
     projects_db = f"{site.getsitepackages()[0]}/tidyscreen/projects_db/projects_database.db"
-    
+
     if not os.path.exists(projects_db):
         print("❌ Projects database does not exist. Create a project first.")
-        return
-    
+        return []
+
     try:
         conn = db_manager.connect_db(projects_db)
         cursor = conn.cursor()
-        
+
         # Build query
         if pattern:
             query = "SELECT id, filter_name, smarts FROM chem_filters WHERE filter_name LIKE ? ORDER BY filter_name"
@@ -71,17 +74,33 @@ def list_chemical_filters(pattern=None):
         else:
             query = "SELECT id, filter_name, smarts FROM chem_filters ORDER BY filter_name"
             cursor.execute(query)
-        
+
         filters = cursor.fetchall()
         conn.close()
-        
-        if not filters:
-            if pattern:
-                print(f"No chemical filters found matching pattern: {pattern}")
-            else:
-                print("No chemical filters found in database.")
-            return
-        
+        return filters
+
+    except Exception as e:
+        print(f"❌ Error listing chemical filters: {e}")
+        return []
+
+def list_chemical_filters(pattern=None):
+    """
+    List all chemical filters available in the database.
+    This can be called independently without activating a specific project.
+
+    Args:
+        pattern (str, optional): Filter names containing this pattern
+    """
+    filters = get_chemical_filters(pattern)
+
+    if not filters:
+        if pattern:
+            print(f"No chemical filters found matching pattern: {pattern}")
+        else:
+            print("No chemical filters found in database.")
+        return
+
+    try:
         print("\n" + "="*80)
         print("CHEMICAL FILTERS")
         print("="*80)
