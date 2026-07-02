@@ -16,6 +16,93 @@ def _db_mtime(db_path):
     except OSError:
         return None
 
+
+_TS_META_TABLE = "_ts_table_meta"
+
+
+def _sync_table_triggers(conn, table_names):
+    """
+    Ensure every table in table_names has a row in _ts_table_meta plus AFTER
+    INSERT/UPDATE/DELETE triggers that bump that row's version on every write.
+
+    SQLite has no built-in per-table "last modified" primitive, and a
+    whole-file mtime can't tell which table changed. TidyScreen tables are
+    routinely modified in place (e.g. inchi_key/sdf_blob backfills via
+    UPDATE ... WHERE id=?) without changing row counts, so row-count-based
+    signatures aren't reliable either. Triggers are the only cheap way to
+    capture every INSERT/UPDATE/DELETE regardless of which code path made it.
+
+    version is a monotonically incrementing counter rather than a
+    timestamp: wall-clock time (e.g. strftime('%s','now')) only has
+    1-second resolution, so two writes to the same table within the same
+    second would produce identical "last modified" values and silently
+    fail to invalidate the cache.
+    """
+    cursor = conn.cursor()
+    cursor.execute(f"CREATE TABLE IF NOT EXISTS [{_TS_META_TABLE}] (table_name TEXT PRIMARY KEY, version INTEGER)")
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='trigger'")
+    existing_triggers = {row[0] for row in cursor.fetchall()}
+    for table in table_names:
+        cursor.execute(
+            f"INSERT OR IGNORE INTO [{_TS_META_TABLE}] (table_name, version) VALUES (?, 0)",
+            (table,)
+        )
+        for op in ("INSERT", "UPDATE", "DELETE"):
+            trigger_name = f"_ts_trg_{table}_{op.lower()}"
+            if trigger_name in existing_triggers:
+                continue
+            cursor.execute(f"""
+                CREATE TRIGGER [{trigger_name}]
+                AFTER {op} ON [{table}]
+                BEGIN
+                    INSERT INTO [{_TS_META_TABLE}] (table_name, version)
+                    VALUES ('{table}', 1)
+                    ON CONFLICT(table_name) DO UPDATE SET version = version + 1;
+                END;
+            """)
+
+
+def get_table_signatures(db_path):
+    """
+    Return an ordered {table_name: version} dict for every table in db_path,
+    where version is incremented by a trigger (see _sync_table_triggers)
+    whenever that specific table is written to.
+
+    Use this instead of _db_mtime as the cache-busting key for per-table
+    reads below, so modifying one table doesn't invalidate every other
+    table's cache. Deliberately not @st.cache_data'd: it must run fresh on
+    every rerun to notice changes, but it only touches small metadata
+    tables/queries (no scanning of user table contents), so it's cheap.
+
+    Connects with isolation_level=None (autocommit) so every statement
+    (including the CREATE TRIGGER/INSERT calls in _sync_table_triggers)
+    commits immediately instead of sitting in one long-lived transaction —
+    and the connection is always closed via `finally`, even if a Streamlit
+    rerun interrupts this function mid-call (Streamlit's rerun signal isn't
+    a plain Exception, so a bare try/except here wouldn't catch it and the
+    connection/lock would otherwise leak). Without both of these, a
+    long-held write lock on chemspace.db can make later reads/writes fail
+    with "database is locked", since this function runs on every page rerun.
+
+    Returns {} on error (e.g. db_path doesn't exist yet).
+    """
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path, isolation_level=None, timeout=10)
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+        tables = [row[0] for row in cursor.fetchall() if row[0] != _TS_META_TABLE]
+        _sync_table_triggers(conn, tables)
+        cursor.execute(f"SELECT table_name, version FROM [{_TS_META_TABLE}]")
+        version_by_table = dict(cursor.fetchall())
+        return {table: version_by_table.get(table) for table in tables}
+    except Exception:
+        return {}
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 def read_database_as_dataframe(db_path, table_name):
     """
     Read a table from a SQLite database and return it as a pandas DataFrame.
@@ -37,33 +124,46 @@ def read_database_as_dataframe(db_path, table_name):
         return pd.DataFrame()
     
 @st.cache_data(show_spinner=False)
-def get_tables_info(db_path, mtime=None):
+def _get_table_row_count(db_path, table_name, mtime=None):
+    """Cached per (db_path, table_name, mtime) — see get_tables_info."""
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path, timeout=10)
+        cursor = conn.cursor()
+        cursor.execute(f"SELECT COUNT(*) FROM [{table_name}]")
+        return cursor.fetchone()[0]
+    except Exception:
+        return None
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def get_tables_info(db_path, signatures=None):
     """
     Return a DataFrame with all table names and number of rows for a given SQLite database.
 
-    Cached per (db_path, mtime): the COUNT(*) scans below are expensive on large
-    tables and Streamlit reruns the whole script on every widget interaction, so
-    without caching this would re-scan every table on every click. Pass the
-    current db mtime as mtime so the cache is invalidated when the file changes.
+    Each table's row count is cached individually, keyed by that table's own
+    last-modified signature (see get_table_signatures) rather than a single
+    whole-file mtime — so writing to one table no longer forces a COUNT(*)
+    rescan of every other table on the next rerun.
 
     Args:
         db_path (str): Path to the SQLite database.
+        signatures (dict, optional): {table_name: last_modified} from
+            get_table_signatures(db_path). Computed internally if omitted.
 
     Returns:
         pd.DataFrame: DataFrame with columns ['table', 'rows'].
     """
+    if signatures is None:
+        signatures = get_table_signatures(db_path)
     try:
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        # Get all table names
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-        tables = [row[0] for row in cursor.fetchall()]
         info = []
-        for table in tables:
-            cursor.execute(f"SELECT COUNT(*) FROM {table}")
-            nrows = cursor.fetchone()[0]
-            info.append({'table': table, 'rows': nrows})
-        conn.close()
+        for table, mtime in signatures.items():
+            nrows = _get_table_row_count(db_path, table, mtime=mtime)
+            if nrows is not None:
+                info.append({'table': table, 'rows': nrows})
         return pd.DataFrame(info)
     except Exception as e:
         return pd.DataFrame([{'table': 'Error', 'rows': str(e)}])
@@ -1851,6 +1951,54 @@ def create_subset_table(db_path: str, source_table: str, new_table: str, row_ind
     except Exception as e:
         return f"error:{e}"
 
+
+def drop_chemspace_tables(db_path: str, table_names: list) -> dict:
+    """
+    Drop one or more tables from a SQLite database.
+
+    Mirrors the SQL steps of ChemSpace.drop_table() (drop any indexes named
+    after the table, then the table itself) without that method's
+    input()/print() prompts, so it can be driven from the Streamlit UI with
+    its own confirmation flow.
+
+    Args:
+        db_path (str): Path to the SQLite database.
+        table_names (list[str]): Names of the tables to drop.
+
+    Returns:
+        dict[str, str]: {table_name: 'dropped'} on success, or
+            {table_name: 'error:<message>'} for tables that failed.
+
+    Connects with isolation_level=None (autocommit) so each DROP INDEX/DROP
+    TABLE commits immediately instead of accumulating in one open
+    transaction, and closes the connection via `finally` so a lock can't be
+    left behind if this is interrupted partway through (see
+    get_table_signatures for why a bare try/except isn't enough).
+    """
+    results = {}
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path, isolation_level=None, timeout=10)
+        cursor = conn.cursor()
+        for table_name in table_names:
+            try:
+                cursor.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index' AND (name LIKE ? OR name LIKE ?)",
+                    (f"idx_{table_name}_%", f"index_{table_name}_%")
+                )
+                for (index_name,) in cursor.fetchall():
+                    cursor.execute(f"DROP INDEX IF EXISTS [{index_name}]")
+                cursor.execute(f"DROP TABLE IF EXISTS [{table_name}]")
+                results[table_name] = "dropped"
+            except Exception as e:
+                results[table_name] = f"error:{e}"
+    except Exception as e:
+        for table_name in table_names:
+            results.setdefault(table_name, f"error:{e}")
+    finally:
+        if conn is not None:
+            conn.close()
+    return results
 
 
 def depict_table_to_images(db_path: str, table_name: str,

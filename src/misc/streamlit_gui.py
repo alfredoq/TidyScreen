@@ -314,8 +314,8 @@ elif page == "ChemSpace Inspection":
     st.write("Welcome to the ChemSpace page.")
     
     db_path = os.path.join(st.session_state["active_project_path"], "chemspace", "processed_data", "chemspace.db")
-    _chemspace_db_mtime = st_funcs._db_mtime(db_path)
-    df = st_funcs.get_tables_info(db_path, mtime=_chemspace_db_mtime)
+    _chemspace_table_sigs = st_funcs.get_table_signatures(db_path)
+    df = st_funcs.get_tables_info(db_path, signatures=_chemspace_table_sigs)
     
     ## Create a button to show the project tables info DataFrame
     if "show_tables_info" not in st.session_state:
@@ -325,6 +325,55 @@ elif page == "ChemSpace Inspection":
         st.rerun()
     if st.session_state["show_tables_info"]:
         st.dataframe(df)
+
+        if df is not None and not df.empty:
+            _drop_table_names = df["table"].tolist()
+            # Sanitize any previously-selected names that no longer exist (e.g.
+            # after a drop) *before* the widget below reads/instantiates its
+            # state — Streamlit forbids changing a widget's session_state value
+            # after it has been instantiated in the same run.
+            if "drop_tables_select" in st.session_state:
+                st.session_state["drop_tables_select"] = [
+                    t for t in st.session_state["drop_tables_select"] if t in _drop_table_names
+                ]
+            _drop_selected = st.multiselect(
+                "Select table(s) to drop:",
+                _drop_table_names,
+                key="drop_tables_select"
+            )
+            _drop_key = "confirm_drop_tables"
+            if not _drop_selected:
+                st.button(
+                    "🗑️ Drop Tables",
+                    key="btn_drop_tables",
+                    disabled=True,
+                    help="Select at least one table above to enable deletion.",
+                )
+            elif not st.session_state.get(_drop_key):
+                if st.button("🗑️ Drop Tables", key="btn_drop_tables"):
+                    st.session_state[_drop_key] = True
+                    st.rerun()
+            else:
+                st.warning(
+                    f"⚠️ Delete {len(_drop_selected)} table(s): **{', '.join(_drop_selected)}**? "
+                    "This action cannot be undone!"
+                )
+                _dtc1, _dtc2 = st.columns(2)
+                with _dtc1:
+                    if st.button("Yes, delete", key="btn_confirm_drop_tables"):
+                        _drop_results = st_funcs.drop_chemspace_tables(db_path, _drop_selected)
+                        _dropped = [t for t, r in _drop_results.items() if r == "dropped"]
+                        _failed = {t: r for t, r in _drop_results.items() if r != "dropped"}
+                        if _dropped:
+                            st.success(f"✅ Dropped table(s): {', '.join(_dropped)}")
+                        for _t, _r in _failed.items():
+                            st.error(f"❌ Failed to drop '{_t}': {_r}")
+                        st.session_state[_drop_key] = False
+                        st.rerun()
+                with _dtc2:
+                    if st.button("Cancel", key="btn_cancel_drop_tables"):
+                        st.session_state[_drop_key] = False
+                        st.rerun()
 
     ## Display full content of a selected table
     st.divider()
@@ -345,7 +394,7 @@ elif page == "ChemSpace Inspection":
                 display_table_names,
                 key="display_table_select"
             )
-            display_columns = st_funcs.get_table_columns(db_path, display_selected_table, mtime=_chemspace_db_mtime)
+            display_columns = st_funcs.get_table_columns(db_path, display_selected_table, mtime=_chemspace_table_sigs.get(display_selected_table))
             if display_columns:
                 st.markdown("**Select columns to display:**")
                 selected_display_cols = [col for col in display_columns if st.checkbox(col, value=True, key=f"display_col_{display_selected_table}_{col}")]
@@ -355,7 +404,7 @@ elif page == "ChemSpace Inspection":
                     _read_limit = _display_row_limit if _table_total_rows > _display_row_limit else None
                     display_df = st_funcs.read_table_columns_as_dataframe(
                         db_path, display_selected_table, selected_display_cols,
-                        limit=_read_limit, mtime=_chemspace_db_mtime
+                        limit=_read_limit, mtime=_chemspace_table_sigs.get(display_selected_table)
                     )
                     if display_df is not None and not display_df.empty:
                         if _read_limit is not None:
@@ -458,7 +507,7 @@ elif page == "ChemSpace Inspection":
             selected_table = st.selectbox("Select a table to depict:", table_names, key="depict_table_select")
 
             ## Load columns for the selected table to let the user pick the label
-            table_columns = st_funcs.get_table_columns(db_path, selected_table, mtime=_chemspace_db_mtime)
+            table_columns = st_funcs.get_table_columns(db_path, selected_table, mtime=_chemspace_table_sigs.get(selected_table))
             default_label = "id" if "id" in table_columns else (table_columns[0] if table_columns else None)
             default_idx = table_columns.index(default_label) if default_label in table_columns else 0
 
@@ -536,7 +585,7 @@ elif page == "ChemSpace Inspection":
                 key="export_table_select"
             )
 
-            export_columns = st_funcs.get_table_columns(db_path, export_selected_table, mtime=_chemspace_db_mtime)
+            export_columns = st_funcs.get_table_columns(db_path, export_selected_table, mtime=_chemspace_table_sigs.get(export_selected_table))
             if export_columns:
                 st.markdown("**Select columns to export:**")
                 selected_cols = [col for col in export_columns if st.checkbox(col, value=True, key=f"export_col_{export_selected_table}_{col}")]
@@ -559,7 +608,7 @@ elif page == "ChemSpace Inspection":
                             st.warning("Please enter a valid file path.")
                         else:
                             try:
-                                export_df = st_funcs.read_table_columns_as_dataframe(db_path, export_selected_table, selected_cols, mtime=_chemspace_db_mtime)
+                                export_df = st_funcs.read_table_columns_as_dataframe(db_path, export_selected_table, selected_cols, mtime=_chemspace_table_sigs.get(export_selected_table))
                                 export_df.to_csv(save_path.strip(), index=False)
                                 st.success(f"Table '{export_selected_table}' saved to: {save_path.strip()}")
                                 st.session_state["show_export_path_input"] = False
@@ -582,6 +631,42 @@ elif page == "ChemSpace Actions":
             st.dataframe(chem_filters_df, use_container_width=True, hide_index=True)
         else:
             st.info("No chemical filters found in database.")
+
+        st.markdown("**Add Filter**")
+        _acf_col1, _acf_col2 = st.columns(2)
+        with _acf_col1:
+            _acf_name = st.text_input("Filter name", key="acf_filter_name")
+        with _acf_col2:
+            _acf_smarts = st.text_input("SMARTS pattern", key="acf_smarts_pattern")
+
+        _acf_overwrite_key = "acf_confirm_overwrite"
+        if not st.session_state.get(_acf_overwrite_key):
+            if st.button("Add Filter", key="btn_add_chem_filter"):
+                _acf_result = tidyscreen.add_chemical_filter_entry(_acf_name, _acf_smarts, overwrite=False)
+                if _acf_result["exists"]:
+                    st.session_state[_acf_overwrite_key] = True
+                    st.rerun()
+                elif _acf_result["success"]:
+                    st.success(f"✅ {_acf_result['message']}")
+                    st.rerun()
+                else:
+                    st.error(f"❌ {_acf_result['message']}")
+        else:
+            st.warning(f"⚠️ Filter '{_acf_name}' already exists. Overwrite it?")
+            _acf_oc1, _acf_oc2 = st.columns(2)
+            with _acf_oc1:
+                if st.button("Yes, overwrite", key="btn_confirm_overwrite_filter"):
+                    _acf_result = tidyscreen.add_chemical_filter_entry(_acf_name, _acf_smarts, overwrite=True)
+                    st.session_state[_acf_overwrite_key] = False
+                    if _acf_result["success"]:
+                        st.success(f"✅ {_acf_result['message']}")
+                    else:
+                        st.error(f"❌ {_acf_result['message']}")
+                    st.rerun()
+            with _acf_oc2:
+                if st.button("Cancel", key="btn_cancel_overwrite_filter"):
+                    st.session_state[_acf_overwrite_key] = False
+                    st.rerun()
 
     with st.expander("📋 List Filtering Workflows"):
         chemspace_db_path = os.path.join(st.session_state["active_project_path"], "chemspace", "processed_data", "chemspace.db")

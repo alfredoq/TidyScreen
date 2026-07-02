@@ -15492,8 +15492,163 @@ class ChemSpace:
                 return
         
         except Exception as e:
-            print(f"❌ Error in substract_tables method: {e}")                  
-                
+            print(f"❌ Error in substract_tables method: {e}")
+
+    def contrast_two_tables(self) -> pd.DataFrame:
+        """
+        Show the user a list of available tables, let them select two, and check
+        which compounds in the first table are also present in the second table.
+
+        Matching is done via 'inchi_key' rather than raw SMILES strings, since the
+        same molecule can be represented by different (but chemically equivalent)
+        SMILES depending on how/when it was canonicalized — the same approach used
+        by substract_tables(). Both tables must already have an 'inchi_key' column
+        populated (see compute_inchi_keys()).
+
+        After reporting the summary counts, prompts the user to optionally print
+        the matching and/or non-matching compounds (id, name, smiles, inchi_key).
+
+        Returns:
+            pd.DataFrame: A copy of table 1 with an added boolean column
+                'contained_in_<table2>' flagging rows whose inchi_key is present
+                in table 2. Empty DataFrame on error or if cancelled.
+        """
+        try:
+            # Get all available tables
+            available_tables = self.get_all_tables()
+            if not available_tables:
+                print("❌ No tables found in chemspace database")
+                return pd.DataFrame()
+
+            print("\n📋 CONTRAST TWO TABLES")
+            print("=" * 60)
+            print(f"Available tables ({len(available_tables)}):")
+            print("-" * 60)
+            for i, table_name in enumerate(available_tables, 1):
+                try:
+                    compound_count = self.get_compound_count(table_name=table_name)
+                    print(f"{i:2d}. {table_name:<35} ({compound_count} compounds)")
+                except Exception as e:
+                    print(f"{i:2d}. {table_name:<35} (Error: {e})")
+            print("-" * 60)
+
+            # Query user for table 1 (the table whose molecules will be checked)
+            print("\nSelect table 1 (molecules to check), by number or name, or 'cancel' to abort.")
+            while True:
+                selection = input("Table 1: ").strip()
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    print("❌ Contrast operation cancelled.")
+                    return pd.DataFrame()
+                if selection.isdigit():
+                    idx = int(selection)
+                    if 1 <= idx <= len(available_tables):
+                        table1 = available_tables[idx - 1]
+                        break
+                    else:
+                        print(f"⚠️  Invalid table index: {idx}")
+                elif selection in available_tables:
+                    table1 = selection
+                    break
+                else:
+                    print(f"⚠️  Table not found: {selection}")
+            print(f"✅ Selected table 1: {table1}")
+
+            # Query user for table 2 (the table to check against)
+            print("\nSelect table 2 (checked against), by number or name, or 'cancel' to abort.")
+            while True:
+                selection = input("Table 2: ").strip()
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    print("❌ Contrast operation cancelled.")
+                    return pd.DataFrame()
+                if selection.isdigit():
+                    idx = int(selection)
+                    if 1 <= idx <= len(available_tables):
+                        candidate = available_tables[idx - 1]
+                    else:
+                        print(f"⚠️  Invalid table index: {idx}")
+                        continue
+                elif selection in available_tables:
+                    candidate = selection
+                else:
+                    print(f"⚠️  Table not found: {selection}")
+                    continue
+                if candidate == table1:
+                    print("⚠️  Table 2 must be different from table 1.")
+                    continue
+                table2 = candidate
+                break
+            print(f"✅ Selected table 2: {table2}")
+
+            # Load both tables
+            table1_df = self._get_table_as_dataframe(table1)
+            if table1_df.empty:
+                print(f"❌ Table '{table1}' is empty or could not be loaded.")
+                return pd.DataFrame()
+
+            table2_df = self._get_table_as_dataframe(table2)
+            if table2_df.empty:
+                print(f"❌ Table '{table2}' is empty or could not be loaded.")
+                return pd.DataFrame()
+
+            if 'inchi_key' not in table1_df.columns or 'inchi_key' not in table2_df.columns:
+                print("❌ Cannot perform contrast because 'inchi_key' column is missing in one of the tables.")
+                print("   Run compute_inchi_keys() on both tables first.")
+                return pd.DataFrame()
+
+            table1_df['inchi_key'] = table1_df['inchi_key'].fillna('')
+            table2_keys = set(table2_df['inchi_key'].fillna(''))
+            table2_keys.discard('')
+
+            result_column = f"contained_in_{table2}"
+            result_df = table1_df.copy()
+            result_df[result_column] = result_df['inchi_key'].isin(table2_keys)
+
+            total_count = len(result_df)
+            contained_count = int(result_df[result_column].sum())
+            not_contained_count = total_count - contained_count
+
+            print("\n" + "=" * 60)
+            print(f"📊 CONTRAST RESULTS: '{table1}' vs '{table2}'")
+            print("=" * 60)
+            print(f"Total compounds in '{table1}':   {total_count}")
+            print(f"✅ Contained in '{table2}':      {contained_count} ({contained_count / total_count * 100:.1f}%)")
+            print(f"❌ Not contained in '{table2}':  {not_contained_count} ({not_contained_count / total_count * 100:.1f}%)")
+            print("=" * 60)
+
+            # Ask the user whether to print the matching and/or non-matching compounds
+            print("\nPrint which compounds?")
+            print("  1. Matching only")
+            print("  2. Non-matching only")
+            print("  3. Both")
+            print("  4. None")
+            while True:
+                print_choice = input("Select an option (1-4, default=4): ").strip() or "4"
+                if print_choice in ('1', '2', '3', '4'):
+                    break
+                print(f"⚠️  Invalid option: {print_choice}")
+
+            display_cols = [c for c in ['id', 'name', 'smiles', 'inchi_key'] if c in result_df.columns]
+
+            if print_choice in ('1', '3'):
+                matching_df = result_df[result_df[result_column]]
+                print(f"\n✅ Matching compounds ({len(matching_df)}):")
+                print("-" * 60)
+                print(matching_df[display_cols].to_string(index=False) if not matching_df.empty else "(none)")
+                print("-" * 60)
+
+            if print_choice in ('2', '3'):
+                non_matching_df = result_df[~result_df[result_column]]
+                print(f"\n❌ Non-matching compounds ({len(non_matching_df)}):")
+                print("-" * 60)
+                print(non_matching_df[display_cols].to_string(index=False) if not non_matching_df.empty else "(none)")
+                print("-" * 60)
+
+            return result_df
+
+        except Exception as e:
+            print(f"❌ Error in contrast_two_tables method: {e}")
+            return pd.DataFrame()
+
     def export_table_as_pdb(self):
 
         """
