@@ -314,7 +314,8 @@ elif page == "ChemSpace Inspection":
     st.write("Welcome to the ChemSpace page.")
     
     db_path = os.path.join(st.session_state["active_project_path"], "chemspace", "processed_data", "chemspace.db")
-    df = st_funcs.get_tables_info(db_path)
+    _chemspace_db_mtime = st_funcs._db_mtime(db_path)
+    df = st_funcs.get_tables_info(db_path, mtime=_chemspace_db_mtime)
     
     ## Create a button to show the project tables info DataFrame
     if "show_tables_info" not in st.session_state:
@@ -344,20 +345,24 @@ elif page == "ChemSpace Inspection":
                 display_table_names,
                 key="display_table_select"
             )
-            display_columns = st_funcs.get_table_columns(db_path, display_selected_table)
+            display_columns = st_funcs.get_table_columns(db_path, display_selected_table, mtime=_chemspace_db_mtime)
             if display_columns:
                 st.markdown("**Select columns to display:**")
                 selected_display_cols = [col for col in display_columns if st.checkbox(col, value=True, key=f"display_col_{display_selected_table}_{col}")]
                 if selected_display_cols:
-                    display_df = st_funcs.read_table_columns_as_dataframe(db_path, display_selected_table, selected_display_cols)
+                    _display_row_limit = 10000
+                    _table_total_rows = int(df.loc[df["table"] == display_selected_table, "rows"].iloc[0])
+                    _read_limit = _display_row_limit if _table_total_rows > _display_row_limit else None
+                    display_df = st_funcs.read_table_columns_as_dataframe(
+                        db_path, display_selected_table, selected_display_cols,
+                        limit=_read_limit, mtime=_chemspace_db_mtime
+                    )
                     if display_df is not None and not display_df.empty:
-                        _display_row_limit = 10000
-                        if len(display_df) > _display_row_limit:
+                        if _read_limit is not None:
                             st.info(
-                                f"Table '{display_selected_table}' has {len(display_df):,} rows; "
+                                f"Table '{display_selected_table}' has {_table_total_rows:,} rows; "
                                 f"showing only the first {_display_row_limit:,}."
                             )
-                            display_df = display_df.head(_display_row_limit)
                         _display_df_sel = display_df.copy()
                         _display_df_sel.insert(0, "Select", False)
                         _edited_display = st.data_editor(
@@ -453,7 +458,7 @@ elif page == "ChemSpace Inspection":
             selected_table = st.selectbox("Select a table to depict:", table_names, key="depict_table_select")
 
             ## Load columns for the selected table to let the user pick the label
-            table_columns = st_funcs.get_table_columns(db_path, selected_table)
+            table_columns = st_funcs.get_table_columns(db_path, selected_table, mtime=_chemspace_db_mtime)
             default_label = "id" if "id" in table_columns else (table_columns[0] if table_columns else None)
             default_idx = table_columns.index(default_label) if default_label in table_columns else 0
 
@@ -531,7 +536,7 @@ elif page == "ChemSpace Inspection":
                 key="export_table_select"
             )
 
-            export_columns = st_funcs.get_table_columns(db_path, export_selected_table)
+            export_columns = st_funcs.get_table_columns(db_path, export_selected_table, mtime=_chemspace_db_mtime)
             if export_columns:
                 st.markdown("**Select columns to export:**")
                 selected_cols = [col for col in export_columns if st.checkbox(col, value=True, key=f"export_col_{export_selected_table}_{col}")]
@@ -554,7 +559,7 @@ elif page == "ChemSpace Inspection":
                             st.warning("Please enter a valid file path.")
                         else:
                             try:
-                                export_df = st_funcs.read_table_columns_as_dataframe(db_path, export_selected_table, selected_cols)
+                                export_df = st_funcs.read_table_columns_as_dataframe(db_path, export_selected_table, selected_cols, mtime=_chemspace_db_mtime)
                                 export_df.to_csv(save_path.strip(), index=False)
                                 st.success(f"Table '{export_selected_table}' saved to: {save_path.strip()}")
                                 st.session_state["show_export_path_input"] = False

@@ -1342,7 +1342,11 @@ class ChemSpace:
                 if retain_largest_fragment:
                     from rdkit.Chem.MolStandardize import rdMolStandardize
                     fragment_chooser = rdMolStandardize.LargestFragmentChooser()
-                for idx, row in df.iterrows():
+                if TQDM_AVAILABLE:
+                    row_iterator = tqdm(df.iterrows(), total=len(df), desc="Parsing compounds", unit="cmpd")
+                else:
+                    row_iterator = df.iterrows()
+                for idx, row in row_iterator:
                     smiles = str(row[smiles_column]).strip()
                     # Handle name column - use provided column or generate from index
                     if name_available:
@@ -1383,8 +1387,10 @@ class ChemSpace:
                         if was_reduced:
                             fragments_retained_count += 1
                     compounds_data.append((smiles, name, flag, flag_description))
+                    if not TQDM_AVAILABLE and (idx + 1) % max(1, len(df) // 10) == 0:
+                        print(f"   📝 Parsed {idx + 1}/{len(df)} rows...")
                 # Insert compounds into database
-                result = self._insert_compounds(compounds_data, table_name, skip_duplicates)
+                result = self._insert_compounds(compounds_data, table_name, skip_duplicates, show_progress=True)
                 result['salts_stripped'] = salts_stripped_count
                 result['fragments_retained'] = fragments_retained_count
                 result['cleanup_failures'] = cleanup_failures_count
@@ -2081,32 +2087,44 @@ class ChemSpace:
         
         return df
     
-    def _insert_compounds(self, compounds_data: List[Tuple], table_name: str, skip_duplicates: bool = True) -> Dict[str, Any]:
+    def _insert_compounds(self, compounds_data: List[Tuple], table_name: str, skip_duplicates: bool = True,
+                         show_progress: bool = False) -> Dict[str, Any]:
         """
         Insert compounds data into the database.
-        
+
         Args:
             compounds_data (List[Tuple]): List of tuples containing compound data
             table_name (str): Name of the table to insert into
             skip_duplicates (bool): Whether to skip duplicate compounds
-            
+            show_progress (bool): Whether to display a tqdm progress bar for this insert batch.
+                Only meaningful when called with a large, un-chunked batch (e.g. the sequential
+                load_csv_file path); left off for per-chunk inserts in the parallel path since an
+                outer progress bar already tracks overall row throughput there.
+
         Returns:
             dict: Results containing counts and status
         """
         try:
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
-            
+
             compounds_added = 0
             duplicates_skipped = 0
             errors = 0
-            
+
             insert_query = f"""
             INSERT INTO {table_name} (smiles, name, flag, flag_description)
             VALUES (?, ?, ?, ?)
             """
-            
-            for compound_data in compounds_data:
+
+            if show_progress and TQDM_AVAILABLE:
+                compound_iterator = tqdm(compounds_data, desc="Inserting compounds", unit="cmpd")
+            else:
+                compound_iterator = compounds_data
+                if show_progress and not TQDM_AVAILABLE:
+                    print(f"   💾 Inserting {len(compounds_data)} compounds into '{table_name}'...")
+
+            for compound_data in compound_iterator:
                 try:
                     cursor.execute(insert_query, compound_data)
                     compounds_added += 1
@@ -2118,7 +2136,7 @@ class ChemSpace:
                 except Exception as e:
                     print(f"⚠️  Error inserting compound {compound_data[1]}: {e}")
                     errors += 1
-            
+
             conn.commit()
             conn.close()
             
@@ -2968,15 +2986,22 @@ class ChemSpace:
                     print(f"   ⚠️  Warning: Could not add inchi_key column: {e}")
                     return False
             
-            # Update each row with computed InChI key
+            # Update each row with computed InChI key.
+            # Uses itertuples() + executemany() rather than iterrows() + per-row execute():
+            # iterrows() rebuilds a pandas Series per row, and a separate execute() per row
+            # crosses the sqlite3 C-API boundary once per row. For large CSVs (100k+ rows)
+            # that dominates the runtime of load_csv_file(); a single executemany() batch
+            # is orders of magnitude faster for the same result.
             update_query = f"UPDATE {table_name} SET inchi_key = ? WHERE id = ?"
-            
-            updates_made = 0
-            for _, row in df.iterrows():
-                if pd.notna(row.get('inchi_key')) and row['inchi_key'] not in ['INVALID_SMILES', 'ERROR']:
-                    cursor.execute(update_query, (row['inchi_key'], row['id']))
-                    updates_made += 1
-            
+
+            updates = [
+                (row.inchi_key, row.id)
+                for row in df.itertuples(index=False)
+                if pd.notna(row.inchi_key) and row.inchi_key not in ['INVALID_SMILES', 'ERROR']
+            ]
+            cursor.executemany(update_query, updates)
+            updates_made = len(updates)
+
             conn.commit()
             conn.close()
             

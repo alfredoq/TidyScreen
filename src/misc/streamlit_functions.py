@@ -4,7 +4,17 @@ import os
 import json
 import pandas as pd
 import matplotlib.pyplot as plt
+import streamlit as st
 from datetime import datetime
+
+
+def _db_mtime(db_path):
+    """Modification time of db_path, used as a cache-busting key so cached
+    reads below auto-invalidate whenever the underlying SQLite file changes."""
+    try:
+        return os.path.getmtime(db_path)
+    except OSError:
+        return None
 
 def read_database_as_dataframe(db_path, table_name):
     """
@@ -26,9 +36,15 @@ def read_database_as_dataframe(db_path, table_name):
         print(f"❌ Error reading database: {e}")
         return pd.DataFrame()
     
-def get_tables_info(db_path):
+@st.cache_data(show_spinner=False)
+def get_tables_info(db_path, mtime=None):
     """
     Return a DataFrame with all table names and number of rows for a given SQLite database.
+
+    Cached per (db_path, mtime): the COUNT(*) scans below are expensive on large
+    tables and Streamlit reruns the whole script on every widget interaction, so
+    without caching this would re-scan every table on every click. Pass the
+    current db mtime as mtime so the cache is invalidated when the file changes.
 
     Args:
         db_path (str): Path to the SQLite database.
@@ -1736,9 +1752,13 @@ def delete_training_set_snapshots(project_path: str, training_set_ids: list) -> 
         return f"error:{e}"
 
 
-def get_table_columns(db_path: str, table_name: str) -> list:
+@st.cache_data(show_spinner=False)
+def get_table_columns(db_path: str, table_name: str, mtime=None) -> list:
     """
     Return the list of column names for a given table in a SQLite database.
+
+    Cached per (db_path, table_name, mtime) so re-running the page (e.g. from
+    toggling an unrelated checkbox) doesn't re-query the schema every time.
 
     Args:
         db_path (str): Path to the SQLite database.
@@ -1758,14 +1778,22 @@ def get_table_columns(db_path: str, table_name: str) -> list:
         return []
 
 
-def read_table_columns_as_dataframe(db_path: str, table_name: str, columns: list) -> "pd.DataFrame":
+@st.cache_data(show_spinner=False)
+def read_table_columns_as_dataframe(db_path: str, table_name: str, columns: list, limit: int = None, mtime=None) -> "pd.DataFrame":
     """
     Read selected columns from a SQLite table and return as a pandas DataFrame.
+
+    Cached per (db_path, table_name, columns, limit, mtime): on large tables this
+    query can be expensive, and Streamlit reruns the whole script on every widget
+    interaction (e.g. toggling a column checkbox), so without caching the full
+    table would be re-read from disk on every click.
 
     Args:
         db_path (str): Path to the SQLite database.
         table_name (str): Name of the table.
         columns (list): List of column names to include.
+        limit (int, optional): If given, only read the first `limit` rows
+            (pushed down as a SQL LIMIT) instead of loading the whole table.
 
     Returns:
         pd.DataFrame: DataFrame with the selected columns, or empty DataFrame on error.
@@ -1773,7 +1801,10 @@ def read_table_columns_as_dataframe(db_path: str, table_name: str, columns: list
     try:
         col_expr = ", ".join(f"[{c}]" for c in columns)
         conn = sqlite3.connect(db_path)
-        df = pd.read_sql_query(f"SELECT {col_expr} FROM [{table_name}]", conn)
+        query = f"SELECT {col_expr} FROM [{table_name}]"
+        if limit is not None:
+            query += f" LIMIT {int(limit)}"
+        df = pd.read_sql_query(query, conn)
         conn.close()
         return df
     except Exception as e:
