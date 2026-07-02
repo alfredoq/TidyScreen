@@ -31,14 +31,81 @@ ActivateProject = tidyscreen.ActivateProject
 
 ## Module level helper functions for multiprocessing workers
 
-def _process_chunk_worker(chunk_df: pd.DataFrame, smiles_column: str, 
+def _strip_salts_from_smiles(smiles: str, remover) -> Tuple[Optional[str], bool]:
+    """
+    Strip salt/counter-ion fragments (e.g. Cl-, Na+) from a SMILES string using
+    RDKit's SaltRemover. Returns None if the SMILES fails to parse entirely, so the
+    caller can drop the compound instead of inserting an unprocessed/invalid SMILES.
+
+    Args:
+        smiles (str): SMILES string to clean
+        remover: An `rdkit.Chem.SaltRemover.SaltRemover` instance
+
+    Returns:
+        Tuple[Optional[str], bool]: (cleaned SMILES, or None if parsing failed;
+            whether a fragment was actually removed)
+    """
+    from rdkit import Chem
+
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None, False
+
+    stripped_mol = remover.StripMol(mol, dontRemoveEverything=True)
+    if stripped_mol is None or stripped_mol.GetNumAtoms() == 0:
+        return smiles, False
+
+    was_stripped = stripped_mol.GetNumAtoms() != mol.GetNumAtoms()
+    if not was_stripped:
+        return smiles, False
+
+    return Chem.MolToSmiles(stripped_mol), True
+
+def _retain_largest_fragment_from_smiles(smiles: str, chooser) -> Tuple[Optional[str], bool]:
+    """
+    Reduce a multi-fragment SMILES down to only its largest fragment (by atom count)
+    using RDKit's LargestFragmentChooser. This catches disconnected components (solvates,
+    unusual counter-ions, etc.) that SaltRemover's curated salt list doesn't recognize.
+    Returns None if the SMILES fails to parse entirely, so the caller can drop the
+    compound instead of inserting an unprocessed/invalid SMILES.
+
+    Args:
+        smiles (str): SMILES string to clean
+        chooser: An `rdkit.Chem.MolStandardize.rdMolStandardize.LargestFragmentChooser` instance
+
+    Returns:
+        Tuple[Optional[str], bool]: (reduced SMILES, or None if parsing failed;
+            whether a fragment was actually discarded)
+    """
+    from rdkit import Chem
+
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None, False
+
+    if len(Chem.GetMolFrags(mol)) <= 1:
+        return smiles, False
+
+    largest_mol = chooser.choose(mol)
+    if largest_mol is None or largest_mol.GetNumAtoms() == 0:
+        return smiles, False
+
+    was_reduced = largest_mol.GetNumAtoms() != mol.GetNumAtoms()
+    if not was_reduced:
+        return smiles, False
+
+    return Chem.MolToSmiles(largest_mol), True
+
+def _process_chunk_worker(chunk_df: pd.DataFrame, smiles_column: str,
                          name_column: Optional[str], flag_column: Optional[str],
-                         name_available: bool, flag_available: bool, 
-                         start_idx: int, flag_description_available) -> List[Tuple[str, str, str]]:
+                         name_available: bool, flag_available: bool,
+                         start_idx: int, flag_description_available,
+                         strip_salts: bool = False,
+                         retain_largest_fragment: bool = False) -> Tuple[List[Tuple[str, str, str, str]], int, int, int]:
     """
     Worker function to process a chunk of DataFrame in parallel.
     This function must be at module level to be pickleable for multiprocessing.
-    
+
     Args:
         chunk_df (pd.DataFrame): Chunk of DataFrame to process
         smiles_column (str): Name of the SMILES column
@@ -48,16 +115,35 @@ def _process_chunk_worker(chunk_df: pd.DataFrame, smiles_column: str,
         flag_available (bool): Whether flag column is available
         start_idx (int): Starting index for compound naming
         flag_description_available (bool): Whether flag description column is available
-        
+        strip_salts (bool): Whether to strip salt/counter-ion fragments from SMILES using RDKit's SaltRemover
+        retain_largest_fragment (bool): Whether to reduce multi-fragment SMILES down to only
+            their largest fragment using RDKit's LargestFragmentChooser (applied after strip_salts)
+
     Returns:
-        List[Tuple[str, str, str]]: List of tuples (smiles, name, flag)
+        Tuple[List[Tuple[str, str, str, str]], int, int, int]: (list of (smiles, name, flag,
+            flag_description) tuples, count of compounds whose SMILES had a salt/counter-ion
+            fragment removed, count of compounds reduced to their largest fragment, count of
+            compounds dropped because RDKit could not parse their SMILES)
     """
     compounds_data = []
-    
+    salts_stripped_count = 0
+    fragments_retained_count = 0
+    failed_count = 0
+
+    remover = None
+    if strip_salts:
+        from rdkit.Chem import SaltRemover
+        remover = SaltRemover.SaltRemover()
+
+    fragment_chooser = None
+    if retain_largest_fragment:
+        from rdkit.Chem.MolStandardize import rdMolStandardize
+        fragment_chooser = rdMolStandardize.LargestFragmentChooser()
+
     for local_idx, (_, row) in enumerate(chunk_df.iterrows()):
         global_idx = start_idx + local_idx
         smiles = str(row[smiles_column]).strip()
-        
+
         # Handle name column - use provided column or generate from index
         if name_available:
             name = str(row[name_column]).strip()
@@ -65,7 +151,7 @@ def _process_chunk_worker(chunk_df: pd.DataFrame, smiles_column: str,
                 name = f"compound_{global_idx + 1}"  # Generate name if empty
         else:
             name = f"compound_{global_idx + 1}"  # Generate name if column doesn't exist
-        
+
         # Handle flag column - use provided column or default to "nd"
         if flag_available:
             flag = str(row[flag_column]).strip()
@@ -73,7 +159,7 @@ def _process_chunk_worker(chunk_df: pd.DataFrame, smiles_column: str,
                 flag = "nd"  # Default flag if empty
         else:
             flag = "nd"  # Default flag if column doesn't exist
-        
+
         # Handle flag description - use provided column of default to "nd"
         if flag_description_available:
             flag_description = str(row.get("flag_description", "nd")).strip()
@@ -83,10 +169,26 @@ def _process_chunk_worker(chunk_df: pd.DataFrame, smiles_column: str,
         # Skip empty SMILES rows (only SMILES is mandatory)
         if not smiles or smiles.lower() in ['nan', 'none', '']:
             continue
-        
+
+        if remover is not None:
+            smiles, was_stripped = _strip_salts_from_smiles(smiles, remover)
+            if smiles is None:
+                failed_count += 1
+                continue
+            if was_stripped:
+                salts_stripped_count += 1
+
+        if fragment_chooser is not None:
+            smiles, was_reduced = _retain_largest_fragment_from_smiles(smiles, fragment_chooser)
+            if smiles is None:
+                failed_count += 1
+                continue
+            if was_reduced:
+                fragments_retained_count += 1
+
         compounds_data.append((smiles, name, flag, flag_description))
-    
-    return compounds_data
+
+    return compounds_data, salts_stripped_count, fragments_retained_count, failed_count
 
 def _compute_inchi_keys_worker(chunk_data: List[Tuple[int, str, str, str]]) -> List[Tuple[int, str, str, str]]:
     """
@@ -743,6 +845,71 @@ class ChemSpace:
             return False
     
     @staticmethod
+    def _detect_csv_delimiter_and_header(csv_file_path: str) -> Tuple[Any, Optional[int]]:
+        """
+        Sniff the field delimiter and header presence of a compounds file so that
+        comma/tab/semicolon/pipe-delimited CSVs and whitespace-delimited .smi-style
+        files (no header, SMILES followed by an ID) both load correctly, instead of
+        always assuming a comma-delimited file with a header row.
+
+        Header presence is inferred by checking whether the first row's first field
+        parses as a valid SMILES with RDKit: a real header label (e.g. "smiles")
+        won't parse, while a data row's SMILES value will.
+
+        Args:
+            csv_file_path (str): Path to the file to sniff
+
+        Returns:
+            Tuple[Any, Optional[int]]: (delimiter, header) usable directly as the
+                `sep`/`header` kwargs of `pd.read_csv`. `delimiter` is a single
+                character, or the regex `r'\\s+'` for whitespace-delimited files.
+                `header` is 0 if a header row was detected, otherwise None.
+        """
+        from rdkit import Chem, RDLogger
+        RDLogger.DisableLog('rdApp.*')
+
+        try:
+            with open(csv_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                sample_lines = [f.readline() for _ in range(5)]
+        except Exception:
+            return ',', 0
+
+        sample_lines = [line for line in sample_lines if line.strip()]
+        if not sample_lines:
+            return ',', 0
+
+        sample = ''.join(sample_lines)
+        first_line = sample_lines[0].rstrip('\n')
+
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=',;\t|')
+            delimiter = dialect.delimiter
+            first_fields = first_line.split(delimiter)
+        except csv.Error:
+            # No standard delimiter found; fall back to whitespace splitting,
+            # matching the plain .smi convention (fields separated by spaces/tabs).
+            delimiter = r'\s+'
+            first_fields = first_line.split()
+
+        first_field = first_fields[0].strip() if first_fields else ''
+        has_header = not first_field or Chem.MolFromSmiles(first_field) is None
+        header = 0 if has_header else None
+
+        return delimiter, header
+
+    def _read_compounds_csv(self, csv_file_path: str) -> pd.DataFrame:
+        """
+        Read a compounds file into a DataFrame using an auto-detected delimiter and
+        header presence (see `_detect_csv_delimiter_and_header`), instead of assuming
+        a comma-delimited CSV with a header row.
+        """
+        delimiter, header = self._detect_csv_delimiter_and_header(csv_file_path)
+        read_kwargs = {'sep': delimiter, 'header': header}
+        if delimiter == r'\s+':
+            read_kwargs['engine'] = 'python'
+        return pd.read_csv(csv_file_path, **read_kwargs)
+
+    @staticmethod
     def _detect_delimiter_mismatch(csv_file_path: str, df: pd.DataFrame) -> Optional[str]:
         """
         Heuristic check for the "everything landed in one column" failure mode: a file
@@ -809,9 +976,15 @@ class ChemSpace:
         valid_fraction = valid_count / len(sample)
         return valid_fraction >= min_valid_fraction, valid_fraction
 
-    def load_csv_file_as_table(self, csv_file_path: str = None):
+    def load_csv_file_as_table(self, csv_file_path: str = None,
+                              strip_salts: Optional[bool] = None,
+                              retain_largest_fragment: Optional[bool] = None):
 
         # Will query the user for the .csv file path if not provided, and load it as a table in the chemspace database, with the table name being queried to the the user. No default is possible. Will check if the table name already exists and ask the user if they want to replace it or not. If not, the process is cancelled.
+        # strip_salts / retain_largest_fragment: same RDKit-based SMILES cleanup as load_csv_file().
+        # If left None, the user is interactively prompted (y/N); pass True/False explicitly to skip
+        # the prompt. Since this loader has no fixed 'smiles' column, if either is enabled and no
+        # 'smiles' column exists the user is asked which column to clean.
 
         # Prompt for CSV file path if not provided
         if not csv_file_path:
@@ -839,9 +1012,9 @@ class ChemSpace:
                 print("❌ Process cancelled.")
                 return False
 
-        # Load the csv as a dataframe using the first row as header
+        # Load the csv as a dataframe, auto-detecting delimiter and header presence
         try:
-            df = pd.read_csv(csv_file_path)
+            df = self._read_compounds_csv(csv_file_path)
         except Exception as e:
             print(f"❌ Error reading CSV file: {e}")
             return False
@@ -856,6 +1029,85 @@ class ChemSpace:
                 print("❌ Process cancelled. Re-run with the correct delimiter.")
                 return False
 
+        # Query the user on whether to strip salt/counter-ion fragments from the SMILES,
+        # unless the caller already decided explicitly (e.g. scripted/non-interactive use).
+        if strip_salts is None:
+            strip_salts_choice = input(
+                "🧂 Strip salts/counter-ions (e.g. HCl, Na+) from SMILES before loading? (y/N): "
+            ).strip().lower()
+            strip_salts = strip_salts_choice in ['y', 'yes']
+
+        # Query the user on whether to reduce multi-fragment SMILES to their largest
+        # fragment, unless the caller already decided explicitly.
+        if retain_largest_fragment is None:
+            retain_largest_fragment_choice = input(
+                "🧩 Retain only the largest fragment of multi-fragment SMILES (e.g. solvates)? (y/N): "
+            ).strip().lower()
+            retain_largest_fragment = retain_largest_fragment_choice in ['y', 'yes']
+
+        if strip_salts or retain_largest_fragment:
+            # This loader has no fixed SMILES column (it dumps whatever the CSV contains),
+            # so ask which column to clean if it can't be inferred.
+            if 'smiles' in df.columns:
+                smiles_col_for_cleaning = 'smiles'
+            else:
+                smiles_col_for_cleaning = None
+                print("\nColumns found in CSV:")
+                for idx, col in enumerate(df.columns):
+                    print(f"  [{idx}] {col}")
+                while smiles_col_for_cleaning is None:
+                    col_input = input("Enter the column name or index containing SMILES to clean: ").strip()
+                    if col_input.isdigit() and int(col_input) < len(df.columns):
+                        smiles_col_for_cleaning = df.columns[int(col_input)]
+                    elif col_input in df.columns:
+                        smiles_col_for_cleaning = col_input
+                    else:
+                        print("Invalid input. Please enter a valid column name or index.")
+
+            salt_remover = None
+            if strip_salts:
+                from rdkit.Chem import SaltRemover
+                salt_remover = SaltRemover.SaltRemover()
+            fragment_chooser = None
+            if retain_largest_fragment:
+                from rdkit.Chem.MolStandardize import rdMolStandardize
+                fragment_chooser = rdMolStandardize.LargestFragmentChooser()
+
+            salts_stripped_count = 0
+            fragments_retained_count = 0
+
+            def _clean_smiles(smiles):
+                nonlocal salts_stripped_count, fragments_retained_count
+                smiles = str(smiles).strip()
+                if salt_remover is not None:
+                    smiles, was_stripped = _strip_salts_from_smiles(smiles, salt_remover)
+                    if smiles is None:
+                        return None
+                    if was_stripped:
+                        salts_stripped_count += 1
+                if fragment_chooser is not None:
+                    smiles, was_reduced = _retain_largest_fragment_from_smiles(smiles, fragment_chooser)
+                    if smiles is None:
+                        return None
+                    if was_reduced:
+                        fragments_retained_count += 1
+                return smiles
+
+            df[smiles_col_for_cleaning] = df[smiles_col_for_cleaning].apply(_clean_smiles)
+
+            # Molecules RDKit couldn't parse at all must not be added to the table.
+            failed_mask = df[smiles_col_for_cleaning].isna()
+            cleanup_failures_count = int(failed_mask.sum())
+            if cleanup_failures_count:
+                df = df[~failed_mask].reset_index(drop=True)
+
+            if strip_salts:
+                print(f"   🧂 Salts/counter-ions stripped: {salts_stripped_count}")
+            if retain_largest_fragment:
+                print(f"   🧩 Reduced to largest fragment: {fragments_retained_count}")
+            if cleanup_failures_count:
+                print(f"   🚫 Dropped (unparseable SMILES): {cleanup_failures_count}")
+
         # Load the dataframe into the database table
         try:
             conn = sqlite3.connect(self.__chemspace_db)
@@ -863,13 +1115,15 @@ class ChemSpace:
             conn.close()
         except Exception as e:
             print(f"❌ Error loading data into table '{table_name}': {e}")
-    
-    def load_csv_file(self, csv_file_path: str = None, 
-                     smiles_column: str = 'smiles', 
-                     name_column: str = 'name', 
+
+    def load_csv_file(self, csv_file_path: str = None,
+                     smiles_column: str = 'smiles',
+                     name_column: str = 'name',
                      flag_column: str = 'flag',
                      skip_duplicates: bool = True,
                      compute_inchi: bool = True,
+                     strip_salts: Optional[bool] = None,
+                     retain_largest_fragment: Optional[bool] = None,
                      parallel_threshold: int = 10000,
                      max_workers: Optional[int] = None,
                      chunk_size: Optional[int] = None) -> Dict[str, Any]:
@@ -878,7 +1132,7 @@ class ChemSpace:
         Creates a table named after the CSV file prefix.
         Automatically computes InChI keys for loaded SMILES.
         Uses parallel processing for large files to improve performance.
-        
+
         Args:
             csv_file_path (str): Path to the CSV file
             smiles_column (str): Name of the column containing SMILES strings
@@ -886,10 +1140,19 @@ class ChemSpace:
             flag_column (Optional[str]): Name of the column containing flags. If None or not found, fills with "nd"
             skip_duplicates (bool): Whether to skip duplicate compounds
             compute_inchi (bool): Whether to automatically compute InChI keys after loading
+            strip_salts (Optional[bool]): Whether to strip salt/counter-ion fragments (e.g. HCl, Na+)
+                from SMILES using RDKit's SaltRemover before storing them. If None (default), the
+                user is interactively prompted (y/N). Pass True/False explicitly to skip the prompt,
+                e.g. for scripted/non-interactive use. The original fragment is discarded once stripped.
+            retain_largest_fragment (Optional[bool]): Whether to reduce multi-fragment SMILES down to
+                only their largest fragment (by atom count) using RDKit's LargestFragmentChooser,
+                applied after strip_salts. Catches disconnected components (solvates, unusual
+                counter-ions) that SaltRemover's curated salt list misses. If None (default), the
+                user is interactively prompted (y/N). Pass True/False explicitly to skip the prompt.
             parallel_threshold (int): Number of rows above which parallel processing is used (default: 10000)
             max_workers (Optional[int]): Maximum number of parallel workers. If None, uses cpu_count()
             chunk_size (Optional[int]): Size of each chunk for parallel processing. If None, automatically calculated
-            
+
         Returns:
             dict: Results containing success status, counts, and messages
         """
@@ -976,8 +1239,8 @@ class ChemSpace:
             print(f"📖 Reading CSV file: {csv_file_path}")
             print(f"📋 Target table: {table_name}")
             
-            # Read the .csv file to be inputed
-            df = pd.read_csv(csv_file_path)
+            # Read the .csv file to be inputed, auto-detecting delimiter and header presence
+            df = self._read_compounds_csv(csv_file_path)
 
             # Safety check: catch the "wrong delimiter collapsed everything into one
             # column, and the first data row got silently used as the header" failure mode.
@@ -1029,7 +1292,23 @@ class ChemSpace:
                 print(f"⚠️  Flag column '{flag_column}' not found. Will use 'nd' as default.")
             if not flag_description_available:
                 print(f"⚠️  Flag description column 'flag_description' not found. Will use 'nd' as default.")
-            
+
+            # Query the user on whether to strip salt/counter-ion fragments from the SMILES,
+            # unless the caller already decided explicitly (e.g. scripted/non-interactive use).
+            if strip_salts is None:
+                strip_salts_choice = input(
+                    "🧂 Strip salts/counter-ions (e.g. HCl, Na+) from SMILES before loading? (y/N): "
+                ).strip().lower()
+                strip_salts = strip_salts_choice in ['y', 'yes']
+
+            # Query the user on whether to reduce multi-fragment SMILES to their largest
+            # fragment, unless the caller already decided explicitly.
+            if retain_largest_fragment is None:
+                retain_largest_fragment_choice = input(
+                    "🧩 Retain only the largest fragment of multi-fragment SMILES (e.g. solvates)? (y/N): "
+                ).strip().lower()
+                retain_largest_fragment = retain_largest_fragment_choice in ['y', 'yes']
+
             # Determine if parallel processing should be used
             use_parallel = len(df) > parallel_threshold
             
@@ -1045,13 +1324,24 @@ class ChemSpace:
                 # Process in parallel chunks
                 result = self._process_csv_parallel(
                     df, table_name, smiles_column, name_column, flag_column,
-                    name_available, flag_available, flag_description_available, 
-                    skip_duplicates, max_workers, chunk_size
+                    name_available, flag_available, flag_description_available,
+                    skip_duplicates, max_workers, chunk_size, strip_salts, retain_largest_fragment
                 )
             else:
                 print(f"📝 Processing {len(df)} rows sequentially...")
                 # Sequential processing for smaller files
                 compounds_data = []
+                salts_stripped_count = 0
+                fragments_retained_count = 0
+                cleanup_failures_count = 0
+                salt_remover = None
+                if strip_salts:
+                    from rdkit.Chem import SaltRemover
+                    salt_remover = SaltRemover.SaltRemover()
+                fragment_chooser = None
+                if retain_largest_fragment:
+                    from rdkit.Chem.MolStandardize import rdMolStandardize
+                    fragment_chooser = rdMolStandardize.LargestFragmentChooser()
                 for idx, row in df.iterrows():
                     smiles = str(row[smiles_column]).strip()
                     # Handle name column - use provided column or generate from index
@@ -1078,10 +1368,27 @@ class ChemSpace:
                     # Skip empty SMILES rows (only SMILES is mandatory)
                     if not smiles or smiles.lower() in ['nan', 'none', '']:
                         continue
+                    if salt_remover is not None:
+                        smiles, was_stripped = _strip_salts_from_smiles(smiles, salt_remover)
+                        if smiles is None:
+                            cleanup_failures_count += 1
+                            continue
+                        if was_stripped:
+                            salts_stripped_count += 1
+                    if fragment_chooser is not None:
+                        smiles, was_reduced = _retain_largest_fragment_from_smiles(smiles, fragment_chooser)
+                        if smiles is None:
+                            cleanup_failures_count += 1
+                            continue
+                        if was_reduced:
+                            fragments_retained_count += 1
                     compounds_data.append((smiles, name, flag, flag_description))
                 # Insert compounds into database
                 result = self._insert_compounds(compounds_data, table_name, skip_duplicates)
-            
+                result['salts_stripped'] = salts_stripped_count
+                result['fragments_retained'] = fragments_retained_count
+                result['cleanup_failures'] = cleanup_failures_count
+
             if result['success']:
                 self._compounds_loaded = True
                 table_count = self.get_compound_count(table_name=table_name)
@@ -1092,7 +1399,13 @@ class ChemSpace:
                 print(f"   🔄 Duplicates skipped: {result['duplicates_skipped']}")
                 print(f"   ❌ Errors: {result['errors']}")
                 print(f"   📈 Total compounds in table '{table_name}': {table_count}")
-                
+                if strip_salts:
+                    print(f"   🧂 Salts/counter-ions stripped: {result.get('salts_stripped', 0)}")
+                if retain_largest_fragment:
+                    print(f"   🧩 Reduced to largest fragment: {result.get('fragments_retained', 0)}")
+                if result.get('cleanup_failures', 0):
+                    print(f"   🚫 Dropped (unparseable SMILES): {result.get('cleanup_failures', 0)}")
+
                 # Automatically compute InChI keys if requested
                 if compute_inchi and result['compounds_added'] > 0:
                     print(f"\n🧪 Computing InChI keys for loaded compounds...")
@@ -1130,13 +1443,25 @@ class ChemSpace:
                 'errors': 1
             }
     
-    def load_csv_file_extended_columns(self, csv_file_path: str = None, skip_duplicates: bool = True) -> dict:
+    def load_csv_file_extended_columns(self, csv_file_path: str = None, skip_duplicates: bool = True,
+                                      strip_salts: Optional[bool] = None,
+                                      retain_largest_fragment: Optional[bool] = None) -> dict:
         """
         Load compounds from a CSV file into the chemspace database, allowing for additional columns.
         Prompts the user to select which columns correspond to SMILES, name, and flag, and loads all other columns as-is, renaming those columns to 'smiles', 'name', and 'flag' in the final table.
 
         Args:
             csv_file_path (str): Path to the CSV file
+            skip_duplicates (bool): Whether to skip duplicate compounds
+            strip_salts (Optional[bool]): Whether to strip salt/counter-ion fragments (e.g. HCl, Na+)
+                from SMILES using RDKit's SaltRemover before storing them. If None (default), the
+                user is interactively prompted (y/N). Pass True/False explicitly to skip the prompt,
+                e.g. for scripted/non-interactive use. The original fragment is discarded once stripped.
+            retain_largest_fragment (Optional[bool]): Whether to reduce multi-fragment SMILES down to
+                only their largest fragment (by atom count) using RDKit's LargestFragmentChooser,
+                applied after strip_salts. Catches disconnected components (solvates, unusual
+                counter-ions) that SaltRemover's curated salt list misses. If None (default), the
+                user is interactively prompted (y/N). Pass True/False explicitly to skip the prompt.
 
         Returns:
             dict: Results containing success status, counts, and messages
@@ -1157,8 +1482,8 @@ class ChemSpace:
                     'errors': 1
                 }
 
-            # Read CSV file
-            df = pd.read_csv(csv_file_path)
+            # Read CSV file, auto-detecting delimiter and header presence
+            df = self._read_compounds_csv(csv_file_path)
             columns = list(df.columns)
             print("\nColumns found in CSV:")
             for idx, col in enumerate(columns):
@@ -1182,6 +1507,60 @@ class ChemSpace:
             # Rename selected columns in the DataFrame
             rename_map = {smiles_col_orig: 'smiles', name_col_orig: 'name', flag_col_orig: 'flag'}
             df = df.rename(columns=rename_map)
+
+            # Query the user on whether to strip salt/counter-ion fragments from the SMILES,
+            # unless the caller already decided explicitly (e.g. scripted/non-interactive use).
+            if strip_salts is None:
+                strip_salts_choice = input(
+                    "🧂 Strip salts/counter-ions (e.g. HCl, Na+) from SMILES before loading? (y/N): "
+                ).strip().lower()
+                strip_salts = strip_salts_choice in ['y', 'yes']
+
+            # Query the user on whether to reduce multi-fragment SMILES to their largest
+            # fragment, unless the caller already decided explicitly.
+            if retain_largest_fragment is None:
+                retain_largest_fragment_choice = input(
+                    "🧩 Retain only the largest fragment of multi-fragment SMILES (e.g. solvates)? (y/N): "
+                ).strip().lower()
+                retain_largest_fragment = retain_largest_fragment_choice in ['y', 'yes']
+
+            salts_stripped_count = 0
+            fragments_retained_count = 0
+            cleanup_failures_count = 0
+            if strip_salts or retain_largest_fragment:
+                salt_remover = None
+                if strip_salts:
+                    from rdkit.Chem import SaltRemover
+                    salt_remover = SaltRemover.SaltRemover()
+                fragment_chooser = None
+                if retain_largest_fragment:
+                    from rdkit.Chem.MolStandardize import rdMolStandardize
+                    fragment_chooser = rdMolStandardize.LargestFragmentChooser()
+
+                def _clean_smiles(smiles):
+                    nonlocal salts_stripped_count, fragments_retained_count
+                    smiles = str(smiles).strip()
+                    if salt_remover is not None:
+                        smiles, was_stripped = _strip_salts_from_smiles(smiles, salt_remover)
+                        if smiles is None:
+                            return None
+                        if was_stripped:
+                            salts_stripped_count += 1
+                    if fragment_chooser is not None:
+                        smiles, was_reduced = _retain_largest_fragment_from_smiles(smiles, fragment_chooser)
+                        if smiles is None:
+                            return None
+                        if was_reduced:
+                            fragments_retained_count += 1
+                    return smiles
+
+                df['smiles'] = df['smiles'].apply(_clean_smiles)
+
+                # Molecules RDKit couldn't parse at all must not be added to the table.
+                failed_mask = df['smiles'].isna()
+                cleanup_failures_count = int(failed_mask.sum())
+                if cleanup_failures_count:
+                    df = df[~failed_mask].reset_index(drop=True)
 
             # Query user for flag_description value
             flag_description_value = input("Enter a description for the 'flag' column to be added to all rows: ").strip()
@@ -1275,6 +1654,12 @@ class ChemSpace:
             conn.close()
 
             print(f"✅ Loaded {compounds_added} compounds into table '{table_name}' (errors: {errors}, duplicates skipped: {duplicates_skipped})")
+            if strip_salts:
+                print(f"   🧂 Salts/counter-ions stripped: {salts_stripped_count}")
+            if retain_largest_fragment:
+                print(f"   🧩 Reduced to largest fragment: {fragments_retained_count}")
+            if cleanup_failures_count:
+                print(f"   🚫 Dropped (unparseable SMILES): {cleanup_failures_count}")
 
             # Compute InChI keys for the loaded compounds, similar to load_csv_file
             try:
@@ -1309,7 +1694,10 @@ class ChemSpace:
                 'duplicates_skipped': duplicates_skipped,
                 'errors': errors,
                 'table_name': table_name,
-                'column_types_fixed': column_types_fixed
+                'column_types_fixed': column_types_fixed,
+                'salts_stripped': salts_stripped_count,
+                'fragments_retained': fragments_retained_count,
+                'cleanup_failures': cleanup_failures_count
             }
 
         except Exception as e:
@@ -2924,10 +3312,11 @@ class ChemSpace:
     def _process_csv_parallel(self, df: pd.DataFrame, table_name: str,
                              smiles_column: str, name_column: Optional[str], flag_column: Optional[str],
                              name_available: bool, flag_available: bool, flag_description_available: bool, skip_duplicates: bool,
-                             max_workers: int, chunk_size: int) -> Dict[str, Any]:
+                             max_workers: int, chunk_size: int, strip_salts: bool = False,
+                             retain_largest_fragment: bool = False) -> Dict[str, Any]:
         """
         Process CSV data using parallel processing with chunks and comprehensive progress tracking.
-        
+
         Args:
             df (pd.DataFrame): DataFrame containing the CSV data
             table_name (str): Name of the target table
@@ -2939,28 +3328,34 @@ class ChemSpace:
             skip_duplicates (bool): Whether to skip duplicate compounds
             max_workers (int): Maximum number of parallel workers
             chunk_size (int): Size of each chunk
-            
+            strip_salts (bool): Whether to strip salt/counter-ion fragments from SMILES using RDKit's SaltRemover
+            retain_largest_fragment (bool): Whether to reduce multi-fragment SMILES down to only
+                their largest fragment using RDKit's LargestFragmentChooser
+
         Returns:
             dict: Results containing counts and status
         """
         try:
             # Record start time for performance tracking
             start_time = time.time()
-            
+
             # Split DataFrame into chunks
             print(f"   📦 Splitting {len(df)} rows into chunks...")
             chunks = self._split_dataframe_into_chunks(df, chunk_size)
             num_chunks = len(chunks)
-            
+
             print(f"   📊 Parallel Processing Setup:")
             print(f"      📦 Total chunks: {num_chunks}")
             print(f"      📏 Chunk size: {chunk_size}")
             print(f"      👥 Workers: {max_workers}")
-            
+
             # Initialize progress tracking
             total_compounds_added = 0
             total_duplicates_skipped = 0
             total_errors = 0
+            total_salts_stripped = 0
+            total_fragments_retained = 0
+            total_cleanup_failures = 0
             processed_rows = 0
             
             # Initialize progress bar if tqdm is available
@@ -2984,7 +3379,8 @@ class ChemSpace:
                     future = executor.submit(
                         _process_chunk_worker,
                         chunk, smiles_column, name_column, flag_column,
-                        name_available, flag_available, i * chunk_size, flag_description_available
+                        name_available, flag_available, i * chunk_size, flag_description_available,
+                        strip_salts, retain_largest_fragment
                     )
                     future_to_chunk[future] = {
                         'index': i,
@@ -3007,9 +3403,12 @@ class ChemSpace:
                     try:
                         # Process chunk result
                         chunk_start_time = time.time()
-                        compounds_data = future.result()
+                        compounds_data, chunk_salts_stripped, chunk_fragments_retained, chunk_cleanup_failures = future.result()
+                        total_salts_stripped += chunk_salts_stripped
+                        total_fragments_retained += chunk_fragments_retained
+                        total_cleanup_failures += chunk_cleanup_failures
                         chunk_process_time = time.time() - chunk_start_time
-                        
+
                         if compounds_data:
                             # Insert this chunk's data into database
                             insert_start_time = time.time()
@@ -3085,13 +3484,22 @@ class ChemSpace:
                 print(f"      ❌ Failed chunks: {failed_chunks}/{num_chunks}")
             print(f"      📊 Final counts: {total_compounds_added:,} added, "
                   f"{total_duplicates_skipped:,} duplicates, {total_errors:,} errors")
-            
+            if strip_salts:
+                print(f"      🧂 Salts/counter-ions stripped: {total_salts_stripped:,}")
+            if retain_largest_fragment:
+                print(f"      🧩 Reduced to largest fragment: {total_fragments_retained:,}")
+            if (strip_salts or retain_largest_fragment) and total_cleanup_failures > 0:
+                print(f"      🚫 Dropped (unparseable SMILES): {total_cleanup_failures:,}")
+
             return {
                 'success': True,
                 'message': f"Parallel processing completed: {total_compounds_added} compounds added",
                 'compounds_added': total_compounds_added,
                 'duplicates_skipped': total_duplicates_skipped,
-                'errors': total_errors
+                'errors': total_errors,
+                'salts_stripped': total_salts_stripped,
+                'fragments_retained': total_fragments_retained,
+                'cleanup_failures': total_cleanup_failures
             }
             
         except Exception as e:

@@ -351,6 +351,13 @@ elif page == "ChemSpace Inspection":
                 if selected_display_cols:
                     display_df = st_funcs.read_table_columns_as_dataframe(db_path, display_selected_table, selected_display_cols)
                     if display_df is not None and not display_df.empty:
+                        _display_row_limit = 10000
+                        if len(display_df) > _display_row_limit:
+                            st.info(
+                                f"Table '{display_selected_table}' has {len(display_df):,} rows; "
+                                f"showing only the first {_display_row_limit:,}."
+                            )
+                            display_df = display_df.head(_display_row_limit)
                         _display_df_sel = display_df.copy()
                         _display_df_sel.insert(0, "Select", False)
                         _edited_display = st.data_editor(
