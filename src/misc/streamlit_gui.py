@@ -128,7 +128,7 @@ if os.path.exists(_logo_path):
     st.sidebar.image(_logo_path, use_container_width=True)
 page = st.sidebar.radio(
     "Go to",
-    ("Project selection", "ChemSpace Inspection", "ChemSpace Actions", "Receptors", "MolDock", "ProLIF Conditions", "Docking analysis", "MolDyn", "MolDyn analysis", "ML features management", "RF model training", "Mol Viewer")
+    ("Project selection", "ChemSpace Inspection", "ChemSpace Actions", "Receptors", "MolDock", "ProLIF Conditions", "Docking analysis", "MolDyn", "MolDyn analysis", "ML features management", "RF model training", "Mol Viewer", "Reaction Viewer")
 )
 
 ## Persistent sidebar info: active project and assay
@@ -4926,3 +4926,148 @@ elif page == "Mol Viewer":
                 st.components.v1.html(view.write_html(), height=420)
     else:
         st.info("Enter a SMILES string above to visualize the molecule.")
+
+elif page == "Reaction Viewer":
+    st.title("Reaction Viewer")
+    st.write(
+        "Simulate a SMARTS-based reaction. The underlying mechanism (RDKit "
+        "ReactionFromSmarts + RunReactants) is homologous to "
+        "ChemSpace.apply_reaction_workflow(), applied here to one manually "
+        "entered reactant (or two, for a bimolecular scheme) instead of a "
+        "whole table of compounds."
+    )
+
+    rxv_scheme = st.radio(
+        "Reaction scheme:",
+        ["Unimolecular (1 reactant)", "Bimolecular (2 reactants)"],
+        key="rxv_scheme",
+    )
+    rxv_is_bimolecular = rxv_scheme.startswith("Bimolecular")
+
+    rxv_col1, rxv_col2 = st.columns(2)
+    with rxv_col1:
+        rxv_reactant1 = st.text_input("Reactant 1 SMILES:", key="rxv_reactant1")
+    with rxv_col2:
+        rxv_reactant2 = st.text_input(
+            "Reactant 2 SMILES:",
+            key="rxv_reactant2",
+            disabled=not rxv_is_bimolecular,
+            help="Only used for the bimolecular scheme.",
+        )
+
+    rxv_smarts = st.text_area(
+        "Reaction SMARTS:",
+        key="rxv_smarts",
+        placeholder="e.g. [C:1](=[O:2])[OH].[N:3]>>[C:1](=[O:2])[N:3]",
+    )
+
+    if st.button("Run Reaction", key="btn_run_reaction"):
+        rxv_errors = []
+        if not rxv_reactant1.strip():
+            rxv_errors.append("Reactant 1 SMILES is required.")
+        if rxv_is_bimolecular and not rxv_reactant2.strip():
+            rxv_errors.append("Reactant 2 SMILES is required for a bimolecular reaction.")
+        if not rxv_smarts.strip():
+            rxv_errors.append("Reaction SMARTS is required.")
+
+        for _rxv_err in rxv_errors:
+            st.error(f"❌ {_rxv_err}")
+
+        if not rxv_errors:
+            rxv_mol1 = Chem.MolFromSmiles(rxv_reactant1.strip())
+            if rxv_mol1 is None:
+                st.error(f"❌ Invalid SMILES for reactant 1: '{rxv_reactant1.strip()}'")
+
+            rxv_mol2 = None
+            if rxv_is_bimolecular:
+                rxv_mol2 = Chem.MolFromSmiles(rxv_reactant2.strip())
+                if rxv_mol2 is None:
+                    st.error(f"❌ Invalid SMILES for reactant 2: '{rxv_reactant2.strip()}'")
+
+            if rxv_mol1 is not None and (not rxv_is_bimolecular or rxv_mol2 is not None):
+                # ReactionFromSmarts doesn't just return None on bad input — some
+                # malformed SMARTS (e.g. multi-step "a>>b>>c") raise instead.
+                rxv_rxn, rxv_smarts_error = None, None
+                try:
+                    rxv_rxn = AllChem.ReactionFromSmarts(rxv_smarts.strip())
+                except Exception as e:
+                    rxv_smarts_error = str(e)
+
+                if rxv_rxn is None:
+                    st.error(f"❌ Invalid reaction SMARTS: {rxv_smarts_error or repr(rxv_smarts.strip())}")
+                else:
+                    rxv_expected = rxv_rxn.GetNumReactantTemplates()
+                    rxv_provided = 2 if rxv_is_bimolecular else 1
+                    if rxv_expected != rxv_provided:
+                        st.warning(
+                            f"⚠️ Reaction SMARTS expects {rxv_expected} reactant(s), but "
+                            f"{rxv_provided} were provided. Attempting to run anyway."
+                        )
+
+                    try:
+                        rxv_reactants = (rxv_mol1, rxv_mol2) if rxv_is_bimolecular else (rxv_mol1,)
+                        rxv_results = rxv_rxn.RunReactants(rxv_reactants)
+                    except Exception as e:
+                        st.error(f"❌ Error running reaction: {e}")
+                        rxv_results = ()
+
+                    rxv_product_smiles = []
+                    for rxv_product_set in rxv_results:
+                        for rxv_product_mol in rxv_product_set:
+                            try:
+                                Chem.SanitizeMol(rxv_product_mol)
+                                rxv_product_smiles.append(Chem.MolToSmiles(rxv_product_mol))
+                            except Exception:
+                                continue
+
+                    # De-duplicate while preserving order (a reaction can match the
+                    # same site more than once and yield identical products)
+                    rxv_seen = set()
+                    rxv_unique_products = []
+                    for _smi in rxv_product_smiles:
+                        if _smi not in rxv_seen:
+                            rxv_seen.add(_smi)
+                            rxv_unique_products.append(_smi)
+
+                    st.divider()
+                    st.subheader("Reaction Scheme")
+
+                    rxv_n_reactants = 2 if rxv_is_bimolecular else 1
+                    if rxv_unique_products:
+                        st.success(f"✅ Reaction successful: {len(rxv_unique_products)} distinct product(s) generated.")
+                        rxv_col_weights = [2] * rxv_n_reactants + [1] + [2] * len(rxv_unique_products)
+                    else:
+                        st.warning("⚠️ No valid product was generated. Check the SMARTS pattern and reactant(s).")
+                        rxv_col_weights = [2] * rxv_n_reactants
+
+                    # Single row: reactant(s) -> arrow -> product(s), so the whole
+                    # scheme reads left to right like a reaction diagram.
+                    rxv_scheme_cols = st.columns(rxv_col_weights)
+                    rxv_col_i = 0
+
+                    with rxv_scheme_cols[rxv_col_i]:
+                        st.image(Draw.MolToImage(rxv_mol1), caption="Reactant 1", use_container_width=True)
+                    rxv_col_i += 1
+
+                    if rxv_is_bimolecular:
+                        with rxv_scheme_cols[rxv_col_i]:
+                            st.image(Draw.MolToImage(rxv_mol2), caption="Reactant 2", use_container_width=True)
+                        rxv_col_i += 1
+
+                    if rxv_unique_products:
+                        with rxv_scheme_cols[rxv_col_i]:
+                            st.markdown(
+                                "<div style='text-align:center; font-size:2em; padding-top:70px;'>&#8594;</div>",
+                                unsafe_allow_html=True,
+                            )
+                        rxv_col_i += 1
+
+                        for _i, _smi in enumerate(rxv_unique_products, 1):
+                            _prod_mol = Chem.MolFromSmiles(_smi)
+                            with rxv_scheme_cols[rxv_col_i]:
+                                if _prod_mol is not None:
+                                    st.image(Draw.MolToImage(_prod_mol), caption=f"Product {_i}", use_container_width=True)
+                                else:
+                                    st.error(f"Could not render product {_i}")
+                                st.code(_smi, language=None)
+                            rxv_col_i += 1
