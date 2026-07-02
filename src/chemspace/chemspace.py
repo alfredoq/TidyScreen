@@ -3758,9 +3758,15 @@ class ChemSpace:
                 csv.writer(f).writerow(['id', 'smiles', 'name', 'flag', 'inchi_key'])
             
             # Process in batches and append to file
-            compound_data = [(row.get('id', 0), row['smiles'], row.get('name', 'unknown'),
-                            row.get('flag', 'nd'), row.get('inchi_key', None))
-                            for _, row in compounds_df.iterrows()]
+            # Vectorized column access instead of .iterrows(): iterrows() rebuilds a
+            # Series per row and is single-threaded, so on large tables it can dominate
+            # wall-clock time before the ProcessPoolExecutor below ever starts, making
+            # the run look single-CPU even though the actual filtering is parallel.
+            id_col = compounds_df['id'] if 'id' in compounds_df.columns else pd.Series(0, index=compounds_df.index)
+            name_col = compounds_df['name'] if 'name' in compounds_df.columns else pd.Series('unknown', index=compounds_df.index)
+            flag_col = compounds_df['flag'] if 'flag' in compounds_df.columns else pd.Series('nd', index=compounds_df.index)
+            inchi_key_col = compounds_df['inchi_key'] if 'inchi_key' in compounds_df.columns else pd.Series([None] * len(compounds_df), index=compounds_df.index, dtype=object)
+            compound_data = list(zip(id_col, compounds_df['smiles'], name_col, flag_col, inchi_key_col))
             
             chunks = [compound_data[i:i + chunk_size] 
                     for i in range(0, len(compound_data), chunk_size)]
@@ -3902,6 +3908,14 @@ class ChemSpace:
             compounds_passed = 0
             callback_interval = max(1, total_compounds // 100)
 
+            # Apply filters requiring at least one match first to narrow the
+            # candidate set before running the (typically costlier) zero-instance
+            # exclusion filters, same ordering as the parallel path.
+            indexed_filters = list(enumerate(workflow_filters))
+            sorted_indexed_filters = sorted(
+                indexed_filters, key=lambda item: (item[1][1] == 0, item[1][1])
+            )
+
             print(f"   🔄 Processing {total_compounds:,} compounds sequentially...")
             
             # Initialize progress tracking with enhanced information
@@ -3930,7 +3944,7 @@ class ChemSpace:
                     
                     # Apply each filter: compound must match each SMARTS exactly
                     # `required_instances` times (same semantics as the parallel path).
-                    for filter_idx, (smarts_pattern, required_instances) in enumerate(workflow_filters):
+                    for filter_idx, (smarts_pattern, required_instances) in sorted_indexed_filters:
                         try:
                             pattern = Chem.MolFromSmarts(smarts_pattern)
                             if pattern is None:
