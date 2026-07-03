@@ -624,6 +624,8 @@ elif page == "ChemSpace Actions":
     st.title("ChemSpace Actions")
     st.write("Welcome to the ChemSpace Actions page.")
 
+    st.subheader("Chemical Filtering")
+
     with st.expander("🧪 Available Chemical Filters"):
         chem_filters = tidyscreen.get_chemical_filters()
         if chem_filters:
@@ -667,23 +669,6 @@ elif page == "ChemSpace Actions":
                 if st.button("Cancel", key="btn_cancel_overwrite_filter"):
                     st.session_state[_acf_overwrite_key] = False
                     st.rerun()
-
-    with st.expander("🧬 Available Chemical Reactions"):
-        chem_reactions = tidyscreen.get_chemical_reactions()
-        if chem_reactions:
-            chem_reactions_df = pd.DataFrame(chem_reactions, columns=["ID", "Reaction Name", "SMARTS Pattern"])
-            st.dataframe(chem_reactions_df, use_container_width=True, hide_index=True)
-        else:
-            st.info("No chemical reactions found in database.")
-
-    with st.expander("📋 List Filtering Workflows"):
-        chemspace_db_path = os.path.join(st.session_state["active_project_path"], "chemspace", "processed_data", "chemspace.db")
-        filtering_workflows = ChemSpace.get_filtering_workflows(chemspace_db_path)
-        if filtering_workflows:
-            filtering_workflows_df = pd.DataFrame(filtering_workflows)
-            st.dataframe(filtering_workflows_df, use_container_width=True, hide_index=True)
-        else:
-            st.info("No saved filtering workflows found.")
 
     with st.expander("🛠️ Create Filtering Workflow"):
         if "cfw_filters" not in st.session_state:
@@ -739,11 +724,15 @@ elif page == "ChemSpace Actions":
             st.info("No filters added to the workflow yet.")
 
         st.markdown("**Save workflow**")
-        cfw_workflow_name = st.text_input("Workflow name (optional)", key="cfw_workflow_name")
+        cfw_workflow_name = st.text_input("Workflow name", key="cfw_workflow_name")
         cfw_description = st.text_area("Description (optional)", key="cfw_description")
         cfw_overwrite = st.checkbox("Overwrite if a workflow with this name already exists", key="cfw_overwrite")
 
-        if st.button("Save Workflow", key="btn_cfw_save_workflow", disabled=not st.session_state["cfw_filters"]):
+        cfw_save_disabled = not st.session_state["cfw_filters"] or not cfw_workflow_name.strip()
+        if not cfw_workflow_name.strip():
+            st.caption("Enter a workflow name to save.")
+
+        if st.button("Save Workflow", key="btn_cfw_save_workflow", disabled=cfw_save_disabled):
             chemspace_db_path = os.path.join(st.session_state["active_project_path"], "chemspace", "processed_data", "chemspace.db")
             workflow_filters = {name: info["instances"] for name, info in st.session_state["cfw_filters"].items()}
             result = ChemSpace.save_filtering_workflow(
@@ -757,6 +746,15 @@ elif page == "ChemSpace Actions":
                 st.rerun()
             else:
                 st.error(result["message"])
+
+    with st.expander("📋 List Filtering Workflows"):
+        chemspace_db_path = os.path.join(st.session_state["active_project_path"], "chemspace", "processed_data", "chemspace.db")
+        filtering_workflows = ChemSpace.get_filtering_workflows(chemspace_db_path)
+        if filtering_workflows:
+            filtering_workflows_df = pd.DataFrame(filtering_workflows)
+            st.dataframe(filtering_workflows_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No saved filtering workflows found.")
 
     with st.expander("🔬 Filter Using Workflow"):
         chemspace_db_path = os.path.join(st.session_state["active_project_path"], "chemspace", "processed_data", "chemspace.db")
@@ -817,6 +815,330 @@ elif page == "ChemSpace Actions":
 
                 with st.expander("Execution log", expanded=filtered_df is None or filtered_df.empty):
                     st.code(fuw_log.getvalue() or "(no output)")
+
+    st.divider()
+    st.subheader("Synthetic workflows")
+
+    with st.expander("🧬 Available Chemical Reactions"):
+        chem_reactions = tidyscreen.get_chemical_reactions()
+        if chem_reactions:
+            chem_reactions_df = pd.DataFrame(chem_reactions, columns=["ID", "Reaction Name", "SMARTS Pattern"])
+            st.dataframe(chem_reactions_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No chemical reactions found in database.")
+
+        st.markdown("**Add chemical reaction**")
+        _acr_col1, _acr_col2 = st.columns(2)
+        with _acr_col1:
+            _acr_name = st.text_input("Reaction name", key="acr_reaction_name")
+        with _acr_col2:
+            _acr_smarts = st.text_input("SMARTS pattern", key="acr_smarts_pattern")
+
+        _acr_overwrite_key = "acr_confirm_overwrite"
+        if not st.session_state.get(_acr_overwrite_key):
+            if st.button("Add Reaction", key="btn_add_chem_reaction"):
+                _acr_result = tidyscreen.add_chemical_reaction_entry(_acr_name, _acr_smarts, overwrite=False)
+                if _acr_result["exists"]:
+                    st.session_state[_acr_overwrite_key] = True
+                    st.rerun()
+                elif _acr_result["success"]:
+                    st.success(f"✅ {_acr_result['message']}")
+                    st.rerun()
+                else:
+                    st.error(f"❌ {_acr_result['message']}")
+        else:
+            st.warning(f"⚠️ Reaction '{_acr_name}' already exists. Overwrite it?")
+            _acr_oc1, _acr_oc2 = st.columns(2)
+            with _acr_oc1:
+                if st.button("Yes, overwrite", key="btn_confirm_overwrite_reaction"):
+                    _acr_result = tidyscreen.add_chemical_reaction_entry(_acr_name, _acr_smarts, overwrite=True)
+                    st.session_state[_acr_overwrite_key] = False
+                    if _acr_result["success"]:
+                        st.success(f"✅ {_acr_result['message']}")
+                    else:
+                        st.error(f"❌ {_acr_result['message']}")
+                    st.rerun()
+            with _acr_oc2:
+                if st.button("Cancel", key="btn_cancel_overwrite_reaction"):
+                    st.session_state[_acr_overwrite_key] = False
+                    st.rerun()
+
+    with st.expander("🛠️ Create Reactions Workflow"):
+        if "crw_reactions" not in st.session_state:
+            st.session_state["crw_reactions"] = {}
+
+        all_reactions = tidyscreen.get_chemical_reactions()
+
+        if not all_reactions:
+            st.info("No chemical reactions found in database. Add some first.")
+        else:
+            reactions_by_name = {name: (reaction_id, smarts) for reaction_id, name, smarts in all_reactions}
+            crw_available_names = [name for name in reactions_by_name if name not in st.session_state["crw_reactions"]]
+
+            st.markdown("**Add a reaction to the workflow**")
+            crw_col1, crw_col2 = st.columns([3, 1])
+            with crw_col1:
+                crw_selected_name = st.selectbox(
+                    "Reaction", crw_available_names, key="crw_selected_reaction"
+                ) if crw_available_names else None
+            with crw_col2:
+                st.markdown("<br>", unsafe_allow_html=True)
+                if st.button("Add Reaction", key="btn_crw_add_reaction", disabled=not crw_available_names):
+                    reaction_id, smarts = reactions_by_name[crw_selected_name]
+                    if ChemSpace._validate_reaction_smarts_pattern(smarts):
+                        st.session_state["crw_reactions"][crw_selected_name] = {
+                            "reaction_id": reaction_id,
+                            "smarts": smarts,
+                            "order": len(st.session_state["crw_reactions"]) + 1,
+                        }
+                        st.rerun()
+                    else:
+                        st.error(f"Invalid SMARTS pattern for reaction '{crw_selected_name}'")
+
+        st.markdown("**Current workflow**")
+        if st.session_state["crw_reactions"]:
+            crw_df = pd.DataFrame([
+                {"Order": info["order"], "Reaction Name": name, "SMARTS": info["smarts"]}
+                for name, info in st.session_state["crw_reactions"].items()
+            ])
+            st.dataframe(crw_df, use_container_width=True, hide_index=True)
+
+            crw_remove_name = st.selectbox(
+                "Remove a reaction", list(st.session_state["crw_reactions"].keys()), key="crw_remove_reaction"
+            )
+            if st.button("Remove Reaction", key="btn_crw_remove_reaction"):
+                del st.session_state["crw_reactions"][crw_remove_name]
+                st.rerun()
+        else:
+            st.info("No reactions added to the workflow yet.")
+
+        st.markdown("**Save workflow**")
+        crw_workflow_name = st.text_input("Workflow name", key="crw_workflow_name")
+        crw_description = st.text_area("Description (optional)", key="crw_description")
+        crw_overwrite = st.checkbox("Overwrite if a workflow with this name already exists", key="crw_overwrite")
+
+        crw_save_disabled = not st.session_state["crw_reactions"] or not crw_workflow_name.strip()
+        if not crw_workflow_name.strip():
+            st.caption("Enter a workflow name to save.")
+
+        if st.button("Save Workflow", key="btn_crw_save_workflow", disabled=crw_save_disabled):
+            chemspace_db_path = os.path.join(st.session_state["active_project_path"], "chemspace", "processed_data", "chemspace.db")
+            workflow_reactions = {
+                str(info["reaction_id"]): {"name": name, "smarts": info["smarts"], "order": info["order"]}
+                for name, info in st.session_state["crw_reactions"].items()
+            }
+            result = ChemSpace.save_reaction_workflow(
+                chemspace_db_path, crw_workflow_name, workflow_reactions,
+                crw_description or None, crw_overwrite
+            )
+            if result["success"]:
+                st.success(f"Saved reaction workflow '{result['workflow_name']}' "
+                           f"({result['reaction_count']} reactions).")
+                st.session_state["crw_reactions"] = {}
+                st.rerun()
+            else:
+                st.error(result["message"])
+
+    with st.expander("📋 List Chemical Reactions Workflows"):
+        chemspace_db_path = os.path.join(st.session_state["active_project_path"], "chemspace", "processed_data", "chemspace.db")
+        reaction_workflows = ChemSpace.get_reaction_workflows(chemspace_db_path)
+        if reaction_workflows:
+            reaction_workflows_df = pd.DataFrame(reaction_workflows)
+            st.dataframe(reaction_workflows_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No saved reaction workflows found.")
+
+    with st.expander("▶️ Apply Reaction Workflow"):
+        chemspace_db_path = os.path.join(st.session_state["active_project_path"], "chemspace", "processed_data", "chemspace.db")
+        arw_workflows = ChemSpace.get_reaction_workflows(chemspace_db_path)
+
+        if not arw_workflows:
+            st.info("No saved reaction workflows found. Create one first.")
+        else:
+            arw_workflow_names = [w["workflow_name"] for w in arw_workflows]
+            arw_selected_name = st.selectbox("Reaction workflow", arw_workflow_names, key="arw_selected_workflow")
+
+            if st.button("Load Workflow", key="btn_arw_load_workflow"):
+                arw_selected_workflow = next(w for w in arw_workflows if w["workflow_name"] == arw_selected_name)
+                arw_sorted_steps = sorted(
+                    arw_selected_workflow["reactions_dict"].items(), key=lambda kv: kv[1]["order"]
+                )
+                st.session_state["arw_run"] = {
+                    "workflow_name": arw_selected_workflow["workflow_name"],
+                    "steps": arw_sorted_steps,
+                    "step_idx": 0,
+                    "step_products": {},
+                }
+                st.rerun()
+
+            arw_run = st.session_state.get("arw_run")
+            if arw_run:
+                st.markdown(f"**Applying workflow: '{arw_run['workflow_name']}'**")
+
+                # ActivateProject(name) looks up the project in this conda env's own
+                # projects_database.db, which is separate from (and can be out of sync
+                # with) the one the project was actually created in. Build a bare
+                # ActivateProject carrying only what ChemSpace needs, using the path
+                # already resolved by the Project selection page, instead of re-querying.
+                arw_project_obj = tidyscreen.ActivateProject.__new__(tidyscreen.ActivateProject)
+                arw_project_obj.name = st.session_state["selected_project"]
+                arw_project_obj.path = st.session_state["active_project_path"]
+                arw_project_obj._project_exists = True
+                arw_chemspace_obj = ChemSpace(arw_project_obj)
+
+                arw_total_steps = len(arw_run["steps"])
+                arw_step_idx = arw_run["step_idx"]
+
+                if arw_step_idx >= arw_total_steps:
+                    st.success(f"Workflow complete: {arw_total_steps} step(s) executed.")
+                    arw_summary_rows = [
+                        {
+                            "Step": step,
+                            "Reaction": info["reaction_name"],
+                            "Products": info["product_count"],
+                            "Table": info["table_name"],
+                        }
+                        for step, info in arw_run["step_products"].items()
+                    ]
+                    if arw_summary_rows:
+                        st.dataframe(pd.DataFrame(arw_summary_rows), use_container_width=True, hide_index=True)
+                    if st.button("Reset", key="btn_arw_reset"):
+                        del st.session_state["arw_run"]
+                        st.rerun()
+                else:
+                    _arw_reaction_id, arw_reaction_raw = arw_run["steps"][arw_step_idx]
+                    arw_reaction_info = {"name": arw_reaction_raw["name"], "smarts": arw_reaction_raw["smarts"]}
+                    arw_reaction_type = arw_chemspace_obj._analyze_single_reaction_type(arw_reaction_info["smarts"])
+
+                    st.markdown(f"**Step {arw_step_idx + 1}/{arw_total_steps}: {arw_reaction_info['name']}** ({arw_reaction_type})")
+                    st.code(arw_reaction_info["smarts"])
+
+                    # Available reactant sources: original tables plus product tables saved by earlier steps
+                    arw_original_tables = [
+                        t for t in arw_chemspace_obj.get_all_tables()
+                        if t not in ("filtering_workflows", "reaction_workflows")
+                    ]
+                    arw_source_options = []
+                    arw_source_labels = {}
+                    for t in arw_original_tables:
+                        arw_count = arw_chemspace_obj.get_compound_count(table_name=t)
+                        arw_source_options.append(t)
+                        arw_source_labels[t] = f"{t} ({arw_count} compounds) [Original]"
+                    for arw_prev_step, arw_info in arw_run["step_products"].items():
+                        if arw_prev_step < arw_step_idx + 1:
+                            t = arw_info["table_name"]
+                            arw_source_options.append(t)
+                            arw_source_labels[t] = (
+                                f"{t} ({arw_info['product_count']} products from "
+                                f"Step {arw_prev_step}: {arw_info['reaction_name']}) [Products]"
+                            )
+
+                    if not arw_source_options:
+                        st.warning("No reactant tables available for this step.")
+                    else:
+                        if arw_reaction_type == "bimolecular":
+                            st.caption("Bimolecular reaction: select a primary and a secondary reactant table "
+                                       "(the same table may be used for both).")
+                            arw_col1, arw_col2 = st.columns(2)
+                            with arw_col1:
+                                arw_primary = st.selectbox(
+                                    "Primary reactant table", arw_source_options,
+                                    format_func=lambda t: arw_source_labels[t], key=f"arw_primary_{arw_step_idx}"
+                                )
+                            with arw_col2:
+                                arw_secondary = st.selectbox(
+                                    "Secondary reactant table", arw_source_options,
+                                    format_func=lambda t: arw_source_labels[t], key=f"arw_secondary_{arw_step_idx}"
+                                )
+                            arw_primary_tables = [arw_primary]
+                            arw_secondary_table = arw_secondary
+                        else:
+                            st.caption("Unimolecular reaction: select one or more reactant tables "
+                                       "(their compounds are combined as the input set).")
+                            arw_primary_tables = st.multiselect(
+                                "Reactant table(s)", arw_source_options,
+                                format_func=lambda t: arw_source_labels[t], key=f"arw_sources_{arw_step_idx}"
+                            )
+                            arw_secondary_table = None
+
+                        arw_save_products = st.checkbox(
+                            "Save products to a new table (required for use in later steps)",
+                            value=True, key=f"arw_save_{arw_step_idx}"
+                        )
+                        arw_output_table_name = ""
+                        if arw_save_products:
+                            arw_default_name = f"step{arw_step_idx + 1}_{arw_reaction_info['name']}"
+                            arw_output_table_name = st.text_input(
+                                "Output table name", value=arw_default_name, key=f"arw_output_name_{arw_step_idx}"
+                            )
+
+                        arw_run_disabled = (
+                            not arw_primary_tables
+                            or (arw_reaction_type == "bimolecular" and not arw_secondary_table)
+                            or (arw_save_products and not arw_output_table_name.strip())
+                        )
+                        if st.button("Run Step", key=f"btn_arw_run_step_{arw_step_idx}", disabled=arw_run_disabled):
+                            arw_log = io.StringIO()
+                            with contextlib.redirect_stdout(arw_log):
+                                arw_result = arw_chemspace_obj.apply_reaction_workflow_step(
+                                    reaction_info=arw_reaction_info,
+                                    workflow_name=arw_run["workflow_name"],
+                                    step_num=arw_step_idx + 1,
+                                    primary_tables=arw_primary_tables,
+                                    secondary_table=arw_secondary_table,
+                                    output_table_name=arw_output_table_name.strip() if arw_save_products else None,
+                                )
+
+                            if arw_result["success"] and arw_result["output_table"]:
+                                arw_run["step_products"][arw_step_idx + 1] = {
+                                    "table_name": arw_result["output_table"],
+                                    "product_count": arw_result["products_generated"],
+                                    "reaction_name": arw_reaction_info["name"],
+                                }
+
+                            if arw_result["success"]:
+                                st.success(f"Generated {arw_result['products_generated']} product(s).")
+                                if arw_result["output_table"]:
+                                    st.info(f"Saved to table '{arw_result['output_table']}'.")
+                                elif arw_save_products:
+                                    st.warning("No products were generated; nothing was saved.")
+                                if arw_result["products"]:
+                                    st.dataframe(
+                                        pd.DataFrame(arw_result["products"][:20]),
+                                        use_container_width=True, hide_index=True
+                                    )
+                                if arw_result["ambiguous_reactants"]:
+                                    arw_ambig_lines = []
+                                    for arw_amb in arw_result["ambiguous_reactants"]:
+                                        if "reactant2_id" in arw_amb:
+                                            arw_ambig_lines.append(
+                                                f"- '{arw_amb['reactant1_name']}' (id={arw_amb['reactant1_id']}, "
+                                                f"smiles={arw_amb.get('reactant1_smiles', 'n/a')}) + "
+                                                f"'{arw_amb['reactant2_name']}' (id={arw_amb['reactant2_id']}, "
+                                                f"smiles={arw_amb.get('reactant2_smiles', 'n/a')}): "
+                                                f"{arw_amb['product_possibilities']} product possibilities"
+                                            )
+                                        else:
+                                            arw_ambig_lines.append(
+                                                f"- '{arw_amb['reactant_name']}' (id={arw_amb['reactant_id']}, "
+                                                f"smiles={arw_amb.get('reactant_smiles', 'n/a')}): "
+                                                f"{arw_amb['product_possibilities']} product possibilities"
+                                            )
+                                    st.warning(
+                                        f"{len(arw_result['ambiguous_reactants'])} reactant(s)/pair(s) matched the "
+                                        f"reaction at more than one site (multiple matching functional groups):\n\n"
+                                        + "\n".join(arw_ambig_lines)
+                                    )
+                            else:
+                                st.error(f"Step failed, workflow halted: {arw_result['message']}")
+
+                            with st.expander("Execution log", expanded=not arw_result["success"]):
+                                st.code(arw_log.getvalue() or "(no output)")
+
+                            if arw_result["success"]:
+                                arw_run["step_idx"] += 1
+                            st.session_state["arw_run"] = arw_run
+                            st.rerun()
 
 elif page == "Receptors":
     st.title("Receptors")

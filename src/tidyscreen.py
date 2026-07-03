@@ -326,90 +326,137 @@ def add_chemical_filter():
         print(f"❌ {result['message']}")
         return False
 
-def add_chemical_reaction():
+def add_chemical_reaction_entry(reaction_name, smarts_pattern, overwrite=False):
     """
-    Add a new chemical reaction by prompting user for input.
-    Updates the JSON file and refreshes the filters table.
-    This can be called independently without activating a specific project.
+    Add (or overwrite) a chemical reaction entry in the chem_reactions.json config
+    file and refresh the chem_reactions table in the projects database.
+
+    Non-interactive core shared by add_chemical_reaction() (CLI, prompts for
+    input via input()) and the Streamlit GUI, which collects the same fields
+    through text inputs instead.
+
+    Args:
+        reaction_name (str): Name of the reaction.
+        smarts_pattern (str): SMARTS pattern for the reaction.
+        overwrite (bool): If True, replace an existing reaction with the same
+            name. If False and the name already exists, no write happens and
+            the result's 'exists' flag is set so the caller can ask the user
+            to confirm before retrying with overwrite=True.
+
+    Returns:
+        dict: {'success': bool, 'message': str, 'exists': bool}
     """
-    print("\n" + "="*60)
-    print("ADD NEW CHEMICAL REACTION")
-    print("="*60)
-    
+    reaction_name = (reaction_name or "").strip()
+    smarts_pattern = (smarts_pattern or "").strip()
+
+    if not reaction_name:
+        return {'success': False, 'message': "Reaction name cannot be empty.", 'exists': False}
+
+    if not smarts_pattern:
+        return {'success': False, 'message': "SMARTS pattern cannot be empty.", 'exists': False}
+
     try:
-        # Get user input
-        reaction_name = input("Enter reaction name: ").strip()
-        if not reaction_name:
-            print("❌ Reaction name cannot be empty.")
-            return False
-        
-        smarts_pattern = input("Enter SMARTS pattern: ").strip()
-        if not smarts_pattern:
-            print("❌ SMARTS pattern cannot be empty.")
-            return False
-        
-        # Confirm input
-        print(f"\n📋 Reaction details:")
-        print(f"   Name: {reaction_name}")
-        print(f"   SMARTS: {smarts_pattern}")
-        
-        confirm = input("\nSave this reaction? (y/n): ").strip().lower()
-        if confirm not in ['y', 'yes']:
-            print("Reaction addition cancelled.")
-            return False
-        
         # Get path to JSON file
         config_path = os.path.join(os.path.dirname(__file__), 'config', 'chem_reactions.json')
-        
+
         # Read existing reactions
         if os.path.exists(config_path):
             with open(config_path, 'r', encoding='utf-8') as f:
                 reactions_data = json.load(f)
         else:
-            filters_data = []
-        
+            reactions_data = []
+
         # Check if reaction name already exists
         existing_names = [f['reaction_name'] for f in reactions_data]
-        if reaction_name in existing_names:
-            print(f"❌ Reaction '{reaction_name}' already exists in the configuration file.")
-            overwrite = input("Do you want to overwrite it? (y/n): ").strip().lower()
-            if overwrite not in ['y', 'yes']:
-                print("Reaction addition cancelled.")
-                return False
-            
-            # Remove existing reaction with same name
-            reactions_data = [f for f in reactions_data if f['reaction_name'] != reaction_name]
-        
-        # Add new reactin
-        new_reaction = {
-            "reaction_name": reaction_name,
-            "smarts": smarts_pattern
-        }
-        reactions_data.append(new_reaction)
-        
+        if reaction_name in existing_names and not overwrite:
+            return {
+                'success': False,
+                'message': f"Reaction '{reaction_name}' already exists in the configuration file.",
+                'exists': True,
+            }
+
+        # Remove existing reaction with same name (no-op if it wasn't there)
+        reactions_data = [f for f in reactions_data if f['reaction_name'] != reaction_name]
+
+        # Add new reaction
+        reactions_data.append({"reaction_name": reaction_name, "smarts": smarts_pattern})
+
         # Sort reactions alphabetically by name
         reactions_data.sort(key=lambda x: x['reaction_name'])
-        
+
         # Write back to JSON file
         with open(config_path, 'w', encoding='utf-8') as f:
-            json.dump(filters_data, f, indent=2, ensure_ascii=False)
-        
+            json.dump(reactions_data, f, indent=2, ensure_ascii=False)
+
         print(f"✅ Reaction '{reaction_name}' added to configuration file.")
         print(f"📍 Updated file: {config_path}")
-        
+
         # Refresh reactions in database
         print("\n🔄 Refreshing reactions in database...")
         success = refresh_reactions()
-        
+
         if success:
-            print("✅ Chemical reaction added and database updated successfully!")
-            return True
+            return {
+                'success': True,
+                'message': f"Chemical reaction '{reaction_name}' added and database updated successfully!",
+                'exists': False,
+            }
         else:
-            print("❌ Reaction was added to configuration but database update failed.")
-            return False
-            
+            return {
+                'success': False,
+                'message': f"Reaction '{reaction_name}' was added to configuration but database update failed.",
+                'exists': False,
+            }
+
     except Exception as e:
-        print(f"❌ Error adding chemical reaction: {e}")
+        return {'success': False, 'message': f"Error adding chemical reaction: {e}", 'exists': False}
+
+def add_chemical_reaction():
+    """
+    Add a new chemical reaction by prompting user for input.
+    Updates the JSON file and refreshes the reactions table.
+    This can be called independently without activating a specific project.
+    """
+    print("\n" + "="*60)
+    print("ADD NEW CHEMICAL REACTION")
+    print("="*60)
+
+    # Get user input
+    reaction_name = input("Enter reaction name: ").strip()
+    if not reaction_name:
+        print("❌ Reaction name cannot be empty.")
+        return False
+
+    smarts_pattern = input("Enter SMARTS pattern: ").strip()
+    if not smarts_pattern:
+        print("❌ SMARTS pattern cannot be empty.")
+        return False
+
+    # Confirm input
+    print(f"\n📋 Reaction details:")
+    print(f"   Name: {reaction_name}")
+    print(f"   SMARTS: {smarts_pattern}")
+
+    confirm = input("\nSave this reaction? (y/n): ").strip().lower()
+    if confirm not in ['y', 'yes']:
+        print("Reaction addition cancelled.")
+        return False
+
+    result = add_chemical_reaction_entry(reaction_name, smarts_pattern, overwrite=False)
+
+    if result['exists']:
+        print(f"❌ {result['message']}")
+        overwrite = input("Do you want to overwrite it? (y/n): ").strip().lower()
+        if overwrite not in ['y', 'yes']:
+            print("Reaction addition cancelled.")
+            return False
+        result = add_chemical_reaction_entry(reaction_name, smarts_pattern, overwrite=True)
+
+    if result['success']:
+        print(f"✅ {result['message']}")
+        return True
+    else:
+        print(f"❌ {result['message']}")
         return False
 
 def update_tidyscreen():

@@ -298,58 +298,76 @@ def _filter_chunk_worker_by_instances(chunk_data: List[Tuple], filters_list: Lis
     
     return results
 
-def _process_bimolecular_chunk_worker(chunk_data: List[Tuple], reaction_smarts: str, 
-                                    reaction_name: str, workflow_name: str) -> List[Dict[str, Any]]:
+def _process_bimolecular_chunk_worker(chunk_data: List[Tuple], reaction_smarts: str,
+                                    reaction_name: str, workflow_name: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Worker function to process a chunk of bimolecular reaction combinations.
     This function must be at module level to be pickleable for multiprocessing.
-    
+
     Args:
         chunk_data (List[Tuple]): List of (primary_compound, secondary_compound) tuples
         reaction_smarts (str): SMARTS pattern for the reaction
         reaction_name (str): Name of the reaction
         workflow_name (str): Name of the workflow
-        
+
     Returns:
-        List[Dict]: List of reaction products
+        Tuple[List[Dict], List[Dict]]: (products, ambiguous_reactants) — ambiguous_reactants has
+            one entry per reactant pair in this chunk for which RunReactants() returned more than
+            one product set (the pair matched the reaction template at more than one site).
     """
     try:
         from rdkit import Chem
         from rdkit.Chem import AllChem
         from rdkit import RDLogger
         RDLogger.DisableLog('rdApp.*')
-        
+
         products = []
-        
+        ambiguous_reactants = []
+
         # Parse reaction
         rxn = AllChem.ReactionFromSmarts(reaction_smarts)
         if rxn is None:
-            return []
-        
+            return [], []
+
         for primary_compound, secondary_compound in chunk_data:
             try:
                 # Parse molecules
                 primary_mol = Chem.MolFromSmiles(primary_compound['smiles'])
                 secondary_mol = Chem.MolFromSmiles(secondary_compound['smiles'])
-                
+
                 if primary_mol is None or secondary_mol is None:
                     continue
-                
+
                 # Run reaction
                 reaction_results = rxn.RunReactants((primary_mol, secondary_mol))
-                
+
+                # Flag reactant pairs that matched the reaction template at more than one
+                # site, generating more than one product possibility for the same pair
+                if len(reaction_results) > 1:
+                    primary_id = primary_compound.get('id', 'unk')
+                    secondary_id = secondary_compound.get('id', 'unk')
+                    ambiguous_reactants.append({
+                        'reactant1_id': primary_id,
+                        'reactant1_name': primary_compound.get('name', f"cpd_{primary_id}"),
+                        'reactant1_smiles': primary_compound['smiles'],
+                        'reactant2_id': secondary_id,
+                        'reactant2_name': secondary_compound.get('name', f"cpd_{secondary_id}"),
+                        'reactant2_smiles': secondary_compound['smiles'],
+                        'product_possibilities': len(reaction_results),
+                    })
+
                 # Process products
                 for product_set_idx, product_set in enumerate(reaction_results):
                     for product_idx, product_mol in enumerate(product_set):
                         try:
                             Chem.SanitizeMol(product_mol)
                             product_smiles = Chem.MolToSmiles(product_mol)
-                            
+
                             # Generate product name
                             primary_name = primary_compound.get('name', f"cpd_{primary_compound.get('id', 'unk')}")
                             secondary_name = secondary_compound.get('name', f"cpd_{secondary_compound.get('id', 'unk')}")
                             product_name = f"{primary_name}+{secondary_name}_{reaction_name}_{product_set_idx}_{product_idx}"
-                            
+
                             products.append({
                                 'smiles': product_smiles,
                                 'name': product_name,
@@ -361,69 +379,83 @@ def _process_bimolecular_chunk_worker(chunk_data: List[Tuple], reaction_smarts: 
                                 'reaction_name': reaction_name,
                                 'workflow': workflow_name
                             })
-                            
+
                         except Exception:
                             continue
-            
+
             except Exception:
                 continue
-        
-        return products
-        
-    except Exception:
-        return []
 
-def _process_unimolecular_chunk_worker(chunk_data: List[Dict], reaction_smarts: str, 
-                                     reaction_name: str, workflow_name: str, 
-                                     name_prefix: str) -> List[Dict[str, Any]]:
+        return products, ambiguous_reactants
+
+    except Exception:
+        return [], []
+
+def _process_unimolecular_chunk_worker(chunk_data: List[Dict], reaction_smarts: str,
+                                     reaction_name: str, workflow_name: str,
+                                     name_prefix: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Worker function to process a chunk of unimolecular reactions.
     This function must be at module level to be pickleable for multiprocessing.
-    
+
     Args:
         chunk_data (List[Dict]): List of compound dictionaries
         reaction_smarts (str): SMARTS pattern for the reaction
         reaction_name (str): Name of the reaction
         workflow_name (str): Name of the workflow
         name_prefix (str): Prefix for product names
-        
+
     Returns:
-        List[Dict]: List of reaction products
+        Tuple[List[Dict], List[Dict]]: (products, ambiguous_reactants) — ambiguous_reactants has
+            one entry per reactant in this chunk for which RunReactants() returned more than one
+            product set (the reactant matched the reaction template at more than one site).
     """
     try:
         from rdkit import Chem
         from rdkit.Chem import AllChem
         from rdkit import RDLogger
         RDLogger.DisableLog('rdApp.*')
-        
+
         products = []
-        
+        ambiguous_reactants = []
+
         # Parse reaction
         rxn = AllChem.ReactionFromSmarts(reaction_smarts)
         if rxn is None:
-            return []
-        
+            return [], []
+
         for compound in chunk_data:
             try:
                 # Parse molecule
                 reactant_mol = Chem.MolFromSmiles(compound['smiles'])
                 if reactant_mol is None:
                     continue
-                
+
                 # Run reaction
                 reaction_results = rxn.RunReactants((reactant_mol,))
-                
+
+                # Flag reactants that matched the reaction template at more than one site,
+                # generating more than one distinct product from that reactant alone
+                if len(reaction_results) > 1:
+                    reactant_id = compound.get('id', 'unk')
+                    ambiguous_reactants.append({
+                        'reactant_id': reactant_id,
+                        'reactant_name': compound.get('name', f"cpd_{reactant_id}"),
+                        'reactant_smiles': compound['smiles'],
+                        'product_possibilities': len(reaction_results),
+                    })
+
                 # Process products
                 for product_set_idx, product_set in enumerate(reaction_results):
                     for product_idx, product_mol in enumerate(product_set):
                         try:
                             Chem.SanitizeMol(product_mol)
                             product_smiles = Chem.MolToSmiles(product_mol)
-                            
+
                             # Generate product name
                             original_name = compound.get('name', f"cpd_{compound.get('id', 'unk')}")
                             product_name = f"{name_prefix}{original_name}_{reaction_name}_{product_set_idx}_{product_idx}"
-                            
+
                             products.append({
                                 'smiles': product_smiles,
                                 'name': product_name,
@@ -433,33 +465,35 @@ def _process_unimolecular_chunk_worker(chunk_data: List[Dict], reaction_smarts: 
                                 'reaction_name': reaction_name,
                                 'workflow': workflow_name
                             })
-                            
+
                         except Exception:
                             continue
-                            
+
             except Exception:
                 continue
-        
-        return products
-        
-    except Exception:
-        return []
 
-def _process_bimolecular_chunk_to_file_worker(chunk_data: List[Tuple], reaction_smarts: str, 
-                                            reaction_name: str, workflow_name: str, 
-                                            output_file_path: str) -> int:
+        return products, ambiguous_reactants
+
+    except Exception:
+        return [], []
+
+def _process_bimolecular_chunk_to_file_worker(chunk_data: List[Tuple], reaction_smarts: str,
+                                            reaction_name: str, workflow_name: str,
+                                            output_file_path: str) -> Tuple[int, List[Dict[str, Any]]]:
     """
     Worker function to process a bimolecular chunk and write results directly to a CSV file.
-    
+
     Args:
         chunk_data (List[Tuple]): List of (primary_compound, secondary_compound) tuples
         reaction_smarts (str): SMARTS pattern for the reaction
         reaction_name (str): Name of the reaction
         workflow_name (str): Name of the workflow
         output_file_path (str): Path to output CSV file
-        
+
     Returns:
-        int: Number of products written to file
+        Tuple[int, List[Dict]]: (products_count, ambiguous_reactants) — ambiguous_reactants has
+            one entry per reactant pair in this chunk for which RunReactants() returned more than
+            one product set (the pair matched the reaction template at more than one site).
     """
     try:
         import csv
@@ -467,45 +501,61 @@ def _process_bimolecular_chunk_to_file_worker(chunk_data: List[Tuple], reaction_
         from rdkit.Chem import AllChem
         from rdkit import RDLogger
         RDLogger.DisableLog('rdApp.*')
-        
+
         products_count = 0
-        
+        ambiguous_reactants = []
+
         # Parse reaction
         rxn = AllChem.ReactionFromSmarts(reaction_smarts)
         if rxn is None:
-            return 0
-        
+            return 0, []
+
         # Open file for writing
         with open(output_file_path, 'w', newline='', encoding='utf-8') as csvfile:
             fieldnames = ['smiles', 'name', 'flag', 'reactant1_name', 'reactant1_smiles',
                          'reactant2_name', 'reactant2_smiles', 'reaction_name', 'workflow']
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
-            
+
             for primary_compound, secondary_compound in chunk_data:
                 try:
                     # Parse molecules
                     primary_mol = Chem.MolFromSmiles(primary_compound['smiles'])
                     secondary_mol = Chem.MolFromSmiles(secondary_compound['smiles'])
-                    
+
                     if primary_mol is None or secondary_mol is None:
                         continue
-                    
+
                     # Run reaction
                     reaction_results = rxn.RunReactants((primary_mol, secondary_mol))
-                    
+
+                    # Flag reactant pairs that matched the reaction template at more than one
+                    # site, generating more than one product possibility for the same pair
+                    if len(reaction_results) > 1:
+                        primary_id = primary_compound.get('id', 'unk')
+                        secondary_id = secondary_compound.get('id', 'unk')
+                        ambiguous_reactants.append({
+                            'reactant1_id': primary_id,
+                            'reactant1_name': primary_compound.get('name', f"cpd_{primary_id}"),
+                            'reactant1_smiles': primary_compound['smiles'],
+                            'reactant2_id': secondary_id,
+                            'reactant2_name': secondary_compound.get('name', f"cpd_{secondary_id}"),
+                            'reactant2_smiles': secondary_compound['smiles'],
+                            'product_possibilities': len(reaction_results),
+                        })
+
                     # Process products and write immediately
                     for product_set_idx, product_set in enumerate(reaction_results):
                         for product_idx, product_mol in enumerate(product_set):
                             try:
                                 Chem.SanitizeMol(product_mol)
                                 product_smiles = Chem.MolToSmiles(product_mol)
-                                
+
                                 # Generate product name
                                 primary_name = primary_compound.get('name', f"cpd_{primary_compound.get('id', 'unk')}")
                                 secondary_name = secondary_compound.get('name', f"cpd_{secondary_compound.get('id', 'unk')}")
                                 product_name = f"{primary_name}+{secondary_name}_{reaction_name}_{product_set_idx}_{product_idx}"
-                                
+
                                 # Write product directly to file
                                 writer.writerow({
                                     'smiles': product_smiles,
@@ -519,24 +569,24 @@ def _process_bimolecular_chunk_to_file_worker(chunk_data: List[Tuple], reaction_
                                     'workflow': workflow_name
                                 })
                                 products_count += 1
-                                
+
                             except Exception:
                                 continue
-                                
+
                 except Exception:
                     continue
-        
-        return products_count
-        
-    except Exception:
-        return 0
 
-def _process_unimolecular_chunk_to_file_worker(chunk_data: List[Dict], reaction_smarts: str, 
+        return products_count, ambiguous_reactants
+
+    except Exception:
+        return 0, []
+
+def _process_unimolecular_chunk_to_file_worker(chunk_data: List[Dict], reaction_smarts: str,
                                              reaction_name: str, workflow_name: str,
-                                             name_prefix: str, output_file_path: str) -> int:
+                                             name_prefix: str, output_file_path: str) -> Tuple[int, List[Dict[str, Any]]]:
     """
     Worker function to process a unimolecular chunk and write results directly to a CSV file.
-    
+
     Args:
         chunk_data (List[Dict]): List of compound dictionaries
         reaction_smarts (str): SMARTS pattern for the reaction
@@ -544,9 +594,11 @@ def _process_unimolecular_chunk_to_file_worker(chunk_data: List[Dict], reaction_
         workflow_name (str): Name of the workflow
         name_prefix (str): Prefix for product names
         output_file_path (str): Path to output CSV file
-        
+
     Returns:
-        int: Number of products written to file
+        Tuple[int, List[Dict]]: (products_count, ambiguous_reactants) — ambiguous_reactants has
+            one entry per reactant in this chunk for which RunReactants() returned more than one
+            product set (the reactant matched the reaction template at more than one site).
     """
     try:
         import csv
@@ -554,42 +606,54 @@ def _process_unimolecular_chunk_to_file_worker(chunk_data: List[Dict], reaction_
         from rdkit.Chem import AllChem
         from rdkit import RDLogger
         RDLogger.DisableLog('rdApp.*')
-        
+
         products_count = 0
-        
+        ambiguous_reactants = []
+
         # Parse reaction
         rxn = AllChem.ReactionFromSmarts(reaction_smarts)
         if rxn is None:
-            return 0
-        
+            return 0, []
+
         # Open file for writing
         with open(output_file_path, 'w', newline='', encoding='utf-8') as csvfile:
-            fieldnames = ['smiles', 'name', 'flag', 'reactant_name', 
+            fieldnames = ['smiles', 'name', 'flag', 'reactant_name',
                          'reactant_smiles', 'reaction_name', 'workflow']
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
-            
+
             for compound in chunk_data:
                 try:
                     # Parse molecule
                     reactant_mol = Chem.MolFromSmiles(compound['smiles'])
                     if reactant_mol is None:
                         continue
-                    
+
                     # Run reaction
                     reaction_results = rxn.RunReactants((reactant_mol,))
-                    
+
+                    # Flag reactants that matched the reaction template at more than one site,
+                    # generating more than one distinct product from that reactant alone
+                    if len(reaction_results) > 1:
+                        reactant_id = compound.get('id', 'unk')
+                        ambiguous_reactants.append({
+                            'reactant_id': reactant_id,
+                            'reactant_name': compound.get('name', f"cpd_{reactant_id}"),
+                            'reactant_smiles': compound['smiles'],
+                            'product_possibilities': len(reaction_results),
+                        })
+
                     # Process products and write immediately
                     for product_set_idx, product_set in enumerate(reaction_results):
                         for product_idx, product_mol in enumerate(product_set):
                             try:
                                 Chem.SanitizeMol(product_mol)
                                 product_smiles = Chem.MolToSmiles(product_mol)
-                                
+
                                 # Generate product name
                                 original_name = compound.get('name', f"cpd_{compound.get('id', 'unk')}")
                                 product_name = f"{name_prefix}{original_name}_{reaction_name}_{product_set_idx}_{product_idx}"
-                                
+
                                 # Write product directly to file
                                 writer.writerow({
                                     'smiles': product_smiles,
@@ -601,17 +665,17 @@ def _process_unimolecular_chunk_to_file_worker(chunk_data: List[Dict], reaction_
                                     'workflow': workflow_name
                                 })
                                 products_count += 1
-                                
+
                             except Exception:
                                 continue
-                                
+
                 except Exception:
                     continue
-        
-        return products_count
-        
+
+        return products_count, ambiguous_reactants
+
     except Exception:
-        return 0
+        return 0, []
 
 class ChemSpace:
     """
@@ -5592,64 +5656,194 @@ class ChemSpace:
         except Exception as e:
             print(f"❌ Error saving reaction workflow: {e}")
 
+    @staticmethod
+    def save_reaction_workflow(chemspace_db_path: str, workflow_name: str,
+                                workflow_reactions: Dict[int, Dict[str, Any]],
+                                description: Optional[str] = None,
+                                overwrite: bool = False) -> Dict[str, Any]:
+        """
+        Persist a reaction workflow to a chemspace database.
+
+        Non-interactive counterpart to _save_reaction_workflow(), reusing the same
+        'reaction_workflows' table schema, so it can be called from the Streamlit
+        GUI (mirrors the save_filtering_workflow() pattern used for filters).
+
+        Args:
+            chemspace_db_path (str): Path to the project's chemspace.db
+            workflow_name (str): Desired workflow name
+            workflow_reactions (Dict[int, Dict]): Dictionary mapping reaction IDs to
+                {'name', 'smarts', 'order'} entries, as built by create_reaction_workflow()
+            description (Optional[str]): Optional description; a default is generated if omitted
+            overwrite (bool): If a workflow with the same name exists, overwrite it when True;
+                otherwise a unique suffixed name is generated automatically.
+
+        Returns:
+            Dict[str, Any]: On success: {'success': True, 'workflow_name', 'reaction_count',
+                'creation_date', 'description'}. On failure: {'success': False, 'message'}.
+        """
+        if not workflow_reactions:
+            return {'success': False, 'message': 'No workflow reactions to save'}
+
+        try:
+            conn = sqlite3.connect(chemspace_db_path)
+            cursor = conn.cursor()
+
+            # Create reaction_workflows table if it doesn't exist
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS reaction_workflows (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workflow_name TEXT NOT NULL UNIQUE,
+                reactions_dict TEXT NOT NULL,
+                creation_date TEXT NOT NULL,
+                description TEXT
+            )
+            """)
+
+            # Create index for faster searches
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_reaction_workflows_name ON reaction_workflows(workflow_name)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_reaction_workflows_date ON reaction_workflows(creation_date)")
+
+            reaction_count = len(workflow_reactions)
+
+            if not description:
+                description = f"Reaction workflow with {reaction_count} reactions"
+
+            workflow_name = workflow_name.strip() or f"reaction_workflow_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+            # Check if workflow name already exists
+            cursor.execute("SELECT COUNT(*) FROM reaction_workflows WHERE workflow_name = ?", (workflow_name,))
+            if cursor.fetchone()[0] > 0:
+                if overwrite:
+                    cursor.execute("DELETE FROM reaction_workflows WHERE workflow_name = ?", (workflow_name,))
+                else:
+                    # Generate unique name
+                    counter = 1
+                    original_name = workflow_name
+                    while True:
+                        new_name = f"{original_name}_{counter}"
+                        cursor.execute("SELECT COUNT(*) FROM reaction_workflows WHERE workflow_name = ?", (new_name,))
+                        if cursor.fetchone()[0] == 0:
+                            workflow_name = new_name
+                            break
+                        counter += 1
+
+            creation_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            reactions_json = json.dumps(workflow_reactions, sort_keys=True)
+
+            cursor.execute("""
+            INSERT INTO reaction_workflows
+            (workflow_name, reactions_dict, creation_date, description)
+            VALUES (?, ?, ?, ?)
+            """, (workflow_name, reactions_json, creation_date, description))
+
+            conn.commit()
+            conn.close()
+
+            return {
+                'success': True,
+                'workflow_name': workflow_name,
+                'reaction_count': reaction_count,
+                'creation_date': creation_date,
+                'description': description,
+            }
+
+        except Exception as e:
+            return {'success': False, 'message': f"Error saving reaction workflow: {e}"}
+
+    @staticmethod
+    def get_reaction_workflows(chemspace_db_path: str) -> List[Dict[str, Any]]:
+        """
+        Retrieve all saved reaction workflows from a chemspace database.
+
+        Non-interactive counterpart to list_reaction_workflows(), reusing the same
+        'reaction_workflows' table, so it can be called from the Streamlit GUI
+        (mirrors the get_filtering_workflows() pattern used for filters).
+
+        Args:
+            chemspace_db_path (str): Path to the project's chemspace.db
+
+        Returns:
+            List[Dict[str, Any]]: One dict per workflow (workflow_id, workflow_name,
+                creation_date, description, reactions_dict, reaction_count), ordered
+                by creation_date descending. Empty list if none found or on error.
+        """
+        try:
+            if not os.path.exists(chemspace_db_path):
+                return []
+
+            conn = sqlite3.connect(chemspace_db_path)
+            cursor = conn.cursor()
+
+            # Check if reaction_workflows table exists
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='reaction_workflows'")
+            if not cursor.fetchone():
+                conn.close()
+                return []
+
+            # Get all workflows with summary information including ID
+            cursor.execute("""
+            SELECT id, workflow_name, creation_date, description, reactions_dict
+            FROM reaction_workflows
+            ORDER BY creation_date DESC
+            """)
+
+            rows = cursor.fetchall()
+            conn.close()
+
+            workflows = []
+            for workflow_id, name, date, desc, reactions_dict_str in rows:
+                try:
+                    reactions_dict = json.loads(reactions_dict_str)
+                except json.JSONDecodeError:
+                    reactions_dict = {}
+
+                workflows.append({
+                    'workflow_id': workflow_id,
+                    'workflow_name': name,
+                    'creation_date': date,
+                    'description': desc,
+                    'reactions_dict': reactions_dict,
+                    'reaction_count': len(reactions_dict),
+                })
+
+            return workflows
+
+        except Exception as e:
+            print(f"❌ Error listing reaction workflows: {e}")
+            return []
+
     def list_reaction_workflows(self) -> None:
         """
         Display all saved reaction workflows in a formatted table with IDs.
         """
-        try:
-            conn = sqlite3.connect(self.__chemspace_db)
-            cursor = conn.cursor()
-            
-            # Check if reaction_workflows table exists
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='reaction_workflows'")
-            if not cursor.fetchone():
-                print("📝 No reaction workflows table found")
-                conn.close()
-                return
-            
-            # Get all workflows with summary information including ID
-            cursor.execute("""
-            SELECT id, workflow_name, creation_date, description, reactions_dict
-            FROM reaction_workflows 
-            ORDER BY creation_date DESC
-            """)
-            
-            workflows = cursor.fetchall()
-            conn.close()
-            
-            if not workflows:
-                print("📝 No saved reaction workflows found")
-                return
-            
-            print("\n" + "="*100)
-            print(f"SAVED REACTION WORKFLOWS - Project: {self.name}")
-            print("="*100)
-            
-            for i, (workflow_id, name, date, desc, reactions_dict_str) in enumerate(workflows, 1):
-                try:
-                    reactions_dict = json.loads(reactions_dict_str)
-                    reaction_count = len(reactions_dict)
-                    
-                    # Get reaction names for summary
-                    reaction_names = [info['name'] for info in reactions_dict.values()]
-                    reactions_summary = ', '.join(reaction_names[:3])
-                    if len(reaction_names) > 3:
-                        reactions_summary += f" and {len(reaction_names) - 3} more..."
-                    
-                except json.JSONDecodeError:
-                    reaction_count = 0
-                    reactions_summary = "Error parsing reactions"
-                
-                print(f"\n🧪 Workflow name: '{name}' (ID: {workflow_id})")
-                print(f"   📅 Created: {date}")
-                print(f"   🔬 Reactions: {reaction_count}")
-                print(f"   📄 Description: {desc}")
-                print(f"   🧪 Reactions: {reactions_summary}")
-            
-            print("="*100)
-            
-        except Exception as e:
-            print(f"❌ Error listing reaction workflows: {e}")
+        workflows = self.get_reaction_workflows(self.__chemspace_db)
+
+        if not workflows:
+            print("📝 No saved reaction workflows found")
+            return
+
+        print("\n" + "="*100)
+        print(f"SAVED REACTION WORKFLOWS - Project: {self.name}")
+        print("="*100)
+
+        for workflow in workflows:
+            reactions_dict = workflow['reactions_dict']
+
+            # Get reaction names for summary
+            reaction_names = [info['name'] for info in reactions_dict.values()] if reactions_dict else []
+            reactions_summary = ', '.join(reaction_names[:3])
+            if len(reaction_names) > 3:
+                reactions_summary += f" and {len(reaction_names) - 3} more..."
+            elif not reactions_summary:
+                reactions_summary = "Error parsing reactions" if workflow['reaction_count'] == 0 else reactions_summary
+
+            print(f"\n🧪 Workflow name: '{workflow['workflow_name']}' (ID: {workflow['workflow_id']})")
+            print(f"   📅 Created: {workflow['creation_date']}")
+            print(f"   🔬 Reactions: {workflow['reaction_count']}")
+            print(f"   📄 Description: {workflow['description']}")
+            print(f"   🧪 Reactions: {reactions_summary}")
+
+        print("="*100)
 
     def _load_reaction_workflow_by_id(self, workflow_id: int) -> Optional[Dict[str, Any]]:
         """
@@ -6559,7 +6753,29 @@ class ChemSpace:
             return mol is not None
         except:
             return False
-    
+
+    @staticmethod
+    def _validate_reaction_smarts_pattern(smarts_pattern: str) -> bool:
+        """
+        Validate a reaction SMARTS pattern (reactants>>products) using RDKit.
+
+        Reaction SMARTS contain a '>>' separator and cannot be parsed by
+        Chem.MolFromSmarts(), which only accepts single-molecule patterns;
+        use this instead of _validate_smarts_pattern() for reaction workflows.
+
+        Args:
+            smarts_pattern (str): Reaction SMARTS pattern to validate
+
+        Returns:
+            bool: True if valid, False otherwise
+        """
+        try:
+            from rdkit.Chem import AllChem
+            rxn = AllChem.ReactionFromSmarts(smarts_pattern)
+            return rxn is not None
+        except:
+            return False
+
     def _show_current_workflow(self, workflow_filters: Dict) -> None:
         """
         Display the current workflow being built.
@@ -8393,16 +8609,23 @@ class ChemSpace:
             print(f"❌ Error processing unimolecular workflow: {e}")
 
     def _apply_bimolecular_reaction(self, primary_df: pd.DataFrame, secondary_df: pd.DataFrame,
-                                reaction_info: Dict[str, Any], workflow_name: str) -> List[Dict[str, Any]]:
+                                reaction_info: Dict[str, Any], workflow_name: str,
+                                ambiguous_reactants: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
         """
         Apply a bimolecular reaction between compounds from two tables.
-        
+
         Args:
             primary_df (pd.DataFrame): Primary reactants dataframe
-            secondary_df (pd.DataFrame): Secondary reactants dataframe  
+            secondary_df (pd.DataFrame): Secondary reactants dataframe
             reaction_info (Dict): Reaction information
             workflow_name (str): Name of the workflow
-            
+            ambiguous_reactants (Optional[List[Dict]]): If provided, appended in place with one
+                entry per reactant pair for which RDKit's RunReactants() returned more than one
+                product set — i.e. the pair matched the reaction template at more than one site,
+                so more than one product possibility was generated for the same pair of reactants
+                (a sign that a reactant contains more than one matching functional group). A
+                warning is always printed regardless of whether this is provided.
+
         Returns:
             List[Dict]: List of reaction products
         """
@@ -8464,7 +8687,29 @@ class ChemSpace:
                         else:
                             # Fallback for reactions that might work with single reactant
                             reaction_results = rxn.RunReactants((primary_mol,))
-                        
+
+                        # Warn when a reactant pair matches the reaction template at more than
+                        # one site, generating more than one product possibility for that pair
+                        if len(reaction_results) > 1:
+                            primary_id = primary_compound.get('id', 'unk')
+                            secondary_id = secondary_compound.get('id', 'unk')
+                            primary_warn_name = primary_compound.get('name', f"cpd_{primary_id}")
+                            secondary_warn_name = secondary_compound.get('name', f"cpd_{secondary_id}")
+                            print(f"   ⚠️  Multiple product possibilities ({len(reaction_results)}) for reactants "
+                                  f"'{primary_warn_name}' (id={primary_id}, smiles={primary_compound['smiles']}) and "
+                                  f"'{secondary_warn_name}' (id={secondary_id}, smiles={secondary_compound['smiles']}) "
+                                  f"- reactant(s) may contain more than one matching functional group")
+                            if ambiguous_reactants is not None:
+                                ambiguous_reactants.append({
+                                    'reactant1_id': primary_id,
+                                    'reactant1_name': primary_warn_name,
+                                    'reactant1_smiles': primary_compound['smiles'],
+                                    'reactant2_id': secondary_id,
+                                    'reactant2_name': secondary_warn_name,
+                                    'reactant2_smiles': secondary_compound['smiles'],
+                                    'product_possibilities': len(reaction_results),
+                                })
+
                         # Process products
                         for product_set_idx, product_set in enumerate(reaction_results):
                             for product_idx, product_mol in enumerate(product_set):
@@ -8514,16 +8759,22 @@ class ChemSpace:
             return []
 
     def _apply_unimolecular_reaction(self, compounds_df: pd.DataFrame, reaction_info: Dict[str, Any],
-                                workflow_name: str, name_prefix: str = "") -> List[Dict[str, Any]]:
+                                workflow_name: str, name_prefix: str = "",
+                                ambiguous_reactants: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
         """
         Apply a unimolecular reaction to compounds from a table.
-        
+
         Args:
             compounds_df (pd.DataFrame): Compounds dataframe
             reaction_info (Dict): Reaction information
             workflow_name (str): Name of the workflow
             name_prefix (str): Prefix for product names
-            
+            ambiguous_reactants (Optional[List[Dict]]): If provided, appended in place with one
+                entry per reactant for which RDKit's RunReactants() returned more than one
+                product set — i.e. the single reactant matched the reaction template at more
+                than one site, generating more than one distinct product from that reactant
+                alone. A warning is always printed regardless of whether this is provided.
+
         Returns:
             List[Dict]: List of reaction products
         """
@@ -8565,7 +8816,23 @@ class ChemSpace:
                     
                     # Run unimolecular reaction
                     reaction_results = rxn.RunReactants((reactant_mol,))
-                    
+
+                    # Warn when a single reactant matches the reaction template at more than
+                    # one site, generating more than one distinct product from that reactant
+                    if len(reaction_results) > 1:
+                        reactant_id = compound.get('id', 'unk')
+                        reactant_warn_name = compound.get('name', f"cpd_{reactant_id}")
+                        print(f"   ⚠️  Multiple product possibilities ({len(reaction_results)}) for reactant "
+                              f"'{reactant_warn_name}' (id={reactant_id}, smiles={compound['smiles']}) "
+                              f"- reactant may contain more than one matching functional group")
+                        if ambiguous_reactants is not None:
+                            ambiguous_reactants.append({
+                                'reactant_id': reactant_id,
+                                'reactant_name': reactant_warn_name,
+                                'reactant_smiles': compound['smiles'],
+                                'product_possibilities': len(reaction_results),
+                            })
+
                     # Process products
                     for product_set_idx, product_set in enumerate(reaction_results):
                         for product_idx, product_mol in enumerate(product_set):
@@ -8607,7 +8874,111 @@ class ChemSpace:
             print(f"   ❌ Error in unimolecular reaction {reaction_info['name']}: {e}")
             return []
 
-    def apply_reaction_workflow(self, workflow_id: Optional[int] = None, 
+    def apply_reaction_workflow_step(self, reaction_info: Dict[str, Any], workflow_name: str, step_num: int,
+                                      primary_tables: List[str], secondary_table: Optional[str] = None,
+                                      output_table_name: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Apply a single reaction-workflow step to explicitly selected reactant tables.
+
+        Non-interactive counterpart to the per-step logic inside apply_reaction_workflow()
+        (reaction-type dispatch, _apply_bimolecular_reaction / _apply_unimolecular_reaction,
+        _save_step_products), with reactant tables passed in directly instead of prompted via
+        input(). Lets a caller (e.g. the Streamlit GUI) drive a workflow step by step, letting
+        a previous step's saved product table be selected as this step's reactant source.
+
+        Args:
+            reaction_info (Dict): {'name', 'smarts'} for this workflow step
+            workflow_name (str): Name of the workflow being applied
+            step_num (int): 1-based step number, used to tag saved products
+            primary_tables (List[str]): One or more table names to use as reactants.
+                For a unimolecular reaction, all listed tables are concatenated as the
+                input compound set. For a bimolecular reaction, only the first table is
+                used as the primary reactant source.
+            secondary_table (Optional[str]): Secondary reactant table, required for
+                bimolecular reactions (may be the same name as the primary table).
+            output_table_name (Optional[str]): If provided, generated products are
+                persisted to a new table with this name (sanitized); otherwise products
+                are returned without being saved, and therefore unavailable as a
+                reactant source for later steps.
+
+        Returns:
+            Dict[str, Any]: {'success': bool, 'reaction_type': str, 'products_generated': int,
+                'products': List[Dict], 'output_table': Optional[str], 'message': Optional[str],
+                'ambiguous_reactants': List[Dict]} — 'ambiguous_reactants' has one entry per
+                reactant (unimolecular) or reactant pair (bimolecular) for which more than one
+                product possibility was generated, i.e. RDKit's RunReactants() matched the
+                reaction template at more than one site on the same reactant(s).
+        """
+        reaction_type = self._analyze_single_reaction_type(reaction_info['smarts'])
+
+        if reaction_type == 'invalid':
+            return {
+                'success': False,
+                'reaction_type': reaction_type,
+                'products_generated': 0,
+                'products': [],
+                'output_table': None,
+                'message': f"Invalid reaction SMARTS: {reaction_info['smarts']}",
+                'ambiguous_reactants': [],
+            }
+
+        if not primary_tables:
+            return {
+                'success': False,
+                'reaction_type': reaction_type,
+                'products_generated': 0,
+                'products': [],
+                'output_table': None,
+                'message': 'No reactant table(s) selected.',
+                'ambiguous_reactants': [],
+            }
+
+        ambiguous_reactants: List[Dict[str, Any]] = []
+
+        if reaction_type == 'bimolecular':
+            if not secondary_table:
+                return {
+                    'success': False,
+                    'reaction_type': reaction_type,
+                    'products_generated': 0,
+                    'products': [],
+                    'output_table': None,
+                    'message': 'Bimolecular reactions require a secondary reactant table.',
+                    'ambiguous_reactants': [],
+                }
+            primary_df = self._get_table_as_dataframe(primary_tables[0])
+            secondary_df = self._get_table_as_dataframe(secondary_table)
+            products = self._apply_bimolecular_reaction(
+                primary_df, secondary_df, reaction_info, workflow_name,
+                ambiguous_reactants=ambiguous_reactants
+            )
+        else:  # unimolecular
+            primary_df = pd.concat(
+                [self._get_table_as_dataframe(t) for t in primary_tables],
+                ignore_index=True
+            )
+            products = self._apply_unimolecular_reaction(
+                primary_df, reaction_info, workflow_name,
+                ambiguous_reactants=ambiguous_reactants
+            )
+
+        output_table = None
+        if products and output_table_name:
+            sanitized_name = self._sanitize_table_name(output_table_name)
+            if self._save_step_products(products, sanitized_name, workflow_name, step_num):
+                output_table = sanitized_name
+
+        return {
+            'success': True,
+            'reaction_type': reaction_type,
+            'products_generated': len(products),
+            'products': products,
+            'output_table': output_table,
+            'message': None,
+            'ambiguous_reactants': ambiguous_reactants,
+        }
+
+    def apply_reaction_workflow(self, workflow_id: Optional[int] = None,
                                         max_workers: Optional[int] = None,
                                         chunk_size: Optional[int] = None,
                                         parallel_threshold: int = 1000,
@@ -8866,7 +9237,9 @@ class ChemSpace:
             
             print(f"\n🌊 Executing Streaming Bimolecular Reaction - Step {step_num}")
             print("-" * 60)
-            
+
+            ambiguous_reactants: List[Dict[str, Any]] = []
+
             # Get compound data
             primary_df = self._get_table_as_dataframe(table_config['primary_table'])
             secondary_df = self._get_table_as_dataframe(table_config['secondary_table'])
@@ -8893,7 +9266,8 @@ class ChemSpace:
                     start_time = time.time()
                     total_products = self._stream_bimolecular_reaction_to_disk(
                         primary_df, secondary_df, reaction_info, workflow_name,
-                        temp_dir, max_workers, chunk_size, temp_files_created
+                        temp_dir, max_workers, chunk_size, temp_files_created,
+                        ambiguous_reactants=ambiguous_reactants
                     )
                     processing_time = time.time() - start_time
                     
@@ -8928,9 +9302,10 @@ class ChemSpace:
                         'disk_writes': len(temp_files_created),
                         'processing_time': processing_time,
                         'output_table': output_table_name,
-                        'combinations_processed': total_combinations
+                        'combinations_processed': total_combinations,
+                        'ambiguous_reactants': ambiguous_reactants
                     }
-                    
+
                 finally:
                     # Clean up temporary files
                     self._cleanup_temp_files(temp_files_created, temp_dir)
@@ -8945,15 +9320,16 @@ class ChemSpace:
                     # Set default chunk size if not provided
                     if chunk_size is None:
                         chunk_size = max(100, total_combinations // (max_workers * 4))
-                    
+
                     products = self._apply_bimolecular_reaction_parallel(
                         primary_df, secondary_df, reaction_info, workflow_name,
-                        max_workers, chunk_size
+                        max_workers, chunk_size, ambiguous_reactants=ambiguous_reactants
                     )
                 else:
                     # Use existing sequential method
                     products = self._apply_bimolecular_reaction(
-                        primary_df, secondary_df, reaction_info, workflow_name
+                        primary_df, secondary_df, reaction_info, workflow_name,
+                        ambiguous_reactants=ambiguous_reactants
                     )
                 
                 # Save products using existing logic
@@ -8983,18 +9359,20 @@ class ChemSpace:
                     'step_num': step_num,
                     'streaming_used': False,
                     'combinations_processed': total_combinations,
-                    'output_table': output_table_name
+                    'output_table': output_table_name,
+                    'ambiguous_reactants': ambiguous_reactants
                 }
-            
+
             return result
-            
+
         except Exception as e:
             print(f"❌ Error applying streaming bimolecular reaction: {e}")
             return {
                 'success': False,
                 'products_generated': 0,
                 'error': str(e),
-                'streaming_used': False
+                'streaming_used': False,
+                'ambiguous_reactants': []
             }
 
     def _apply_streaming_step_unimolecular_reaction(self, table_config: Dict[str, Any], 
@@ -9027,7 +9405,9 @@ class ChemSpace:
             
             print(f"\n🌊 Executing Streaming Unimolecular Reaction - Step {step_num}")
             print("-" * 60)
-            
+
+            ambiguous_reactants: List[Dict[str, Any]] = []
+
             total_compounds = table_config.get('total_compounds', 0)
             
             # Estimate if streaming is needed
@@ -9057,7 +9437,8 @@ class ChemSpace:
                         source_prefix = f"stream_step{step_num}_{source['name']}_"
                         source_products = self._stream_unimolecular_reaction_to_disk(
                             compounds_df, reaction_info, workflow_name, source_prefix,
-                            temp_dir, max_workers, chunk_size, temp_files_created
+                            temp_dir, max_workers, chunk_size, temp_files_created,
+                            ambiguous_reactants=ambiguous_reactants
                         )
                         
                         total_products += source_products
@@ -9096,9 +9477,10 @@ class ChemSpace:
                         'chunks_streamed': len(temp_files_created),
                         'disk_writes': len(temp_files_created),
                         'processing_time': processing_time,
-                        'compounds_processed': total_compounds
+                        'compounds_processed': total_compounds,
+                        'ambiguous_reactants': ambiguous_reactants
                     }
-                    
+
                 finally:
                     # Clean up temporary files
                     self._cleanup_temp_files(temp_files_created, temp_dir)
@@ -9130,13 +9512,14 @@ class ChemSpace:
                         source_prefix = f"step{step_num}_{source['name']}_"
                         products = self._apply_unimolecular_reaction_parallel(
                             compounds_df, reaction_info, workflow_name, source_prefix,
-                            max_workers, source_chunk_size
+                            max_workers, source_chunk_size, ambiguous_reactants=ambiguous_reactants
                         )
                     else:
                         # Use existing sequential method
                         source_prefix = f"step{step_num}_{source['name']}_"
                         products = self._apply_unimolecular_reaction(
-                            compounds_df, reaction_info, workflow_name, source_prefix
+                            compounds_df, reaction_info, workflow_name, source_prefix,
+                            ambiguous_reactants=ambiguous_reactants
                         )
                     
                     all_products.extend(products)
@@ -9169,27 +9552,30 @@ class ChemSpace:
                     'reaction_type': 'unimolecular',
                     'step_num': step_num,
                     'streaming_used': False,
-                    'compounds_processed': total_compounds
+                    'compounds_processed': total_compounds,
+                    'ambiguous_reactants': ambiguous_reactants
                 }
-            
+
             return result
-            
+
         except Exception as e:
             print(f"❌ Error applying streaming unimolecular reaction: {e}")
             return {
                 'success': False,
                 'products_generated': 0,
                 'error': str(e),
-                'streaming_used': False
+                'streaming_used': False,
+                'ambiguous_reactants': []
             }
 
     def _stream_bimolecular_reaction_to_disk(self, primary_df: pd.DataFrame, secondary_df: pd.DataFrame,
                                         reaction_info: Dict[str, Any], workflow_name: str,
                                         temp_dir: str, max_workers: int, chunk_size: Optional[int],
-                                        temp_files_created: List[str]) -> int:
+                                        temp_files_created: List[str],
+                                        ambiguous_reactants: Optional[List[Dict[str, Any]]] = None) -> int:
         """
         Stream bimolecular reaction results directly to disk files.
-        
+
         Args:
             primary_df (pd.DataFrame): Primary reactants
             secondary_df (pd.DataFrame): Secondary reactants
@@ -9199,7 +9585,12 @@ class ChemSpace:
             max_workers (int): Maximum workers
             chunk_size (Optional[int]): Chunk size
             temp_files_created (List[str]): List to track created files
-            
+            ambiguous_reactants (Optional[List[Dict]]): If provided, appended in place with one
+                entry per reactant pair (across all chunks) for which RunReactants() returned
+                more than one product set — i.e. the pair matched the reaction template at more
+                than one site. A summary warning is always printed regardless of whether this
+                is provided.
+
         Returns:
             int: Total number of products streamed
         """
@@ -9221,10 +9612,11 @@ class ChemSpace:
             
             print(f"   📦 Created {len(chunks)} chunks for streaming processing")
             print(f"   🌊 Each chunk will be streamed directly to disk")
-            
+
             total_products = 0
             processed_chunks = 0
-            
+            all_ambiguous_reactants = []
+
             # Initialize progress tracking
             if TQDM_AVAILABLE:
                 progress_bar = tqdm(
@@ -9234,7 +9626,7 @@ class ChemSpace:
                 )
             else:
                 progress_bar = None
-            
+
             # Process chunks and stream to disk
             with ProcessPoolExecutor(max_workers=max_workers) as executor:
                 # Submit streaming jobs
@@ -9242,22 +9634,23 @@ class ChemSpace:
                 for i, chunk in enumerate(chunks):
                     temp_file_path = os.path.join(temp_dir, f'bimolecular_chunk_{i:06d}.csv')
                     temp_files_created.append(temp_file_path)
-                    
+
                     future = executor.submit(
                         _process_bimolecular_chunk_to_file_worker,
                         chunk, reaction_smarts, reaction_name, workflow_name, temp_file_path
                     )
                     future_to_chunk[future] = i
-                
+
                 # Collect results
                 for future in as_completed(future_to_chunk):
                     chunk_idx = future_to_chunk[future]
-                    
+
                     try:
-                        chunk_products_count = future.result()
+                        chunk_products_count, chunk_ambiguous = future.result()
                         total_products += chunk_products_count
+                        all_ambiguous_reactants.extend(chunk_ambiguous)
                         processed_chunks += 1
-                        
+
                         if progress_bar:
                             progress_bar.update(1)
                             progress_bar.set_postfix({
@@ -9268,30 +9661,36 @@ class ChemSpace:
                             if processed_chunks % max(1, len(chunks) // 10) == 0:
                                 progress = (processed_chunks / len(chunks)) * 100
                                 print(f"      📊 Progress: {progress:.1f}% ({total_products:,} products streamed)")
-                    
+
                     except Exception as e:
                         print(f"   ❌ Error processing chunk {chunk_idx}: {e}")
                         processed_chunks += 1
                         if progress_bar:
                             progress_bar.update(1)
-            
+
             if progress_bar:
                 progress_bar.close()
-            
+
             print(f"   ✅ Streaming completed: {total_products:,} products in {len(temp_files_created)} files")
+            if all_ambiguous_reactants:
+                print(f"   ⚠️  {len(all_ambiguous_reactants)} reactant pair(s) matched the reaction template "
+                      f"at more than one site (multiple product possibilities from the same pair)")
+                if ambiguous_reactants is not None:
+                    ambiguous_reactants.extend(all_ambiguous_reactants)
             return total_products
-            
+
         except Exception as e:
             print(f"   ❌ Error in streaming bimolecular reaction: {e}")
             return 0
 
-    def _stream_unimolecular_reaction_to_disk(self, compounds_df: pd.DataFrame, 
+    def _stream_unimolecular_reaction_to_disk(self, compounds_df: pd.DataFrame,
                                             reaction_info: Dict[str, Any], workflow_name: str,
                                             name_prefix: str, temp_dir: str, max_workers: int,
-                                            chunk_size: Optional[int], temp_files_created: List[str]) -> int:
+                                            chunk_size: Optional[int], temp_files_created: List[str],
+                                            ambiguous_reactants: Optional[List[Dict[str, Any]]] = None) -> int:
         """
         Stream unimolecular reaction results directly to disk files.
-        
+
         Args:
             compounds_df (pd.DataFrame): Compounds dataframe
             reaction_info (Dict): Reaction information
@@ -9301,29 +9700,35 @@ class ChemSpace:
             max_workers (int): Maximum workers
             chunk_size (Optional[int]): Chunk size
             temp_files_created (List[str]): List to track created files
-            
+            ambiguous_reactants (Optional[List[Dict]]): If provided, appended in place with one
+                entry per reactant (across all chunks) for which RunReactants() returned more
+                than one product set — i.e. the reactant matched the reaction template at more
+                than one site. A summary warning is always printed regardless of whether this
+                is provided.
+
         Returns:
             int: Total number of products streamed
         """
         try:
             from concurrent.futures import ProcessPoolExecutor, as_completed
             import os
-            
+
             reaction_smarts = reaction_info['smarts']
             reaction_name = reaction_info['name']
-            
+
             # Set default chunk size if not provided
             if chunk_size is None:
                 chunk_size = max(500, len(compounds_df) // (max_workers * 8))  # Smaller chunks for streaming
-            
+
             # Create chunks for streaming processing
             chunks = self._create_unimolecular_chunks(compounds_df, chunk_size)
-            
+
             print(f"      📦 Created {len(chunks)} chunks for streaming processing")
-            
+
             total_products = 0
             processed_chunks = 0
-            
+            all_ambiguous_reactants = []
+
             # Initialize progress tracking
             if TQDM_AVAILABLE:
                 progress_bar = tqdm(
@@ -9333,7 +9738,7 @@ class ChemSpace:
                 )
             else:
                 progress_bar = None
-            
+
             # Process chunks and stream to disk
             with ProcessPoolExecutor(max_workers=max_workers) as executor:
                 # Submit streaming jobs
@@ -9341,40 +9746,46 @@ class ChemSpace:
                 for i, chunk in enumerate(chunks):
                     temp_file_path = os.path.join(temp_dir, f'unimolecular_chunk_{i:06d}.csv')
                     temp_files_created.append(temp_file_path)
-                    
+
                     future = executor.submit(
                         _process_unimolecular_chunk_to_file_worker,
                         chunk, reaction_smarts, reaction_name, workflow_name, name_prefix, temp_file_path
                     )
                     future_to_chunk[future] = i
-                
+
                 # Collect results
                 for future in as_completed(future_to_chunk):
                     chunk_idx = future_to_chunk[future]
-                    
+
                     try:
-                        chunk_products_count = future.result()
+                        chunk_products_count, chunk_ambiguous = future.result()
                         total_products += chunk_products_count
+                        all_ambiguous_reactants.extend(chunk_ambiguous)
                         processed_chunks += 1
-                        
+
                         if progress_bar:
                             progress_bar.update(1)
                             progress_bar.set_postfix({
                                 'products': total_products
                             })
-                    
+
                     except Exception as e:
                         print(f"      ❌ Error processing chunk {chunk_idx}: {e}")
                         processed_chunks += 1
                         if progress_bar:
                             progress_bar.update(1)
-            
+
             if progress_bar:
                 progress_bar.close()
-            
+
             print(f"      ✅ Streaming completed: {total_products:,} products")
+            if all_ambiguous_reactants:
+                print(f"      ⚠️  {len(all_ambiguous_reactants)} reactant(s) matched the reaction template "
+                      f"at more than one site (multiple product possibilities from the same reactant)")
+                if ambiguous_reactants is not None:
+                    ambiguous_reactants.extend(all_ambiguous_reactants)
             return total_products
-            
+
         except Exception as e:
             print(f"      ❌ Error in streaming unimolecular reaction: {e}")
             return 0
@@ -9890,10 +10301,11 @@ class ChemSpace:
 
     def _apply_bimolecular_reaction_parallel(self, primary_df: pd.DataFrame, secondary_df: pd.DataFrame,
                                         reaction_info: Dict[str, Any], workflow_name: str,
-                                        max_workers: int, chunk_size: int) -> List[Dict[str, Any]]:
+                                        max_workers: int, chunk_size: int,
+                                        ambiguous_reactants: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
         """
         Apply a bimolecular reaction using parallel processing.
-        
+
         Args:
             primary_df (pd.DataFrame): Primary reactants dataframe
             secondary_df (pd.DataFrame): Secondary reactants dataframe
@@ -9901,7 +10313,12 @@ class ChemSpace:
             workflow_name (str): Name of the workflow
             max_workers (int): Maximum number of parallel workers
             chunk_size (int): Size of each chunk for parallel processing
-            
+            ambiguous_reactants (Optional[List[Dict]]): If provided, appended in place with one
+                entry per reactant pair (across all chunks) for which RunReactants() returned
+                more than one product set — i.e. the pair matched the reaction template at more
+                than one site. A summary warning is always printed regardless of whether this
+                is provided.
+
         Returns:
             List[Dict]: List of reaction products
         """
@@ -9919,11 +10336,12 @@ class ChemSpace:
             chunks = self._create_bimolecular_chunks(primary_df, secondary_df, chunk_size)
             
             print(f"   📦 Created {len(chunks)} chunks for parallel processing")
-            
+
             all_products = []
+            all_ambiguous_reactants = []
             processed_chunks = 0
             successful_reactions = 0
-            
+
             # Initialize progress tracking
             if TQDM_AVAILABLE:
                 progress_bar = tqdm(
@@ -9933,7 +10351,7 @@ class ChemSpace:
                 )
             else:
                 progress_bar = None
-            
+
             # Process chunks in parallel
             with ProcessPoolExecutor(max_workers=max_workers) as executor:
                 # Submit all chunks
@@ -9949,11 +10367,12 @@ class ChemSpace:
                     chunk_idx = future_to_chunk[future]
                     
                     try:
-                        chunk_products = future.result()
+                        chunk_products, chunk_ambiguous = future.result()
                         all_products.extend(chunk_products)
+                        all_ambiguous_reactants.extend(chunk_ambiguous)
                         successful_reactions += len(chunk_products)
                         processed_chunks += 1
-                        
+
                         if progress_bar:
                             progress_bar.update(1)
                             progress_bar.set_postfix({
@@ -9964,30 +10383,36 @@ class ChemSpace:
                             if processed_chunks % max(1, len(chunks) // 10) == 0:
                                 progress = (processed_chunks / len(chunks)) * 100
                                 print(f"      📊 Progress: {progress:.1f}% ({len(all_products)} products)")
-                    
+
                     except Exception as e:
                         print(f"   ❌ Error processing chunk {chunk_idx}: {e}")
                         processed_chunks += 1
                         if progress_bar:
                             progress_bar.update(1)
-            
+
             if progress_bar:
                 progress_bar.close()
-            
+
             print(f"   ✅ Parallel processing completed: {len(all_products)} products from {successful_reactions} reactions")
+            if all_ambiguous_reactants:
+                print(f"   ⚠️  {len(all_ambiguous_reactants)} reactant pair(s) matched the reaction template "
+                      f"at more than one site (multiple product possibilities from the same pair)")
+                if ambiguous_reactants is not None:
+                    ambiguous_reactants.extend(all_ambiguous_reactants)
             return all_products
-            
+
         except Exception as e:
             print(f"   ❌ Error in parallel bimolecular reaction: {e}")
             return []
 
-    def _apply_unimolecular_reaction_parallel(self, compounds_df: pd.DataFrame, 
+    def _apply_unimolecular_reaction_parallel(self, compounds_df: pd.DataFrame,
                                             reaction_info: Dict[str, Any], workflow_name: str,
-                                            name_prefix: str, max_workers: int, 
-                                            chunk_size: int) -> List[Dict[str, Any]]:
+                                            name_prefix: str, max_workers: int,
+                                            chunk_size: int,
+                                            ambiguous_reactants: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
         """
         Apply a unimolecular reaction using parallel processing.
-        
+
         Args:
             compounds_df (pd.DataFrame): Compounds dataframe
             reaction_info (Dict): Reaction information
@@ -9995,7 +10420,12 @@ class ChemSpace:
             name_prefix (str): Prefix for product names
             max_workers (int): Maximum number of parallel workers
             chunk_size (int): Size of each chunk for parallel processing
-            
+            ambiguous_reactants (Optional[List[Dict]]): If provided, appended in place with one
+                entry per reactant (across all chunks) for which RunReactants() returned more
+                than one product set — i.e. the reactant matched the reaction template at more
+                than one site. A summary warning is always printed regardless of whether this
+                is provided.
+
         Returns:
             List[Dict]: List of reaction products
         """
@@ -10009,11 +10439,12 @@ class ChemSpace:
             chunks = self._create_unimolecular_chunks(compounds_df, chunk_size)
             
             print(f"      📦 Created {len(chunks)} chunks for parallel processing")
-            
+
             all_products = []
+            all_ambiguous_reactants = []
             processed_chunks = 0
             successful_reactions = 0
-            
+
             # Initialize progress tracking
             if TQDM_AVAILABLE:
                 progress_bar = tqdm(
@@ -10023,7 +10454,7 @@ class ChemSpace:
                 )
             else:
                 progress_bar = None
-            
+
             # Process chunks in parallel
             with ProcessPoolExecutor(max_workers=max_workers) as executor:
                 # Submit all chunks
@@ -10033,35 +10464,41 @@ class ChemSpace:
                         chunk, reaction_smarts, reaction_name, workflow_name, name_prefix
                     ): i for i, chunk in enumerate(chunks)
                 }
-                
+
                 # Collect results
                 for future in as_completed(future_to_chunk):
                     chunk_idx = future_to_chunk[future]
-                    
+
                     try:
-                        chunk_products = future.result()
+                        chunk_products, chunk_ambiguous = future.result()
                         all_products.extend(chunk_products)
+                        all_ambiguous_reactants.extend(chunk_ambiguous)
                         successful_reactions += len(chunk_products)
                         processed_chunks += 1
-                        
+
                         if progress_bar:
                             progress_bar.update(1)
                             progress_bar.set_postfix({
                                 'products': len(all_products)
                             })
-                        
+
                     except Exception as e:
                         print(f"      ❌ Error processing chunk {chunk_idx}: {e}")
                         processed_chunks += 1
                         if progress_bar:
                             progress_bar.update(1)
-            
+
             if progress_bar:
                 progress_bar.close()
-            
+
             print(f"      ✅ Parallel processing completed: {len(all_products)} products")
+            if all_ambiguous_reactants:
+                print(f"      ⚠️  {len(all_ambiguous_reactants)} reactant(s) matched the reaction template "
+                      f"at more than one site (multiple product possibilities from the same reactant)")
+                if ambiguous_reactants is not None:
+                    ambiguous_reactants.extend(all_ambiguous_reactants)
             return all_products
-            
+
         except Exception as e:
             print(f"      ❌ Error in parallel unimolecular reaction: {e}")
             return []
@@ -10914,28 +11351,48 @@ class ChemSpace:
             
             total_products = 0
             successful_steps = 0
-            
+            total_ambiguous = 0
+
             for step_num, result in workflow_state['step_results'].items():
                 status_icon = "✅" if result['success'] else "❌"
                 products = result.get('products_generated', 0)
                 total_products += products
-                
+
                 if result['success']:
                     successful_steps += 1
-                
+
                 print(f"\n{status_icon} Step {step_num}: {products:,} products generated")
-                
+
                 if result.get('output_table'):
                     print(f"   💾 Saved to: '{result['output_table']}'")
-                
+
                 if not result['success']:
                     print(f"   ❌ Error: {result.get('error', 'Unknown error')}")
-            
+
+                step_ambiguous = result.get('ambiguous_reactants') or []
+                if step_ambiguous:
+                    total_ambiguous += len(step_ambiguous)
+                    print(f"   ⚠️  {len(step_ambiguous)} reactant(s)/pair(s) matched the reaction at more "
+                          f"than one site (multiple matching functional groups):")
+                    for amb in step_ambiguous:
+                        if 'reactant2_id' in amb:
+                            print(f"      - '{amb['reactant1_name']}' (id={amb['reactant1_id']}, "
+                                  f"smiles={amb.get('reactant1_smiles', 'n/a')}) + "
+                                  f"'{amb['reactant2_name']}' (id={amb['reactant2_id']}, "
+                                  f"smiles={amb.get('reactant2_smiles', 'n/a')}): "
+                                  f"{amb['product_possibilities']} product possibilities")
+                        else:
+                            print(f"      - '{amb['reactant_name']}' (id={amb['reactant_id']}, "
+                                  f"smiles={amb.get('reactant_smiles', 'n/a')}): "
+                                  f"{amb['product_possibilities']} product possibilities")
+
             print(f"\n📊 FINAL RESULTS:")
             print(f"   🔬 Total steps: {len(workflow_state['step_results'])}")
             print(f"   ✅ Successful steps: {successful_steps}")
             print(f"   🧪 Total products generated: {total_products:,}")
-            
+            if total_ambiguous:
+                print(f"   ⚠️  Total ambiguous reactant(s)/pair(s) across workflow: {total_ambiguous}")
+
             if workflow_state['step_products']:
                 print(f"\n📋 Product Tables Created:")
                 for step, product_info in workflow_state['step_products'].items():

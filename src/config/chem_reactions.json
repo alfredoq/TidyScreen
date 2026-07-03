@@ -6,7 +6,7 @@
 {"reaction_name":"Thiolation","smarts":"[CX3:1](=[O:2])[OX2H,OX1-:3]>>[CX4:1][SX2H]","User":"Juampi"},
 {"reaction_name":"Thiosulfonation","smarts":"[CX4:1][SX2H:2].[$([#16X3:3](=[OX1:4])[OX2H,OX1H0-:5]),$([#16X3+]([OX1-])[OX2H,OX1H0-])][#6:6]>>[CX4:1][S:2][#16X4:3](=[OX1:4])(=[OX1:5])[#6:6]","User":"Juampi"},
 {"reaction_name":"Nitrile_from_COOH","smarts":"[CX3:1](=[O:2])[OX2H,OX1-:3]>>[CX2:1]#[NX1]","User":"Juampi"},
-{"reaction_name":"Ald_reduction_propargyl_alcohol","smarts":"[CX3H1:1](=[O:2])>>[C:1]([OX2H:2])[C:3]#[C:4]","User":"Juampi"},
+{"reaction_name":"Ald_reduction_propargyl_alcohol","smarts":"[CX3H1;!$(C-N):1](=[O:2])>>[C:1]([OX2H:2])[C:3]#[C:4]","User":"Juampi"},
 {"reaction_name":"Mitsunobu_from_sec_amines","smarts":"[NX3;H2:1].[C:2]([OX2H:3])>>[NX3,H1:1][C:2]","User":"Juampi"},
 {"reaction_name":"Mitsunobu_from_prim_amines","smarts":"[#7X3;H1:1].[C:2]([OX2H:3])>>[#7X3:1][C:2]","User":"Juampi"},
 {"reaction_name":"Diamines_to_sym_benzotriazole","smarts":"[c:1]1[c:2][c:3][c:4]([NX3H2:5])[c:6]([NX3H2:7])[c:8]1>>[c:1]1[c:2][c:3][c:4]2[n:5][nH][n:7][c:6]2[c:8]1","User":"Agus"},
