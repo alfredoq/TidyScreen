@@ -668,6 +668,14 @@ elif page == "ChemSpace Actions":
                     st.session_state[_acf_overwrite_key] = False
                     st.rerun()
 
+    with st.expander("🧬 Available Chemical Reactions"):
+        chem_reactions = tidyscreen.get_chemical_reactions()
+        if chem_reactions:
+            chem_reactions_df = pd.DataFrame(chem_reactions, columns=["ID", "Reaction Name", "SMARTS Pattern"])
+            st.dataframe(chem_reactions_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No chemical reactions found in database.")
+
     with st.expander("📋 List Filtering Workflows"):
         chemspace_db_path = os.path.join(st.session_state["active_project_path"], "chemspace", "processed_data", "chemspace.db")
         filtering_workflows = ChemSpace.get_filtering_workflows(chemspace_db_path)

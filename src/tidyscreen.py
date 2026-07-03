@@ -119,25 +119,28 @@ def list_chemical_filters(pattern=None):
     except Exception as e:
         print(f"❌ Error listing chemical filters: {e}")
 
-def list_chemical_reactions(pattern=None):
+def get_chemical_reactions(pattern=None):
     """
-    List all chemical reactions available in the database.
+    Retrieve chemical reactions available in the database.
     This can be called independently without activating a specific project.
-    
+
     Args:
         pattern (str, optional): Reaction names containing this pattern
+
+    Returns:
+        list[tuple]: (id, reaction_name, smarts) tuples, empty list if none found or on error.
     """
     db_manager = DatabaseManager()
     projects_db = f"{site.getsitepackages()[0]}/tidyscreen/projects_db/projects_database.db"
-    
+
     if not os.path.exists(projects_db):
         print("❌ Projects database does not exist. Create a project first.")
-        return
-    
+        return []
+
     try:
         conn = db_manager.connect_db(projects_db)
         cursor = conn.cursor()
-        
+
         # Build query
         if pattern:
             query = "SELECT id, reaction_name, smarts FROM chem_reactions WHERE reaction_name LIKE ? ORDER BY reaction_name"
@@ -145,34 +148,50 @@ def list_chemical_reactions(pattern=None):
         else:
             query = "SELECT id, reaction_name, smarts FROM chem_reactions ORDER BY reaction_name"
             cursor.execute(query)
-        
+
         reactions = cursor.fetchall()
         conn.close()
-        
-        if not reactions:
-            if pattern:
-                print(f"No chemical reactions found matching pattern: {pattern}")
-            else:
-                print("No chemical reactions found in database.")
-            return
-        
+        return reactions
+
+    except Exception as e:
+        print(f"❌ Error listing chemical reactions: {e}")
+        return []
+
+def list_chemical_reactions(pattern=None):
+    """
+    List all chemical reactions available in the database.
+    This can be called independently without activating a specific project.
+
+    Args:
+        pattern (str, optional): Reaction names containing this pattern
+    """
+    reactions = get_chemical_reactions(pattern)
+
+    if not reactions:
+        if pattern:
+            print(f"No chemical reactions found matching pattern: {pattern}")
+        else:
+            print("No chemical reactions found in database.")
+        return
+
+    try:
         print("\n" + "="*80)
         print("CHEMICAL REACTIONS")
         print("="*80)
         print(f"{'ID':<4} {'Reaction Name':<30} {'SMARTS Pattern':<80}")
         print("-"*80)
-        
+
         for reaction_id, reaction_name, smarts in reactions:
             print(f"{reaction_id:<4} {reaction_name:<30} {smarts:<80}")
 
         print("="*80)
         print(f"Total reactions: {len(reactions)}")
-        
+
         if pattern:
             print(f"Filtered by: {pattern}")
-        
+
     except Exception as e:
-        print(f"❌ Error listing chemical filters: {e}")
+        print(f"❌ Error listing chemical reactions: {e}")
 
 def add_chemical_filter_entry(filter_name, smarts_pattern, overwrite=False):
     """

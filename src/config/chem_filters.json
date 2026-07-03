@@ -51,4 +51,6 @@
 {"filter_name":"Bicyclic","smarts":"[$([*R2]([*R])([*R])([*R]))].[$([*R2]([*R])([*R])([*R]))]"},
 {"filter_name":"hydroxyl","smarts":"[OX2;H1]"},
 {"filter_name":"sulphonamide","smarts":"[SX4](=O)(=O)N"},
-{"filter_name":"Rare_oxygen","smarts":"[17O]"}]
+{"filter_name":"Rare_oxygen","smarts":"[17O]"},
+{"filter_name":"aa_backbone","smarts":"[NX3H2,NX4+H3][CX4H]([*])[CX3H0](=[OX1])[OX2H,OX1-]"},
+{"filter_name":"alpha_hidroxi_alkynes","smarts":"[CX2H1]#[CX2H0][CX4H1,O1]([OX2H1])[*]"}]
