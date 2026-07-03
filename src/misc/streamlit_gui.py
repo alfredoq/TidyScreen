@@ -948,6 +948,36 @@ elif page == "ChemSpace Actions":
         else:
             st.info("No saved reaction workflows found.")
 
+        st.markdown("**Delete reactions workflow**")
+        if not reaction_workflows:
+            st.button("🗑️ Delete Workflow", key="btn_delete_rw", disabled=True,
+                       help="No reaction workflows available to delete.")
+        else:
+            drw_workflow_names = [w["workflow_name"] for w in reaction_workflows]
+            drw_selected_name = st.selectbox("Workflow to delete", drw_workflow_names, key="drw_selected_workflow")
+
+            _del_rw_key = f"confirm_delete_rw_{drw_selected_name}"
+            if not st.session_state.get(_del_rw_key):
+                if st.button("🗑️ Delete Workflow", key="btn_delete_rw"):
+                    st.session_state[_del_rw_key] = True
+                    st.rerun()
+            else:
+                st.warning(f"Delete reaction workflow **{drw_selected_name}**?")
+                _drw_c1, _drw_c2 = st.columns(2)
+                with _drw_c1:
+                    if st.button("Yes, delete", key=f"btn_confirm_delete_rw_{drw_selected_name}"):
+                        _drw_result = ChemSpace.delete_reaction_workflow_entry(chemspace_db_path, drw_selected_name)
+                        st.session_state[_del_rw_key] = False
+                        if _drw_result["success"]:
+                            st.success(f"✅ {_drw_result['message']}")
+                        else:
+                            st.error(f"❌ {_drw_result['message']}")
+                        st.rerun()
+                with _drw_c2:
+                    if st.button("Cancel", key=f"btn_cancel_delete_rw_{drw_selected_name}"):
+                        st.session_state[_del_rw_key] = False
+                        st.rerun()
+
     with st.expander("▶️ Apply Reaction Workflow"):
         chemspace_db_path = os.path.join(st.session_state["active_project_path"], "chemspace", "processed_data", "chemspace.db")
         arw_workflows = ChemSpace.get_reaction_workflows(chemspace_db_path)

@@ -7726,6 +7726,102 @@ class ChemSpace:
             print(f"❌ Error generating duplicate report: {e}")
             return False
         
+    @staticmethod
+    def delete_reaction_workflow_entry(chemspace_db_path: str, workflow_identifier: str) -> Dict[str, Any]:
+        """
+        Delete a reaction workflow by name or ID from a chemspace database.
+
+        Non-interactive counterpart to delete_reaction_workflow(), reusing the same
+        'reaction_workflows' table and the same ID/name lookup semantics, so it can
+        be called from the Streamlit GUI. The two-step interactive confirmation
+        (yes/no, then re-typing the workflow name) is skipped here — the caller is
+        expected to collect its own confirmation before calling this.
+
+        Args:
+            chemspace_db_path (str): Path to the project's chemspace.db
+            workflow_identifier (str): Workflow name or numeric ID to delete
+
+        Returns:
+            Dict[str, Any]: {'success': bool, 'message': str, 'workflow_name': Optional[str],
+                'workflow_id': Optional[int], 'reaction_count': int}
+        """
+        try:
+            if not os.path.exists(chemspace_db_path):
+                return {'success': False, 'message': 'ChemSpace database not found.',
+                         'workflow_name': None, 'workflow_id': None, 'reaction_count': 0}
+
+            conn = sqlite3.connect(chemspace_db_path)
+            cursor = conn.cursor()
+
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='reaction_workflows'")
+            if not cursor.fetchone():
+                conn.close()
+                return {'success': False, 'message': 'No reaction workflows table found.',
+                         'workflow_name': None, 'workflow_id': None, 'reaction_count': 0}
+
+            cursor.execute("""
+                SELECT id, workflow_name, creation_date, description, reactions_dict
+                FROM reaction_workflows
+                ORDER BY creation_date DESC
+            """)
+            workflows = cursor.fetchall()
+
+            if not workflows:
+                conn.close()
+                return {'success': False, 'message': 'No reaction workflows found to delete.',
+                         'workflow_name': None, 'workflow_id': None, 'reaction_count': 0}
+
+            # Find by ID first, then by exact name (case-insensitive)
+            workflow_to_delete = None
+            try:
+                search_id = int(workflow_identifier)
+                for wf in workflows:
+                    if wf[0] == search_id:
+                        workflow_to_delete = wf
+                        break
+            except (TypeError, ValueError):
+                pass
+
+            if workflow_to_delete is None:
+                identifier_lower = str(workflow_identifier).lower()
+                for wf in workflows:
+                    if wf[1].lower() == identifier_lower:
+                        workflow_to_delete = wf
+                        break
+
+            if workflow_to_delete is None:
+                conn.close()
+                return {'success': False, 'message': f"No workflow found with identifier '{workflow_identifier}'.",
+                         'workflow_name': None, 'workflow_id': None, 'reaction_count': 0}
+
+            workflow_id, workflow_name, creation_date, description, reactions_dict_str = workflow_to_delete
+
+            try:
+                reaction_count = len(json.loads(reactions_dict_str))
+            except json.JSONDecodeError:
+                reaction_count = 0
+
+            cursor.execute("DELETE FROM reaction_workflows WHERE id = ?", (workflow_id,))
+            deleted_rows = cursor.rowcount
+            conn.commit()
+            conn.close()
+
+            if deleted_rows > 0:
+                return {
+                    'success': True,
+                    'message': f"Deleted reaction workflow '{workflow_name}' ({reaction_count} reactions).",
+                    'workflow_name': workflow_name,
+                    'workflow_id': workflow_id,
+                    'reaction_count': reaction_count,
+                }
+            else:
+                return {'success': False, 'message': 'Delete failed (no rows affected).',
+                         'workflow_name': workflow_name, 'workflow_id': workflow_id, 'reaction_count': reaction_count}
+
+        except Exception as e:
+            return {'success': False, 'message': f"Error deleting reaction workflow: {e}",
+                     'workflow_name': None, 'workflow_id': None, 'reaction_count': 0}
+
     def delete_reaction_workflow(self, workflow_identifier: Optional[str] = None) -> bool:
         """
         Delete a reaction workflow from the chemspace database.
@@ -9885,10 +9981,20 @@ class ChemSpace:
             
             conn.commit()
             conn.close()
-            
+
             print(f"   💾 Consolidated {total_inserted:,} products to table '{output_table_name}'")
+
+            # Compute InChI keys for the newly consolidated products, mirroring the same
+            # post-save step used by load_csv_file() and _save_step_products()
+            if total_inserted > 0:
+                try:
+                    print(f"   🧪 Computing InChI keys for table '{output_table_name}'...")
+                    self.compute_inchi_keys(output_table_name, update_database=True)
+                except Exception as inchi_error:
+                    print(f"   ⚠️  Warning: InChI key computation failed: {inchi_error}")
+
             return True
-            
+
         except Exception as e:
             print(f"   ❌ Error consolidating temp files: {e}")
             return False
@@ -11328,10 +11434,20 @@ class ChemSpace:
             
             conn.commit()
             conn.close()
-            
+
             print(f"   💾 Saved {inserted_count} products to table '{table_name}'")
+
+            # Compute InChI keys for the newly stored products, mirroring the same
+            # post-save step used by load_csv_file()
+            if inserted_count > 0:
+                try:
+                    print(f"   🧪 Computing InChI keys for table '{table_name}'...")
+                    self.compute_inchi_keys(table_name, update_database=True)
+                except Exception as inchi_error:
+                    print(f"   ⚠️  Warning: InChI key computation failed: {inchi_error}")
+
             return True
-            
+
         except Exception as e:
             print(f"   ❌ Error saving step products: {e}")
             return False
