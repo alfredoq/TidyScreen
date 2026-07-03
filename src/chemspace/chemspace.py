@@ -7091,7 +7091,7 @@ class ChemSpace:
 
         print("="*100)
 
-    def check_duplicates(self, table_name: str, 
+    def check_duplicates(self, table_name: Optional[str] = None,
                     duplicate_by: str = 'smiles',
                     show_duplicates: bool = True,
                     remove_duplicates: bool = False,
@@ -7100,26 +7100,33 @@ class ChemSpace:
                     export_path: Optional[str] = None) -> Dict[str, Any]:
         """
         Check for duplicate molecules in a table based on specified criteria.
-        
+
         Args:
-            table_name (str): Name of the table to check for duplicates
+            table_name (Optional[str]): Name of the table to check for duplicates. If None, prompts an interactive table selection.
             duplicate_by (str): Column to check for duplicates ('smiles', 'inchi_key', 'name', or 'all')
             show_duplicates (bool): Whether to display duplicate entries
             remove_duplicates (bool): Whether to remove duplicate entries from the table
             keep_first (bool): If removing duplicates, whether to keep first occurrence (True) or last (False)
             export_duplicates (bool): Whether to export duplicate entries to CSV
             export_path (Optional[str]): Path for export file. If None, uses default naming
-            
+
         Returns:
             Dict[str, Any]: Results dictionary with duplicate statistics and details
         """
         try:
+            # Reuse existing table selection method
+            if table_name is None:
+                table_name = self._select_table_interactive("SELECT TABLE FOR DUPLICATE CHECK")
+                if not table_name:
+                    print("❌ No table selected for duplicate checking")
+                    return {'success': False, 'message': "No table selected"}
+
             # Check if table exists
             tables = self.get_all_tables()
             if table_name not in tables:
                 print(f"❌ Table '{table_name}' does not exist in chemspace database")
                 return {'success': False, 'message': f"Table '{table_name}' not found"}
-            
+
             # Get table data
             compounds_df = self._get_table_as_dataframe(table_name)
             if compounds_df.empty:
