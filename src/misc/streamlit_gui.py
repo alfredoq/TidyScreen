@@ -1,8 +1,12 @@
 import streamlit as st
 from tidyscreen import tidyscreen
 from tidyscreen.chemspace.chemspace import ChemSpace
+from tidyscreen.moldock.moldock import MolDock
+from tidyscreen.moldyn.moldyn import MolDyn
+from tidyscreen.ml.ml_functions import MachineLearning
 import io
 import contextlib
+import inspect
 import sys
 import os
 import glob
@@ -120,15 +124,100 @@ def _gs_cb_feat():
     st.session_state["rf_gs_feat_extra"] = ""
 
 
+def _render_python_api_section(header, cls, class_label, search_lower):
+    with st.expander(header, expanded=True):
+        st.write(
+            f"Public methods available in `{class_label}` (helper methods, i.e. names "
+            "starting with `_`, are excluded)."
+        )
+        _methods = [
+            (name, member)
+            for name, member in inspect.getmembers(cls, predicate=inspect.isfunction)
+            if not name.startswith("_")
+        ]
+
+        _entries = []
+        for _method_name, _method in sorted(_methods, key=lambda item: item[0]):
+            try:
+                _method_signature = str(inspect.signature(_method))
+            except (TypeError, ValueError):
+                _method_signature = "(...)"
+            _method_doc = inspect.getdoc(_method)
+            _method_summary = _method_doc.strip().split("\n")[0] if _method_doc else ""
+            _entries.append((_method_name, _method_signature, _method_summary))
+
+        if search_lower:
+            _entries = [
+                entry for entry in _entries
+                if search_lower in entry[0].lower() or search_lower in entry[2].lower()
+            ]
+
+        st.caption(f"{len(_entries)} method(s) found.")
+        for _method_name, _method_signature, _method_summary in _entries:
+            st.markdown(f"**`{_method_name}{_method_signature}`**")
+            if _method_summary:
+                st.caption(_method_summary)
+
+
 st.set_page_config(page_title="TidyScreen App", layout="wide")
 
 # Sidebar navigation
+_SIDEBAR_SEPARATOR = "──────────"
+_SIDEBAR_SECTION_CHEMSPACE = "ChemSpace"
+_SIDEBAR_SECTION_HELPERS = "Helpers"
+_SIDEBAR_SECTION_ML = "Machine learning"
+_SIDEBAR_SECTION_MOLDYN = "MolDyn"
+_SIDEBAR_SECTION_MOLDOCK = "MolDock"
+_SIDEBAR_NON_SELECTABLE_OPTIONS = {_SIDEBAR_SEPARATOR, _SIDEBAR_SECTION_CHEMSPACE, _SIDEBAR_SECTION_HELPERS, _SIDEBAR_SECTION_ML, _SIDEBAR_SECTION_MOLDYN, _SIDEBAR_SECTION_MOLDOCK}
+_SIDEBAR_SECTION_HEADERS = {_SIDEBAR_SECTION_CHEMSPACE, _SIDEBAR_SECTION_HELPERS, _SIDEBAR_SECTION_ML, _SIDEBAR_SECTION_MOLDYN, _SIDEBAR_SECTION_MOLDOCK}
+
+
+def _on_sidebar_page_change():
+    if st.session_state.get("_sidebar_page_radio") in _SIDEBAR_NON_SELECTABLE_OPTIONS:
+        st.session_state["_sidebar_page_radio"] = st.session_state.get("_sidebar_last_page", "Project selection")
+    else:
+        st.session_state["_sidebar_last_page"] = st.session_state["_sidebar_page_radio"]
+
+
 _logo_path = os.path.join(tidyscreen_package_path, "images", "tidyscreen_logo.png")
 if os.path.exists(_logo_path):
     st.sidebar.image(_logo_path, use_container_width=True)
+_sidebar_page_options = ("Project selection", _SIDEBAR_SEPARATOR, _SIDEBAR_SECTION_CHEMSPACE, "ChemSpace Inspection", "ChemSpace Actions", _SIDEBAR_SEPARATOR, _SIDEBAR_SECTION_MOLDOCK, "Receptors", "MolDock assays", "ProLIF Conditions", "Docking analysis", _SIDEBAR_SEPARATOR, _SIDEBAR_SECTION_MOLDYN, "MolDyn assays", "MolDyn analysis", _SIDEBAR_SEPARATOR, _SIDEBAR_SECTION_ML, "ML features management", "RF model training", _SIDEBAR_SEPARATOR, _SIDEBAR_SECTION_HELPERS, "Mol Viewer", "Reaction Viewer", "Python API")
+_separator_rules = "\n".join(
+    f"""
+    section[data-testid="stSidebar"] div[role="radiogroup"] > label:nth-of-type({i + 1}) {{
+        pointer-events: none;
+    }}
+    section[data-testid="stSidebar"] div[role="radiogroup"] > label:nth-of-type({i + 1}) > div:first-child {{
+        display: none;
+    }}
+    """
+    + (
+        f"""
+    section[data-testid="stSidebar"] div[role="radiogroup"] > label:nth-of-type({i + 1}) p {{
+        font-size: 0.875rem;
+    }}
+    section[data-testid="stSidebar"] div[role="radiogroup"] > label:nth-of-type({i + 1}) {{
+        padding-left: 0;
+        margin-left: 0;
+    }}
+    section[data-testid="stSidebar"] div[role="radiogroup"] > label:nth-of-type({i + 1}) > div:last-child {{
+        padding-left: 0;
+        margin-left: 0;
+    }}
+    """
+        if opt in _SIDEBAR_SECTION_HEADERS
+        else ""
+    )
+    for i, opt in enumerate(_sidebar_page_options)
+    if opt in _SIDEBAR_NON_SELECTABLE_OPTIONS
+)
+st.sidebar.markdown(f"<style>{_separator_rules}</style>", unsafe_allow_html=True)
 page = st.sidebar.radio(
-    "Go to",
-    ("Project selection", "ChemSpace Inspection", "ChemSpace Actions", "Receptors", "MolDock", "ProLIF Conditions", "Docking analysis", "MolDyn", "MolDyn analysis", "ML features management", "RF model training", "Mol Viewer", "Reaction Viewer")
+    "Project management",
+    _sidebar_page_options,
+    key="_sidebar_page_radio",
+    on_change=_on_sidebar_page_change,
 )
 
 ## Persistent sidebar info: active project and assay
@@ -1272,8 +1361,8 @@ elif page == "Receptors":
         if st.session_state["show_receptors_models"]:
             st.dataframe(df_receptors_models)
 
-elif page == "MolDock":
-    st.title("MolDock")
+elif page == "MolDock assays":
+    st.title("MolDock assays")
     st.write("Welcome to the MolDock page.")
 
     ## --- Docking Methods ---
@@ -1554,8 +1643,8 @@ elif page == "MolDock":
         st.write(f"Selected Docking Assay: {st.session_state.get('selected_assay_name', 'None')}")
 
 
-elif page == "MolDyn":
-    st.title("MolDyn")
+elif page == "MolDyn assays":
+    st.title("MolDyn assays")
     st.write("Welcome to the MolDyn page.")
 
     if "active_project_path" not in st.session_state:
@@ -5431,3 +5520,27 @@ elif page == "Reaction Viewer":
                                     st.error(f"Could not render product {_i}")
                                 st.code(_smi, language=None)
                             rxv_col_i += 1
+
+elif page == "Python API":
+    st.title("Python API")
+
+    _api_search = st.text_input(
+        "Search methods:",
+        key="python_api_search",
+        placeholder="Filter by method name or description...",
+    )
+    _api_search_lower = _api_search.strip().lower()
+
+    _render_python_api_section("ChemSpace Methods", ChemSpace, "ChemSpace", _api_search_lower)
+
+    st.divider()
+
+    _render_python_api_section("MolDock Methods", MolDock, "MolDock", _api_search_lower)
+
+    st.divider()
+
+    _render_python_api_section("MolDyn Methods", MolDyn, "MolDyn", _api_search_lower)
+
+    st.divider()
+
+    _render_python_api_section("ML Methods", MachineLearning, "MachineLearning", _api_search_lower)
