@@ -124,19 +124,72 @@ def _gs_cb_feat():
     st.session_state["rf_gs_feat_extra"] = ""
 
 
-def _render_python_api_section(header, cls, class_label, search_lower):
+_WORKFLOW_VAR_BY_CLASS_LABEL = {
+    "TidyScreen": "tidyscreen",
+    "ChemSpace": "active_project_cs",
+    "MolDock": "active_project_moldock",
+    "MolDyn": "active_project_moldyn",
+    "MachineLearning": "active_project_ml",
+}
+
+
+def _build_workflow_script(project_name, selections):
+    _lines = [
+        "",
+        "from tidyscreen import tidyscreen",
+        "from tidyscreen.chemspace.chemspace import ChemSpace",
+        "from tidyscreen.moldock.moldock import MolDock",
+        "from tidyscreen.moldyn.moldyn import MolDyn",
+        "from tidyscreen.ml.ml_functions import MachineLearning",
+        "",
+        f'active_project = tidyscreen.ActivateProject("{project_name}")',
+        "active_project_cs = ChemSpace(active_project)",
+        "active_project_moldock = MolDock(active_project)",
+        "active_project_ml = MachineLearning(active_project)",
+        "active_project_moldyn = MolDyn(active_project)",
+        "",
+    ]
+
+    for _class_label, _entries in selections.items():
+        if not _entries:
+            continue
+        _var_name = _WORKFLOW_VAR_BY_CLASS_LABEL[_class_label]
+        for _method_name, _method_signature, _method_summary in _entries:
+            if _method_summary:
+                _lines.append(f"## {_method_summary}")
+            _lines.append(f"#{_var_name}.{_method_name}()")
+            _lines.append("")
+
+    return "\n".join(_lines)
+
+
+def _render_python_api_section(header, obj, class_label, search_lower, include_classes=False, exclude_names=None):
+    _exclude_names = exclude_names or set()
     with st.expander(header, expanded=True):
         st.write(
             f"Public methods available in `{class_label}` (helper methods, i.e. names "
-            "starting with `_`, are excluded)."
+            "starting with `_`, are excluded). Check the methods to include in a "
+            "generated workflow file (see 'Build Workflow File' below)."
         )
-        _methods = [
-            (name, member)
-            for name, member in inspect.getmembers(cls, predicate=inspect.isfunction)
-            if not name.startswith("_")
-        ]
+        if include_classes:
+            _module_name = getattr(obj, "__name__", None)
+            _methods = [
+                (name, member)
+                for name, member in inspect.getmembers(
+                    obj, predicate=lambda m: inspect.isfunction(m) or inspect.isclass(m)
+                )
+                if not name.startswith("_")
+                and name not in _exclude_names
+                and getattr(member, "__module__", None) == _module_name
+            ]
+        else:
+            _methods = [
+                (name, member)
+                for name, member in inspect.getmembers(obj, predicate=inspect.isfunction)
+                if not name.startswith("_") and name not in _exclude_names
+            ]
 
-        _entries = []
+        _all_entries = []
         for _method_name, _method in sorted(_methods, key=lambda item: item[0]):
             try:
                 _method_signature = str(inspect.signature(_method))
@@ -144,19 +197,49 @@ def _render_python_api_section(header, cls, class_label, search_lower):
                 _method_signature = "(...)"
             _method_doc = inspect.getdoc(_method)
             _method_summary = _method_doc.strip().split("\n")[0] if _method_doc else ""
-            _entries.append((_method_name, _method_signature, _method_summary))
+            _all_entries.append((_method_name, _method_signature, _method_summary))
 
+        _display_entries = _all_entries
         if search_lower:
-            _entries = [
-                entry for entry in _entries
+            _display_entries = [
+                entry for entry in _all_entries
                 if search_lower in entry[0].lower() or search_lower in entry[2].lower()
             ]
 
-        st.caption(f"{len(_entries)} method(s) found.")
-        for _method_name, _method_signature, _method_summary in _entries:
-            st.markdown(f"**`{_method_name}{_method_signature}`**")
-            if _method_summary:
-                st.caption(_method_summary)
+        st.caption(f"{len(_display_entries)} method(s) found.")
+
+        _sel_key = f"python_api_selected_{class_label}"
+        _prior_selected = set(st.session_state.get(_sel_key, []))
+
+        if not _display_entries:
+            st.info("No methods match the current filter.")
+        else:
+            _df_api = pd.DataFrame(
+                {
+                    "Select": [_name in _prior_selected for _name, _, _ in _display_entries],
+                    "Method": [f"{_name}{_sig}" for _name, _sig, _ in _display_entries],
+                    "Description": [_summary for _, _, _summary in _display_entries],
+                }
+            )
+            _edited_api = st.data_editor(
+                _df_api,
+                column_config={"Select": st.column_config.CheckboxColumn("Select", default=False)},
+                disabled=["Method", "Description"],
+                hide_index=True,
+                use_container_width=True,
+                key=f"python_api_data_editor_{class_label}_{search_lower}",
+            )
+            _visible_names = {_name for _name, _, _ in _display_entries}
+            _newly_selected = {
+                _display_entries[_i][0]
+                for _i in range(len(_display_entries))
+                if _edited_api.iloc[_i]["Select"]
+            }
+            _prior_selected = (_prior_selected - _visible_names) | _newly_selected
+            st.session_state[_sel_key] = sorted(_prior_selected)
+
+        _selected_now = set(st.session_state.get(_sel_key, []))
+        return [entry for entry in _all_entries if entry[0] in _selected_now]
 
 
 st.set_page_config(page_title="TidyScreen App", layout="wide")
@@ -5531,16 +5614,77 @@ elif page == "Python API":
     )
     _api_search_lower = _api_search.strip().lower()
 
-    _render_python_api_section("ChemSpace Methods", ChemSpace, "ChemSpace", _api_search_lower)
+    _selected_tidyscreen = _render_python_api_section(
+        "TidyScreen Methods",
+        tidyscreen,
+        "TidyScreen",
+        _api_search_lower,
+        include_classes=True,
+        exclude_names={"ActivateProject"},
+    )
 
     st.divider()
 
-    _render_python_api_section("MolDock Methods", MolDock, "MolDock", _api_search_lower)
+    _selected_chemspace = _render_python_api_section("ChemSpace Methods", ChemSpace, "ChemSpace", _api_search_lower)
 
     st.divider()
 
-    _render_python_api_section("MolDyn Methods", MolDyn, "MolDyn", _api_search_lower)
+    _selected_moldock = _render_python_api_section("MolDock Methods", MolDock, "MolDock", _api_search_lower)
 
     st.divider()
 
-    _render_python_api_section("ML Methods", MachineLearning, "MachineLearning", _api_search_lower)
+    _selected_moldyn = _render_python_api_section("MolDyn Methods", MolDyn, "MolDyn", _api_search_lower)
+
+    st.divider()
+
+    _selected_ml = _render_python_api_section("ML Methods", MachineLearning, "MachineLearning", _api_search_lower)
+
+    st.divider()
+    st.subheader("Build Workflow File")
+    st.write(
+        "Checked methods are chained (in commented form, ready to be filled in and "
+        "uncommented) into a standalone workflow script, following the same pattern "
+        "as a hand-written chaining script."
+    )
+
+    _api_selections = {
+        "TidyScreen": _selected_tidyscreen,
+        "ChemSpace": _selected_chemspace,
+        "MolDock": _selected_moldock,
+        "MolDyn": _selected_moldyn,
+        "MachineLearning": _selected_ml,
+    }
+    _api_total_selected = sum(len(v) for v in _api_selections.values())
+    st.caption(f"{_api_total_selected} method(s) selected across all sections.")
+
+    if _api_total_selected == 0:
+        st.info("Check methods above to include them in the generated workflow file.")
+    else:
+        _workflow_project_name = st.text_input(
+            "Project name (used in tidyscreen.ActivateProject(...)):",
+            value=st.session_state.get("selected_project", ""),
+            key="python_api_workflow_project_name",
+        )
+        _workflow_code = _build_workflow_script(
+            _workflow_project_name.strip() or "project_name", _api_selections
+        )
+        st.code(_workflow_code, language="python")
+
+        _default_workflow_path = os.path.join(
+            st.session_state.get("active_project_path", os.getcwd()),
+            f"{(_workflow_project_name.strip() or 'workflow')}_workflow.py",
+        )
+        _workflow_out_path = st.text_input(
+            "Output .py path:",
+            value=_default_workflow_path,
+            key="python_api_workflow_output_path",
+        )
+        if st.button("💾 Save Workflow File", key="btn_save_python_api_workflow"):
+            try:
+                _out = _workflow_out_path.strip()
+                os.makedirs(os.path.dirname(os.path.abspath(_out)), exist_ok=True)
+                with open(_out, "w", encoding="utf-8") as _f:
+                    _f.write(_workflow_code)
+                st.success(f"✅ Workflow saved to: {_out}")
+            except Exception as _e:
+                st.error(f"❌ Save failed: {_e}")
