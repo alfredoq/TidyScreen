@@ -239,7 +239,62 @@ def _compute_inchi_keys_worker(chunk_data: List[Tuple[int, str, str, str]]) -> L
         except Exception:
             # Error computing InChI key
             results.append((idx, 'ERROR', name))
-    
+
+    return results
+
+def _compute_morgan_fingerprints_worker(chunk_data: List[Tuple[int, str, str]], radius: int,
+                                        fp_size: int) -> List[Tuple[int, str, str]]:
+    """
+    Worker function to compute Morgan fingerprints for a chunk of SMILES strings in parallel.
+    This function must be at module level to be pickleable for multiprocessing.
+
+    Args:
+        chunk_data (List[Tuple[int, str, str]]): List of tuples (row_index, smiles, compound_name)
+        radius (int): Morgan fingerprint radius
+        fp_size (int): Fingerprint bit-vector length
+
+    Returns:
+        List[Tuple[int, str, str]]: List of tuples (row_index, fingerprint_bitstring, compound_name)
+    """
+    try:
+        # Import RDKit inside worker to avoid import issues
+        from rdkit import Chem
+        from rdkit.Chem import rdFingerprintGenerator
+
+        # Suppress RDKit warnings for cleaner parallel output
+        from rdkit import RDLogger
+        RDLogger.DisableLog('rdApp.*')
+
+        generator = rdFingerprintGenerator.GetMorganGenerator(radius=radius, fpSize=fp_size)
+
+    except ImportError:
+        # If RDKit is not available, return error for all compounds in chunk
+        return [(idx, 'ERROR', name) for idx, smiles, name in chunk_data]
+
+    results = []
+
+    for idx, smiles, name in chunk_data:
+        try:
+            # Skip empty or None SMILES
+            if not smiles or smiles.strip() == '':
+                results.append((idx, 'INVALID_SMILES', name))
+                continue
+
+            # Parse SMILES with RDKit
+            mol = Chem.MolFromSmiles(str(smiles).strip())
+
+            if mol is not None:
+                # Compute Morgan fingerprint
+                fp = generator.GetFingerprint(mol)
+                results.append((idx, fp.ToBitString(), name))
+            else:
+                # Invalid SMILES
+                results.append((idx, 'INVALID_SMILES', name))
+
+        except Exception:
+            # Error computing fingerprint
+            results.append((idx, 'ERROR', name))
+
     return results
 
 def _filter_chunk_worker_by_instances(chunk_data: List[Tuple], filters_list: List[Tuple]) -> List[Dict]:
@@ -3075,7 +3130,481 @@ class ChemSpace:
         except Exception as e:
             print(f"❌ Error updating database table '{table_name}' with InChI keys: {e}")
             return False
-    
+
+    _MORGAN_FP_SIZE_OPTIONS = (512, 1024, 2048)
+
+    def compute_morgan_fingerprints(self, table_name: Optional[str] = None,
+                                    fp_size: Optional[int] = None,
+                                    radius: Optional[int] = None,
+                                    update_database: bool = True,
+                                    parallel_threshold: int = 1000,
+                                    max_workers: Optional[int] = None,
+                                    chunk_size: Optional[int] = None) -> pd.DataFrame:
+        """
+        Retrieve a table as DataFrame and compute Morgan fingerprints for each SMILES string using parallel processing.
+
+        Args:
+            table_name (Optional[str]): Name of the table to process. If None, prompts an interactive table selection.
+            fp_size (Optional[int]): Fingerprint bit-vector length, one of 512, 1024 or 2048. If None, prompts an interactive selection.
+            radius (Optional[int]): Morgan fingerprint radius. If None, prompts an interactive selection (default: 3).
+            update_database (bool): Whether to store the computed fingerprints back into the table
+            parallel_threshold (int): Number of compounds above which parallel processing is used (default: 1000)
+            max_workers (Optional[int]): Maximum number of parallel workers. If None, uses cpu_count()
+            chunk_size (Optional[int]): Size of each chunk for parallel processing. If None, automatically calculated
+
+        Returns:
+            pd.DataFrame: DataFrame with an added 'morgan_fp_r<radius>_<fp_size>' column, empty DataFrame if error occurs
+        """
+        try:
+            # Check RDKit availability early
+            try:
+                from rdkit import Chem
+                from rdkit.Chem import rdFingerprintGenerator
+            except ImportError:
+                print("❌ RDKit not installed. Please install RDKit to compute Morgan fingerprints:")
+                print("   conda install -c conda-forge rdkit")
+                print("   or")
+                print("   pip install rdkit")
+                return pd.DataFrame()
+
+            # Resolve table interactively if not provided
+            if table_name is None:
+                table_name = self._select_table_interactive("SELECT TABLE FOR MORGAN FINGERPRINT COMPUTATION")
+                if not table_name:
+                    print("❌ No table selected for Morgan fingerprint computation")
+                    return pd.DataFrame()
+
+            # Resolve fpSize interactively if not provided
+            if fp_size is None:
+                fp_size = self._select_morgan_fp_size_interactive()
+                if fp_size is None:
+                    print("❌ No fingerprint size selected")
+                    return pd.DataFrame()
+            elif fp_size not in self._MORGAN_FP_SIZE_OPTIONS:
+                print(f"❌ Invalid fpSize {fp_size}. Must be one of {self._MORGAN_FP_SIZE_OPTIONS}")
+                return pd.DataFrame()
+
+            # Resolve radius interactively if not provided
+            if radius is None:
+                radius = self._select_morgan_radius_interactive()
+                if radius is None:
+                    print("❌ No radius selected")
+                    return pd.DataFrame()
+            elif not isinstance(radius, int) or radius < 0:
+                print(f"❌ Invalid radius {radius}. Must be a non-negative integer")
+                return pd.DataFrame()
+
+            # Get the DataFrame using existing method
+            print(f"📊 Retrieving table '{table_name}' for Morgan fingerprint computation...")
+            df = self._get_table_as_dataframe(table_name)
+
+            if df.empty:
+                print(f"⚠️  No data retrieved from table '{table_name}'")
+                return pd.DataFrame()
+
+            # Check if SMILES column exists
+            if 'smiles' not in df.columns:
+                print("❌ No 'smiles' column found in the DataFrame")
+                return pd.DataFrame()
+
+            # Initialize fingerprint column (named after radius and fpSize so different
+            # combinations can coexist without overwriting each other)
+            fp_column = f"morgan_fp_r{radius}_{fp_size}"
+            df[fp_column] = None
+
+            num_compounds = len(df)
+            print(f"🔬 Computing Morgan fingerprints (radius={radius}, fpSize={fp_size}) for {num_compounds} compounds...")
+
+            # Determine processing method
+            use_parallel = num_compounds > parallel_threshold
+
+            if use_parallel:
+                print(f"🚀 Large dataset detected ({num_compounds} compounds). Using parallel processing...")
+
+                # Set up parallel processing parameters
+                if max_workers is None:
+                    max_workers = min(cpu_count(), 8)  # Limit to reasonable number
+
+                if chunk_size is None:
+                    chunk_size = max(100, num_compounds // (max_workers * 4))  # Ensure reasonable chunk size
+
+                print(f"   👥 Workers: {max_workers}")
+                print(f"   📦 Chunk size: {chunk_size}")
+
+                # Process in parallel
+                successful_computations, failed_computations = self._compute_morgan_fingerprints_parallel(
+                    df, fp_column, radius, fp_size, max_workers, chunk_size
+                )
+            else:
+                print(f"📝 Processing {num_compounds} compounds sequentially...")
+                # Sequential processing for smaller datasets
+                successful_computations, failed_computations = self._compute_morgan_fingerprints_sequential(
+                    df, fp_column, radius, fp_size
+                )
+
+            # Print summary
+            print(f"✅ Morgan fingerprint computation completed:")
+            print(f"   🎯 Successful: {successful_computations}")
+            print(f"   ❌ Failed: {failed_computations}")
+
+            # Optionally update the database table
+            if update_database and successful_computations > 0:
+                print(f"💾 Updating database table '{table_name}' with Morgan fingerprints...")
+                success = self._update_table_with_morgan_fingerprints(table_name, df, fp_column)
+                if success:
+                    print(f"✅ Database table '{table_name}' updated with column '{fp_column}'")
+                else:
+                    print(f"❌ Failed to update database table '{table_name}'")
+
+            return df
+
+        except Exception as e:
+            print(f"❌ Error computing Morgan fingerprints for table '{table_name}': {e}")
+            return pd.DataFrame()
+
+    def _select_morgan_fp_size_interactive(self) -> Optional[int]:
+        """
+        Interactive selection of the Morgan fingerprint bit-vector size (fpSize).
+
+        Returns:
+            Optional[int]: Selected fpSize (512, 1024 or 2048), or None if cancelled
+        """
+        fp_size_options = self._MORGAN_FP_SIZE_OPTIONS
+
+        print(f"\n🔍 SELECT MORGAN FINGERPRINT SIZE (fpSize)")
+        print("=" * 60)
+        for i, option in enumerate(fp_size_options, 1):
+            print(f"{i}. {option}")
+        print("-" * 60)
+        print("Commands: Enter option number, fpSize value, or 'cancel' to abort")
+
+        while True:
+            try:
+                selection = input(f"\n🔍 Select fpSize: ").strip()
+
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    return None
+
+                try:
+                    selection_int = int(selection)
+                except ValueError:
+                    print(f"❌ Invalid input. Please enter 1-{len(fp_size_options)} or one of {fp_size_options}")
+                    continue
+
+                if 1 <= selection_int <= len(fp_size_options):
+                    return fp_size_options[selection_int - 1]
+                if selection_int in fp_size_options:
+                    return selection_int
+
+                print(f"❌ Invalid selection. Please enter 1-{len(fp_size_options)} or one of {fp_size_options}")
+
+            except KeyboardInterrupt:
+                print("\n❌ fpSize selection cancelled")
+                return None
+
+    _MORGAN_RADIUS_DEFAULT = 3
+
+    def _select_morgan_radius_interactive(self) -> Optional[int]:
+        """
+        Interactive selection of the Morgan fingerprint radius.
+
+        Returns:
+            Optional[int]: Selected radius (non-negative integer), or None if cancelled
+        """
+        default_radius = self._MORGAN_RADIUS_DEFAULT
+
+        print(f"\n🔍 SELECT MORGAN FINGERPRINT RADIUS")
+        print("=" * 60)
+        print(f"Enter a non-negative integer radius (press Enter for default: {default_radius})")
+        print("-" * 60)
+        print("Commands: Enter radius value, or 'cancel' to abort")
+
+        while True:
+            try:
+                selection = input(f"\n🔍 Select radius [{default_radius}]: ").strip()
+
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    return None
+
+                if selection == '':
+                    return default_radius
+
+                try:
+                    selection_int = int(selection)
+                except ValueError:
+                    print("❌ Invalid input. Please enter a non-negative integer")
+                    continue
+
+                if selection_int < 0:
+                    print("❌ Invalid radius. Please enter a non-negative integer")
+                    continue
+
+                return selection_int
+
+            except KeyboardInterrupt:
+                print("\n❌ Radius selection cancelled")
+                return None
+
+    def _compute_morgan_fingerprints_parallel(self, df: pd.DataFrame, fp_column: str, radius: int, fp_size: int,
+                                              max_workers: int, chunk_size: int) -> Tuple[int, int]:
+        """
+        Compute Morgan fingerprints using parallel processing.
+
+        Args:
+            df (pd.DataFrame): DataFrame containing SMILES data
+            fp_column (str): Name of the column to store computed fingerprints in
+            radius (int): Morgan fingerprint radius
+            fp_size (int): Fingerprint bit-vector length
+            max_workers (int): Maximum number of parallel workers
+            chunk_size (int): Size of each chunk for parallel processing
+
+        Returns:
+            Tuple[int, int]: (successful_computations, failed_computations)
+        """
+        try:
+            start_time = time.time()
+
+            # Prepare data for parallel processing
+            print(f"   📦 Preparing data for parallel processing...")
+            chunk_data_list = []
+
+            # Split data into chunks
+            for i in range(0, len(df), chunk_size):
+                chunk_df = df.iloc[i:i + chunk_size]
+                chunk_data = []
+
+                for idx, row in chunk_df.iterrows():
+                    smiles = row['smiles']
+                    name = row.get('name', 'unknown')
+                    chunk_data.append((idx, smiles, name))
+
+                if chunk_data:  # Only add non-empty chunks
+                    chunk_data_list.append(chunk_data)
+
+            num_chunks = len(chunk_data_list)
+            print(f"   📊 Split {len(df)} compounds into {num_chunks} chunks")
+
+            # Initialize progress tracking
+            successful_computations = 0
+            failed_computations = 0
+            processed_chunks = 0
+            failed_chunks = 0
+
+            # Initialize progress bar if tqdm is available
+            if TQDM_AVAILABLE:
+                progress_bar = tqdm(
+                    total=len(df),
+                    desc="Computing Morgan fingerprints",
+                    unit="compounds",
+                    bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
+                )
+            else:
+                progress_bar = None
+                print(f"   🚀 Starting parallel processing of {num_chunks} chunks...")
+
+            # Process chunks in parallel
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                # Submit all chunk processing jobs
+                future_to_chunk = {}
+                chunk_submission_start = time.time()
+
+                for i, chunk_data in enumerate(chunk_data_list):
+                    future = executor.submit(_compute_morgan_fingerprints_worker, chunk_data, radius, fp_size)
+                    future_to_chunk[future] = i
+
+                chunk_submission_time = time.time() - chunk_submission_start
+                print(f"   ⏱️  All {num_chunks} chunks submitted in {chunk_submission_time:.2f}s")
+
+                # Collect results
+                for future in as_completed(future_to_chunk):
+                    chunk_idx = future_to_chunk[future]
+
+                    try:
+                        chunk_results = future.result()
+
+                        # Update DataFrame with results
+                        chunk_successful = 0
+                        chunk_failed = 0
+
+                        for idx, fp_value, name in chunk_results:
+                            df.at[idx, fp_column] = fp_value
+
+                            if fp_value in ['INVALID_SMILES', 'ERROR']:
+                                chunk_failed += 1
+                                # Show only first few errors
+                                if failed_computations + chunk_failed <= 5:
+                                    error_type = "Invalid SMILES" if fp_value == 'INVALID_SMILES' else "Computation error"
+                                    print(f"⚠️  {error_type} for compound '{name}' (chunk {chunk_idx})")
+                            else:
+                                chunk_successful += 1
+
+                        successful_computations += chunk_successful
+                        failed_computations += chunk_failed
+                        processed_chunks += 1
+
+                        # Update progress
+                        chunk_size_actual = len(chunk_results)
+                        if progress_bar:
+                            progress_bar.update(chunk_size_actual)
+                        else:
+                            # Print progress every 5 chunks if no tqdm
+                            if processed_chunks % 5 == 0 or processed_chunks == num_chunks:
+                                progress_pct = (processed_chunks / num_chunks) * 100
+                                print(f"   📈 Progress: {processed_chunks}/{num_chunks} chunks ({progress_pct:.1f}%)")
+
+                    except Exception as e:
+                        failed_chunks += 1
+                        chunk_size_est = len(chunk_data_list[chunk_idx]) if chunk_idx < len(chunk_data_list) else chunk_size
+                        failed_computations += chunk_size_est
+                        processed_chunks += 1
+
+                        print(f"   ❌ Error processing chunk {chunk_idx}: {e}")
+
+                        # Update progress even for failed chunks
+                        if progress_bar:
+                            progress_bar.update(chunk_size_est)
+
+            # Close progress bar
+            if progress_bar:
+                progress_bar.close()
+
+            processing_time = time.time() - start_time
+            print(f"   ⏱️  Parallel processing completed in {processing_time:.2f}s")
+
+            if failed_chunks > 0:
+                print(f"   ⚠️  {failed_chunks} chunks failed during processing")
+
+            return successful_computations, failed_computations
+
+        except Exception as e:
+            print(f"❌ Error in parallel Morgan fingerprint computation: {e}")
+            return 0, len(df)
+
+    def _compute_morgan_fingerprints_sequential(self, df: pd.DataFrame, fp_column: str,
+                                                radius: int, fp_size: int) -> Tuple[int, int]:
+        """
+        Compute Morgan fingerprints using sequential processing.
+
+        Args:
+            df (pd.DataFrame): DataFrame containing SMILES data
+            fp_column (str): Name of the column to store computed fingerprints in
+            radius (int): Morgan fingerprint radius
+            fp_size (int): Fingerprint bit-vector length
+
+        Returns:
+            Tuple[int, int]: (successful_computations, failed_computations)
+        """
+        try:
+            from rdkit import Chem
+            from rdkit.Chem import rdFingerprintGenerator
+        except ImportError:
+            print("❌ RDKit not available for sequential processing")
+            return 0, len(df)
+
+        generator = rdFingerprintGenerator.GetMorganGenerator(radius=radius, fpSize=fp_size)
+
+        successful_computations = 0
+        failed_computations = 0
+
+        # Initialize progress bar if tqdm is available
+        if TQDM_AVAILABLE:
+            progress_bar = tqdm(
+                total=len(df),
+                desc="Computing Morgan fingerprints",
+                unit="compounds"
+            )
+        else:
+            progress_bar = None
+
+        for idx, row in df.iterrows():
+            smiles = row['smiles']
+            name = row.get('name', 'unknown')
+
+            try:
+                # Parse SMILES with RDKit
+                mol = Chem.MolFromSmiles(smiles)
+
+                if mol is not None:
+                    # Compute Morgan fingerprint
+                    fp = generator.GetFingerprint(mol)
+                    df.at[idx, fp_column] = fp.ToBitString()
+                    successful_computations += 1
+                else:
+                    # Invalid SMILES
+                    df.at[idx, fp_column] = 'INVALID_SMILES'
+                    failed_computations += 1
+                    if failed_computations <= 5:  # Show only first 5 errors
+                        print(f"⚠️  Invalid SMILES for compound '{name}': {smiles}")
+
+            except Exception as e:
+                df.at[idx, fp_column] = 'ERROR'
+                failed_computations += 1
+                if failed_computations <= 5:  # Show only first 5 errors
+                    print(f"⚠️  Error computing Morgan fingerprint for '{name}': {e}")
+
+            # Update progress
+            if progress_bar:
+                progress_bar.update(1)
+
+        # Close progress bar
+        if progress_bar:
+            progress_bar.close()
+
+        return successful_computations, failed_computations
+
+    def _update_table_with_morgan_fingerprints(self, table_name: str, df: pd.DataFrame, fp_column: str) -> bool:
+        """
+        Update the database table with computed Morgan fingerprint values.
+        Adds the fingerprint column if it doesn't already exist (for backward compatibility).
+
+        Args:
+            table_name (str): Name of the table to update
+            df (pd.DataFrame): DataFrame containing the computed fingerprints
+            fp_column (str): Name of the fingerprint column to write
+
+        Returns:
+            bool: True if update was successful
+        """
+        try:
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+
+            # Check if the fingerprint column exists, add it if it doesn't
+            cursor.execute(f"PRAGMA table_info({table_name})")
+            columns = [row[1] for row in cursor.fetchall()]
+
+            if fp_column not in columns:
+                try:
+                    cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {fp_column} TEXT")
+                    print(f"   📋 Added '{fp_column}' column to existing table '{table_name}'")
+                except sqlite3.OperationalError as e:
+                    print(f"   ⚠️  Warning: Could not add {fp_column} column: {e}")
+                    return False
+
+            # Update each row with the computed fingerprint bitstring.
+            # Uses itertuples() + executemany() rather than iterrows() + per-row execute()
+            # for the same reason as _update_table_with_inchi_keys: a single executemany()
+            # batch avoids crossing the sqlite3 C-API boundary once per row.
+            update_query = f"UPDATE {table_name} SET {fp_column} = ? WHERE id = ?"
+
+            updates = [
+                (getattr(row, fp_column), row.id)
+                for row in df.itertuples(index=False)
+                if pd.notna(getattr(row, fp_column)) and getattr(row, fp_column) not in ['INVALID_SMILES', 'ERROR']
+            ]
+            cursor.executemany(update_query, updates)
+            updates_made = len(updates)
+
+            conn.commit()
+            conn.close()
+
+            print(f"   📊 Updated {updates_made} rows with Morgan fingerprints")
+            return True
+
+        except Exception as e:
+            print(f"❌ Error updating database table '{table_name}' with Morgan fingerprints: {e}")
+            return False
+
     def _create_sql_registers_table(self) -> bool:
         """
         Create the sql_registers table to track SQL import operations.
