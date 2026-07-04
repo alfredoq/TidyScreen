@@ -2785,8 +2785,29 @@ class ChemSpace:
         except Exception as e:
             print(f"❌ Error retrieving table '{table_name}' as DataFrame: {e}")
             return pd.DataFrame()
-    
-    def compute_inchi_keys(self, table_name: str, 
+
+    def _get_table_columns(self, table_name: str) -> List[str]:
+        """
+        Get the column names of a table without loading its data.
+
+        Args:
+            table_name (str): Name of the table to inspect
+
+        Returns:
+            List[str]: Column names, empty list on error
+        """
+        try:
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            cursor.execute(f"PRAGMA table_info({table_name})")
+            columns = [row[1] for row in cursor.fetchall()]
+            conn.close()
+            return columns
+        except Exception as e:
+            print(f"❌ Error getting columns for table '{table_name}': {e}")
+            return []
+
+    def compute_inchi_keys(self, table_name: str,
                           update_database: bool = True,
                           parallel_threshold: int = 1000,
                           max_workers: Optional[int] = None,
@@ -3604,6 +3625,615 @@ class ChemSpace:
         except Exception as e:
             print(f"❌ Error updating database table '{table_name}' with Morgan fingerprints: {e}")
             return False
+
+    _DIM_REDUCTION_METHODS = ('pca', 'tsne', 'umap')
+    _DIM_REDUCTION_LABELS = {'pca': 'PCA', 'tsne': 't-SNE', 'umap': 'UMAP'}
+    _MORGAN_FP_COLUMN_PATTERN = re.compile(r'^morgan_fp_r\d+_\d+$')
+
+    def reduce_dimensionality(self, table_name: Optional[str] = None,
+                              fp_column: Optional[str] = None,
+                              method: Optional[str] = None,
+                              n_components: int = 2,
+                              update_database: bool = True,
+                              random_state: int = 42,
+                              n_jobs: int = -1,
+                              save_model_path: Optional[str] = None,
+                              load_model_path: Optional[str] = None) -> pd.DataFrame:
+        """
+        Retrieve a table as DataFrame and reduce the dimensionality of a previously computed
+        Morgan fingerprint column using PCA, t-SNE or UMAP.
+
+        Args:
+            table_name (Optional[str]): Name of the table to process. If None, prompts an interactive table selection.
+            fp_column (Optional[str]): Name of the fingerprint column to reduce (e.g. 'morgan_fp_r3_2048'),
+                as created by compute_morgan_fingerprints(). If None, prompts an interactive selection
+                among the table's fingerprint columns.
+            method (Optional[str]): One of 'pca', 'tsne', 'umap', or 'all' to run all three.
+                If None (and load_model_path is not set), prompts an interactive selection
+                (which also offers an "All" option). When load_model_path is set, this only
+                restricts which of the loaded model(s) to apply; leave None to apply all of them.
+            n_components (int): Number of output dimensions (default: 2). Ignored when
+                load_model_path is set — the loaded model's own dimensionality is used instead.
+            update_database (bool): Whether to store the reduced coordinates back into the table
+            random_state (int): Random seed for reproducibility (tsne/umap)
+            n_jobs (int): Number of parallel jobs for tsne/umap neighbor search (default: -1, all cores)
+            save_model_path (Optional[str]): If set, save the newly fitted reducer(s) to this path
+                via joblib (as a {method: fitted_reducer} dict), so the exact same embedding can
+                later be applied to new compounds via load_model_path. Ignored if load_model_path is set.
+            load_model_path (Optional[str]): If set, load a previously fitted reducer (saved via
+                save_model_path) and project this table's fingerprints into that existing embedding
+                using .transform() instead of fitting a new one. Note t-SNE has no .transform();
+                a loaded t-SNE model is skipped with a warning.
+
+        Returns:
+            pd.DataFrame: DataFrame with added '<method>_1'..'<method>_<n_components>' columns,
+                empty DataFrame if error occurs
+        """
+        try:
+            if save_model_path and load_model_path:
+                print("❌ save_model_path and load_model_path are mutually exclusive: "
+                      "you either fit (and optionally save) a new model, or load and apply an existing one")
+                return pd.DataFrame()
+
+            try:
+                import joblib
+            except ImportError:
+                print("❌ joblib not installed. Please install it to save/load reduction models:")
+                print("   pip install joblib")
+                return pd.DataFrame()
+
+            # Check scikit-learn availability early
+            try:
+                from sklearn.decomposition import PCA
+                from sklearn.manifold import TSNE
+            except ImportError:
+                print("❌ scikit-learn not installed. Please install it to reduce dimensionality:")
+                print("   pip install scikit-learn")
+                return pd.DataFrame()
+
+            # If loading a previously fitted model, resolve it before touching the method prompt
+            loaded_reducers = None
+            if load_model_path:
+                if not os.path.exists(load_model_path):
+                    print(f"❌ Model file not found: {load_model_path}")
+                    return pd.DataFrame()
+                try:
+                    loaded_object = joblib.load(load_model_path)
+                except Exception as e:
+                    print(f"❌ Error loading model from '{load_model_path}': {e}")
+                    return pd.DataFrame()
+
+                if isinstance(loaded_object, dict):
+                    loaded_reducers = loaded_object
+                else:
+                    # Bare estimator (e.g. saved by an external script): infer its method from its type
+                    inferred = None
+                    for m in self._DIM_REDUCTION_METHODS:
+                        if type(loaded_object).__name__.lower() == m or \
+                           (m == 'tsne' and type(loaded_object).__name__ == 'TSNE') or \
+                           (m == 'umap' and type(loaded_object).__name__ == 'UMAP') or \
+                           (m == 'pca' and type(loaded_object).__name__ == 'PCA'):
+                            inferred = m
+                            break
+                    if inferred is None:
+                        print(f"❌ Could not infer the reduction method of the loaded model "
+                              f"({type(loaded_object).__name__}). Save it as a dict via "
+                              f"save_model_path, or provide a recognizable PCA/TSNE/UMAP object.")
+                        return pd.DataFrame()
+                    loaded_reducers = {inferred: loaded_object}
+
+                print(f"📂 Loaded model(s) from '{load_model_path}': {list(loaded_reducers.keys())}")
+
+            # Resolve table interactively if not provided, restricted to tables that
+            # already have at least one Morgan fingerprint column
+            if table_name is None:
+                tables_with_fp = [
+                    t for t in self.get_all_tables()
+                    if any(self._MORGAN_FP_COLUMN_PATTERN.match(c) for c in self._get_table_columns(t))
+                ]
+                if not tables_with_fp:
+                    print("❌ No tables with Morgan fingerprint columns found.")
+                    print("   Run compute_morgan_fingerprints() on a table first.")
+                    return pd.DataFrame()
+
+                table_name = self._select_table_interactive(
+                    "SELECT TABLE FOR DIMENSIONALITY REDUCTION", tables_override=tables_with_fp
+                )
+                if not table_name:
+                    print("❌ No table selected for dimensionality reduction")
+                    return pd.DataFrame()
+
+            # Get the DataFrame using existing method
+            print(f"📊 Retrieving table '{table_name}' for dimensionality reduction...")
+            df = self._get_table_as_dataframe(table_name)
+
+            if df.empty:
+                print(f"⚠️  No data retrieved from table '{table_name}'")
+                return pd.DataFrame()
+
+            # Resolve fingerprint column interactively if not provided
+            available_fp_columns = [c for c in df.columns if self._MORGAN_FP_COLUMN_PATTERN.match(c)]
+
+            if not available_fp_columns:
+                print(f"❌ No Morgan fingerprint columns found in table '{table_name}'.")
+                print("   Run compute_morgan_fingerprints() on this table first.")
+                return pd.DataFrame()
+
+            if fp_column is None:
+                fp_column = self._select_morgan_fp_column_interactive(available_fp_columns)
+                if fp_column is None:
+                    print("❌ No fingerprint column selected")
+                    return pd.DataFrame()
+            elif fp_column not in available_fp_columns:
+                print(f"❌ Fingerprint column '{fp_column}' not found in table '{table_name}'.")
+                print(f"   Available columns: {available_fp_columns}")
+                return pd.DataFrame()
+
+            # Resolve which method(s) to run
+            if loaded_reducers is not None:
+                # The loaded model(s) already dictate which method(s) are available;
+                # 'method' (if given) only restricts to a subset of them
+                if method is None or method == 'all':
+                    methods_to_run = [m for m in self._DIM_REDUCTION_METHODS if m in loaded_reducers]
+                elif method not in self._DIM_REDUCTION_METHODS:
+                    print(f"❌ Invalid method '{method}'. Must be one of {self._DIM_REDUCTION_METHODS} or 'all'")
+                    return pd.DataFrame()
+                elif method not in loaded_reducers:
+                    print(f"❌ Loaded model does not contain method '{method}'. "
+                          f"Available: {list(loaded_reducers.keys())}")
+                    return pd.DataFrame()
+                else:
+                    methods_to_run = [method]
+            else:
+                # Resolve method interactively if not provided
+                if method is None:
+                    method = self._select_dimensionality_reduction_method_interactive(allow_all=True)
+                    if method is None:
+                        print("❌ No dimensionality reduction method selected")
+                        return pd.DataFrame()
+                elif method != 'all' and method not in self._DIM_REDUCTION_METHODS:
+                    print(f"❌ Invalid method '{method}'. Must be one of {self._DIM_REDUCTION_METHODS} or 'all'")
+                    return pd.DataFrame()
+
+                methods_to_run = list(self._DIM_REDUCTION_METHODS) if method == 'all' else [method]
+
+                if 'umap' in methods_to_run:
+                    try:
+                        from umap import UMAP
+                    except ImportError:
+                        print("❌ umap-learn not installed. Please install it to use UMAP:")
+                        print("   pip install umap-learn")
+                        return pd.DataFrame()
+
+            # Keep only rows with a valid (successfully computed) fingerprint
+            valid_mask = ~df[fp_column].isin(['INVALID_SMILES', 'ERROR']) & df[fp_column].notna()
+            num_valid = int(valid_mask.sum())
+
+            if num_valid < n_components + 1:
+                print(f"❌ Not enough valid fingerprints ({num_valid}) to reduce to {n_components} components")
+                return pd.DataFrame()
+
+            # Convert bitstrings to a numeric matrix once, shared across all requested methods
+            fp_strings = df.loc[valid_mask, fp_column].tolist()
+            X = np.array(
+                [np.frombuffer(s.encode('ascii'), dtype=np.uint8) - ord('0') for s in fp_strings],
+                dtype=np.float32
+            )
+
+            all_output_columns = []
+            fitted_reducers = {}
+
+            for current_method in methods_to_run:
+                label = self._DIM_REDUCTION_LABELS[current_method]
+
+                if loaded_reducers is not None:
+                    reducer = loaded_reducers[current_method]
+
+                    # t-SNE has no out-of-sample transform(): it can only ever refit on the
+                    # exact data it was given, so a loaded t-SNE model can't project new
+                    # compounds into its existing embedding. Skip it with a clear explanation
+                    # instead of failing the whole run.
+                    if current_method == 'tsne' or not hasattr(reducer, 'transform'):
+                        print(f"⚠️  Skipping {label}: loaded t-SNE models don't support transform()-based "
+                              f"projection of new data (t-SNE has no out-of-sample mapping). "
+                              f"Re-run with method='tsne' (no load_model_path) to fit it fresh on this table instead.")
+                        continue
+
+                    print(f"🔬 Projecting '{fp_column}' ({num_valid} compounds) into the loaded "
+                          f"{label} embedding...")
+                    start_time = time.time()
+                    embedding = reducer.transform(X)
+                    processing_time = time.time() - start_time
+                    print(f"   ⏱️  {label} projection completed in {processing_time:.2f}s")
+                else:
+                    print(f"🔬 Reducing '{fp_column}' ({num_valid} compounds) with "
+                          f"{label} to {n_components} components...")
+
+                    start_time = time.time()
+
+                    if current_method == 'pca':
+                        reducer = PCA(n_components=n_components, random_state=random_state)
+                    elif current_method == 'tsne':
+                        # Perplexity must be < number of samples; keep it in a sane range for small datasets
+                        perplexity = min(30, max(5, num_valid - 1))
+                        reducer = TSNE(n_components=n_components, random_state=random_state,
+                                      perplexity=perplexity, init='pca', n_jobs=n_jobs)
+                    else:  # umap
+                        reducer = UMAP(n_components=n_components, random_state=random_state, n_jobs=n_jobs)
+
+                    embedding = reducer.fit_transform(X)
+                    fitted_reducers[current_method] = reducer
+
+                    processing_time = time.time() - start_time
+                    print(f"   ⏱️  {label} completed in {processing_time:.2f}s")
+
+                # Initialize output columns and assign computed coordinates (component count
+                # taken from the actual embedding, robust to a loaded model's own dimensionality)
+                output_columns = [f"{current_method}_{i + 1}" for i in range(embedding.shape[1])]
+                for col in output_columns:
+                    df[col] = None
+                df.loc[valid_mask, output_columns] = embedding
+
+                print(f"✅ {label} completed: {num_valid} compounds embedded into {output_columns}")
+
+                all_output_columns.extend(output_columns)
+
+            if not all_output_columns:
+                print("❌ No dimensionality reduction was performed (all requested methods were skipped)")
+                return pd.DataFrame()
+
+            # Optionally persist the newly fitted reducer(s) for later reuse via load_model_path
+            if save_model_path and fitted_reducers:
+                try:
+                    os.makedirs(os.path.dirname(os.path.abspath(save_model_path)), exist_ok=True)
+                    joblib.dump(fitted_reducers, save_model_path)
+                    print(f"💾 Saved fitted model(s) to: {save_model_path}")
+                except Exception as e:
+                    print(f"⚠️  Could not save model to '{save_model_path}': {e}")
+
+            # Optionally update the database table
+            if update_database:
+                print(f"💾 Updating database table '{table_name}' with reduced coordinates...")
+                success = self._update_table_with_reduced_coordinates(table_name, df, all_output_columns)
+                if success:
+                    print(f"✅ Database table '{table_name}' updated with columns {all_output_columns}")
+                else:
+                    print(f"❌ Failed to update database table '{table_name}'")
+
+            return df
+
+        except Exception as e:
+            print(f"❌ Error reducing dimensionality for table '{table_name}': {e}")
+            return pd.DataFrame()
+
+    def _select_morgan_fp_column_interactive(self, available_columns: List[str]) -> Optional[str]:
+        """
+        Interactive selection of a previously computed Morgan fingerprint column.
+
+        Args:
+            available_columns (List[str]): Fingerprint columns present in the table
+
+        Returns:
+            Optional[str]: Selected column name, or None if cancelled
+        """
+        print(f"\n🔍 SELECT FINGERPRINT COLUMN")
+        print("=" * 60)
+        for i, col in enumerate(available_columns, 1):
+            print(f"{i}. {col}")
+        print("-" * 60)
+        print("Commands: Enter option number, column name, or 'cancel' to abort")
+
+        while True:
+            try:
+                selection = input(f"\n🔍 Select fingerprint column: ").strip()
+
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    return None
+
+                try:
+                    idx = int(selection) - 1
+                    if 0 <= idx < len(available_columns):
+                        return available_columns[idx]
+                    print(f"❌ Invalid selection. Please enter 1-{len(available_columns)}")
+                    continue
+                except ValueError:
+                    matches = [c for c in available_columns if c.lower() == selection.lower()]
+                    if matches:
+                        return matches[0]
+                    print(f"❌ Column '{selection}' not found")
+
+            except KeyboardInterrupt:
+                print("\n❌ Fingerprint column selection cancelled")
+                return None
+
+    def _select_dimensionality_reduction_method_interactive(self, methods: Optional[Tuple[str, ...]] = None,
+                                                            allow_all: bool = False) -> Optional[str]:
+        """
+        Interactive selection of the dimensionality reduction method.
+
+        Args:
+            methods (Optional[Tuple[str, ...]]): Restrict the offered choices to this subset
+                (e.g. only methods with coordinates already present in a table). Defaults to
+                all supported methods.
+            allow_all (bool): If True, offer an extra "All" option that runs every method
+                in `methods` in sequence, returned as the sentinel string 'all'.
+
+        Returns:
+            Optional[str]: One of 'pca', 'tsne', 'umap', 'all' (if allow_all), or None if cancelled
+        """
+        methods = tuple(methods) if methods else self._DIM_REDUCTION_METHODS
+
+        print(f"\n🔍 SELECT DIMENSIONALITY REDUCTION METHOD")
+        print("=" * 60)
+        for i, m in enumerate(methods, 1):
+            print(f"{i}. {self._DIM_REDUCTION_LABELS[m]}")
+        if allow_all:
+            all_label = " + ".join(self._DIM_REDUCTION_LABELS[m] for m in methods)
+            print(f"{len(methods) + 1}. All ({all_label})")
+        print("-" * 60)
+        print("Commands: Enter option number, method name, or 'cancel' to abort")
+
+        while True:
+            try:
+                selection = input(f"\n🔍 Select method: ").strip()
+
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    return None
+
+                try:
+                    idx = int(selection) - 1
+                    if 0 <= idx < len(methods):
+                        return methods[idx]
+                    if allow_all and idx == len(methods):
+                        return 'all'
+                    max_option = len(methods) + 1 if allow_all else len(methods)
+                    print(f"❌ Invalid selection. Please enter 1-{max_option}")
+                    continue
+                except ValueError:
+                    normalized = selection.lower().replace('-', '').replace('_', '')
+                    if allow_all and normalized == 'all':
+                        return 'all'
+                    for m in methods:
+                        if normalized in (m, self._DIM_REDUCTION_LABELS[m].lower().replace('-', '')):
+                            return m
+                    print(f"❌ Invalid method '{selection}'. Choose one of {methods}"
+                          f"{' or all' if allow_all else ''}")
+
+            except KeyboardInterrupt:
+                print("\n❌ Method selection cancelled")
+                return None
+
+    def _update_table_with_reduced_coordinates(self, table_name: str, df: pd.DataFrame,
+                                               output_columns: List[str]) -> bool:
+        """
+        Update the database table with computed dimensionality-reduction coordinates.
+        Adds the coordinate columns if they don't already exist (for backward compatibility).
+
+        Args:
+            table_name (str): Name of the table to update
+            df (pd.DataFrame): DataFrame containing the computed coordinates
+            output_columns (List[str]): Names of the coordinate columns to write
+
+        Returns:
+            bool: True if update was successful
+        """
+        try:
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+
+            cursor.execute(f"PRAGMA table_info({table_name})")
+            existing_columns = [row[1] for row in cursor.fetchall()]
+
+            for col in output_columns:
+                if col not in existing_columns:
+                    try:
+                        cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {col} REAL")
+                        print(f"   📋 Added '{col}' column to existing table '{table_name}'")
+                    except sqlite3.OperationalError as e:
+                        print(f"   ⚠️  Warning: Could not add {col} column: {e}")
+                        return False
+
+            set_clause = ", ".join(f"{col} = ?" for col in output_columns)
+            update_query = f"UPDATE {table_name} SET {set_clause} WHERE id = ?"
+
+            updates = [
+                tuple(getattr(row, col) for col in output_columns) + (row.id,)
+                for row in df.itertuples(index=False)
+                if all(pd.notna(getattr(row, col)) for col in output_columns)
+            ]
+            cursor.executemany(update_query, updates)
+            updates_made = len(updates)
+
+            conn.commit()
+            conn.close()
+
+            print(f"   📊 Updated {updates_made} rows with reduced coordinates")
+            return True
+
+        except Exception as e:
+            print(f"❌ Error updating database table '{table_name}' with reduced coordinates: {e}")
+            return False
+
+    def _detect_reduction_methods_in_columns(self, columns) -> Dict[str, List[str]]:
+        """
+        Detect which dimensionality-reduction methods already have coordinate columns present.
+
+        Args:
+            columns: Iterable of column names to scan (e.g. df.columns)
+
+        Returns:
+            Dict[str, List[str]]: method -> coordinate column names sorted by component index
+                (e.g. 'pca' -> ['pca_1', 'pca_2']); only methods with 2+ components are included
+        """
+        result = {}
+        for m in self._DIM_REDUCTION_METHODS:
+            pattern = re.compile(rf'^{m}_(\d+)$')
+            matches = []
+            for c in columns:
+                match = pattern.match(c)
+                if match:
+                    matches.append((int(match.group(1)), c))
+            if len(matches) >= 2:
+                matches.sort(key=lambda x: x[0])
+                result[m] = [c for _, c in matches]
+        return result
+
+    def plot_reduced_coordinates(self, table_name: Optional[str] = None,
+                                 method: Optional[str] = None,
+                                 color_by: Optional[str] = None,
+                                 output_path: Optional[str] = None,
+                                 figsize: Tuple[int, int] = (8, 8),
+                                 point_size: float = 20,
+                                 alpha: float = 0.7,
+                                 show: bool = False) -> Optional[str]:
+        """
+        Visualize previously computed dimensionality-reduction coordinates (from
+        reduce_dimensionality()) as a 2D scatter plot, saved as a PNG.
+
+        Args:
+            table_name (Optional[str]): Name of the table to plot. If None, prompts an interactive table selection.
+            method (Optional[str]): One of 'pca', 'tsne', 'umap'. If None and a single method's coordinates
+                are present in the table, that one is used automatically; otherwise prompts an interactive selection.
+            color_by (Optional[str]): Name of a column to color points by. Numeric columns use a continuous
+                colormap with a colorbar; non-numeric columns use discrete colors with a legend. If None,
+                all points share a single color.
+            output_path (Optional[str]): Path to save the PNG. If None, defaults to
+                '<project>/chemspace/misc/dim_reduction/<table_name>_<method>_<timestamp>.png'
+            figsize (Tuple[int, int]): Matplotlib figure size in inches
+            point_size (float): Marker size for scatter points
+            alpha (float): Marker transparency
+            show (bool): Whether to also display the plot interactively (plt.show())
+
+        Returns:
+            Optional[str]: Path to the saved PNG, or None if an error occurred
+        """
+        try:
+            try:
+                import matplotlib.pyplot as plt
+            except ImportError:
+                print("❌ matplotlib not installed. Please install it to plot reduced coordinates:")
+                print("   pip install matplotlib")
+                return None
+
+            # Resolve table interactively if not provided, restricted to tables that
+            # already have reduced-coordinate columns from reduce_dimensionality()
+            if table_name is None:
+                tables_with_coords = [
+                    t for t in self.get_all_tables()
+                    if self._detect_reduction_methods_in_columns(self._get_table_columns(t))
+                ]
+                if not tables_with_coords:
+                    print("❌ No tables with reduced-coordinate columns found.")
+                    print("   Run reduce_dimensionality() on a table first.")
+                    return None
+
+                table_name = self._select_table_interactive(
+                    "SELECT TABLE FOR REDUCED-COORDINATE PLOT", tables_override=tables_with_coords
+                )
+                if not table_name:
+                    print("❌ No table selected for plotting")
+                    return None
+
+            print(f"📊 Retrieving table '{table_name}' for plotting...")
+            df = self._get_table_as_dataframe(table_name)
+
+            if df.empty:
+                print(f"⚠️  No data retrieved from table '{table_name}'")
+                return None
+
+            # Resolve which method's coordinates to plot
+            available_methods = self._detect_reduction_methods_in_columns(df.columns)
+
+            if not available_methods:
+                print(f"❌ No reduced-coordinate columns found in table '{table_name}'.")
+                print("   Run reduce_dimensionality() on this table first.")
+                return None
+
+            if method is None:
+                if len(available_methods) == 1:
+                    method = next(iter(available_methods))
+                else:
+                    method = self._select_dimensionality_reduction_method_interactive(
+                        tuple(available_methods.keys())
+                    )
+                    if method is None:
+                        print("❌ No dimensionality reduction method selected")
+                        return None
+            elif method not in available_methods:
+                print(f"❌ No reduced coordinates for method '{method}' found in table '{table_name}'.")
+                print(f"   Available: {list(available_methods.keys())}")
+                return None
+
+            coord_columns = available_methods[method][:2]
+            x_col, y_col = coord_columns
+
+            # Only keep rows with both coordinates present
+            plot_df = df.dropna(subset=[x_col, y_col]).copy()
+
+            if plot_df.empty:
+                print(f"❌ No rows with valid '{method}' coordinates in table '{table_name}'")
+                return None
+
+            # Resolve coloring
+            color_values = None
+            is_numeric_color = False
+            if color_by is not None:
+                if color_by not in df.columns:
+                    print(f"❌ Column '{color_by}' not found in table '{table_name}'")
+                    return None
+                plot_df = plot_df.dropna(subset=[color_by])
+                if plot_df.empty:
+                    print(f"❌ No rows with valid '{color_by}' values to color by")
+                    return None
+                color_values = plot_df[color_by]
+                is_numeric_color = pd.api.types.is_numeric_dtype(color_values)
+
+            print(f"🎨 Plotting {len(plot_df)} compounds ({self._DIM_REDUCTION_LABELS[method]}: {x_col} vs {y_col})...")
+
+            fig, ax = plt.subplots(figsize=figsize)
+
+            if color_values is None:
+                ax.scatter(plot_df[x_col], plot_df[y_col], s=point_size, alpha=alpha, color='steelblue')
+            elif is_numeric_color:
+                scatter = ax.scatter(plot_df[x_col], plot_df[y_col], s=point_size, alpha=alpha,
+                                     c=color_values, cmap='viridis')
+                fig.colorbar(scatter, ax=ax, label=color_by)
+            else:
+                categories = sorted(color_values.astype(str).unique())
+                cmap = plt.get_cmap('tab20' if len(categories) > 10 else 'tab10')
+                category_colors = {cat: cmap(i % cmap.N) for i, cat in enumerate(categories)}
+                for cat in categories:
+                    mask = color_values.astype(str) == cat
+                    ax.scatter(plot_df.loc[mask, x_col], plot_df.loc[mask, y_col],
+                              s=point_size, alpha=alpha, color=category_colors[cat], label=cat)
+                ax.legend(title=color_by, loc='best', fontsize=8)
+
+            ax.set_xlabel(x_col)
+            ax.set_ylabel(y_col)
+            ax.set_title(f"{self._DIM_REDUCTION_LABELS[method]} — {table_name}")
+            ax.grid(True, alpha=0.3)
+
+            if output_path is None:
+                output_dir = os.path.join(self.path, 'chemspace', 'misc', 'dim_reduction')
+                os.makedirs(output_dir, exist_ok=True)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                output_path = os.path.join(output_dir, f"{table_name}_{method}_{timestamp}.png")
+            else:
+                os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+
+            fig.savefig(output_path, dpi=300, bbox_inches='tight')
+
+            if show:
+                plt.show()
+
+            plt.close(fig)
+
+            print(f"✅ Plot saved to: {output_path}")
+            return output_path
+
+        except Exception as e:
+            print(f"❌ Error plotting reduced coordinates for table '{table_name}': {e}")
+            return None
 
     def _create_sql_registers_table(self) -> bool:
         """
@@ -14806,29 +15436,33 @@ class ChemSpace:
             print(f"❌ Error analyzing stereocenters: {e}")
             return pd.DataFrame()
 
-    def _select_table_interactive(self, prompt_title: str = "SELECT TABLE", 
+    def _select_table_interactive(self, prompt_title: str = "SELECT TABLE",
                                 filter_type: Optional[str] = None,
-                                show_compound_count: bool = True) -> Optional[str]:
+                                show_compound_count: bool = True,
+                                tables_override: Optional[List[str]] = None) -> Optional[str]:
         """
         Unified interactive table selection method.
-        
+
         Args:
             prompt_title (str): Title for the selection prompt
             filter_type (Optional[str]): Optional filter for table types
             show_compound_count (bool): Whether to show compound counts
-            
+            tables_override (Optional[List[str]]): If provided, restrict selection to exactly
+                this list of tables instead of every table in the database (filter_type is
+                ignored in this case, since the caller has already pre-filtered)
+
         Returns:
             Optional[str]: Selected table name or None if cancelled
         """
         try:
-            available_tables = self.get_all_tables()
-            
+            available_tables = tables_override if tables_override is not None else self.get_all_tables()
+
             if not available_tables:
                 print("❌ No tables available for selection")
                 return None
-            
+
             # Filter tables if type specified
-            if filter_type:
+            if filter_type and tables_override is None:
                 filtered_tables = []
                 for table in available_tables:
                     table_type = self._classify_table_type(table)
