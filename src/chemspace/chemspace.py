@@ -1,5 +1,6 @@
 import os
 import csv
+import io
 import sqlite3
 import pandas as pd
 import re
@@ -3636,12 +3637,14 @@ class ChemSpace:
                               n_components: int = 2,
                               update_database: bool = True,
                               random_state: int = 42,
-                              n_jobs: int = -1,
-                              save_model_path: Optional[str] = None,
-                              load_model_path: Optional[str] = None) -> pd.DataFrame:
+                              n_jobs: int = -1) -> pd.DataFrame:
         """
         Retrieve a table as DataFrame and reduce the dimensionality of a previously computed
         Morgan fingerprint column using PCA, t-SNE or UMAP.
+
+        Every fitted reducer is automatically persisted to the 'dim_reduction_models' table
+        in chemspace.db (keyed by table_name/fp_column/method), alongside the x/y coordinates
+        it produced.
 
         Args:
             table_name (Optional[str]): Name of the table to process. If None, prompts an interactive table selection.
@@ -3649,36 +3652,21 @@ class ChemSpace:
                 as created by compute_morgan_fingerprints(). If None, prompts an interactive selection
                 among the table's fingerprint columns.
             method (Optional[str]): One of 'pca', 'tsne', 'umap', or 'all' to run all three.
-                If None (and load_model_path is not set), prompts an interactive selection
-                (which also offers an "All" option). When load_model_path is set, this only
-                restricts which of the loaded model(s) to apply; leave None to apply all of them.
-            n_components (int): Number of output dimensions (default: 2). Ignored when
-                load_model_path is set — the loaded model's own dimensionality is used instead.
+                If None, prompts an interactive selection (which also offers an "All" option).
+            n_components (int): Number of output dimensions (default: 2)
             update_database (bool): Whether to store the reduced coordinates back into the table
             random_state (int): Random seed for reproducibility (tsne/umap)
             n_jobs (int): Number of parallel jobs for tsne/umap neighbor search (default: -1, all cores)
-            save_model_path (Optional[str]): If set, save the newly fitted reducer(s) to this path
-                via joblib (as a {method: fitted_reducer} dict), so the exact same embedding can
-                later be applied to new compounds via load_model_path. Ignored if load_model_path is set.
-            load_model_path (Optional[str]): If set, load a previously fitted reducer (saved via
-                save_model_path) and project this table's fingerprints into that existing embedding
-                using .transform() instead of fitting a new one. Note t-SNE has no .transform();
-                a loaded t-SNE model is skipped with a warning.
 
         Returns:
             pd.DataFrame: DataFrame with added '<method>_1'..'<method>_<n_components>' columns,
                 empty DataFrame if error occurs
         """
         try:
-            if save_model_path and load_model_path:
-                print("❌ save_model_path and load_model_path are mutually exclusive: "
-                      "you either fit (and optionally save) a new model, or load and apply an existing one")
-                return pd.DataFrame()
-
             try:
                 import joblib
             except ImportError:
-                print("❌ joblib not installed. Please install it to save/load reduction models:")
+                print("❌ joblib not installed. Please install it to save reduction models:")
                 print("   pip install joblib")
                 return pd.DataFrame()
 
@@ -3690,39 +3678,6 @@ class ChemSpace:
                 print("❌ scikit-learn not installed. Please install it to reduce dimensionality:")
                 print("   pip install scikit-learn")
                 return pd.DataFrame()
-
-            # If loading a previously fitted model, resolve it before touching the method prompt
-            loaded_reducers = None
-            if load_model_path:
-                if not os.path.exists(load_model_path):
-                    print(f"❌ Model file not found: {load_model_path}")
-                    return pd.DataFrame()
-                try:
-                    loaded_object = joblib.load(load_model_path)
-                except Exception as e:
-                    print(f"❌ Error loading model from '{load_model_path}': {e}")
-                    return pd.DataFrame()
-
-                if isinstance(loaded_object, dict):
-                    loaded_reducers = loaded_object
-                else:
-                    # Bare estimator (e.g. saved by an external script): infer its method from its type
-                    inferred = None
-                    for m in self._DIM_REDUCTION_METHODS:
-                        if type(loaded_object).__name__.lower() == m or \
-                           (m == 'tsne' and type(loaded_object).__name__ == 'TSNE') or \
-                           (m == 'umap' and type(loaded_object).__name__ == 'UMAP') or \
-                           (m == 'pca' and type(loaded_object).__name__ == 'PCA'):
-                            inferred = m
-                            break
-                    if inferred is None:
-                        print(f"❌ Could not infer the reduction method of the loaded model "
-                              f"({type(loaded_object).__name__}). Save it as a dict via "
-                              f"save_model_path, or provide a recognizable PCA/TSNE/UMAP object.")
-                        return pd.DataFrame()
-                    loaded_reducers = {inferred: loaded_object}
-
-                print(f"📂 Loaded model(s) from '{load_model_path}': {list(loaded_reducers.keys())}")
 
             # Resolve table interactively if not provided, restricted to tables that
             # already have at least one Morgan fingerprint column
@@ -3769,41 +3724,25 @@ class ChemSpace:
                 print(f"   Available columns: {available_fp_columns}")
                 return pd.DataFrame()
 
-            # Resolve which method(s) to run
-            if loaded_reducers is not None:
-                # The loaded model(s) already dictate which method(s) are available;
-                # 'method' (if given) only restricts to a subset of them
-                if method is None or method == 'all':
-                    methods_to_run = [m for m in self._DIM_REDUCTION_METHODS if m in loaded_reducers]
-                elif method not in self._DIM_REDUCTION_METHODS:
-                    print(f"❌ Invalid method '{method}'. Must be one of {self._DIM_REDUCTION_METHODS} or 'all'")
-                    return pd.DataFrame()
-                elif method not in loaded_reducers:
-                    print(f"❌ Loaded model does not contain method '{method}'. "
-                          f"Available: {list(loaded_reducers.keys())}")
-                    return pd.DataFrame()
-                else:
-                    methods_to_run = [method]
-            else:
-                # Resolve method interactively if not provided
+            # Resolve method interactively if not provided
+            if method is None:
+                method = self._select_dimensionality_reduction_method_interactive(allow_all=True)
                 if method is None:
-                    method = self._select_dimensionality_reduction_method_interactive(allow_all=True)
-                    if method is None:
-                        print("❌ No dimensionality reduction method selected")
-                        return pd.DataFrame()
-                elif method != 'all' and method not in self._DIM_REDUCTION_METHODS:
-                    print(f"❌ Invalid method '{method}'. Must be one of {self._DIM_REDUCTION_METHODS} or 'all'")
+                    print("❌ No dimensionality reduction method selected")
                     return pd.DataFrame()
+            elif method != 'all' and method not in self._DIM_REDUCTION_METHODS:
+                print(f"❌ Invalid method '{method}'. Must be one of {self._DIM_REDUCTION_METHODS} or 'all'")
+                return pd.DataFrame()
 
-                methods_to_run = list(self._DIM_REDUCTION_METHODS) if method == 'all' else [method]
+            methods_to_run = list(self._DIM_REDUCTION_METHODS) if method == 'all' else [method]
 
-                if 'umap' in methods_to_run:
-                    try:
-                        from umap import UMAP
-                    except ImportError:
-                        print("❌ umap-learn not installed. Please install it to use UMAP:")
-                        print("   pip install umap-learn")
-                        return pd.DataFrame()
+            if 'umap' in methods_to_run:
+                try:
+                    from umap import UMAP
+                except ImportError:
+                    print("❌ umap-learn not installed. Please install it to use UMAP:")
+                    print("   pip install umap-learn")
+                    return pd.DataFrame()
 
             # Keep only rows with a valid (successfully computed) fingerprint
             valid_mask = ~df[fp_column].isin(['INVALID_SMILES', 'ERROR']) & df[fp_column].notna()
@@ -3821,54 +3760,36 @@ class ChemSpace:
             )
 
             all_output_columns = []
-            fitted_reducers = {}
 
             for current_method in methods_to_run:
                 label = self._DIM_REDUCTION_LABELS[current_method]
 
-                if loaded_reducers is not None:
-                    reducer = loaded_reducers[current_method]
+                print(f"🔬 Reducing '{fp_column}' ({num_valid} compounds) with "
+                      f"{label} to {n_components} components...")
 
-                    # t-SNE has no out-of-sample transform(): it can only ever refit on the
-                    # exact data it was given, so a loaded t-SNE model can't project new
-                    # compounds into its existing embedding. Skip it with a clear explanation
-                    # instead of failing the whole run.
-                    if current_method == 'tsne' or not hasattr(reducer, 'transform'):
-                        print(f"⚠️  Skipping {label}: loaded t-SNE models don't support transform()-based "
-                              f"projection of new data (t-SNE has no out-of-sample mapping). "
-                              f"Re-run with method='tsne' (no load_model_path) to fit it fresh on this table instead.")
-                        continue
+                start_time = time.time()
 
-                    print(f"🔬 Projecting '{fp_column}' ({num_valid} compounds) into the loaded "
-                          f"{label} embedding...")
-                    start_time = time.time()
-                    embedding = reducer.transform(X)
-                    processing_time = time.time() - start_time
-                    print(f"   ⏱️  {label} projection completed in {processing_time:.2f}s")
-                else:
-                    print(f"🔬 Reducing '{fp_column}' ({num_valid} compounds) with "
-                          f"{label} to {n_components} components...")
+                if current_method == 'pca':
+                    reducer = PCA(n_components=n_components, random_state=random_state)
+                elif current_method == 'tsne':
+                    # Perplexity must be < number of samples; keep it in a sane range for small datasets
+                    perplexity = min(30, max(5, num_valid - 1))
+                    reducer = TSNE(n_components=n_components, random_state=random_state,
+                                  perplexity=perplexity, init='pca', n_jobs=n_jobs)
+                else:  # umap
+                    reducer = UMAP(n_components=n_components, random_state=random_state, n_jobs=n_jobs)
 
-                    start_time = time.time()
+                embedding = reducer.fit_transform(X)
 
-                    if current_method == 'pca':
-                        reducer = PCA(n_components=n_components, random_state=random_state)
-                    elif current_method == 'tsne':
-                        # Perplexity must be < number of samples; keep it in a sane range for small datasets
-                        perplexity = min(30, max(5, num_valid - 1))
-                        reducer = TSNE(n_components=n_components, random_state=random_state,
-                                      perplexity=perplexity, init='pca', n_jobs=n_jobs)
-                    else:  # umap
-                        reducer = UMAP(n_components=n_components, random_state=random_state, n_jobs=n_jobs)
+                processing_time = time.time() - start_time
+                print(f"   ⏱️  {label} completed in {processing_time:.2f}s")
 
-                    embedding = reducer.fit_transform(X)
-                    fitted_reducers[current_method] = reducer
-
-                    processing_time = time.time() - start_time
-                    print(f"   ⏱️  {label} completed in {processing_time:.2f}s")
+                # Always persist the newly fitted reducer alongside the x/y values it produced
+                self._save_reduction_model_to_db(table_name, fp_column, current_method,
+                                                  embedding.shape[1], reducer)
 
                 # Initialize output columns and assign computed coordinates (component count
-                # taken from the actual embedding, robust to a loaded model's own dimensionality)
+                # taken from the actual embedding, in case it ever differs from n_components)
                 output_columns = [f"{current_method}_{i + 1}" for i in range(embedding.shape[1])]
                 for col in output_columns:
                     df[col] = None
@@ -3881,15 +3802,6 @@ class ChemSpace:
             if not all_output_columns:
                 print("❌ No dimensionality reduction was performed (all requested methods were skipped)")
                 return pd.DataFrame()
-
-            # Optionally persist the newly fitted reducer(s) for later reuse via load_model_path
-            if save_model_path and fitted_reducers:
-                try:
-                    os.makedirs(os.path.dirname(os.path.abspath(save_model_path)), exist_ok=True)
-                    joblib.dump(fitted_reducers, save_model_path)
-                    print(f"💾 Saved fitted model(s) to: {save_model_path}")
-                except Exception as e:
-                    print(f"⚠️  Could not save model to '{save_model_path}': {e}")
 
             # Optionally update the database table
             if update_database:
@@ -3904,6 +3816,345 @@ class ChemSpace:
 
         except Exception as e:
             print(f"❌ Error reducing dimensionality for table '{table_name}': {e}")
+            return pd.DataFrame()
+
+    _DIM_REDUCTION_MODELS_TABLE = 'dim_reduction_models'
+
+    def _ensure_dim_reduction_models_table(self, cursor: sqlite3.Cursor) -> None:
+        """
+        Create the table that stores fitted dimensionality-reduction models, if it
+        doesn't already exist. One row per (table_name, fp_column, method) combination.
+        """
+        cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS {self._DIM_REDUCTION_MODELS_TABLE} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                table_name TEXT NOT NULL,
+                fp_column TEXT NOT NULL,
+                method TEXT NOT NULL,
+                n_components INTEGER NOT NULL,
+                model_blob BLOB NOT NULL,
+                created_date TEXT NOT NULL,
+                UNIQUE(table_name, fp_column, method)
+            )
+        """)
+
+    def _save_reduction_model_to_db(self, table_name: str, fp_column: str, method: str,
+                                    n_components: int, reducer) -> bool:
+        """
+        Serialize a fitted reducer (via joblib) and persist it to the 'dim_reduction_models'
+        table, replacing any previously saved model for the same (table_name, fp_column, method).
+
+        Returns:
+            bool: True if the model was saved successfully
+        """
+        try:
+            import joblib
+
+            buffer = io.BytesIO()
+            joblib.dump(reducer, buffer)
+            model_blob = buffer.getvalue()
+
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            self._ensure_dim_reduction_models_table(cursor)
+            cursor.execute(f"""
+                INSERT INTO {self._DIM_REDUCTION_MODELS_TABLE}
+                    (table_name, fp_column, method, n_components, model_blob, created_date)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(table_name, fp_column, method) DO UPDATE SET
+                    n_components = excluded.n_components,
+                    model_blob = excluded.model_blob,
+                    created_date = excluded.created_date
+            """, (table_name, fp_column, method, n_components, model_blob, datetime.now().isoformat()))
+            conn.commit()
+            conn.close()
+
+            print(f"   💾 Saved {self._DIM_REDUCTION_LABELS[method]} model for '{table_name}' "
+                  f"to '{self._DIM_REDUCTION_MODELS_TABLE}'")
+            return True
+
+        except Exception as e:
+            print(f"⚠️  Could not save {method} model for '{table_name}' to the database: {e}")
+            return False
+
+    def _get_tables_with_saved_reduction_models(self) -> List[str]:
+        """
+        List the distinct table_name values present in 'dim_reduction_models', i.e. the
+        tables on which at least one reducer has been fitted and saved.
+
+        Returns:
+            List[str]: Sorted table names with at least one saved model, empty on error
+        """
+        try:
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            self._ensure_dim_reduction_models_table(cursor)
+            cursor.execute(f"SELECT DISTINCT table_name FROM {self._DIM_REDUCTION_MODELS_TABLE} ORDER BY table_name")
+            tables = [row[0] for row in cursor.fetchall()]
+            conn.close()
+            return tables
+
+        except Exception as e:
+            print(f"❌ Error listing tables with saved reduction models: {e}")
+            return []
+
+    def _get_saved_reduction_methods_for_table(self, table_name: str) -> List[str]:
+        """
+        List which methods have a saved model for a given table, without deserializing the
+        model blobs. Use this instead of _load_reduction_models_from_db() whenever only the
+        metadata is needed (e.g. to decide what's deletable) — unpickling a saved UMAP/t-SNE
+        model imports its whole library (and, for UMAP, transitively TensorFlow) just to
+        answer "does a model exist", which is unnecessary overhead/noise.
+
+        Args:
+            table_name (str): Name of the table to check
+
+        Returns:
+            List[str]: Method names with a saved model for this table, empty on error
+        """
+        try:
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            self._ensure_dim_reduction_models_table(cursor)
+            cursor.execute(
+                f"SELECT DISTINCT method FROM {self._DIM_REDUCTION_MODELS_TABLE} WHERE table_name = ?",
+                (table_name,)
+            )
+            methods = [row[0] for row in cursor.fetchall()]
+            conn.close()
+            return methods
+
+        except Exception as e:
+            print(f"❌ Error listing saved reduction methods for table '{table_name}': {e}")
+            return []
+
+    def _load_reduction_models_from_db(self, source_table_name: str,
+                                       method: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+        """
+        Load previously fitted reduction model(s) for a given source table from the
+        'dim_reduction_models' table.
+
+        Args:
+            source_table_name (str): Name of the table the model(s) were originally fit on
+            method (Optional[str]): Restrict to a single method; None or 'all' loads every
+                method saved for that table
+
+        Returns:
+            Dict[str, Dict[str, Any]]: {method: {'reducer': obj, 'fp_column': str, 'n_components': int}},
+                empty dict if none found or on error
+        """
+        try:
+            import joblib
+
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            self._ensure_dim_reduction_models_table(cursor)
+
+            if method and method != 'all':
+                cursor.execute(f"""
+                    SELECT method, fp_column, n_components, model_blob
+                    FROM {self._DIM_REDUCTION_MODELS_TABLE}
+                    WHERE table_name = ? AND method = ?
+                """, (source_table_name, method))
+            else:
+                cursor.execute(f"""
+                    SELECT method, fp_column, n_components, model_blob
+                    FROM {self._DIM_REDUCTION_MODELS_TABLE}
+                    WHERE table_name = ?
+                """, (source_table_name,))
+
+            rows = cursor.fetchall()
+            conn.close()
+
+            models = {}
+            for saved_method, fp_col, n_comp, model_blob in rows:
+                models[saved_method] = {
+                    'reducer': joblib.load(io.BytesIO(model_blob)),
+                    'fp_column': fp_col,
+                    'n_components': n_comp
+                }
+            return models
+
+        except Exception as e:
+            print(f"❌ Error loading reduction model(s) for table '{source_table_name}': {e}")
+            return {}
+
+    def project_dimensionality_on_table(self, table_name: Optional[str] = None,
+                                        reference_table: Optional[str] = None,
+                                        method: Optional[str] = None,
+                                        update_database: bool = True) -> pd.DataFrame:
+        """
+        Project a table's already-computed Morgan fingerprints into a dimensionality-reduction
+        embedding previously fit (and auto-saved by reduce_dimensionality()) on another table.
+
+        Args:
+            table_name (Optional[str]): Name of the table to project, which must already have
+                the same Morgan fingerprint column the reference model was fit on. If None,
+                prompts an interactive table selection.
+            reference_table (Optional[str]): Name of the table whose saved model(s) should be
+                loaded from 'dim_reduction_models'. If None, prompts an interactive selection
+                restricted to tables that have at least one saved model.
+            method (Optional[str]): One of 'pca', 'tsne', 'umap', or 'all' to project with every
+                saved method. If None, prompts an interactive selection restricted to the methods
+                actually saved for reference_table. Note t-SNE has no .transform(); a saved t-SNE
+                model is always skipped with a warning.
+            update_database (bool): Whether to store the projected coordinates back into table_name
+
+        Returns:
+            pd.DataFrame: DataFrame with added '<method>_from_<reference_table>_1'..'_<n>' columns,
+                empty DataFrame if error occurs
+        """
+        try:
+            try:
+                import joblib
+            except ImportError:
+                print("❌ joblib not installed. Please install it to load reduction models:")
+                print("   pip install joblib")
+                return pd.DataFrame()
+
+            # Resolve reference table interactively if not provided
+            reference_tables = self._get_tables_with_saved_reduction_models()
+            if not reference_tables:
+                print("❌ No saved reduction models found. Run reduce_dimensionality() on a table first.")
+                return pd.DataFrame()
+
+            if reference_table is None:
+                reference_table = self._select_table_interactive(
+                    "SELECT REFERENCE TABLE (SAVED MODEL)", tables_override=reference_tables
+                )
+                if not reference_table:
+                    print("❌ No reference table selected")
+                    return pd.DataFrame()
+            elif reference_table not in reference_tables:
+                print(f"❌ No saved reduction model(s) found for reference table '{reference_table}'.")
+                print(f"   Tables with saved models: {reference_tables}")
+                return pd.DataFrame()
+
+            # Load every saved model for the reference table, then narrow down to the requested method
+            available_models = self._load_reduction_models_from_db(reference_table)
+            if not available_models:
+                print(f"❌ No saved reduction model(s) found for reference table '{reference_table}'.")
+                return pd.DataFrame()
+
+            if method is None:
+                method = self._select_dimensionality_reduction_method_interactive(
+                    methods=tuple(available_models.keys()), allow_all=True
+                )
+                if method is None:
+                    print("❌ No dimensionality reduction method selected")
+                    return pd.DataFrame()
+            elif method != 'all' and method not in self._DIM_REDUCTION_METHODS:
+                print(f"❌ Invalid method '{method}'. Must be one of {self._DIM_REDUCTION_METHODS} or 'all'")
+                return pd.DataFrame()
+            elif method != 'all' and method not in available_models:
+                print(f"❌ No saved '{method}' model for reference table '{reference_table}'. "
+                      f"Available: {list(available_models.keys())}")
+                return pd.DataFrame()
+
+            methods_to_run = list(available_models.keys()) if method == 'all' else [method]
+
+            # Resolve target table interactively if not provided, restricted to tables that
+            # already have at least one Morgan fingerprint column
+            if table_name is None:
+                tables_with_fp = [
+                    t for t in self.get_all_tables()
+                    if any(self._MORGAN_FP_COLUMN_PATTERN.match(c) for c in self._get_table_columns(t))
+                ]
+                if not tables_with_fp:
+                    print("❌ No tables with Morgan fingerprint columns found.")
+                    print("   Run compute_morgan_fingerprints() on a table first.")
+                    return pd.DataFrame()
+
+                table_name = self._select_table_interactive(
+                    "SELECT TABLE TO PROJECT", tables_override=tables_with_fp
+                )
+                if not table_name:
+                    print("❌ No table selected for dimensionality projection")
+                    return pd.DataFrame()
+
+            print(f"📊 Retrieving table '{table_name}' for dimensionality projection...")
+            df = self._get_table_as_dataframe(table_name)
+
+            if df.empty:
+                print(f"⚠️  No data retrieved from table '{table_name}'")
+                return pd.DataFrame()
+
+            all_output_columns = []
+            # Different methods could have been fit on different fp_columns, so their matrices
+            # are built lazily and cached by column name.
+            fp_matrix_cache: Dict[str, Tuple[Any, Any, int]] = {}
+
+            for current_method in methods_to_run:
+                label = self._DIM_REDUCTION_LABELS[current_method]
+                model_info = available_models[current_method]
+                reducer = model_info['reducer']
+                fp_column = model_info['fp_column']
+
+                # t-SNE has no out-of-sample transform(): it can only ever refit on the
+                # exact data it was given, so a saved t-SNE model can't project new
+                # compounds into its existing embedding. Skip it with a clear explanation
+                # instead of failing the whole run.
+                if current_method == 'tsne' or not hasattr(reducer, 'transform'):
+                    print(f"⚠️  Skipping {label}: saved t-SNE models don't support transform()-based "
+                          f"projection of new data (t-SNE has no out-of-sample mapping).")
+                    continue
+
+                if fp_column not in df.columns:
+                    print(f"⚠️  Skipping {label}: fingerprint column '{fp_column}' (used to fit "
+                          f"this model on '{reference_table}') is not present in table '{table_name}'.")
+                    continue
+
+                if fp_column not in fp_matrix_cache:
+                    valid_mask = ~df[fp_column].isin(['INVALID_SMILES', 'ERROR']) & df[fp_column].notna()
+                    num_valid = int(valid_mask.sum())
+                    X = None
+                    if num_valid > 0:
+                        fp_strings = df.loc[valid_mask, fp_column].tolist()
+                        X = np.array(
+                            [np.frombuffer(s.encode('ascii'), dtype=np.uint8) - ord('0') for s in fp_strings],
+                            dtype=np.float32
+                        )
+                    fp_matrix_cache[fp_column] = (valid_mask, X, num_valid)
+
+                valid_mask, X, num_valid = fp_matrix_cache[fp_column]
+                if X is None:
+                    print(f"⚠️  Skipping {label}: no valid fingerprints found in column '{fp_column}'.")
+                    continue
+
+                print(f"🔬 Projecting '{fp_column}' ({num_valid} compounds) into the saved "
+                      f"{label} embedding fit on '{reference_table}'...")
+                start_time = time.time()
+                embedding = reducer.transform(X)
+                processing_time = time.time() - start_time
+                print(f"   ⏱️  {label} projection completed in {processing_time:.2f}s")
+
+                # Column names reference the reference table the loaded model was fit on
+                output_columns = [f"{current_method}_from_{reference_table}_{i + 1}"
+                                  for i in range(embedding.shape[1])]
+                for col in output_columns:
+                    df[col] = None
+                df.loc[valid_mask, output_columns] = embedding
+
+                print(f"✅ {label} completed: {num_valid} compounds embedded into {output_columns}")
+
+                all_output_columns.extend(output_columns)
+
+            if not all_output_columns:
+                print("❌ No dimensionality projection was performed (all requested methods were skipped)")
+                return pd.DataFrame()
+
+            if update_database:
+                print(f"💾 Updating database table '{table_name}' with projected coordinates...")
+                success = self._update_table_with_reduced_coordinates(table_name, df, all_output_columns)
+                if success:
+                    print(f"✅ Database table '{table_name}' updated with columns {all_output_columns}")
+                else:
+                    print(f"❌ Failed to update database table '{table_name}'")
+
+            return df
+
+        except Exception as e:
+            print(f"❌ Error projecting dimensionality for table '{table_name}': {e}")
             return pd.DataFrame()
 
     def _select_morgan_fp_column_interactive(self, available_columns: List[str]) -> Optional[str]:
@@ -4078,6 +4329,156 @@ class ChemSpace:
                 result[m] = [c for _, c in matches]
         return result
 
+    _PROJECTED_COORD_PATTERN = re.compile(r'^(pca|tsne|umap)_from_(.+)_(\d+)$')
+
+    def _detect_projected_reduction_columns_in_columns(self, columns) -> Dict[Tuple[str, str], List[str]]:
+        """
+        Detect projected dimensionality-reduction coordinate columns produced by
+        project_dimensionality_on_table(), named '<method>_from_<reference_table>_<i>'.
+
+        Args:
+            columns: Iterable of column names to scan (e.g. df.columns)
+
+        Returns:
+            Dict[Tuple[str, str], List[str]]: (method, reference_table) -> coordinate column
+                names sorted by component index; only combinations with 2+ components are included
+        """
+        matches_by_key: Dict[Tuple[str, str], List[Tuple[int, str]]] = {}
+        for c in columns:
+            match = self._PROJECTED_COORD_PATTERN.match(c)
+            if match:
+                proj_method, proj_reference_table, idx = match.group(1), match.group(2), int(match.group(3))
+                matches_by_key.setdefault((proj_method, proj_reference_table), []).append((idx, c))
+
+        result = {}
+        for key, matches in matches_by_key.items():
+            if len(matches) >= 2:
+                matches.sort(key=lambda x: x[0])
+                result[key] = [c for _, c in matches]
+        return result
+
+    def _select_projection_interactive(self, candidates: List[Tuple[str, str]]) -> Optional[Tuple[str, str]]:
+        """
+        Interactive selection among multiple projected (method, reference_table) combinations
+        found in a single table.
+
+        Args:
+            candidates (List[Tuple[str, str]]): (method, reference_table) pairs to choose from
+
+        Returns:
+            Optional[Tuple[str, str]]: Selected (method, reference_table) pair, or None if cancelled
+        """
+        print(f"\n🔍 SELECT PROJECTED EMBEDDING")
+        print("=" * 60)
+        for i, (proj_method, proj_reference_table) in enumerate(candidates, 1):
+            print(f"{i}. {self._DIM_REDUCTION_LABELS[proj_method]} (from '{proj_reference_table}')")
+        print("-" * 60)
+        print("Commands: Enter option number, or 'cancel' to abort")
+
+        while True:
+            try:
+                selection = input(f"\n🔍 Select projection: ").strip()
+
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    return None
+
+                try:
+                    idx = int(selection) - 1
+                    if 0 <= idx < len(candidates):
+                        return candidates[idx]
+                    print(f"❌ Invalid selection. Please enter 1-{len(candidates)}")
+                except ValueError:
+                    print(f"❌ Invalid input '{selection}'")
+
+            except KeyboardInterrupt:
+                print("\n❌ Projection selection cancelled")
+                return None
+
+    def _export_plot_data_and_script(self, output_path: str, datasets: Dict[str, pd.DataFrame],
+                                     script_text: str) -> Tuple[List[str], str]:
+        """
+        Write the data used to produce a plot as CSV file(s), and a standalone Python script
+        that regenerates the plot from them. All artifacts share the PNG's base name/directory
+        so the trio (png/csv/py) stay named consistently with the plotted coordinate columns.
+
+        Args:
+            output_path (str): Path the PNG was (or will be) saved to
+            datasets (Dict[str, pd.DataFrame]): suffix -> DataFrame to write as '<base><suffix>.csv'.
+                Use suffix '' for a single dataset, or e.g. '_reference'/'_projected' for multiple.
+            script_text (str): Contents of the standalone regeneration script, saved as '<base>.py'
+
+        Returns:
+            Tuple[List[str], str]: (csv paths in insertion order, script path)
+        """
+        base_path = os.path.splitext(output_path)[0]
+
+        csv_paths = []
+        for suffix, data in datasets.items():
+            csv_path = f"{base_path}{suffix}.csv"
+            data.to_csv(csv_path, index=False)
+            csv_paths.append(csv_path)
+
+        script_path = f"{base_path}.py"
+        with open(script_path, 'w') as f:
+            f.write(script_text)
+
+        return csv_paths, script_path
+
+    def _render_reduced_coordinates_plot_script(self, csv_name: str, png_name: str, x_col: str, y_col: str,
+                                                color_by: Optional[str], figsize: Tuple[int, int],
+                                                point_size: float, alpha: float, title: str) -> str:
+        """
+        Render a standalone Python script that reproduces a plot_reduced_coordinates() plot
+        from its exported CSV, with no dependency on TidyScreen.
+        """
+        return f'''#!/usr/bin/env python3
+"""
+Regenerates '{png_name}' from '{csv_name}'.
+Generated by ChemSpace.plot_reduced_coordinates().
+"""
+import os
+import pandas as pd
+import matplotlib.pyplot as plt
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CSV_PATH = os.path.join(SCRIPT_DIR, {csv_name!r})
+OUTPUT_PATH = os.path.join(SCRIPT_DIR, {png_name!r})
+
+X_COL = {x_col!r}
+Y_COL = {y_col!r}
+COLOR_BY = {color_by!r}
+POINT_SIZE = {point_size!r}
+ALPHA = {alpha!r}
+
+df = pd.read_csv(CSV_PATH)
+
+fig, ax = plt.subplots(figsize={tuple(figsize)!r})
+
+if COLOR_BY is None:
+    ax.scatter(df[X_COL], df[Y_COL], s=POINT_SIZE, alpha=ALPHA, color='steelblue')
+elif pd.api.types.is_numeric_dtype(df[COLOR_BY]):
+    scatter = ax.scatter(df[X_COL], df[Y_COL], s=POINT_SIZE, alpha=ALPHA,
+                         c=df[COLOR_BY], cmap='viridis')
+    fig.colorbar(scatter, ax=ax, label=COLOR_BY)
+else:
+    categories = sorted(df[COLOR_BY].astype(str).unique())
+    cmap = plt.get_cmap('tab20' if len(categories) > 10 else 'tab10')
+    category_colors = {{cat: cmap(i % cmap.N) for i, cat in enumerate(categories)}}
+    for cat in categories:
+        mask = df[COLOR_BY].astype(str) == cat
+        ax.scatter(df.loc[mask, X_COL], df.loc[mask, Y_COL],
+                  s=POINT_SIZE, alpha=ALPHA, color=category_colors[cat], label=cat)
+    ax.legend(title=COLOR_BY, loc='best', fontsize=8)
+
+ax.set_xlabel(X_COL)
+ax.set_ylabel(Y_COL)
+ax.set_title({title!r})
+ax.grid(True, alpha=0.3)
+
+fig.savefig(OUTPUT_PATH, dpi=300, bbox_inches='tight')
+plt.show()
+'''
+
     def plot_reduced_coordinates(self, table_name: Optional[str] = None,
                                  method: Optional[str] = None,
                                  color_by: Optional[str] = None,
@@ -4228,12 +4629,743 @@ class ChemSpace:
 
             plt.close(fig)
 
+            # Alongside the PNG, export the plotted data as CSV and a standalone script that
+            # regenerates the plot from it, named consistently (same base name/columns) with the PNG
+            csv_columns = (['id'] if 'id' in plot_df.columns else []) + [x_col, y_col]
+            if color_by is not None and color_by not in csv_columns:
+                csv_columns.append(color_by)
+
+            csv_paths, script_path = self._export_plot_data_and_script(
+                output_path, {'': plot_df[csv_columns]},
+                self._render_reduced_coordinates_plot_script(
+                    csv_name=f"{os.path.splitext(os.path.basename(output_path))[0]}.csv",
+                    png_name=os.path.basename(output_path),
+                    x_col=x_col, y_col=y_col, color_by=color_by,
+                    figsize=figsize, point_size=point_size, alpha=alpha,
+                    title=f"{self._DIM_REDUCTION_LABELS[method]} — {table_name}"
+                )
+            )
+
             print(f"✅ Plot saved to: {output_path}")
+            print(f"   📄 Data saved to: {csv_paths[0]}")
+            print(f"   📝 Script saved to: {script_path}")
             return output_path
 
         except Exception as e:
             print(f"❌ Error plotting reduced coordinates for table '{table_name}': {e}")
             return None
+
+    def plot_projected_chemical_space(self, table_name: Optional[str] = None,
+                                      method: Optional[str] = None,
+                                      reference_table: Optional[str] = None,
+                                      color_by: Optional[str] = None,
+                                      output_path: Optional[str] = None,
+                                      figsize: Tuple[int, int] = (8, 8),
+                                      point_size: float = 20,
+                                      reference_point_size: float = 15,
+                                      alpha: float = 0.8,
+                                      reference_alpha: float = 0.25,
+                                      show: bool = False) -> Optional[str]:
+        """
+        Visualize a table's projected dimensionality-reduction coordinates (from
+        project_dimensionality_on_table()) as a 2D scatter plot, overlaid on top of the
+        reference table's own coordinates (from reduce_dimensionality()) that were used to
+        fit the embedding. Saved as a PNG.
+
+        Args:
+            table_name (Optional[str]): Name of the table containing projected coordinates
+                ('<method>_from_<reference_table>_1'/'_2' columns). If None, prompts an
+                interactive table selection restricted to tables with such columns.
+            method (Optional[str]): Restrict to a projected embedding fit with this method
+                ('pca', 'tsne', 'umap'). Combined with reference_table to disambiguate when
+                a table holds more than one projection.
+            reference_table (Optional[str]): Restrict to a projected embedding that was fit
+                on this particular reference table.
+            color_by (Optional[str]): Name of a column (in table_name) to color the projected
+                points by. Numeric columns use a continuous colormap with a colorbar;
+                non-numeric columns use discrete colors with a legend. The reference points
+                are always drawn in a single neutral background color. If None, all projected
+                points share a single color.
+            output_path (Optional[str]): Path to save the PNG. If None, defaults to
+                '<project>/chemspace/misc/dim_reduction/<table_name>_projected_<method>_from_<reference_table>_<timestamp>.png'
+            figsize (Tuple[int, int]): Matplotlib figure size in inches
+            point_size (float): Marker size for the projected points
+            reference_point_size (float): Marker size for the reference points
+            alpha (float): Marker transparency for the projected points
+            reference_alpha (float): Marker transparency for the reference points
+            show (bool): Whether to also display the plot interactively (plt.show())
+
+        Returns:
+            Optional[str]: Path to the saved PNG, or None if an error occurred
+        """
+        try:
+            try:
+                import matplotlib.pyplot as plt
+            except ImportError:
+                print("❌ matplotlib not installed. Please install it to plot projected coordinates:")
+                print("   pip install matplotlib")
+                return None
+
+            # Resolve table interactively if not provided, restricted to tables that
+            # already have projected-coordinate columns from project_dimensionality_on_table()
+            if table_name is None:
+                tables_with_projections = [
+                    t for t in self.get_all_tables()
+                    if self._detect_projected_reduction_columns_in_columns(self._get_table_columns(t))
+                ]
+                if not tables_with_projections:
+                    print("❌ No tables with projected-coordinate columns found.")
+                    print("   Run project_dimensionality_on_table() on a table first.")
+                    return None
+
+                table_name = self._select_table_interactive(
+                    "SELECT TABLE FOR PROJECTED-COORDINATE PLOT", tables_override=tables_with_projections
+                )
+                if not table_name:
+                    print("❌ No table selected for plotting")
+                    return None
+
+            print(f"📊 Retrieving table '{table_name}' for plotting...")
+            df = self._get_table_as_dataframe(table_name)
+
+            if df.empty:
+                print(f"⚠️  No data retrieved from table '{table_name}'")
+                return None
+
+            # Resolve which projected (method, reference_table) combination to plot
+            available_projections = self._detect_projected_reduction_columns_in_columns(df.columns)
+
+            if not available_projections:
+                print(f"❌ No projected-coordinate columns found in table '{table_name}'.")
+                print("   Run project_dimensionality_on_table() on this table first.")
+                return None
+
+            candidate_keys = list(available_projections.keys())
+
+            if method is not None:
+                candidate_keys = [k for k in candidate_keys if k[0] == method]
+                if not candidate_keys:
+                    print(f"❌ No projected '{method}' coordinates found in table '{table_name}'.")
+                    print(f"   Available: {sorted({k[0] for k in available_projections})}")
+                    return None
+
+            if reference_table is not None:
+                candidate_keys = [k for k in candidate_keys if k[1] == reference_table]
+                if not candidate_keys:
+                    print(f"❌ No projected coordinates from reference table '{reference_table}' found "
+                          f"in table '{table_name}'.")
+                    print(f"   Available: {available_projections.keys()}")
+                    return None
+
+            if len(candidate_keys) == 1:
+                selected_method, selected_reference_table = candidate_keys[0]
+            else:
+                selected_key = self._select_projection_interactive(candidate_keys)
+                if selected_key is None:
+                    print("❌ No projected embedding selected")
+                    return None
+                selected_method, selected_reference_table = selected_key
+
+            proj_x_col, proj_y_col = available_projections[(selected_method, selected_reference_table)][:2]
+
+            proj_df = df.dropna(subset=[proj_x_col, proj_y_col]).copy()
+
+            if proj_df.empty:
+                print(f"❌ No rows with valid projected coordinates in table '{table_name}'")
+                return None
+
+            # Load the reference table's own embedding coordinates for the same method
+            ref_df = None
+            ref_x_col = ref_y_col = None
+            if selected_reference_table not in self.get_all_tables():
+                print(f"⚠️  Reference table '{selected_reference_table}' no longer exists; "
+                      f"plotting projected points only.")
+            else:
+                ref_full_df = self._get_table_as_dataframe(selected_reference_table)
+                ref_methods = self._detect_reduction_methods_in_columns(ref_full_df.columns)
+                if selected_method not in ref_methods:
+                    print(f"⚠️  Reference table '{selected_reference_table}' has no '{selected_method}' "
+                          f"coordinates; plotting projected points only.")
+                else:
+                    ref_x_col, ref_y_col = ref_methods[selected_method][:2]
+                    ref_df = ref_full_df.dropna(subset=[ref_x_col, ref_y_col]).copy()
+
+            # Resolve coloring for the projected points only; reference points always use a
+            # single neutral background color
+            color_values = None
+            is_numeric_color = False
+            if color_by is not None:
+                if color_by not in df.columns:
+                    print(f"❌ Column '{color_by}' not found in table '{table_name}'")
+                    return None
+                proj_df = proj_df.dropna(subset=[color_by])
+                if proj_df.empty:
+                    print(f"❌ No rows with valid '{color_by}' values to color by")
+                    return None
+                color_values = proj_df[color_by]
+                is_numeric_color = pd.api.types.is_numeric_dtype(color_values)
+
+            label = self._DIM_REDUCTION_LABELS[selected_method]
+            print(f"🎨 Plotting {len(proj_df)} projected compounds from '{table_name}' on top of "
+                  f"{len(ref_df) if ref_df is not None else 0} reference compounds from "
+                  f"'{selected_reference_table}' ({label})...")
+
+            fig, ax = plt.subplots(figsize=figsize)
+
+            if ref_df is not None and not ref_df.empty:
+                ax.scatter(ref_df[ref_x_col], ref_df[ref_y_col], s=reference_point_size,
+                          alpha=reference_alpha, color='lightgray',
+                          label=f"Reference ({selected_reference_table})")
+
+            if color_values is None:
+                ax.scatter(proj_df[proj_x_col], proj_df[proj_y_col], s=point_size, alpha=alpha,
+                          color='crimson', label=f"Projected ({table_name})")
+            elif is_numeric_color:
+                scatter = ax.scatter(proj_df[proj_x_col], proj_df[proj_y_col], s=point_size, alpha=alpha,
+                                     c=color_values, cmap='viridis', label=f"Projected ({table_name})")
+                fig.colorbar(scatter, ax=ax, label=color_by)
+            else:
+                categories = sorted(color_values.astype(str).unique())
+                cmap = plt.get_cmap('tab20' if len(categories) > 10 else 'tab10')
+                category_colors = {cat: cmap(i % cmap.N) for i, cat in enumerate(categories)}
+                for cat in categories:
+                    mask = color_values.astype(str) == cat
+                    ax.scatter(proj_df.loc[mask, proj_x_col], proj_df.loc[mask, proj_y_col],
+                              s=point_size, alpha=alpha, color=category_colors[cat], label=cat)
+
+            ax.set_xlabel(proj_x_col)
+            ax.set_ylabel(proj_y_col)
+            ax.set_title(f"{label} — {table_name} projected onto {selected_reference_table}")
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc='best', fontsize=8)
+
+            if output_path is None:
+                output_dir = os.path.join(self.path, 'chemspace', 'misc', 'dim_reduction')
+                os.makedirs(output_dir, exist_ok=True)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                output_path = os.path.join(
+                    output_dir,
+                    f"{table_name}_projected_{selected_method}_from_{selected_reference_table}_{timestamp}.png"
+                )
+            else:
+                os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+
+            fig.savefig(output_path, dpi=300, bbox_inches='tight')
+
+            if show:
+                plt.show()
+
+            plt.close(fig)
+
+            # Alongside the PNG, export the plotted data as CSV(s) and a standalone script that
+            # regenerates the plot from them, named consistently (same base name) with the PNG
+            base_name = os.path.splitext(os.path.basename(output_path))[0]
+
+            proj_csv_columns = (['id'] if 'id' in proj_df.columns else []) + [proj_x_col, proj_y_col]
+            if color_by is not None and color_by not in proj_csv_columns:
+                proj_csv_columns.append(color_by)
+
+            datasets = {'_projected': proj_df[proj_csv_columns]}
+            ref_csv_name = None
+            if ref_df is not None and not ref_df.empty:
+                ref_csv_columns = (['id'] if 'id' in ref_df.columns else []) + [ref_x_col, ref_y_col]
+                datasets['_reference'] = ref_df[ref_csv_columns]
+                ref_csv_name = f"{base_name}_reference.csv"
+
+            csv_paths, script_path = self._export_plot_data_and_script(
+                output_path, datasets,
+                self._render_projected_chemical_space_plot_script(
+                    proj_csv_name=f"{base_name}_projected.csv",
+                    ref_csv_name=ref_csv_name,
+                    png_name=os.path.basename(output_path),
+                    proj_x_col=proj_x_col, proj_y_col=proj_y_col,
+                    ref_x_col=ref_x_col, ref_y_col=ref_y_col,
+                    color_by=color_by, figsize=figsize,
+                    point_size=point_size, reference_point_size=reference_point_size,
+                    alpha=alpha, reference_alpha=reference_alpha,
+                    title=f"{label} — {table_name} projected onto {selected_reference_table}",
+                    reference_label=f"Reference ({selected_reference_table})",
+                    projected_label=f"Projected ({table_name})"
+                )
+            )
+
+            print(f"✅ Plot saved to: {output_path}")
+            print(f"   📄 Data saved to: {', '.join(csv_paths)}")
+            print(f"   📝 Script saved to: {script_path}")
+            return output_path
+
+        except Exception as e:
+            print(f"❌ Error plotting projected chemical space for table '{table_name}': {e}")
+            return None
+
+    def _render_projected_chemical_space_plot_script(self, proj_csv_name: str, ref_csv_name: Optional[str],
+                                                      png_name: str, proj_x_col: str, proj_y_col: str,
+                                                      ref_x_col: Optional[str], ref_y_col: Optional[str],
+                                                      color_by: Optional[str], figsize: Tuple[int, int],
+                                                      point_size: float, reference_point_size: float,
+                                                      alpha: float, reference_alpha: float, title: str,
+                                                      reference_label: str, projected_label: str) -> str:
+        """
+        Render a standalone Python script that reproduces a plot_projected_chemical_space() plot
+        from its exported CSV(s), with no dependency on TidyScreen.
+        """
+        ref_block = ""
+        if ref_csv_name is not None:
+            ref_block = f'''
+REF_CSV_PATH = os.path.join(SCRIPT_DIR, {ref_csv_name!r})
+REF_X_COL = {ref_x_col!r}
+REF_Y_COL = {ref_y_col!r}
+
+ref_df = pd.read_csv(REF_CSV_PATH)
+ax.scatter(ref_df[REF_X_COL], ref_df[REF_Y_COL], s={reference_point_size!r}, alpha={reference_alpha!r},
+          color='lightgray', label={reference_label!r})
+'''
+
+        return f'''#!/usr/bin/env python3
+"""
+Regenerates '{png_name}' from '{proj_csv_name}'{f" and '{ref_csv_name}'" if ref_csv_name else ""}.
+Generated by ChemSpace.plot_projected_chemical_space().
+"""
+import os
+import pandas as pd
+import matplotlib.pyplot as plt
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJ_CSV_PATH = os.path.join(SCRIPT_DIR, {proj_csv_name!r})
+OUTPUT_PATH = os.path.join(SCRIPT_DIR, {png_name!r})
+
+PROJ_X_COL = {proj_x_col!r}
+PROJ_Y_COL = {proj_y_col!r}
+COLOR_BY = {color_by!r}
+POINT_SIZE = {point_size!r}
+ALPHA = {alpha!r}
+
+proj_df = pd.read_csv(PROJ_CSV_PATH)
+
+fig, ax = plt.subplots(figsize={tuple(figsize)!r})
+{ref_block}
+if COLOR_BY is None:
+    ax.scatter(proj_df[PROJ_X_COL], proj_df[PROJ_Y_COL], s=POINT_SIZE, alpha=ALPHA,
+              color='crimson', label={projected_label!r})
+elif pd.api.types.is_numeric_dtype(proj_df[COLOR_BY]):
+    scatter = ax.scatter(proj_df[PROJ_X_COL], proj_df[PROJ_Y_COL], s=POINT_SIZE, alpha=ALPHA,
+                         c=proj_df[COLOR_BY], cmap='viridis', label={projected_label!r})
+    fig.colorbar(scatter, ax=ax, label=COLOR_BY)
+else:
+    categories = sorted(proj_df[COLOR_BY].astype(str).unique())
+    cmap = plt.get_cmap('tab20' if len(categories) > 10 else 'tab10')
+    category_colors = {{cat: cmap(i % cmap.N) for i, cat in enumerate(categories)}}
+    for cat in categories:
+        mask = proj_df[COLOR_BY].astype(str) == cat
+        ax.scatter(proj_df.loc[mask, PROJ_X_COL], proj_df.loc[mask, PROJ_Y_COL],
+                  s=POINT_SIZE, alpha=ALPHA, color=category_colors[cat], label=cat)
+
+ax.set_xlabel(PROJ_X_COL)
+ax.set_ylabel(PROJ_Y_COL)
+ax.set_title({title!r})
+ax.grid(True, alpha=0.3)
+ax.legend(loc='best', fontsize=8)
+
+fig.savefig(OUTPUT_PATH, dpi=300, bbox_inches='tight')
+plt.show()
+'''
+
+    def _select_projections_to_delete_interactive(self, candidates: List[Tuple[str, str]]
+                                                  ) -> Optional[List[Tuple[str, str]]]:
+        """
+        Interactive multi-selection among projected (method, reference_table) combinations,
+        for deletion.
+
+        Args:
+            candidates (List[Tuple[str, str]]): (method, reference_table) pairs to choose from
+
+        Returns:
+            Optional[List[Tuple[str, str]]]: Selected pairs (in the order chosen, de-duplicated),
+                or None if cancelled
+        """
+        print(f"\n🔍 SELECT PROJECTED EMBEDDING(S) TO DELETE")
+        print("=" * 60)
+        for i, (proj_method, proj_reference_table) in enumerate(candidates, 1):
+            print(f"{i}. {self._DIM_REDUCTION_LABELS[proj_method]} (from '{proj_reference_table}')")
+        print("-" * 60)
+        print("Commands: Enter option number(s) (comma-separated), 'all', or 'cancel' to abort")
+
+        while True:
+            try:
+                selection = input(f"\n🔍 Select projection(s): ").strip()
+
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    return None
+
+                if selection.lower() == 'all':
+                    return list(candidates)
+
+                try:
+                    indices = [int(part.strip()) - 1 for part in selection.split(',') if part.strip()]
+                    if indices and all(0 <= idx < len(candidates) for idx in indices):
+                        seen = set()
+                        selected = []
+                        for idx in indices:
+                            if idx not in seen:
+                                seen.add(idx)
+                                selected.append(candidates[idx])
+                        return selected
+                    print(f"❌ Invalid selection. Please enter number(s) between 1-{len(candidates)}")
+                except ValueError:
+                    print(f"❌ Invalid input '{selection}'")
+
+            except KeyboardInterrupt:
+                print("\n❌ Selection cancelled")
+                return None
+
+    def _drop_table_columns(self, table_name: str, columns: List[str]) -> bool:
+        """
+        Drop one or more columns from a table in a single rewrite.
+
+        SQLite's 'ALTER TABLE ... DROP COLUMN' triggers a full table rewrite per call unless
+        the dropped column happens to be the rightmost one — so looping it once per column
+        costs a full copy of the table N times over for N columns. This instead rebuilds the
+        table once with only the surviving columns and copies every row in a single pass,
+        regardless of how many columns are being dropped.
+
+        Args:
+            table_name (str): Name of the table to modify
+            columns (List[str]): Column names to drop
+
+        Returns:
+            bool: True if the column(s) were dropped successfully
+        """
+        try:
+            columns_to_drop = set(columns)
+
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+
+            cursor.execute(f"PRAGMA table_info({table_name})")
+            columns_info = cursor.fetchall()
+
+            surviving_columns = [c for c in columns_info if c[1] not in columns_to_drop]
+
+            if not surviving_columns:
+                print(f"❌ Error: cannot drop all columns from table '{table_name}'")
+                conn.close()
+                return False
+
+            if len(surviving_columns) == len(columns_info):
+                conn.close()
+                return True
+
+            # Reconstruct the surviving columns' definitions
+            column_defs = []
+            for _, col_name, col_type, col_notnull, col_default, col_pk in surviving_columns:
+                col_def = f"{col_name} {col_type}"
+
+                if col_notnull:
+                    col_def += " NOT NULL"
+
+                if col_default is not None and str(col_default).strip() != "":
+                    default_str = str(col_default).strip()
+                    if default_str.upper() == "NULL":
+                        col_def += " DEFAULT NULL"
+                    elif default_str.replace(".", "", 1).lstrip("-").isdigit():
+                        col_def += f" DEFAULT {default_str}"
+                    else:
+                        if not (default_str.startswith("'") or default_str.startswith('"')):
+                            default_str = f"'{default_str}'"
+                        col_def += f" DEFAULT {default_str}"
+
+                if col_pk:
+                    col_def += " PRIMARY KEY AUTOINCREMENT"
+
+                column_defs.append(col_def)
+
+            # Preserve a table-level UNIQUE(...) constraint, if any, as long as it doesn't
+            # reference a column being dropped
+            cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table_name,))
+            original_sql_row = cursor.fetchone()
+            original_sql = original_sql_row[0] if original_sql_row else ""
+
+            unique_constraint = ""
+            unique_match = re.search(r'UNIQUE\s*\(([^)]*)\)', original_sql, re.IGNORECASE)
+            if unique_match:
+                referenced_columns = {c.strip() for c in unique_match.group(1).split(',')}
+                if not (referenced_columns & columns_to_drop):
+                    unique_constraint = f", UNIQUE({unique_match.group(1)})"
+
+            # Capture explicit (non-autoindex) indexes to try to recreate afterward
+            cursor.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type='index' AND tbl_name=? AND sql IS NOT NULL",
+                (table_name,)
+            )
+            index_statements = cursor.fetchall()
+
+            surviving_column_names = [c[1] for c in surviving_columns]
+            columns_str = ', '.join(surviving_column_names)
+            temp_table_name = f"{table_name}_tmp_{int(time.time() * 1000)}"
+
+            cursor.execute(f"CREATE TABLE {temp_table_name} ({', '.join(column_defs)}{unique_constraint})")
+            cursor.execute(f"INSERT INTO {temp_table_name} ({columns_str}) SELECT {columns_str} FROM {table_name}")
+            cursor.execute(f"DROP TABLE {table_name}")
+            cursor.execute(f"ALTER TABLE {temp_table_name} RENAME TO {table_name}")
+
+            for index_name, index_sql in index_statements:
+                try:
+                    cursor.execute(index_sql)
+                except sqlite3.OperationalError:
+                    print(f"   ⚠️  Warning: index '{index_name}' referenced a dropped column and was not recreated")
+
+            conn.commit()
+            conn.close()
+            return True
+
+        except Exception as e:
+            print(f"❌ Error dropping column(s) from table '{table_name}': {e}")
+            return False
+
+    def delete_projected_space(self, table_name: Optional[str] = None,
+                              method: Optional[str] = None,
+                              reference_table: Optional[str] = None,
+                              confirm: bool = True) -> bool:
+        """
+        Delete previously computed projected dimensionality-reduction coordinate columns
+        (from project_dimensionality_on_table(), named '<method>_from_<reference_table>_<i>')
+        from a table. Only the projected columns are removed — any of the table's own fitted
+        coordinates (from reduce_dimensionality(), named '<method>_<i>') are left untouched.
+
+        Args:
+            table_name (Optional[str]): Name of the table to clean up. If None, prompts an
+                interactive table selection restricted to tables with projected-coordinate columns.
+            method (Optional[str]): Restrict to a projected embedding fit with this method
+                ('pca', 'tsne', 'umap'). Combined with reference_table to disambiguate when a
+                table holds more than one projection.
+            reference_table (Optional[str]): Restrict to a projected embedding that was fit on
+                this particular reference table.
+            confirm (bool): If True (default), prompts an interactive yes/no confirmation before
+                deleting. Set to False to skip the prompt for scripted/non-interactive use.
+
+        Returns:
+            bool: True if the column(s) were deleted successfully, False on error or if cancelled
+        """
+        try:
+            # Resolve table interactively if not provided, restricted to tables that already
+            # have projected-coordinate columns from project_dimensionality_on_table()
+            if table_name is None:
+                tables_with_projections = [
+                    t for t in self.get_all_tables()
+                    if self._detect_projected_reduction_columns_in_columns(self._get_table_columns(t))
+                ]
+                if not tables_with_projections:
+                    print("❌ No tables with projected-coordinate columns found.")
+                    print("   Run project_dimensionality_on_table() on a table first.")
+                    return False
+
+                table_name = self._select_table_interactive(
+                    "SELECT TABLE TO DELETE PROJECTED COORDINATES FROM", tables_override=tables_with_projections
+                )
+                if not table_name:
+                    print("❌ No table selected")
+                    return False
+
+            available_projections = self._detect_projected_reduction_columns_in_columns(
+                self._get_table_columns(table_name)
+            )
+
+            if not available_projections:
+                print(f"❌ No projected-coordinate columns found in table '{table_name}'.")
+                return False
+
+            candidate_keys = list(available_projections.keys())
+
+            if method is not None:
+                candidate_keys = [k for k in candidate_keys if k[0] == method]
+                if not candidate_keys:
+                    print(f"❌ No projected '{method}' coordinates found in table '{table_name}'.")
+                    return False
+
+            if reference_table is not None:
+                candidate_keys = [k for k in candidate_keys if k[1] == reference_table]
+                if not candidate_keys:
+                    print(f"❌ No projected coordinates from reference table '{reference_table}' "
+                          f"found in table '{table_name}'.")
+                    return False
+
+            if len(candidate_keys) == 1:
+                selected_keys = candidate_keys
+            else:
+                selected_keys = self._select_projections_to_delete_interactive(candidate_keys)
+                if not selected_keys:
+                    print("❌ No projected embedding(s) selected for deletion")
+                    return False
+
+            columns_to_delete = []
+            for key in selected_keys:
+                columns_to_delete.extend(available_projections[key])
+
+            print(f"🗑️  The following projected coordinate column(s) will be permanently deleted "
+                  f"from '{table_name}':")
+            for proj_method, proj_reference_table in selected_keys:
+                cols = available_projections[(proj_method, proj_reference_table)]
+                print(f"   - {self._DIM_REDUCTION_LABELS[proj_method]} (from '{proj_reference_table}'): "
+                      f"{', '.join(cols)}")
+
+            if confirm:
+                answer = input(f"\n⚠️  This cannot be undone. Continue? (yes/no, default: no): ").strip().lower()
+                if answer not in ('y', 'yes'):
+                    print("❌ Deletion cancelled")
+                    return False
+
+            success = self._drop_table_columns(table_name, columns_to_delete)
+            if success:
+                print(f"✅ Deleted {len(columns_to_delete)} column(s) from '{table_name}'")
+            else:
+                print(f"❌ Failed to delete column(s) from '{table_name}'")
+            return success
+
+        except Exception as e:
+            print(f"❌ Error deleting projected space from table '{table_name}': {e}")
+            return False
+
+    def _delete_reduction_models_from_db(self, table_name: str, methods: List[str]) -> int:
+        """
+        Delete saved reduction model(s) for a table from 'dim_reduction_models'.
+
+        Args:
+            table_name (str): Name of the table whose model(s) to delete
+            methods (List[str]): Method names to delete saved models for
+
+        Returns:
+            int: Number of rows deleted
+        """
+        try:
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            self._ensure_dim_reduction_models_table(cursor)
+            placeholders = ', '.join('?' for _ in methods)
+            cursor.execute(
+                f"DELETE FROM {self._DIM_REDUCTION_MODELS_TABLE} "
+                f"WHERE table_name = ? AND method IN ({placeholders})",
+                (table_name, *methods)
+            )
+            deleted = cursor.rowcount
+            conn.commit()
+            conn.close()
+            return deleted
+
+        except Exception as e:
+            print(f"⚠️  Could not delete saved model(s) for '{table_name}': {e}")
+            return 0
+
+    def delete_chemical_space(self, table_name: Optional[str] = None,
+                              method: Optional[str] = None,
+                              confirm: bool = True) -> bool:
+        """
+        Delete all data associated with a dimensionality reduction computed by
+        reduce_dimensionality() on a table: its coordinate columns ('<method>_<i>') and any
+        saved fitted model(s) for that table in 'dim_reduction_models'.
+
+        Note: projected coordinate columns derived from this table's model via
+        project_dimensionality_on_table() in OTHER tables are not touched, but they will no
+        longer be reproducible once the underlying model is deleted here.
+
+        Args:
+            table_name (Optional[str]): Name of the table to clean up. If None, prompts an
+                interactive table selection restricted to tables with reduced-coordinate columns
+                or a saved model.
+            method (Optional[str]): One of 'pca', 'tsne', 'umap', or 'all' to delete every
+                method's data. If None, prompts an interactive selection (offers an "All"
+                option) restricted to the methods actually present for this table.
+            confirm (bool): If True (default), prompts an interactive yes/no confirmation before
+                deleting. Set to False to skip the prompt for scripted/non-interactive use.
+
+        Returns:
+            bool: True if deleted successfully, False on error or if cancelled
+        """
+        try:
+            # Resolve table interactively if not provided, restricted to tables that have
+            # either reduced-coordinate columns or a saved model
+            if table_name is None:
+                candidate_tables = [
+                    t for t in self.get_all_tables()
+                    if self._detect_reduction_methods_in_columns(self._get_table_columns(t))
+                ]
+                for t in self._get_tables_with_saved_reduction_models():
+                    if t not in candidate_tables and t in self.get_all_tables():
+                        candidate_tables.append(t)
+
+                if not candidate_tables:
+                    print("❌ No tables with reduced-coordinate columns or saved models found.")
+                    print("   Run reduce_dimensionality() on a table first.")
+                    return False
+
+                table_name = self._select_table_interactive(
+                    "SELECT TABLE TO DELETE CHEMICAL SPACE FROM", tables_override=candidate_tables
+                )
+                if not table_name:
+                    print("❌ No table selected")
+                    return False
+
+            available_methods = self._detect_reduction_methods_in_columns(self._get_table_columns(table_name))
+            saved_model_methods = self._get_saved_reduction_methods_for_table(table_name)
+
+            candidate_methods = [m for m in self._DIM_REDUCTION_METHODS
+                                 if m in available_methods or m in saved_model_methods]
+
+            if not candidate_methods:
+                print(f"❌ No reduced-coordinate columns or saved models found for table '{table_name}'.")
+                return False
+
+            if method is None:
+                method = self._select_dimensionality_reduction_method_interactive(
+                    tuple(candidate_methods), allow_all=True
+                )
+                if method is None:
+                    print("❌ No dimensionality reduction method selected")
+                    return False
+            elif method != 'all' and method not in candidate_methods:
+                print(f"❌ No reduced coordinates or saved model for method '{method}' found "
+                      f"in table '{table_name}'.")
+                print(f"   Available: {candidate_methods}")
+                return False
+
+            methods_to_delete = list(candidate_methods) if method == 'all' else [method]
+
+            columns_to_delete = []
+            for m in methods_to_delete:
+                columns_to_delete.extend(available_methods.get(m, []))
+
+            methods_with_saved_models = [m for m in methods_to_delete if m in saved_model_methods]
+
+            print(f"🗑️  The following will be permanently deleted for table '{table_name}':")
+            for m in methods_to_delete:
+                cols = available_methods.get(m, [])
+                col_desc = ', '.join(cols) if cols else '(no coordinate columns present)'
+                model_note = " + saved model" if m in methods_with_saved_models else ""
+                print(f"   - {self._DIM_REDUCTION_LABELS[m]}: {col_desc}{model_note}")
+
+            if confirm:
+                answer = input(f"\n⚠️  This cannot be undone. Continue? (yes/no, default: no): ").strip().lower()
+                if answer not in ('y', 'yes'):
+                    print("❌ Deletion cancelled")
+                    return False
+
+            success = True
+            if columns_to_delete:
+                success = self._drop_table_columns(table_name, columns_to_delete)
+
+            models_deleted = 0
+            if methods_with_saved_models:
+                models_deleted = self._delete_reduction_models_from_db(table_name, methods_with_saved_models)
+
+            if success:
+                print(f"✅ Deleted {len(columns_to_delete)} column(s) and {models_deleted} saved model(s) "
+                      f"from '{table_name}'")
+            else:
+                print(f"❌ Failed to delete column(s) from '{table_name}'")
+            return success
+
+        except Exception as e:
+            print(f"❌ Error deleting chemical space from table '{table_name}': {e}")
+            return False
 
     def _create_sql_registers_table(self) -> bool:
         """
