@@ -243,6 +243,17 @@ def _compute_inchi_keys_worker(chunk_data: List[Tuple[int, str, str, str]]) -> L
 
     return results
 
+def _suppress_tensorflow_logging() -> None:
+    """
+    Quiet TensorFlow's C++ startup logging (oneDNN notice, CUDA plugin registration
+    warnings, CPU feature guard) before something imports it. umap-learn's __init__
+    unconditionally tries to import its optional parametric-UMAP support, which pulls in
+    TensorFlow as a side effect of merely importing umap — even when it's never used.
+    Uses setdefault() so it never overrides an explicit user setting.
+    """
+    os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')
+    os.environ.setdefault('TF_ENABLE_ONEDNN_OPTS', '0')
+
 def _pack_fingerprint_bitstring(bitstring: str) -> bytes:
     """
     Pack an RDKit fingerprint bit-string ('0'/'1' chars, one byte each) into a compact
@@ -3855,6 +3866,7 @@ class ChemSpace:
 
             if 'umap' in methods_to_run:
                 try:
+                    _suppress_tensorflow_logging()
                     from umap import UMAP
                 except ImportError:
                     print("❌ umap-learn not installed. Please install it to use UMAP:")
@@ -4063,6 +4075,10 @@ class ChemSpace:
         """
         try:
             import joblib
+
+            # Unpickling a saved UMAP reducer below imports the umap module transparently,
+            # which pulls in TensorFlow as a side effect — quiet its startup logging first
+            _suppress_tensorflow_logging()
 
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
