@@ -243,8 +243,16 @@ def _compute_inchi_keys_worker(chunk_data: List[Tuple[int, str, str, str]]) -> L
 
     return results
 
+def _pack_fingerprint_bitstring(bitstring: str) -> bytes:
+    """
+    Pack an RDKit fingerprint bit-string ('0'/'1' chars, one byte each) into a compact
+    bytes blob (one bit per bit), for efficient storage. 8x smaller than the ASCII form.
+    """
+    bits = np.frombuffer(bitstring.encode('ascii'), dtype=np.uint8) - ord('0')
+    return np.packbits(bits).tobytes()
+
 def _compute_morgan_fingerprints_worker(chunk_data: List[Tuple[int, str, str]], radius: int,
-                                        fp_size: int) -> List[Tuple[int, str, str]]:
+                                        fp_size: int) -> List[Tuple[int, object, str]]:
     """
     Worker function to compute Morgan fingerprints for a chunk of SMILES strings in parallel.
     This function must be at module level to be pickleable for multiprocessing.
@@ -255,7 +263,9 @@ def _compute_morgan_fingerprints_worker(chunk_data: List[Tuple[int, str, str]], 
         fp_size (int): Fingerprint bit-vector length
 
     Returns:
-        List[Tuple[int, str, str]]: List of tuples (row_index, fingerprint_bitstring, compound_name)
+        List[Tuple[int, object, str]]: List of tuples (row_index, fingerprint_value, compound_name),
+            where fingerprint_value is a packed bytes blob on success, or the sentinel string
+            'INVALID_SMILES'/'ERROR' on failure
     """
     try:
         # Import RDKit inside worker to avoid import issues
@@ -285,9 +295,9 @@ def _compute_morgan_fingerprints_worker(chunk_data: List[Tuple[int, str, str]], 
             mol = Chem.MolFromSmiles(str(smiles).strip())
 
             if mol is not None:
-                # Compute Morgan fingerprint
+                # Compute Morgan fingerprint, packed into a compact bytes blob for storage
                 fp = generator.GetFingerprint(mol)
-                results.append((idx, fp.ToBitString(), name))
+                results.append((idx, _pack_fingerprint_bitstring(fp.ToBitString()), name))
             else:
                 # Invalid SMILES
                 results.append((idx, 'INVALID_SMILES', name))
@@ -3161,7 +3171,8 @@ class ChemSpace:
                                     update_database: bool = True,
                                     parallel_threshold: int = 1000,
                                     max_workers: Optional[int] = None,
-                                    chunk_size: Optional[int] = None) -> pd.DataFrame:
+                                    chunk_size: Optional[int] = None,
+                                    confirm_overwrite: bool = True) -> pd.DataFrame:
         """
         Retrieve a table as DataFrame and compute Morgan fingerprints for each SMILES string using parallel processing.
 
@@ -3173,6 +3184,10 @@ class ChemSpace:
             parallel_threshold (int): Number of compounds above which parallel processing is used (default: 1000)
             max_workers (Optional[int]): Maximum number of parallel workers. If None, uses cpu_count()
             chunk_size (Optional[int]): Size of each chunk for parallel processing. If None, automatically calculated
+            confirm_overwrite (bool): If True (default) and this exact radius/fpSize configuration
+                was already computed for the table, prompts an interactive yes/no confirmation
+                before overwriting the existing column's values. Set to False to skip the prompt
+                for scripted/non-interactive use.
 
         Returns:
             pd.DataFrame: DataFrame with an added 'morgan_fp_r<radius>_<fp_size>' column, empty DataFrame if error occurs
@@ -3232,6 +3247,19 @@ class ChemSpace:
             # Initialize fingerprint column (named after radius and fpSize so different
             # combinations can coexist without overwriting each other)
             fp_column = f"morgan_fp_r{radius}_{fp_size}"
+
+            # Warn if this exact configuration was already computed for this table, since
+            # proceeding will overwrite the existing column's values
+            if update_database and fp_column in df.columns:
+                print(f"⚠️  Column '{fp_column}' already exists in table '{table_name}' "
+                      f"(radius={radius}, fpSize={fp_size}) — it was already computed before.")
+                if confirm_overwrite:
+                    answer = input(f"   Overwrite existing fingerprint values? "
+                                   f"(yes/no, default: no): ").strip().lower()
+                    if answer not in ('y', 'yes'):
+                        print("❌ Fingerprint computation cancelled to avoid overwriting existing data")
+                        return pd.DataFrame()
+
             df[fp_column] = None
 
             num_compounds = len(df)
@@ -3547,9 +3575,9 @@ class ChemSpace:
                 mol = Chem.MolFromSmiles(smiles)
 
                 if mol is not None:
-                    # Compute Morgan fingerprint
+                    # Compute Morgan fingerprint, packed into a compact bytes blob for storage
                     fp = generator.GetFingerprint(mol)
-                    df.at[idx, fp_column] = fp.ToBitString()
+                    df.at[idx, fp_column] = _pack_fingerprint_bitstring(fp.ToBitString())
                     successful_computations += 1
                 else:
                     # Invalid SMILES
@@ -3597,13 +3625,13 @@ class ChemSpace:
 
             if fp_column not in columns:
                 try:
-                    cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {fp_column} TEXT")
+                    cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {fp_column} BLOB")
                     print(f"   📋 Added '{fp_column}' column to existing table '{table_name}'")
                 except sqlite3.OperationalError as e:
                     print(f"   ⚠️  Warning: Could not add {fp_column} column: {e}")
                     return False
 
-            # Update each row with the computed fingerprint bitstring.
+            # Update each row with the computed fingerprint, packed as a bytes blob.
             # Uses itertuples() + executemany() rather than iterrows() + per-row execute()
             # for the same reason as _update_table_with_inchi_keys: a single executemany()
             # batch avoids crossing the sqlite3 C-API boundary once per row.
@@ -3752,10 +3780,11 @@ class ChemSpace:
                 print(f"❌ Not enough valid fingerprints ({num_valid}) to reduce to {n_components} components")
                 return pd.DataFrame()
 
-            # Convert bitstrings to a numeric matrix once, shared across all requested methods
-            fp_strings = df.loc[valid_mask, fp_column].tolist()
+            # Unpack the stored fingerprint blobs into a numeric matrix once, shared across
+            # all requested methods
+            fp_blobs = df.loc[valid_mask, fp_column].tolist()
             X = np.array(
-                [np.frombuffer(s.encode('ascii'), dtype=np.uint8) - ord('0') for s in fp_strings],
+                [np.unpackbits(np.frombuffer(b, dtype=np.uint8)) for b in fp_blobs],
                 dtype=np.float32
             )
 
@@ -4109,9 +4138,9 @@ class ChemSpace:
                     num_valid = int(valid_mask.sum())
                     X = None
                     if num_valid > 0:
-                        fp_strings = df.loc[valid_mask, fp_column].tolist()
+                        fp_blobs = df.loc[valid_mask, fp_column].tolist()
                         X = np.array(
-                            [np.frombuffer(s.encode('ascii'), dtype=np.uint8) - ord('0') for s in fp_strings],
+                            [np.unpackbits(np.frombuffer(b, dtype=np.uint8)) for b in fp_blobs],
                             dtype=np.float32
                         )
                     fp_matrix_cache[fp_column] = (valid_mask, X, num_valid)
