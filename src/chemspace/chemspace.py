@@ -3655,6 +3655,95 @@ class ChemSpace:
             print(f"❌ Error updating database table '{table_name}' with Morgan fingerprints: {e}")
             return False
 
+    def delete_morgan_fingerprints(self, table_name: Optional[str] = None,
+                                   fp_column: Optional[str] = None,
+                                   confirm: bool = True) -> bool:
+        """
+        Delete a previously computed Morgan fingerprint column ('morgan_fp_r<radius>_<fpSize>',
+        from compute_morgan_fingerprints()) from a table.
+
+        Note: any dimensionality-reduction model saved for this (table, fp_column) combination
+        in 'dim_reduction_models' (see reduce_dimensionality()) can no longer be used for
+        projection via project_dimensionality_on_table() once its fingerprint column is gone —
+        already-computed coordinate columns ('<method>_<i>') are untouched, though.
+
+        Args:
+            table_name (Optional[str]): Name of the table to clean up. If None, prompts an
+                interactive table selection restricted to tables with at least one Morgan
+                fingerprint column.
+            fp_column (Optional[str]): Name of the fingerprint column to delete (e.g.
+                'morgan_fp_r3_2048'), or 'all' to delete every fingerprint column on the table.
+                If None, prompts an interactive selection among the table's fingerprint
+                columns (offers an "All" option when more than one exists).
+            confirm (bool): If True (default), prompts an interactive yes/no confirmation before
+                deleting. Set to False to skip the prompt for scripted/non-interactive use.
+
+        Returns:
+            bool: True if deleted successfully, False on error or if cancelled
+        """
+        try:
+            # Resolve table interactively if not provided, restricted to tables that already
+            # have at least one Morgan fingerprint column
+            if table_name is None:
+                tables_with_fp = [
+                    t for t in self.get_all_tables()
+                    if any(self._MORGAN_FP_COLUMN_PATTERN.match(c) for c in self._get_table_columns(t))
+                ]
+                if not tables_with_fp:
+                    print("❌ No tables with Morgan fingerprint columns found.")
+                    print("   Run compute_morgan_fingerprints() on a table first.")
+                    return False
+
+                table_name = self._select_table_interactive(
+                    "SELECT TABLE TO DELETE MORGAN FINGERPRINTS FROM", tables_override=tables_with_fp
+                )
+                if not table_name:
+                    print("❌ No table selected")
+                    return False
+
+            available_fp_columns = [c for c in self._get_table_columns(table_name)
+                                    if self._MORGAN_FP_COLUMN_PATTERN.match(c)]
+
+            if not available_fp_columns:
+                print(f"❌ No Morgan fingerprint columns found in table '{table_name}'.")
+                return False
+
+            if fp_column is None:
+                fp_column = self._select_morgan_fp_column_interactive(
+                    available_fp_columns, allow_all=True
+                )
+                if fp_column is None:
+                    print("❌ No fingerprint column selected")
+                    return False
+            elif fp_column != 'all' and fp_column not in available_fp_columns:
+                print(f"❌ Fingerprint column '{fp_column}' not found in table '{table_name}'.")
+                print(f"   Available columns: {available_fp_columns}")
+                return False
+
+            columns_to_delete = list(available_fp_columns) if fp_column == 'all' else [fp_column]
+
+            print(f"🗑️  The following Morgan fingerprint column(s) will be permanently deleted "
+                  f"from '{table_name}':")
+            for col in columns_to_delete:
+                print(f"   - {col}")
+
+            if confirm:
+                answer = input(f"\n⚠️  This cannot be undone. Continue? (yes/no, default: no): ").strip().lower()
+                if answer not in ('y', 'yes'):
+                    print("❌ Deletion cancelled")
+                    return False
+
+            success = self._drop_table_columns(table_name, columns_to_delete)
+            if success:
+                print(f"✅ Deleted {len(columns_to_delete)} column(s) from '{table_name}'")
+            else:
+                print(f"❌ Failed to delete column(s) from '{table_name}'")
+            return success
+
+        except Exception as e:
+            print(f"❌ Error deleting Morgan fingerprints from table '{table_name}': {e}")
+            return False
+
     _DIM_REDUCTION_METHODS = ('pca', 'tsne', 'umap')
     _DIM_REDUCTION_LABELS = {'pca': 'PCA', 'tsne': 't-SNE', 'umap': 'UMAP'}
     _MORGAN_FP_COLUMN_PATTERN = re.compile(r'^morgan_fp_r\d+_\d+$')
@@ -4186,20 +4275,25 @@ class ChemSpace:
             print(f"❌ Error projecting dimensionality for table '{table_name}': {e}")
             return pd.DataFrame()
 
-    def _select_morgan_fp_column_interactive(self, available_columns: List[str]) -> Optional[str]:
+    def _select_morgan_fp_column_interactive(self, available_columns: List[str],
+                                             allow_all: bool = False) -> Optional[str]:
         """
         Interactive selection of a previously computed Morgan fingerprint column.
 
         Args:
             available_columns (List[str]): Fingerprint columns present in the table
+            allow_all (bool): If True, offer an extra "All" option that selects every column,
+                returned as the sentinel string 'all'.
 
         Returns:
-            Optional[str]: Selected column name, or None if cancelled
+            Optional[str]: Selected column name, 'all' (if allow_all), or None if cancelled
         """
         print(f"\n🔍 SELECT FINGERPRINT COLUMN")
         print("=" * 60)
         for i, col in enumerate(available_columns, 1):
             print(f"{i}. {col}")
+        if allow_all:
+            print(f"{len(available_columns) + 1}. All ({', '.join(available_columns)})")
         print("-" * 60)
         print("Commands: Enter option number, column name, or 'cancel' to abort")
 
@@ -4210,11 +4304,17 @@ class ChemSpace:
                 if selection.lower() in ['cancel', 'quit', 'exit']:
                     return None
 
+                if allow_all and selection.lower() == 'all':
+                    return 'all'
+
                 try:
                     idx = int(selection) - 1
                     if 0 <= idx < len(available_columns):
                         return available_columns[idx]
-                    print(f"❌ Invalid selection. Please enter 1-{len(available_columns)}")
+                    if allow_all and idx == len(available_columns):
+                        return 'all'
+                    max_option = len(available_columns) + 1 if allow_all else len(available_columns)
+                    print(f"❌ Invalid selection. Please enter 1-{max_option}")
                     continue
                 except ValueError:
                     matches = [c for c in available_columns if c.lower() == selection.lower()]
