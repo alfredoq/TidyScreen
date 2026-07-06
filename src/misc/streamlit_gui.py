@@ -796,7 +796,7 @@ elif page == "ChemSpace Actions":
     st.title("ChemSpace Actions")
     st.write("Welcome to the ChemSpace Actions page.")
 
-    st.subheader("Chemical Filtering")
+    st.subheader("Chemical Filtering: functional group based")
 
     with st.expander("🧪 Available Chemical Filters"):
         chem_filters = tidyscreen.get_chemical_filters()
@@ -934,7 +934,7 @@ elif page == "ChemSpace Actions":
                        help="No filtering workflows available to delete.")
         else:
             dfw_workflow_names = [w["workflow_name"] for w in filtering_workflows]
-            dfw_selected_name = st.selectbox("Workflow to delete", dfw_workflow_names, key="dfw_selected_workflow")
+            dfw_selected_name = st.selectbox("Select filtering workflow", dfw_workflow_names, key="dfw_selected_workflow")
 
             _del_fw_key = f"confirm_delete_fw_{dfw_selected_name}"
             if not st.session_state.get(_del_fw_key):
@@ -957,6 +957,44 @@ elif page == "ChemSpace Actions":
                     if st.button("Cancel", key=f"btn_cancel_delete_fw_{dfw_selected_name}"):
                         st.session_state[_del_fw_key] = False
                         st.rerun()
+
+            st.markdown("**Export filtering workflow**")
+            if st.button(
+                f"{'Hide Export' if st.session_state.get('show_export_fw_form') else '📤 Export filtering workflow'}: {dfw_selected_name}",
+                key="btn_export_fw",
+            ):
+                st.session_state["show_export_fw_form"] = not st.session_state.get("show_export_fw_form", False)
+                st.rerun()
+
+            if st.session_state.get("show_export_fw_form"):
+                _default_exp_fw_path = os.path.join(
+                    st.session_state["active_project_path"],
+                    "chemspace", "misc",
+                    f"{dfw_selected_name}.json",
+                )
+                _exp_fw_path = st.text_input(
+                    "Output JSON path:",
+                    value=_default_exp_fw_path,
+                    key=f"export_fw_path_{dfw_selected_name}",
+                )
+                if st.button("💾 Save", key=f"btn_save_fw_{dfw_selected_name}"):
+                    try:
+                        _all_filters = tidyscreen.get_chemical_filters()
+                        _smarts_by_name = {_name: _smarts for _id, _name, _smarts in _all_filters}
+                        _selected_wf = next(w for w in filtering_workflows if w["workflow_name"] == dfw_selected_name)
+                        _payload = [
+                            {"filter_name": _fname, "smarts": _smarts_by_name.get(_fname, "")}
+                            for _fname in _selected_wf["filters_dict"]
+                        ]
+                        _out = _exp_fw_path.strip()
+                        os.makedirs(os.path.dirname(os.path.abspath(_out)), exist_ok=True)
+                        with open(_out, "w", encoding="utf-8") as _f:
+                            json.dump(_payload, _f, indent=2, ensure_ascii=False)
+                        st.success(f"✅ Exported to: {_out}")
+                        st.session_state["show_export_fw_form"] = False
+                        st.rerun()
+                    except Exception as _e:
+                        st.error(f"❌ Export failed: {_e}")
 
     with st.expander("🔬 Filter Using Workflow"):
         chemspace_db_path = os.path.join(st.session_state["active_project_path"], "chemspace", "processed_data", "chemspace.db")
