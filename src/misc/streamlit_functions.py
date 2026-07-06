@@ -43,23 +43,39 @@ def _sync_table_triggers(conn, table_names):
     cursor.execute("SELECT name FROM sqlite_master WHERE type='trigger'")
     existing_triggers = {row[0] for row in cursor.fetchall()}
     for table in table_names:
-        cursor.execute(
-            f"INSERT OR IGNORE INTO [{_TS_META_TABLE}] (table_name, version) VALUES (?, 0)",
-            (table,)
-        )
-        for op in ("INSERT", "UPDATE", "DELETE"):
-            trigger_name = f"_ts_trg_{table}_{op.lower()}"
-            if trigger_name in existing_triggers:
-                continue
-            cursor.execute(f"""
-                CREATE TRIGGER [{trigger_name}]
-                AFTER {op} ON [{table}]
-                BEGIN
-                    INSERT INTO [{_TS_META_TABLE}] (table_name, version)
-                    VALUES ('{table}', 1)
-                    ON CONFLICT(table_name) DO UPDATE SET version = version + 1;
-                END;
-            """)
+        trigger_names = [f"_ts_trg_{table}_{op.lower()}" for op in ("INSERT", "UPDATE", "DELETE")]
+        # DROP TABLE also drops that table's triggers, but not its
+        # _ts_table_meta row. If the table was dropped and recreated under
+        # the same name, its triggers are missing here even though a stale
+        # version row still exists — trusting that row would return a
+        # cached row count from before the drop. Treat "triggers missing"
+        # (true for brand-new tables too) as "must invalidate" and bump the
+        # version unconditionally instead of leaving a stale/absent row.
+        if not existing_triggers.issuperset(trigger_names):
+            cursor.execute(
+                f"""
+                INSERT INTO [{_TS_META_TABLE}] (table_name, version) VALUES (?, 1)
+                ON CONFLICT(table_name) DO UPDATE SET version = version + 1
+                """,
+                (table,)
+            )
+            for trigger_name, op in zip(trigger_names, ("INSERT", "UPDATE", "DELETE")):
+                if trigger_name in existing_triggers:
+                    continue
+                cursor.execute(f"""
+                    CREATE TRIGGER [{trigger_name}]
+                    AFTER {op} ON [{table}]
+                    BEGIN
+                        INSERT INTO [{_TS_META_TABLE}] (table_name, version)
+                        VALUES ('{table}', 1)
+                        ON CONFLICT(table_name) DO UPDATE SET version = version + 1;
+                    END;
+                """)
+        else:
+            cursor.execute(
+                f"INSERT OR IGNORE INTO [{_TS_META_TABLE}] (table_name, version) VALUES (?, 0)",
+                (table,)
+            )
 
 
 def get_table_signatures(db_path):
