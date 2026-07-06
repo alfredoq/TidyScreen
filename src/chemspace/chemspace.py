@@ -9623,6 +9623,465 @@ plt.show()
 
         print("="*100)
 
+    def create_physicochemical_filtering_workflow(self):
+        """
+        Create a physicochemical filtering workflow by selecting RDKit molecular
+        descriptors (e.g. MolWt, TPSA) and assigning an acceptable [min, max] range
+        to each. Unlike create_filtering_workflow(), which pairs SMARTS patterns
+        with a required instance count, each entry here is a numeric descriptor
+        range evaluated directly on the molecule -- there is no SMARTS involved.
+
+        Returns:
+            dict: Dictionary mapping descriptor name to {'min': ..., 'max': ...}
+        """
+        try:
+            from rdkit.Chem import Descriptors
+            descriptor_names = [name for name, _ in Descriptors._descList]
+
+            self._display_rdkit_descriptors(descriptor_names)
+
+            workflow_filters: Dict[str, Dict[str, float]] = {}
+            filter_counter = 1
+
+            print(f"\n📋 Building Physicochemical Filtering Workflow")
+            print("=" * 80)
+            print("Commands:")
+            print("   • Enter descriptor ID to add a descriptor")
+            print("   • Type 'list' to show available descriptors again")
+            print("   • Type 'search <term>' to search descriptors by name")
+            print("   • Type 'remove <descriptor_name>' to remove a descriptor")
+            print("   • Type 'show' to display current workflow")
+            print("   • Type '-1' or 'done' to finish")
+            print("=" * 80)
+
+            while True:
+                try:
+                    raw_input_value = input(f"\n🔍 Command or Descriptor ID #{filter_counter}: ").strip()
+                    lowered = raw_input_value.lower()
+
+                    if lowered in ['-1', 'done', 'finish', 'exit']:
+                        break
+                    elif lowered == 'list':
+                        self._display_rdkit_descriptors(descriptor_names)
+                        continue
+                    elif lowered.startswith('search '):
+                        search_term = raw_input_value[len('search '):].strip()
+                        self._display_rdkit_descriptors(descriptor_names, search_term=search_term)
+                        continue
+                    elif lowered.startswith('remove '):
+                        descriptor_name = raw_input_value[len('remove '):].strip()
+                        if descriptor_name in workflow_filters:
+                            del workflow_filters[descriptor_name]
+                            print(f"✅ Removed descriptor: '{descriptor_name}'")
+                        else:
+                            print(f"❌ Descriptor '{descriptor_name}' not found in workflow")
+                        continue
+                    elif lowered == 'show':
+                        self._show_current_physicochemical_workflow(workflow_filters)
+                        continue
+
+                    # Handle numeric descriptor ID input
+                    try:
+                        descriptor_id = int(raw_input_value)
+                    except ValueError:
+                        print("❌ Invalid command. Enter a descriptor ID, or use 'list'/'search <term>'/'remove <name>'/'show'/'-1'")
+                        continue
+
+                    if descriptor_id < 1 or descriptor_id > len(descriptor_names):
+                        print(f"❌ No descriptor found with ID {descriptor_id}")
+                        continue
+
+                    descriptor_name = descriptor_names[descriptor_id - 1]
+
+                    if descriptor_name in workflow_filters:
+                        print(f"⚠️  Descriptor '{descriptor_name}' is already in the workflow")
+                        continue
+
+                    bounds = self._get_descriptor_bounds(descriptor_name)
+                    if bounds is None:
+                        continue
+
+                    lower_bound, upper_bound = bounds
+                    workflow_filters[descriptor_name] = {'min': lower_bound, 'max': upper_bound}
+
+                    print(f"✅ Added descriptor #{filter_counter}: '{descriptor_name}' (ID: {descriptor_id})")
+                    print(f"   📏 Range: [{lower_bound}, {upper_bound}]")
+                    filter_counter += 1
+
+                except KeyboardInterrupt:
+                    print("\n\n⏹️  Workflow creation cancelled by user")
+                    return {}
+                except Exception as e:
+                    print(f"❌ Error processing input: {e}")
+                    continue
+
+            # Display final workflow summary
+            if workflow_filters:
+                print(f"\n✅ Physicochemical Filtering Workflow Created!")
+                print("=" * 70)
+                self._show_current_physicochemical_workflow(workflow_filters)
+
+                save_workflow = input("\n💾 Save this workflow? (y/n): ").strip().lower()
+                if save_workflow in ['y', 'yes']:
+                    self._save_physicochemical_filtering_workflow(workflow_filters)
+            else:
+                print("\n⚠️  No descriptors were added to the workflow")
+
+            print("\n🏁 Physicochemical filtering workflow creation completed.")
+
+            return workflow_filters
+
+        except Exception as e:
+            print(f"❌ Error creating physicochemical filtering workflow: {e}")
+            return {}
+
+    def _display_rdkit_descriptors(self, descriptor_names: List[str], search_term: Optional[str] = None) -> None:
+        """
+        Display available RDKit physicochemical descriptors with pagination.
+
+        IDs shown always correspond to the descriptor's 1-based position in the
+        full descriptor_names list (not its position within search results), so
+        an ID selected after a 'search' remains valid against the full list.
+
+        Args:
+            descriptor_names (List[str]): Full ordered list of RDKit descriptor names
+            search_term (Optional[str]): If provided, only descriptors whose name
+                contains this term (case-insensitive) are shown
+        """
+        indexed = list(enumerate(descriptor_names, 1))
+
+        if search_term:
+            term_lower = search_term.lower()
+            indexed = [(idx, name) for idx, name in indexed if term_lower in name.lower()]
+            if not indexed:
+                print(f"🔍 No descriptors found matching '{search_term}'")
+                return
+            header = f"\n🔍 Search Results for '{search_term}' ({len(indexed)} found)"
+        else:
+            header = f"\n📋 Available Physicochemical Descriptors ({len(indexed)} total)"
+
+        print(header)
+        print("=" * 60)
+        print(f"{'ID':<5} {'Descriptor Name':<40}")
+        print("=" * 60)
+
+        page_size = 20
+        total_pages = (len(indexed) + page_size - 1) // page_size
+
+        for page in range(total_pages):
+            start_idx = page * page_size
+            end_idx = min(start_idx + page_size, len(indexed))
+
+            for idx, name in indexed[start_idx:end_idx]:
+                print(f"{idx:<5} {name:<40}")
+
+            if total_pages > 1:
+                print(f"\n📄 Page {page + 1}/{total_pages} - Showing descriptors {start_idx + 1}-{end_idx}")
+                if page < total_pages - 1:
+                    continue_display = input("Press Enter to see more descriptors, or 'q' to stop: ").strip().lower()
+                    if continue_display == 'q':
+                        break
+
+        print("=" * 60)
+
+    def _get_descriptor_bounds(self, descriptor_name: str) -> Optional[Tuple[float, float]]:
+        """
+        Prompt for a lower/upper bound pair for a physicochemical descriptor.
+
+        Blank input falls back to the default (-9999 / 9999). Non-numeric input
+        reprompts; a lower bound greater than the upper bound warns and reprompts
+        both values.
+
+        Args:
+            descriptor_name (str): Name of the descriptor being bounded (for the prompt)
+
+        Returns:
+            Optional[Tuple[float, float]]: (lower_bound, upper_bound), or None if
+                the user cancelled
+        """
+        default_min = -9999.0
+        default_max = 9999.0
+
+        while True:
+            try:
+                lower_input = input(f"Enter lower bound for '{descriptor_name}' (default {default_min}): ").strip()
+                if lower_input.lower() in ['cancel', 'skip', 'back']:
+                    return None
+                lower_bound = default_min if lower_input == '' else float(lower_input)
+
+                upper_input = input(f"Enter upper bound for '{descriptor_name}' (default {default_max}): ").strip()
+                if upper_input.lower() in ['cancel', 'skip', 'back']:
+                    return None
+                upper_bound = default_max if upper_input == '' else float(upper_input)
+
+                if lower_bound > upper_bound:
+                    print(f"❌ Lower bound ({lower_bound}) cannot be greater than upper bound ({upper_bound}). Please re-enter both.")
+                    continue
+
+                return lower_bound, upper_bound
+
+            except ValueError:
+                print("❌ Please enter valid numeric bounds")
+                continue
+            except KeyboardInterrupt:
+                return None
+
+    def _show_current_physicochemical_workflow(self, workflow_filters: Dict[str, Dict[str, float]]) -> None:
+        """
+        Display the current physicochemical filtering workflow being built.
+
+        Args:
+            workflow_filters (Dict[str, Dict[str, float]]): Current workflow, mapping
+                descriptor name to {'min': ..., 'max': ...}
+        """
+        if not workflow_filters:
+            print("📋 Current workflow is empty")
+            return
+
+        print(f"\n📋 Current Physicochemical Filtering Workflow ({len(workflow_filters)} descriptors)")
+        print("=" * 60)
+        print(f"{'#':<3} {'Descriptor Name':<30} {'Min':<12} {'Max':<12}")
+        print("=" * 60)
+
+        for i, (name, bounds) in enumerate(workflow_filters.items(), 1):
+            print(f"{i:<3} {name[:29]:<30} {bounds['min']:<12} {bounds['max']:<12}")
+
+        print("=" * 60)
+
+    @staticmethod
+    def save_physicochemical_filtering_workflow(chemspace_db_path: str, workflow_name: str,
+                                                  workflow_filters: Dict[str, Dict[str, float]],
+                                                  description: Optional[str] = None,
+                                                  overwrite: bool = False) -> Dict[str, Any]:
+        """
+        Persist a physicochemical filtering workflow to a chemspace database.
+
+        Mirrors save_filtering_workflow(), but stores per-descriptor {'min', 'max'}
+        ranges rather than SMARTS+instance counts, in a dedicated
+        'physicochemical_filtering_workflows' table (kept separate so existing
+        filter_using_workflow()/GUI code that assumes instances+smarts is unaffected).
+
+        Args:
+            chemspace_db_path (str): Path to the project's chemspace.db
+            workflow_name (str): Desired workflow name
+            workflow_filters (Dict[str, Dict[str, float]]): Dictionary mapping descriptor
+                name to {'min': ..., 'max': ...}
+            description (Optional[str]): Optional description; a default is generated if omitted
+            overwrite (bool): If a workflow with the same name exists, overwrite it when True;
+                otherwise a unique suffixed name is generated automatically.
+
+        Returns:
+            Dict[str, Any]: On success: {'success': True, 'workflow_name', 'filter_count',
+                'creation_date', 'description'}. On failure: {'success': False, 'message'}.
+        """
+        if not workflow_filters:
+            return {'success': False, 'message': 'No workflow filters to save'}
+
+        try:
+            conn = sqlite3.connect(chemspace_db_path)
+            cursor = conn.cursor()
+
+            # Create physicochemical_filtering_workflows table if it doesn't exist
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS physicochemical_filtering_workflows (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workflow_name TEXT NOT NULL UNIQUE,
+                filters_dict TEXT NOT NULL,
+                creation_date TEXT NOT NULL,
+                description TEXT,
+                filter_count INTEGER DEFAULT 0
+            )
+            """)
+
+            # Create indexes for faster searches
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_physicochemical_filtering_workflows_name ON physicochemical_filtering_workflows(workflow_name)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_physicochemical_filtering_workflows_date ON physicochemical_filtering_workflows(creation_date)")
+
+            filter_count = len(workflow_filters)
+
+            if not description:
+                description = f"Physicochemical filtering workflow with {filter_count} descriptors"
+
+            workflow_name = workflow_name.strip() or f"physicochemical_filtering_workflow_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+            # Check if workflow name already exists
+            cursor.execute("SELECT COUNT(*) FROM physicochemical_filtering_workflows WHERE workflow_name = ?", (workflow_name,))
+            if cursor.fetchone()[0] > 0:
+                if overwrite:
+                    cursor.execute("DELETE FROM physicochemical_filtering_workflows WHERE workflow_name = ?", (workflow_name,))
+                else:
+                    # Generate unique name
+                    counter = 1
+                    original_name = workflow_name
+                    while True:
+                        new_name = f"{original_name}_{counter}"
+                        cursor.execute("SELECT COUNT(*) FROM physicochemical_filtering_workflows WHERE workflow_name = ?", (new_name,))
+                        if cursor.fetchone()[0] == 0:
+                            workflow_name = new_name
+                            break
+                        counter += 1
+
+            creation_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            filters_json = json.dumps(workflow_filters, sort_keys=True)
+
+            cursor.execute("""
+            INSERT INTO physicochemical_filtering_workflows
+            (workflow_name, filters_dict, creation_date, description, filter_count)
+            VALUES (?, ?, ?, ?, ?)
+            """, (workflow_name, filters_json, creation_date, description, filter_count))
+
+            conn.commit()
+            conn.close()
+
+            return {
+                'success': True,
+                'workflow_name': workflow_name,
+                'filter_count': filter_count,
+                'creation_date': creation_date,
+                'description': description,
+            }
+
+        except Exception as e:
+            return {'success': False, 'message': f"Error saving physicochemical filtering workflow: {e}"}
+
+    def _save_physicochemical_filtering_workflow(self, workflow_filters: Dict[str, Dict[str, float]]) -> None:
+        """
+        Save a physicochemical filtering workflow to the chemspace database, prompting
+        the user for the workflow name, description, and an overwrite decision if needed.
+
+        Args:
+            workflow_filters (Dict[str, Dict[str, float]]): Dictionary mapping descriptor
+                name to {'min': ..., 'max': ...}
+        """
+        if not workflow_filters:
+            print("⚠️  No workflow filters to save")
+            return
+
+        # Get workflow name from user
+        workflow_name = input("📝 Enter a name for this physicochemical filtering workflow: ").strip()
+        if not workflow_name:
+            workflow_name = f"physicochemical_filtering_workflow_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            print(f"📋 Using default name: {workflow_name}")
+
+        # Get optional description from user
+        description = input("📄 Enter a description for this physicochemical filtering workflow (optional): ").strip()
+
+        overwrite = False
+        conn = sqlite3.connect(self.__chemspace_db)
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='physicochemical_filtering_workflows'")
+        if cursor.fetchone():
+            cursor.execute("SELECT COUNT(*) FROM physicochemical_filtering_workflows WHERE workflow_name = ?", (workflow_name,))
+            if cursor.fetchone()[0] > 0:
+                answer = input(f"⚠️  Physicochemical filtering workflow '{workflow_name}' already exists. Overwrite? (y/n): ").strip().lower()
+                overwrite = answer in ['y', 'yes']
+        conn.close()
+
+        result = self.save_physicochemical_filtering_workflow(self.__chemspace_db, workflow_name, workflow_filters,
+                                                                description or None, overwrite)
+
+        if result['success']:
+            print(f"✅ Successfully saved physicochemical filtering workflow!")
+            print(f"   📋 Workflow name: '{result['workflow_name']}'")
+            print(f"   🔬 Descriptors saved: {result['filter_count']}")
+            print(f"   📅 Created: {result['creation_date']}")
+            print(f"   📄 Description: {result['description']}")
+        else:
+            print(f"❌ {result['message']}")
+
+    @staticmethod
+    def get_physicochemical_filtering_workflows(chemspace_db_path: str) -> List[Dict[str, Any]]:
+        """
+        Retrieve all saved physicochemical filtering workflows from a chemspace database.
+
+        Args:
+            chemspace_db_path (str): Path to the project's chemspace.db
+
+        Returns:
+            List[Dict[str, Any]]: One dict per workflow (workflow_name, creation_date,
+                description, filters_dict, filter_count), ordered by creation_date
+                descending. Empty list if none found or on error.
+        """
+        try:
+            if not os.path.exists(chemspace_db_path):
+                return []
+
+            conn = sqlite3.connect(chemspace_db_path)
+            cursor = conn.cursor()
+
+            # Check if physicochemical_filtering_workflows table exists
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='physicochemical_filtering_workflows'")
+            if not cursor.fetchone():
+                conn.close()
+                return []
+
+            # Get all workflows with summary information
+            cursor.execute("""
+            SELECT workflow_name, creation_date, description, filters_dict, filter_count
+            FROM physicochemical_filtering_workflows
+            ORDER BY creation_date DESC
+            """)
+
+            rows = cursor.fetchall()
+            conn.close()
+
+            workflows = []
+            for name, date, desc, filters_dict_str, filter_count in rows:
+                try:
+                    filters_dict = json.loads(filters_dict_str)
+                    actual_filter_count = len(filters_dict) if filters_dict else filter_count
+                except json.JSONDecodeError:
+                    filters_dict = {}
+                    actual_filter_count = filter_count or 0
+
+                workflows.append({
+                    'workflow_name': name,
+                    'creation_date': date,
+                    'description': desc,
+                    'filters_dict': filters_dict,
+                    'filter_count': actual_filter_count,
+                })
+
+            return workflows
+
+        except Exception as e:
+            print(f"❌ Error listing physicochemical filtering workflows: {e}")
+            return []
+
+    def list_physicochemical_filtering_workflows(self) -> None:
+        """
+        Display all saved physicochemical filtering workflows in a formatted table.
+        """
+        workflows = self.get_physicochemical_filtering_workflows(self.__chemspace_db)
+
+        if not workflows:
+            print("📝 No saved physicochemical filtering workflows found")
+            return
+
+        print("\n" + "="*100)
+        print(f"SAVED PHYSICOCHEMICAL FILTERING WORKFLOWS - Project: {self.name}")
+        print("="*100)
+
+        for i, workflow in enumerate(workflows, 1):
+            filters_dict = workflow['filters_dict']
+
+            # Get descriptor names for summary
+            descriptor_names = list(filters_dict.keys()) if filters_dict else []
+            descriptors_summary = ', '.join(descriptor_names[:3])
+            if len(descriptor_names) > 3:
+                descriptors_summary += f" and {len(descriptor_names) - 3} more..."
+            elif not descriptors_summary:
+                descriptors_summary = "No descriptors available"
+
+            print(f"\n🔍 Workflow {i}: '{workflow['workflow_name']}'")
+            print(f"   📅 Created: {workflow['creation_date']}")
+            print(f"   🔬 Descriptors: {workflow['filter_count']}")
+            print(f"   📄 Description: {workflow['description']}")
+            print(f"   🔍 Descriptors: {descriptors_summary}")
+            print(f"   🔍 Descriptors dictionary: {filters_dict}")
+
+        print("="*100)
+
     def check_duplicates(self, table_name: Optional[str] = None,
                     duplicate_by: str = 'smiles',
                     show_duplicates: bool = True,
