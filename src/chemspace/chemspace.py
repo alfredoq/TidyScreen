@@ -9492,6 +9492,102 @@ plt.show()
             print(f"❌ Error listing filtering workflows: {e}")
             return []
 
+    @staticmethod
+    def delete_filtering_workflow_entry(chemspace_db_path: str, workflow_identifier: str) -> Dict[str, Any]:
+        """
+        Delete a filtering workflow by name or ID from a chemspace database.
+
+        Non-interactive counterpart to delete_filtering_workflow(), reusing the same
+        'filtering_workflows' table and the same ID/name lookup semantics, so it can
+        be called from the Streamlit GUI. The two-step interactive confirmation
+        (yes/no, then re-typing the workflow name) is skipped here — the caller is
+        expected to collect its own confirmation before calling this.
+
+        Args:
+            chemspace_db_path (str): Path to the project's chemspace.db
+            workflow_identifier (str): Workflow name or numeric ID to delete
+
+        Returns:
+            Dict[str, Any]: {'success': bool, 'message': str, 'workflow_name': Optional[str],
+                'workflow_id': Optional[int], 'filter_count': int}
+        """
+        try:
+            if not os.path.exists(chemspace_db_path):
+                return {'success': False, 'message': 'ChemSpace database not found.',
+                         'workflow_name': None, 'workflow_id': None, 'filter_count': 0}
+
+            conn = sqlite3.connect(chemspace_db_path)
+            cursor = conn.cursor()
+
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='filtering_workflows'")
+            if not cursor.fetchone():
+                conn.close()
+                return {'success': False, 'message': 'No filtering workflows table found.',
+                         'workflow_name': None, 'workflow_id': None, 'filter_count': 0}
+
+            cursor.execute("""
+                SELECT id, workflow_name, creation_date, description, filters_dict, filter_count
+                FROM filtering_workflows
+                ORDER BY creation_date DESC
+            """)
+            workflows = cursor.fetchall()
+
+            if not workflows:
+                conn.close()
+                return {'success': False, 'message': 'No filtering workflows found to delete.',
+                         'workflow_name': None, 'workflow_id': None, 'filter_count': 0}
+
+            # Find by ID first, then by exact name (case-insensitive)
+            workflow_to_delete = None
+            try:
+                search_id = int(workflow_identifier)
+                for wf in workflows:
+                    if wf[0] == search_id:
+                        workflow_to_delete = wf
+                        break
+            except (TypeError, ValueError):
+                pass
+
+            if workflow_to_delete is None:
+                identifier_lower = str(workflow_identifier).lower()
+                for wf in workflows:
+                    if wf[1].lower() == identifier_lower:
+                        workflow_to_delete = wf
+                        break
+
+            if workflow_to_delete is None:
+                conn.close()
+                return {'success': False, 'message': f"No workflow found with identifier '{workflow_identifier}'.",
+                         'workflow_name': None, 'workflow_id': None, 'filter_count': 0}
+
+            workflow_id, workflow_name, creation_date, description, filters_dict_str, filter_count = workflow_to_delete
+
+            try:
+                actual_filter_count = len(json.loads(filters_dict_str))
+            except json.JSONDecodeError:
+                actual_filter_count = filter_count or 0
+
+            cursor.execute("DELETE FROM filtering_workflows WHERE id = ?", (workflow_id,))
+            deleted_rows = cursor.rowcount
+            conn.commit()
+            conn.close()
+
+            if deleted_rows > 0:
+                return {
+                    'success': True,
+                    'message': f"Deleted filtering workflow '{workflow_name}' ({actual_filter_count} filters).",
+                    'workflow_name': workflow_name,
+                    'workflow_id': workflow_id,
+                    'filter_count': actual_filter_count,
+                }
+            else:
+                return {'success': False, 'message': 'Delete failed (no rows affected).',
+                         'workflow_name': workflow_name, 'workflow_id': workflow_id, 'filter_count': actual_filter_count}
+
+        except Exception as e:
+            return {'success': False, 'message': f"Error deleting filtering workflow: {e}",
+                     'workflow_name': None, 'workflow_id': None, 'filter_count': 0}
+
     def list_filtering_workflows(self) -> None:
         """
         Display all saved filtering workflows in a formatted table.

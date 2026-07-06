@@ -928,6 +928,36 @@ elif page == "ChemSpace Actions":
         else:
             st.info("No saved filtering workflows found.")
 
+        st.markdown("**Delete filtering workflow**")
+        if not filtering_workflows:
+            st.button("🗑️ Delete filtering workflow", key="btn_delete_fw", disabled=True,
+                       help="No filtering workflows available to delete.")
+        else:
+            dfw_workflow_names = [w["workflow_name"] for w in filtering_workflows]
+            dfw_selected_name = st.selectbox("Workflow to delete", dfw_workflow_names, key="dfw_selected_workflow")
+
+            _del_fw_key = f"confirm_delete_fw_{dfw_selected_name}"
+            if not st.session_state.get(_del_fw_key):
+                if st.button("🗑️ Delete filtering workflow", key="btn_delete_fw"):
+                    st.session_state[_del_fw_key] = True
+                    st.rerun()
+            else:
+                st.warning(f"Delete filtering workflow **{dfw_selected_name}**?")
+                _dfw_c1, _dfw_c2 = st.columns(2)
+                with _dfw_c1:
+                    if st.button("Yes, delete", key=f"btn_confirm_delete_fw_{dfw_selected_name}"):
+                        _dfw_result = ChemSpace.delete_filtering_workflow_entry(chemspace_db_path, dfw_selected_name)
+                        st.session_state[_del_fw_key] = False
+                        if _dfw_result["success"]:
+                            st.success(f"✅ {_dfw_result['message']}")
+                        else:
+                            st.error(f"❌ {_dfw_result['message']}")
+                        st.rerun()
+                with _dfw_c2:
+                    if st.button("Cancel", key=f"btn_cancel_delete_fw_{dfw_selected_name}"):
+                        st.session_state[_del_fw_key] = False
+                        st.rerun()
+
     with st.expander("🔬 Filter Using Workflow"):
         chemspace_db_path = os.path.join(st.session_state["active_project_path"], "chemspace", "processed_data", "chemspace.db")
         fuw_tables = [t for t in ChemSpace.list_tables(chemspace_db_path) if t != "filtering_workflows"]
