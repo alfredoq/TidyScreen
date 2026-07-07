@@ -996,6 +996,85 @@ elif page == "ChemSpace Actions":
                     except Exception as _e:
                         st.error(f"❌ Export failed: {_e}")
 
+    with st.expander("✏️ Edit Filtering Workflow"):
+        chemspace_db_path = os.path.join(st.session_state["active_project_path"], "chemspace", "processed_data", "chemspace.db")
+        efw_workflows = ChemSpace.get_filtering_workflows(chemspace_db_path)
+
+        if not efw_workflows:
+            st.info("No saved filtering workflows found. Create one first.")
+        else:
+            efw_workflow_names = [w["workflow_name"] for w in efw_workflows]
+            efw_selected_name = st.selectbox("Select workflow to edit", efw_workflow_names, key="efw_selected_workflow")
+            efw_selected_wf = next(w for w in efw_workflows if w["workflow_name"] == efw_selected_name)
+
+            if st.session_state.get("efw_loaded_workflow") != efw_selected_name:
+                st.session_state["efw_filters"] = dict(efw_selected_wf["filters_dict"])
+                st.session_state["efw_loaded_workflow"] = efw_selected_name
+
+            efw_all_filters = tidyscreen.get_chemical_filters()
+
+            if not efw_all_filters:
+                st.info("No chemical filters found in database. Add some first.")
+            else:
+                efw_filters_by_name = {name: (filter_id, smarts) for filter_id, name, smarts in efw_all_filters}
+
+                st.markdown("**Add or update a filter**")
+                efw_col1, efw_col2, efw_col3 = st.columns([3, 1, 1])
+                with efw_col1:
+                    efw_selected_filter = st.selectbox(
+                        "Filter", list(efw_filters_by_name.keys()), key="efw_selected_filter"
+                    )
+                with efw_col2:
+                    _efw_existing_instances = st.session_state["efw_filters"].get(efw_selected_filter, 1)
+                    efw_instances = st.number_input(
+                        "Required instances", min_value=0, value=int(_efw_existing_instances), step=1,
+                        key=f"efw_instances_{efw_selected_name}_{efw_selected_filter}"
+                    )
+                with efw_col3:
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    if st.button("Add / Update Filter", key="btn_efw_add_filter"):
+                        _, efw_smarts = efw_filters_by_name[efw_selected_filter]
+                        if ChemSpace._validate_smarts_pattern(efw_smarts):
+                            st.session_state["efw_filters"][efw_selected_filter] = int(efw_instances)
+                            st.rerun()
+                        else:
+                            st.error(f"Invalid SMARTS pattern for filter '{efw_selected_filter}'")
+
+            st.markdown("**Current workflow parameters**")
+            if st.session_state["efw_filters"]:
+                efw_df = pd.DataFrame([
+                    {"Filter Name": name, "Required Instances": instances}
+                    for name, instances in st.session_state["efw_filters"].items()
+                ])
+                st.dataframe(efw_df, use_container_width=True, hide_index=True)
+
+                efw_remove_name = st.selectbox(
+                    "Remove a filter", list(st.session_state["efw_filters"].keys()), key="efw_remove_filter"
+                )
+                if st.button("Remove Filter", key="btn_efw_remove_filter"):
+                    del st.session_state["efw_filters"][efw_remove_name]
+                    st.rerun()
+            else:
+                st.warning("No filters remaining in this workflow. Add at least one before saving.")
+
+            st.markdown("**Save changes**")
+            efw_description = st.text_area(
+                "Description", value=efw_selected_wf["description"] or "",
+                key=f"efw_description_input_{efw_selected_name}"
+            )
+
+            efw_save_disabled = not st.session_state["efw_filters"]
+            if st.button("Save Changes", key="btn_efw_save", disabled=efw_save_disabled):
+                result = ChemSpace.save_filtering_workflow(
+                    chemspace_db_path, efw_selected_name, st.session_state["efw_filters"],
+                    efw_description or None, overwrite=True
+                )
+                if result["success"]:
+                    st.success(f"Saved filtering workflow '{result['workflow_name']}' "
+                               f"({result['filter_count']} filters, {result['total_instances']} total instances).")
+                else:
+                    st.error(result["message"])
+
     with st.expander("🔬 Filter Using Workflow"):
         chemspace_db_path = os.path.join(st.session_state["active_project_path"], "chemspace", "processed_data", "chemspace.db")
         fuw_tables = [t for t in ChemSpace.list_tables(chemspace_db_path) if t != "filtering_workflows"]
@@ -1231,6 +1310,90 @@ elif page == "ChemSpace Actions":
                         st.rerun()
                     except Exception as _e:
                         st.error(f"❌ Export failed: {_e}")
+
+    with st.expander("✏️ Edit Physicochemical Filtering Workflow"):
+        chemspace_db_path = os.path.join(st.session_state["active_project_path"], "chemspace", "processed_data", "chemspace.db")
+        epfw_workflows = ChemSpace.get_physicochemical_filtering_workflows(chemspace_db_path)
+
+        if not epfw_workflows:
+            st.info("No saved physicochemical filtering workflows found. Create one first.")
+        else:
+            epfw_workflow_names = [w["workflow_name"] for w in epfw_workflows]
+            epfw_selected_name = st.selectbox("Select workflow to edit", epfw_workflow_names, key="epfw_selected_workflow")
+            epfw_selected_wf = next(w for w in epfw_workflows if w["workflow_name"] == epfw_selected_name)
+
+            if st.session_state.get("epfw_loaded_workflow") != epfw_selected_name:
+                st.session_state["epfw_filters"] = dict(epfw_selected_wf["filters_dict"])
+                st.session_state["epfw_loaded_workflow"] = epfw_selected_name
+
+            from rdkit.Chem import Descriptors
+            epfw_descriptor_names = [name for name, _ in Descriptors._descList]
+
+            st.markdown("**Add or update a descriptor**")
+            epfw_col1, epfw_col2, epfw_col3 = st.columns(3)
+            with epfw_col1:
+                epfw_selected_descriptor = st.selectbox("Descriptor", epfw_descriptor_names, key="epfw_selected_descriptor")
+            _epfw_existing_bounds = st.session_state["epfw_filters"].get(epfw_selected_descriptor, {})
+            with epfw_col2:
+                epfw_min_bound = st.number_input(
+                    "Lower bound", value=float(_epfw_existing_bounds.get("min", -9999.0)),
+                    key=f"epfw_min_bound_{epfw_selected_name}_{epfw_selected_descriptor}"
+                )
+            with epfw_col3:
+                epfw_max_bound = st.number_input(
+                    "Upper bound", value=float(_epfw_existing_bounds.get("max", 9999.0)),
+                    key=f"epfw_max_bound_{epfw_selected_name}_{epfw_selected_descriptor}"
+                )
+
+            if st.button("Add / Update Descriptor", key="btn_epfw_add_descriptor"):
+                if epfw_min_bound > epfw_max_bound:
+                    st.error(f"Lower bound ({epfw_min_bound}) cannot be greater than upper bound ({epfw_max_bound}).")
+                else:
+                    st.session_state["epfw_filters"][epfw_selected_descriptor] = {
+                        "min": float(epfw_min_bound),
+                        "max": float(epfw_max_bound),
+                    }
+                    st.rerun()
+
+            st.markdown("**Current workflow parameters**")
+            if st.session_state["epfw_filters"]:
+                epfw_df = pd.DataFrame([
+                    {"Descriptor Name": name, "Lower Bound": bounds["min"], "Upper Bound": bounds["max"]}
+                    for name, bounds in st.session_state["epfw_filters"].items()
+                ])
+                st.dataframe(epfw_df, use_container_width=True, hide_index=True)
+
+                epfw_remove_name = st.selectbox(
+                    "Remove a descriptor", list(st.session_state["epfw_filters"].keys()), key="epfw_remove_descriptor"
+                )
+                if st.button("Remove Descriptor", key="btn_epfw_remove_descriptor"):
+                    del st.session_state["epfw_filters"][epfw_remove_name]
+                    st.rerun()
+            else:
+                st.warning("No descriptors remaining in this workflow. Add at least one before saving.")
+
+            st.markdown("**Save changes**")
+            epfw_description = st.text_area(
+                "Description", value=epfw_selected_wf["description"] or "",
+                key=f"epfw_description_input_{epfw_selected_name}"
+            )
+
+            epfw_save_disabled = not st.session_state["epfw_filters"]
+            if st.button("Save Changes", key="btn_epfw_save", disabled=epfw_save_disabled):
+                result = ChemSpace.save_physicochemical_filtering_workflow(
+                    chemspace_db_path, epfw_selected_name, st.session_state["epfw_filters"],
+                    epfw_description or None, overwrite=True
+                )
+                if result["success"]:
+                    st.success(
+                        f"✅ Successfully updated physicochemical filtering workflow!\n\n"
+                        f"- **Workflow name:** {result['workflow_name']}\n"
+                        f"- **Descriptors saved:** {result['filter_count']}\n"
+                        f"- **Updated:** {result['creation_date']}\n"
+                        f"- **Description:** {result['description']}"
+                    )
+                else:
+                    st.error(result["message"])
 
     with st.expander("🔬 Filter Using Physicochemical Workflow"):
         chemspace_db_path = os.path.join(st.session_state["active_project_path"], "chemspace", "processed_data", "chemspace.db")
