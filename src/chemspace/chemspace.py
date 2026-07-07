@@ -369,11 +369,77 @@ def _filter_chunk_worker_by_instances(chunk_data: List[Tuple], filters_list: Lis
                     'inchi_key': inchi_key
                     # Remove all the heavy metadata
                 })
-                
+
         except Exception:
             continue  # Skip problematic compounds
-    
+
     return results
+
+def _filter_chunk_worker_by_descriptor_bounds(chunk_data: List[Tuple], descriptor_filters: List[Tuple]) -> Tuple[List[Dict], Dict[str, int]]:
+    """
+    Worker function applying RDKit descriptor [min, max] bounds to a chunk of compounds.
+    Mirrors _filter_chunk_worker_by_instances() but evaluates numeric descriptor ranges
+    instead of SMARTS+instance counts. Must be at module level to be pickleable for
+    multiprocessing.
+
+    Returns:
+        Tuple[List[Dict], Dict[str, int]]: (passing compounds, removed_counts) where
+            removed_counts maps descriptor name to the number of compounds in this
+            chunk excluded because that descriptor was the first one out of bounds
+            (filters are evaluated in order with early exit, so each removed compound
+            is attributed to exactly one descriptor).
+    """
+    try:
+        from rdkit import Chem
+        from rdkit.Chem import Descriptors
+        from rdkit import RDLogger
+        RDLogger.DisableLog('rdApp.*')
+    except ImportError:
+        return [{"error": "RDKit not available"}], {}
+
+    descriptor_funcs = {name: func for name, func in Descriptors._descList}
+    results = []
+    removed_counts = {name: 0 for name, _, _ in descriptor_filters}
+
+    for compound_id, smiles, name, flag, inchi_key in chunk_data:
+        try:
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is None:
+                continue  # Skip invalid compounds entirely
+
+            passes_all_filters = True
+
+            for descriptor_name, lower_bound, upper_bound in descriptor_filters:
+                descriptor_func = descriptor_funcs.get(descriptor_name)
+                if descriptor_func is None:
+                    passes_all_filters = False
+                    break
+
+                try:
+                    value = descriptor_func(mol)
+                except Exception:
+                    passes_all_filters = False
+                    break
+
+                if value < lower_bound or value > upper_bound:
+                    passes_all_filters = False
+                    removed_counts[descriptor_name] += 1
+                    break  # Early exit - don't process more descriptors
+
+            # Only store compounds that pass ALL descriptor filters
+            if passes_all_filters:
+                results.append({
+                    'id': compound_id,
+                    'smiles': smiles,
+                    'name': name or 'unknown',
+                    'flag': flag or 'nd',
+                    'inchi_key': inchi_key
+                })
+
+        except Exception:
+            continue  # Skip problematic compounds
+
+    return results, removed_counts
 
 def _process_bimolecular_chunk_worker(chunk_data: List[Tuple], reaction_smarts: str,
                                     reaction_name: str, workflow_name: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -6941,14 +7007,18 @@ plt.show()
                                     workflow_name: str, 
                                     filter_results: Dict[str, Dict]) -> bool:
         """
-        Save filtered compounds from workflow to a new table in chemspace.db with metadata and progress tracking.
-        
+        Save filtered compounds from workflow to a table in chemspace.db with metadata and progress tracking.
+
+        If a table with `new_table_name` already exists, it is dropped and recreated,
+        so the filtered results replace any previously stored data rather than being
+        appended to it.
+
         Args:
             compounds_df (pd.DataFrame): DataFrame containing filtered compounds
-            new_table_name (str): Name of the new table to create
+            new_table_name (str): Name of the table to create (or replace)
             workflow_name (str): Name of the workflow that was applied
             filter_results (Dict[str, Dict]): Results from each filter step
-            
+
         Returns:
             bool: True if compounds were saved successfully, False otherwise
         """
@@ -6986,13 +7056,17 @@ plt.show()
             
             # Sanitize table name
             new_table_name = self._sanitize_table_name(new_table_name)
-            
+
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
-            
+
+            # Drop any existing table with this name so the filtered results replace
+            # previously stored data instead of being appended to it
+            cursor.execute(f"DROP TABLE IF EXISTS {new_table_name}")
+
             # Create the new table with extended schema including workflow metadata
             cursor.execute(f'''
-                CREATE TABLE IF NOT EXISTS {new_table_name} (
+                CREATE TABLE {new_table_name} (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     smiles TEXT NOT NULL,
                     name TEXT,
@@ -10048,6 +10122,101 @@ plt.show()
             print(f"❌ Error listing physicochemical filtering workflows: {e}")
             return []
 
+    @staticmethod
+    def delete_physicochemical_filtering_workflow_entry(chemspace_db_path: str, workflow_identifier: str) -> Dict[str, Any]:
+        """
+        Delete a physicochemical filtering workflow by name or ID from a chemspace database.
+
+        Mirrors delete_filtering_workflow_entry(), but operates on the
+        'physicochemical_filtering_workflows' table. Non-interactive, so it can be
+        called from the Streamlit GUI -- the caller is expected to collect its own
+        confirmation before calling this.
+
+        Args:
+            chemspace_db_path (str): Path to the project's chemspace.db
+            workflow_identifier (str): Workflow name or numeric ID to delete
+
+        Returns:
+            Dict[str, Any]: {'success': bool, 'message': str, 'workflow_name': Optional[str],
+                'workflow_id': Optional[int], 'filter_count': int}
+        """
+        try:
+            if not os.path.exists(chemspace_db_path):
+                return {'success': False, 'message': 'ChemSpace database not found.',
+                         'workflow_name': None, 'workflow_id': None, 'filter_count': 0}
+
+            conn = sqlite3.connect(chemspace_db_path)
+            cursor = conn.cursor()
+
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='physicochemical_filtering_workflows'")
+            if not cursor.fetchone():
+                conn.close()
+                return {'success': False, 'message': 'No physicochemical filtering workflows table found.',
+                         'workflow_name': None, 'workflow_id': None, 'filter_count': 0}
+
+            cursor.execute("""
+                SELECT id, workflow_name, creation_date, description, filters_dict, filter_count
+                FROM physicochemical_filtering_workflows
+                ORDER BY creation_date DESC
+            """)
+            workflows = cursor.fetchall()
+
+            if not workflows:
+                conn.close()
+                return {'success': False, 'message': 'No physicochemical filtering workflows found to delete.',
+                         'workflow_name': None, 'workflow_id': None, 'filter_count': 0}
+
+            # Find by ID first, then by exact name (case-insensitive)
+            workflow_to_delete = None
+            try:
+                search_id = int(workflow_identifier)
+                for wf in workflows:
+                    if wf[0] == search_id:
+                        workflow_to_delete = wf
+                        break
+            except (TypeError, ValueError):
+                pass
+
+            if workflow_to_delete is None:
+                identifier_lower = str(workflow_identifier).lower()
+                for wf in workflows:
+                    if wf[1].lower() == identifier_lower:
+                        workflow_to_delete = wf
+                        break
+
+            if workflow_to_delete is None:
+                conn.close()
+                return {'success': False, 'message': f"No workflow found with identifier '{workflow_identifier}'.",
+                         'workflow_name': None, 'workflow_id': None, 'filter_count': 0}
+
+            workflow_id, workflow_name, creation_date, description, filters_dict_str, filter_count = workflow_to_delete
+
+            try:
+                actual_filter_count = len(json.loads(filters_dict_str))
+            except json.JSONDecodeError:
+                actual_filter_count = filter_count or 0
+
+            cursor.execute("DELETE FROM physicochemical_filtering_workflows WHERE id = ?", (workflow_id,))
+            deleted_rows = cursor.rowcount
+            conn.commit()
+            conn.close()
+
+            if deleted_rows > 0:
+                return {
+                    'success': True,
+                    'message': f"Deleted physicochemical filtering workflow '{workflow_name}' ({actual_filter_count} descriptors).",
+                    'workflow_name': workflow_name,
+                    'workflow_id': workflow_id,
+                    'filter_count': actual_filter_count,
+                }
+            else:
+                return {'success': False, 'message': 'Delete failed (no rows affected).',
+                         'workflow_name': workflow_name, 'workflow_id': workflow_id, 'filter_count': actual_filter_count}
+
+        except Exception as e:
+            return {'success': False, 'message': f"Error deleting physicochemical filtering workflow: {e}",
+                     'workflow_name': None, 'workflow_id': None, 'filter_count': 0}
+
     def list_physicochemical_filtering_workflows(self) -> None:
         """
         Display all saved physicochemical filtering workflows in a formatted table.
@@ -10081,6 +10250,556 @@ plt.show()
             print(f"   🔍 Descriptors dictionary: {filters_dict}")
 
         print("="*100)
+
+    def _select_physicochemical_workflow_for_filtering(self) -> Optional[str]:
+        """
+        Interactive selection of a physicochemical filtering workflow.
+
+        Returns:
+            Optional[str]: Selected workflow name or None if cancelled
+        """
+        try:
+            workflows = self.get_physicochemical_filtering_workflows(self.__chemspace_db)
+
+            if not workflows:
+                print("❌ No physicochemical filtering workflows found")
+                print("   Create workflows first using create_physicochemical_filtering_workflow()")
+                return None
+
+            print(f"\n🧪 SELECT PHYSICOCHEMICAL FILTERING WORKFLOW")
+            print("=" * 80)
+            print(f"Available workflows ({len(workflows)} total):")
+            print("-" * 80)
+            print(f"{'#':<3} {'Workflow Name':<25} {'Descriptors':<12} {'Created':<12} {'Description':<25}")
+            print("-" * 80)
+
+            for i, workflow in enumerate(workflows, 1):
+                name = workflow['workflow_name']
+                date_short = (workflow['creation_date'] or "Unknown")[:10]
+                name_display = name[:24] if len(name) <= 24 else name[:21] + "..."
+                desc_display = (workflow['description'] or "No description")[:25]
+
+                print(f"{i:<3} {name_display:<25} {workflow['filter_count']:<12} {date_short:<12} {desc_display:<25}")
+
+            print("-" * 80)
+            print("Commands: Enter workflow number, workflow name, or 'cancel' to abort")
+
+            while True:
+                try:
+                    selection = input(f"\n🔍 Select physicochemical filtering workflow: ").strip()
+
+                    if selection.lower() in ['cancel', 'quit', 'exit']:
+                        return None
+
+                    # Try as number first
+                    try:
+                        workflow_idx = int(selection) - 1
+                        if 0 <= workflow_idx < len(workflows):
+                            selected_workflow = workflows[workflow_idx]['workflow_name']
+                            print(f"\n✅ Selected workflow: '{selected_workflow}'")
+                            return selected_workflow
+                        else:
+                            print(f"❌ Invalid selection. Please enter 1-{len(workflows)}")
+                            continue
+                    except ValueError:
+                        # Try as workflow name
+                        matching_workflows = [w['workflow_name'] for w in workflows if w['workflow_name'].lower() == selection.lower()]
+                        if matching_workflows:
+                            selected_workflow = matching_workflows[0]
+                            print(f"\n✅ Selected workflow: '{selected_workflow}'")
+                            return selected_workflow
+                        else:
+                            print(f"❌ Workflow '{selection}' not found")
+                            continue
+
+                except KeyboardInterrupt:
+                    print("\n❌ Workflow selection cancelled")
+                    return None
+
+        except Exception as e:
+            print(f"❌ Error selecting physicochemical workflow for filtering: {e}")
+            return None
+
+    def _load_physicochemical_workflow_filters(self, workflow_name: str) -> List[Tuple[str, float, float]]:
+        """
+        Load a physicochemical filtering workflow's descriptor bounds from the database.
+
+        Unlike _load_workflow_filters(), no external lookup is needed -- the descriptor
+        name and [min, max] bounds are stored verbatim in filters_dict.
+
+        Args:
+            workflow_name (str): Name of the workflow to load
+
+        Returns:
+            List[Tuple[str, float, float]]: List of (descriptor_name, lower_bound, upper_bound)
+                tuples, empty list if workflow not found or error occurs
+        """
+        try:
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='physicochemical_filtering_workflows'")
+            if not cursor.fetchone():
+                print("❌ No physicochemical filtering workflows table found in chemspace database")
+                print("   Create workflows first using create_physicochemical_filtering_workflow()")
+                conn.close()
+                return []
+
+            cursor.execute(
+                "SELECT filters_dict FROM physicochemical_filtering_workflows WHERE workflow_name = ?",
+                (workflow_name,)
+            )
+            workflow_result = cursor.fetchone()
+            conn.close()
+
+            if not workflow_result:
+                print(f"❌ Workflow '{workflow_name}' not found in physicochemical_filtering_workflows table")
+                return []
+
+            try:
+                filters_dict = json.loads(workflow_result[0])
+            except json.JSONDecodeError as e:
+                print(f"❌ Error parsing filters dictionary for workflow '{workflow_name}': {e}")
+                return []
+
+            if not filters_dict:
+                print(f"⚠️  Workflow '{workflow_name}' contains no descriptor filters")
+                return []
+
+            workflow_filters = [
+                (descriptor_name, bounds['min'], bounds['max'])
+                for descriptor_name, bounds in filters_dict.items()
+            ]
+
+            print(f"✅ Loaded {len(workflow_filters)} descriptor filters for workflow '{workflow_name}'")
+            return workflow_filters
+
+        except Exception as e:
+            print(f"❌ Error loading physicochemical workflow filters for '{workflow_name}': {e}")
+            return []
+
+    def _apply_physicochemical_filters_parallel(self, compounds_df: pd.DataFrame,
+                                    workflow_filters: List[Tuple[str, float, float]],
+                                    max_workers: int, chunk_size: int,
+                                    progress_callback: Optional[Callable[[int, int], None]] = None) -> Tuple[pd.DataFrame, Dict[str, int]]:
+        """
+        Ultra-memory-efficient version that streams results to temporary files with progress tracking.
+        Mirrors _apply_filters_parallel(), but evaluates descriptor [min, max] bounds instead of
+        SMARTS+instance counts.
+
+        Returns:
+            Tuple[pd.DataFrame, Dict[str, int]]: (filtered compounds, removed_counts) where
+                removed_counts maps descriptor name to the number of compounds excluded
+                because that descriptor was the first one out of bounds.
+        """
+        import tempfile
+        import os
+        import csv
+
+        # Import tqdm locally to avoid multiprocessing issues
+        try:
+            from tqdm import tqdm
+            tqdm_available = True
+        except ImportError:
+            tqdm_available = False
+
+        try:
+            # Create temporary file for results
+            temp_dir = tempfile.mkdtemp(prefix='chemspace_physicochemical_filter_')
+            temp_file = os.path.join(temp_dir, 'filtered_results.csv')
+
+            # Write header
+            with open(temp_file, 'w', newline='') as f:
+                csv.writer(f).writerow(['id', 'smiles', 'name', 'flag', 'inchi_key'])
+
+            id_col = compounds_df['id'] if 'id' in compounds_df.columns else pd.Series(0, index=compounds_df.index)
+            name_col = compounds_df['name'] if 'name' in compounds_df.columns else pd.Series('unknown', index=compounds_df.index)
+            flag_col = compounds_df['flag'] if 'flag' in compounds_df.columns else pd.Series('nd', index=compounds_df.index)
+            inchi_key_col = compounds_df['inchi_key'] if 'inchi_key' in compounds_df.columns else pd.Series([None] * len(compounds_df), index=compounds_df.index, dtype=object)
+            compound_data = list(zip(id_col, compounds_df['smiles'], name_col, flag_col, inchi_key_col))
+
+            chunks = [compound_data[i:i + chunk_size]
+                    for i in range(0, len(compound_data), chunk_size)]
+
+            total_passed = 0
+            processed_chunks = 0
+            removed_counts = {name: 0 for name, _, _ in workflow_filters}
+
+            print(f"   📦 Processing {len(chunks)} chunks with {max_workers} workers...")
+
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                future_to_chunk = {
+                    executor.submit(_filter_chunk_worker_by_descriptor_bounds, chunk, workflow_filters): i
+                    for i, chunk in enumerate(chunks[:max_workers])
+                }
+
+                remaining_chunks = chunks[max_workers:]
+
+                if tqdm_available:
+                    progress_bar = tqdm(
+                        total=len(chunks),
+                        desc="Filtering chunks",
+                        unit="chunks",
+                        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
+                    )
+                else:
+                    progress_bar = None
+                    print(f"   🔄 Started processing {len(chunks)} chunks...")
+
+                with open(temp_file, 'a', newline='') as f:
+                    csv_writer = csv.writer(f)
+                    while future_to_chunk:
+                        for future in as_completed(list(future_to_chunk.keys())):
+                            chunk_idx = future_to_chunk.pop(future)
+
+                            try:
+                                chunk_results, chunk_removed_counts = future.result()
+
+                                chunk_passed = 0
+                                for result in chunk_results:
+                                    csv_writer.writerow([
+                                        result['id'], result['smiles'], result['name'],
+                                        result['flag'], result.get('inchi_key', '')
+                                    ])
+                                    chunk_passed += 1
+
+                                for descriptor_name, count in chunk_removed_counts.items():
+                                    removed_counts[descriptor_name] = removed_counts.get(descriptor_name, 0) + count
+
+                                total_passed += chunk_passed
+                                processed_chunks += 1
+
+                                if progress_bar:
+                                    progress_bar.update(1)
+                                    progress_bar.set_postfix({
+                                        'passed': total_passed,
+                                        'chunks': f"{processed_chunks}/{len(chunks)}"
+                                    })
+                                else:
+                                    if processed_chunks % max(1, len(chunks) // 10) == 0:
+                                        progress_pct = (processed_chunks / len(chunks)) * 100
+                                        print(f"      📊 Progress: {progress_pct:.1f}% ({processed_chunks}/{len(chunks)} chunks, {total_passed} passed)")
+
+                                if remaining_chunks:
+                                    next_chunk = remaining_chunks.pop(0)
+                                    new_future = executor.submit(
+                                        _filter_chunk_worker_by_descriptor_bounds, next_chunk, workflow_filters
+                                    )
+                                    future_to_chunk[new_future] = len(chunks) - len(remaining_chunks) - 1
+
+                                if progress_callback:
+                                    progress_callback(processed_chunks, len(chunks))
+
+                            except Exception as e:
+                                processed_chunks += 1
+                                if progress_bar:
+                                    progress_bar.update(1)
+                                print(f"   ❌ Chunk {chunk_idx} error: {e}")
+                                if progress_callback:
+                                    progress_callback(processed_chunks, len(chunks))
+
+                if progress_bar:
+                    progress_bar.close()
+
+            print(f"   📊 Reading {total_passed} filtered compounds from disk...")
+            try:
+                if tqdm_available:
+                    from tqdm import tqdm
+
+                    file_size = os.path.getsize(temp_file)
+
+                    with tqdm(total=file_size, unit='B', unit_scale=True, desc="Reading results") as pbar:
+                        result_df = pd.read_csv(temp_file)
+                        pbar.update(file_size)
+
+                else:
+                    result_df = pd.read_csv(temp_file)
+
+                print(f"   ✅ Successfully loaded {len(result_df)} filtered compounds")
+                return result_df, removed_counts
+            finally:
+                try:
+                    os.unlink(temp_file)
+                    os.rmdir(temp_dir)
+                except:
+                    pass
+
+        except Exception as e:
+            print(f"❌ Error in streaming parallel physicochemical filtering: {e}")
+            return pd.DataFrame(), {}
+
+    def _apply_physicochemical_filters_sequential(self, compounds_df: pd.DataFrame,
+                                workflow_filters: List[Tuple[str, float, float]],
+                                progress_callback: Optional[Callable[[int, int], None]] = None) -> Tuple[pd.DataFrame, Dict[str, int]]:
+        """
+        Apply RDKit descriptor [min, max] filters using sequential processing with progress tracking.
+        Mirrors _apply_filters_sequential(), but evaluates numeric descriptor ranges instead of
+        SMARTS+instance counts.
+
+        Returns:
+            Tuple[pd.DataFrame, Dict[str, int]]: (filtered compounds, removed_counts) where
+                removed_counts maps descriptor name to the number of compounds excluded
+                because that descriptor was the first one out of bounds (filters are
+                evaluated in order with early exit, so each removed compound is
+                attributed to exactly one descriptor).
+        """
+        try:
+            from tqdm import tqdm
+            tqdm_available = True
+        except ImportError:
+            tqdm_available = False
+
+        try:
+            from rdkit import Chem
+            from rdkit.Chem import Descriptors
+            from rdkit import RDLogger
+            RDLogger.DisableLog('rdApp.*')
+
+            descriptor_funcs = {name: func for name, func in Descriptors._descList}
+
+            filtered_compounds = []
+            total_compounds = len(compounds_df)
+            processed_count = 0
+            compounds_passed = 0
+            callback_interval = max(1, total_compounds // 100)
+            removed_counts = {name: 0 for name, _, _ in workflow_filters}
+
+            print(f"   🔄 Processing {total_compounds:,} compounds sequentially...")
+
+            if tqdm_available:
+                progress_bar = tqdm(
+                    compounds_df.iterrows(),
+                    total=total_compounds,
+                    desc="Filtering compounds",
+                    unit="compounds",
+                    bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] Passed: {postfix}",
+                    postfix="0"
+                )
+            else:
+                progress_bar = compounds_df.iterrows()
+                print_interval = max(1, total_compounds // 20)
+
+            for _, compound in progress_bar:
+                processed_count += 1
+                passes_all_filters = True
+                descriptor_values = {}
+
+                try:
+                    mol = Chem.MolFromSmiles(compound['smiles'])
+                    if mol is None:
+                        continue
+
+                    for descriptor_name, lower_bound, upper_bound in workflow_filters:
+                        descriptor_func = descriptor_funcs.get(descriptor_name)
+                        if descriptor_func is None:
+                            passes_all_filters = False
+                            break
+
+                        try:
+                            value = descriptor_func(mol)
+                        except Exception:
+                            passes_all_filters = False
+                            break
+
+                        descriptor_values[descriptor_name] = value
+
+                        if value < lower_bound or value > upper_bound:
+                            passes_all_filters = False
+                            removed_counts[descriptor_name] += 1
+                            break
+
+                    if passes_all_filters:
+                        compound_data = {
+                            'smiles': compound['smiles'],
+                            'name': compound.get('name', 'unknown'),
+                            'flag': compound.get('flag', 'nd'),
+                            'inchi_key': compound.get('inchi_key', None)
+                        }
+                        compound_data.update(descriptor_values)
+                        filtered_compounds.append(compound_data)
+                        compounds_passed += 1
+
+                except Exception:
+                    continue
+
+                if tqdm_available:
+                    progress_bar.set_postfix(passed=compounds_passed)
+                else:
+                    if processed_count % print_interval == 0 or processed_count == total_compounds:
+                        progress_pct = (processed_count / total_compounds) * 100
+                        retention_rate = (compounds_passed / processed_count) * 100 if processed_count > 0 else 0
+                        print(f"      📊 Progress: {progress_pct:.1f}% ({processed_count:,}/{total_compounds:,}) | "
+                            f"Passed: {compounds_passed:,} ({retention_rate:.1f}%)")
+
+                if progress_callback and (processed_count % callback_interval == 0 or processed_count == total_compounds):
+                    progress_callback(processed_count, total_compounds)
+
+            if tqdm_available and hasattr(progress_bar, 'close'):
+                progress_bar.close()
+
+            final_retention_rate = (len(filtered_compounds) / total_compounds) * 100 if total_compounds > 0 else 0
+            print(f"   ✅ Sequential processing completed")
+            print(f"   📊 Final results: {len(filtered_compounds):,}/{total_compounds:,} compounds passed ({final_retention_rate:.2f}%)")
+
+            return pd.DataFrame(filtered_compounds), removed_counts
+
+        except Exception as e:
+            print(f"❌ Error in sequential physicochemical filtering: {e}")
+            return pd.DataFrame(), {}
+
+    def filter_using_physicochemical_workflow(self, table_name: Optional[str] = None, workflow_name: Optional[str] = None,
+                    save_results: Optional[bool] = None,
+                    result_table_name: Optional[str] = None,
+                    parallel_threshold: int = 10000,
+                    max_workers: Optional[int] = None,
+                    chunk_size: Optional[int] = None,
+                    progress_callback: Optional[Callable[[int, int], None]] = None) -> pd.DataFrame:
+        """
+        Apply a physicochemical filtering workflow to compounds in a table with parallel
+        processing support. Mirrors filter_using_workflow(), but evaluates RDKit descriptor
+        [min, max] ranges instead of SMARTS+instance filters. A compound passes only if ALL
+        descriptor values fall within their configured range.
+
+        Args:
+            table_name (Optional[str]): Name of the table containing compounds to filter. If None, shows selection.
+            workflow_name (Optional[str]): Name of the physicochemical workflow to apply. If None, shows selection.
+            save_results (Optional[bool]): Whether to save filtered results to database (prompts if None)
+            result_table_name (Optional[str]): Name for the result table (prompts if save_results=True and None)
+            parallel_threshold (int): Minimum number of compounds to trigger parallel processing
+            max_workers (Optional[int]): Maximum number of worker processes (default: min(cpu_count(), 8))
+            chunk_size (Optional[int]): Size of chunks for parallel processing (auto-calculated if None)
+            progress_callback (Optional[Callable[[int, int], None]]): Optional callback invoked as
+                progress_callback(done, total) while filtering is in progress, e.g. to drive a GUI
+                progress bar. `done`/`total` are compounds for sequential processing or chunks for
+                parallel processing.
+
+        Returns:
+            pd.DataFrame: DataFrame containing filtered compounds with descriptor values
+        """
+        try:
+            print(f"\n🔬 Starting physicochemical workflow filtering...")
+
+            # Interactive table selection if not provided
+            if table_name is None:
+                table_name = self._select_table_for_filtering()
+                if not table_name:
+                    print("❌ No table selected for filtering")
+                    return pd.DataFrame()
+
+            # Interactive workflow selection if not provided
+            if workflow_name is None:
+                workflow_name = self._select_physicochemical_workflow_for_filtering()
+                if not workflow_name:
+                    print("❌ No workflow selected for filtering")
+                    return pd.DataFrame()
+
+            print(f"   📋 Table: '{table_name}'")
+            print(f"   🧪 Workflow: '{workflow_name}'")
+
+            # Load workflow filters
+            print(f"   🔍 Loading workflow filters...")
+            workflow_filters = self._load_physicochemical_workflow_filters(workflow_name)
+
+            if not workflow_filters:
+                print(f"❌ No filters found for workflow '{workflow_name}'")
+                return pd.DataFrame()
+
+            print(f"   ✅ Loaded {len(workflow_filters)} descriptor filters")
+            for i, (descriptor_name, lower_bound, upper_bound) in enumerate(workflow_filters, 1):
+                print(f"      {i}. {descriptor_name} -> [{lower_bound}, {upper_bound}]")
+
+            # Get compounds from table
+            print(f"   📊 Loading compounds from table '{table_name}'...")
+            compounds_df = self._get_table_as_dataframe(table_name)
+            if compounds_df.empty:
+                print(f"❌ No compounds found in table '{table_name}'")
+                return pd.DataFrame()
+
+            total_compounds = len(compounds_df)
+            print(f"   ✅ Loaded {total_compounds:,} compounds to filter")
+
+            # Determine processing method
+            use_parallel = total_compounds >= parallel_threshold
+
+            if use_parallel:
+                print(f"   🚀 Using parallel processing (threshold: {parallel_threshold:,})")
+
+                if max_workers is None:
+                    max_workers = min(os.cpu_count() or 4, 8)
+
+                if chunk_size is None:
+                    chunk_size = max(1000, total_compounds // (max_workers * 4))
+
+                print(f"      👥 Workers: {max_workers}")
+                print(f"      📦 Chunk size: {chunk_size:,}")
+
+                filtered_df, removed_counts = self._apply_physicochemical_filters_parallel(
+                    compounds_df, workflow_filters, max_workers, chunk_size,
+                    progress_callback=progress_callback
+                )
+            else:
+                print(f"   🔄 Using sequential processing")
+                filtered_df, removed_counts = self._apply_physicochemical_filters_sequential(
+                    compounds_df, workflow_filters, progress_callback=progress_callback
+                )
+
+            # Calculate statistics
+            compounds_removed = total_compounds - len(filtered_df)
+            retention_rate = (len(filtered_df) / total_compounds) * 100 if total_compounds > 0 else 0
+
+            print(f"\n📊 Filtering Results:")
+            print(f"   ✅ Compounds passed: {len(filtered_df):,}")
+            print(f"   ❌ Compounds removed: {compounds_removed:,}")
+            print(f"   📈 Retention rate: {retention_rate:.2f}%")
+
+            if removed_counts:
+                print(f"\n📉 Compounds removed per filter (first descriptor out of bounds):")
+                for descriptor_name, count in removed_counts.items():
+                    print(f"      • {descriptor_name}: {count:,}")
+
+            if filtered_df.empty:
+                print("❌ No compounds passed the filtering workflow")
+                return pd.DataFrame()
+
+            # Prompt for save_results if not provided
+            if save_results is None:
+                save_choice = input("\n💾 Do you want to save the filtered results to a new table? (y/n): ").strip().lower()
+                save_results = save_choice in ['y', 'yes']
+
+            # Save results if requested
+            if save_results:
+                if result_table_name is None:
+                    default_name = f"{table_name}_filtered_{workflow_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                    user_table_name = input(f"📝 Enter table name for results (default: {default_name}): ").strip()
+                    result_table_name = user_table_name if user_table_name else default_name
+
+                print(f"   💾 Saving filtered results to '{result_table_name}'...")
+
+                filter_results = {
+                    'workflow_name': workflow_name,
+                    'initial_compounds': total_compounds,
+                    'final_compounds': len(filtered_df),
+                    'compounds_removed': compounds_removed,
+                    'retention_rate': retention_rate,
+                    'processing_method': 'parallel' if use_parallel else 'sequential'
+                }
+
+                success = self._save_workflow_filtered_compounds(
+                    filtered_df, result_table_name, workflow_name, filter_results
+                )
+
+                if success:
+                    print(f"   ✅ Results saved to table: '{result_table_name}'")
+                else:
+                    print(f"   ❌ Failed to save results to database")
+            else:
+                print("   📄 Results not saved to database")
+
+            return filtered_df
+
+        except Exception as e:
+            print(f"❌ Error in filter_using_physicochemical_workflow: {e}")
+            return pd.DataFrame()
 
     def check_duplicates(self, table_name: Optional[str] = None,
                     duplicate_by: str = 'smiles',

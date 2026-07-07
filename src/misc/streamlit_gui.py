@@ -1056,6 +1056,238 @@ elif page == "ChemSpace Actions":
                 with st.expander("Execution log", expanded=filtered_df is None or filtered_df.empty):
                     st.code(fuw_log.getvalue() or "(no output)")
 
+    st.subheader("Chemical Filtering: physicochemical properties based")
+
+    with st.expander("🔬 Available Physicochemical Filters"):
+        from rdkit.Chem import Descriptors
+        apf_descriptor_names = [name for name, _ in Descriptors._descList]
+
+        apf_search = st.text_input("Search descriptors", key="apf_search")
+        if apf_search.strip():
+            apf_search_lower = apf_search.strip().lower()
+            apf_rows = [(idx, name) for idx, name in enumerate(apf_descriptor_names, 1) if apf_search_lower in name.lower()]
+        else:
+            apf_rows = list(enumerate(apf_descriptor_names, 1))
+
+        apf_df = pd.DataFrame(apf_rows, columns=["ID", "Descriptor Name"])
+        st.dataframe(apf_df, use_container_width=True, hide_index=True)
+
+    with st.expander("🛠️ Create Physicochemical Filtering Workflow"):
+        if "cpfw_filters" not in st.session_state:
+            st.session_state["cpfw_filters"] = {}
+
+        from rdkit.Chem import Descriptors
+        cpfw_descriptor_names = [name for name, _ in Descriptors._descList]
+        cpfw_available_names = [name for name in cpfw_descriptor_names if name not in st.session_state["cpfw_filters"]]
+
+        st.markdown("**Add a descriptor to the workflow**")
+        cpfw_col1, cpfw_col2, cpfw_col3 = st.columns(3)
+        with cpfw_col1:
+            cpfw_selected_name = st.selectbox(
+                "Descriptor", cpfw_available_names, key="cpfw_selected_descriptor"
+            ) if cpfw_available_names else None
+        with cpfw_col2:
+            cpfw_min_bound = st.number_input(
+                "Lower bound", value=-9999.0, key="cpfw_min_bound"
+            )
+        with cpfw_col3:
+            cpfw_max_bound = st.number_input(
+                "Upper bound", value=9999.0, key="cpfw_max_bound"
+            )
+
+        if st.button("Add Descriptor", key="btn_cpfw_add_descriptor", disabled=not cpfw_available_names):
+            if cpfw_min_bound > cpfw_max_bound:
+                st.error(f"Lower bound ({cpfw_min_bound}) cannot be greater than upper bound ({cpfw_max_bound}).")
+            else:
+                st.session_state["cpfw_filters"][cpfw_selected_name] = {
+                    "min": float(cpfw_min_bound),
+                    "max": float(cpfw_max_bound),
+                }
+                st.rerun()
+
+        st.markdown("**Current workflow**")
+        if st.session_state["cpfw_filters"]:
+            cpfw_df = pd.DataFrame([
+                {"Descriptor Name": name, "Lower Bound": bounds["min"], "Upper Bound": bounds["max"]}
+                for name, bounds in st.session_state["cpfw_filters"].items()
+            ])
+            st.dataframe(cpfw_df, use_container_width=True, hide_index=True)
+
+            cpfw_remove_name = st.selectbox(
+                "Remove a descriptor", list(st.session_state["cpfw_filters"].keys()), key="cpfw_remove_descriptor"
+            )
+            if st.button("Remove Descriptor", key="btn_cpfw_remove_descriptor"):
+                del st.session_state["cpfw_filters"][cpfw_remove_name]
+                st.rerun()
+        else:
+            st.info("No descriptors added to the workflow yet.")
+
+        st.markdown("**Save workflow**")
+        cpfw_workflow_name = st.text_input("Workflow name", key="cpfw_workflow_name")
+        cpfw_description = st.text_area("Description (optional)", key="cpfw_description")
+        cpfw_overwrite = st.checkbox("Overwrite if a workflow with this name already exists", key="cpfw_overwrite")
+
+        cpfw_save_disabled = not st.session_state["cpfw_filters"] or not cpfw_workflow_name.strip()
+        if not cpfw_workflow_name.strip():
+            st.caption("Enter a workflow name to save.")
+
+        if st.button("Save Workflow", key="btn_cpfw_save_workflow", disabled=cpfw_save_disabled):
+            chemspace_db_path = os.path.join(st.session_state["active_project_path"], "chemspace", "processed_data", "chemspace.db")
+            result = ChemSpace.save_physicochemical_filtering_workflow(
+                chemspace_db_path, cpfw_workflow_name, st.session_state["cpfw_filters"],
+                cpfw_description or None, cpfw_overwrite
+            )
+            if result["success"]:
+                st.success(
+                    f"✅ Successfully saved physicochemical filtering workflow!\n\n"
+                    f"- **Workflow name:** {result['workflow_name']}\n"
+                    f"- **Descriptors saved:** {result['filter_count']}\n"
+                    f"- **Created:** {result['creation_date']}\n"
+                    f"- **Description:** {result['description']}"
+                )
+                st.session_state["cpfw_filters"] = {}
+                st.session_state["cpfw_last_saved"] = result
+            else:
+                st.error(result["message"])
+
+        if st.session_state.get("cpfw_last_saved") and not st.session_state["cpfw_filters"]:
+            _last = st.session_state["cpfw_last_saved"]
+            st.info(
+                f"Last saved workflow: **{_last['workflow_name']}** "
+                f"({_last['filter_count']} descriptors, created {_last['creation_date']})"
+            )
+
+    with st.expander("📋 List Physicochemical Filtering Workflows"):
+        chemspace_db_path = os.path.join(st.session_state["active_project_path"], "chemspace", "processed_data", "chemspace.db")
+        physicochemical_workflows = ChemSpace.get_physicochemical_filtering_workflows(chemspace_db_path)
+        if physicochemical_workflows:
+            physicochemical_workflows_df = pd.DataFrame(physicochemical_workflows)
+            st.dataframe(physicochemical_workflows_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No saved physicochemical filtering workflows found.")
+
+        st.markdown("**Delete physicochemical filtering workflow**")
+        if not physicochemical_workflows:
+            st.button("🗑️ Delete physicochemical filtering workflow", key="btn_delete_pfw", disabled=True,
+                       help="No physicochemical filtering workflows available to delete.")
+        else:
+            dpfw_workflow_names = [w["workflow_name"] for w in physicochemical_workflows]
+            dpfw_selected_name = st.selectbox("Select physicochemical filtering workflow", dpfw_workflow_names, key="dpfw_selected_workflow")
+
+            _del_pfw_key = f"confirm_delete_pfw_{dpfw_selected_name}"
+            if not st.session_state.get(_del_pfw_key):
+                if st.button("🗑️ Delete physicochemical filtering workflow", key="btn_delete_pfw"):
+                    st.session_state[_del_pfw_key] = True
+                    st.rerun()
+            else:
+                st.warning(f"Delete physicochemical filtering workflow **{dpfw_selected_name}**?")
+                _dpfw_c1, _dpfw_c2 = st.columns(2)
+                with _dpfw_c1:
+                    if st.button("Yes, delete", key=f"btn_confirm_delete_pfw_{dpfw_selected_name}"):
+                        _dpfw_result = ChemSpace.delete_physicochemical_filtering_workflow_entry(chemspace_db_path, dpfw_selected_name)
+                        st.session_state[_del_pfw_key] = False
+                        if _dpfw_result["success"]:
+                            st.success(f"✅ {_dpfw_result['message']}")
+                        else:
+                            st.error(f"❌ {_dpfw_result['message']}")
+                        st.rerun()
+                with _dpfw_c2:
+                    if st.button("Cancel", key=f"btn_cancel_delete_pfw_{dpfw_selected_name}"):
+                        st.session_state[_del_pfw_key] = False
+                        st.rerun()
+
+            st.markdown("**Export physicochemical filtering workflow**")
+            if st.button(
+                f"{'Hide Export' if st.session_state.get('show_export_pfw_form') else '📤 Export physicochemical filtering workflow'}: {dpfw_selected_name}",
+                key="btn_export_pfw",
+            ):
+                st.session_state["show_export_pfw_form"] = not st.session_state.get("show_export_pfw_form", False)
+                st.rerun()
+
+            if st.session_state.get("show_export_pfw_form"):
+                _default_exp_pfw_path = os.path.join(
+                    st.session_state["active_project_path"],
+                    "chemspace", "misc",
+                    f"{dpfw_selected_name}.json",
+                )
+                _exp_pfw_path = st.text_input(
+                    "Output JSON path:",
+                    value=_default_exp_pfw_path,
+                    key=f"export_pfw_path_{dpfw_selected_name}",
+                )
+                if st.button("💾 Save", key=f"btn_save_pfw_{dpfw_selected_name}"):
+                    try:
+                        _selected_pfw = next(w for w in physicochemical_workflows if w["workflow_name"] == dpfw_selected_name)
+                        _payload = [
+                            {"descriptor_name": _dname, "min": _bounds["min"], "max": _bounds["max"]}
+                            for _dname, _bounds in _selected_pfw["filters_dict"].items()
+                        ]
+                        _out = _exp_pfw_path.strip()
+                        os.makedirs(os.path.dirname(os.path.abspath(_out)), exist_ok=True)
+                        with open(_out, "w", encoding="utf-8") as _f:
+                            json.dump(_payload, _f, indent=2, ensure_ascii=False)
+                        st.success(f"✅ Exported to: {_out}")
+                        st.session_state["show_export_pfw_form"] = False
+                        st.rerun()
+                    except Exception as _e:
+                        st.error(f"❌ Export failed: {_e}")
+
+    with st.expander("🔬 Filter Using Physicochemical Workflow"):
+        chemspace_db_path = os.path.join(st.session_state["active_project_path"], "chemspace", "processed_data", "chemspace.db")
+        fupw_tables = [t for t in ChemSpace.list_tables(chemspace_db_path)
+                       if t not in ("filtering_workflows", "physicochemical_filtering_workflows")]
+        fupw_workflows = [w["workflow_name"] for w in ChemSpace.get_physicochemical_filtering_workflows(chemspace_db_path)]
+
+        if not fupw_tables:
+            st.info("No compound tables found in the ChemSpace database.")
+        elif not fupw_workflows:
+            st.info("No saved physicochemical filtering workflows found. Create one first.")
+        else:
+            fupw_table_name = st.selectbox("Compound table", fupw_tables, key="fupw_table_name")
+            fupw_workflow_name = st.selectbox("Physicochemical workflow", fupw_workflows, key="fupw_workflow_name")
+            fupw_save_results = st.checkbox("Save filtered results to a new table", key="fupw_save_results")
+
+            fupw_result_table_name = ""
+            if fupw_save_results:
+                fupw_result_table_name = st.text_input("Result table name", key="fupw_result_table_name")
+
+            fupw_run_disabled = fupw_save_results and not fupw_result_table_name.strip()
+            if fupw_run_disabled:
+                st.caption("Enter a result table name to save the filtered results.")
+
+            if st.button("Run Filtering", key="btn_fupw_run", disabled=fupw_run_disabled):
+                project_obj = tidyscreen.ActivateProject.__new__(tidyscreen.ActivateProject)
+                project_obj.name = st.session_state["selected_project"]
+                project_obj.path = st.session_state["active_project_path"]
+                project_obj._project_exists = True
+                chemspace_obj = ChemSpace(project_obj)
+
+                fupw_progress_bar = st.progress(0.0, text="Starting physicochemical filtering workflow...")
+
+                def _fupw_update_progress(done, total):
+                    fraction = min(done / total, 1.0) if total else 1.0
+                    fupw_progress_bar.progress(fraction, text=f"Filtering... {done}/{total}")
+
+                fupw_log = io.StringIO()
+                with contextlib.redirect_stdout(fupw_log):
+                    filtered_df = chemspace_obj.filter_using_physicochemical_workflow(
+                        table_name=fupw_table_name,
+                        workflow_name=fupw_workflow_name,
+                        save_results=fupw_save_results,
+                        result_table_name=fupw_result_table_name.strip() if fupw_save_results else None,
+                        progress_callback=_fupw_update_progress,
+                    )
+                fupw_progress_bar.progress(1.0, text="Filtering complete.")
+
+                if filtered_df is not None and not filtered_df.empty:
+                    st.success(f"Filtering complete: {len(filtered_df):,} compounds passed the workflow.")
+                    st.dataframe(filtered_df, use_container_width=True, hide_index=True)
+                else:
+                    st.warning("No compounds passed the filtering workflow.")
+
+                with st.expander("Execution log", expanded=filtered_df is None or filtered_df.empty):
+                    st.code(fupw_log.getvalue() or "(no output)")
+
     st.divider()
     st.subheader("Synthetic workflows")
 
