@@ -5890,6 +5890,10 @@ elif page == "Mol Viewer":
     smiles_input = st.text_input("Enter a SMILES string:", key="mv_smiles")
     smarts_input = st.text_input("Optional SMARTS to highlight:", key="mv_smarts")
 
+    from rdkit.Chem import Descriptors as _mv_Descriptors
+    _mv_descriptor_names = [name for name, _ in _mv_Descriptors._descList]
+    mv_descriptor_name = st.selectbox("Select an RDKit descriptor to compute:", _mv_descriptor_names, key="mv_descriptor")
+
     if smiles_input:
         col1, col2 = st.columns(2)
         img, match_count, draw_error = _mv_draw_molecule(smiles_input, smarts_input.strip())
@@ -5905,6 +5909,15 @@ elif page == "Mol Viewer":
                         st.success(f"SMARTS matches found: {match_count}")
                     else:
                         st.warning("No SMARTS match found in this molecule.")
+
+                mv_mol = Chem.MolFromSmiles(smiles_input)
+                mv_descriptor_func = dict(_mv_Descriptors._descList).get(mv_descriptor_name)
+                if mv_mol is not None and mv_descriptor_func is not None:
+                    try:
+                        mv_descriptor_value = mv_descriptor_func(mv_mol)
+                        st.metric(mv_descriptor_name, f"{mv_descriptor_value:.4g}")
+                    except Exception as _mv_desc_error:
+                        st.error(f"Error computing descriptor '{mv_descriptor_name}': {_mv_desc_error}")
             else:
                 st.error("Invalid SMILES string.")
         with col2:
