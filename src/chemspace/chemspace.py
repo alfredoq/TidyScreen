@@ -13523,6 +13523,8 @@ plt.show()
             if all_ambiguous_reactants:
                 print(f"   ⚠️  {len(all_ambiguous_reactants)} reactant pair(s) matched the reaction template "
                       f"at more than one site (multiple product possibilities from the same pair)")
+                for ambiguous in all_ambiguous_reactants:
+                    print(f"      - {ambiguous['reactant1_smiles']} + {ambiguous['reactant2_smiles']}")
                 if ambiguous_reactants is not None:
                     ambiguous_reactants.extend(all_ambiguous_reactants)
             return total_products
@@ -13630,6 +13632,8 @@ plt.show()
             if all_ambiguous_reactants:
                 print(f"      ⚠️  {len(all_ambiguous_reactants)} reactant(s) matched the reaction template "
                       f"at more than one site (multiple product possibilities from the same reactant)")
+                for ambiguous in all_ambiguous_reactants:
+                    print(f"         - {ambiguous['reactant_smiles']}")
                 if ambiguous_reactants is not None:
                     ambiguous_reactants.extend(all_ambiguous_reactants)
             return total_products
@@ -14255,6 +14259,8 @@ plt.show()
             if all_ambiguous_reactants:
                 print(f"   ⚠️  {len(all_ambiguous_reactants)} reactant pair(s) matched the reaction template "
                       f"at more than one site (multiple product possibilities from the same pair)")
+                for ambiguous in all_ambiguous_reactants:
+                    print(f"      - {ambiguous['reactant1_smiles']} + {ambiguous['reactant2_smiles']}")
                 if ambiguous_reactants is not None:
                     ambiguous_reactants.extend(all_ambiguous_reactants)
             return all_products
@@ -14353,6 +14359,8 @@ plt.show()
             if all_ambiguous_reactants:
                 print(f"      ⚠️  {len(all_ambiguous_reactants)} reactant(s) matched the reaction template "
                       f"at more than one site (multiple product possibilities from the same reactant)")
+                for ambiguous in all_ambiguous_reactants:
+                    print(f"         - {ambiguous['reactant_smiles']}")
                 if ambiguous_reactants is not None:
                     ambiguous_reactants.extend(all_ambiguous_reactants)
             return all_products
