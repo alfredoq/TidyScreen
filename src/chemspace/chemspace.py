@@ -102,7 +102,7 @@ def _process_chunk_worker(chunk_df: pd.DataFrame, smiles_column: str,
                          name_available: bool, flag_available: bool,
                          start_idx: int, flag_description_available,
                          strip_salts: bool = False,
-                         retain_largest_fragment: bool = False) -> Tuple[List[Tuple[str, str, str, str]], int, int, int]:
+                         retain_largest_fragment: bool = False) -> Tuple[List[Tuple[str, str, str, str]], int, int, int, List[str]]:
     """
     Worker function to process a chunk of DataFrame in parallel.
     This function must be at module level to be pickleable for multiprocessing.
@@ -121,12 +121,14 @@ def _process_chunk_worker(chunk_df: pd.DataFrame, smiles_column: str,
             their largest fragment using RDKit's LargestFragmentChooser (applied after strip_salts)
 
     Returns:
-        Tuple[List[Tuple[str, str, str, str]], int, int, int]: (list of (smiles, name, flag,
+        Tuple[List[Tuple[str, str, str, str]], int, int, int, List[str]]: (list of (smiles, name, flag,
             flag_description) tuples, count of compounds whose SMILES had a salt/counter-ion
             fragment removed, count of compounds reduced to their largest fragment, count of
-            compounds dropped because RDKit could not parse their SMILES)
+            compounds dropped because RDKit could not parse their SMILES, the original (pre-cleanup)
+            SMILES strings of those dropped compounds)
     """
     compounds_data = []
+    failed_smiles = []
     salts_stripped_count = 0
     fragments_retained_count = 0
     failed_count = 0
@@ -144,6 +146,7 @@ def _process_chunk_worker(chunk_df: pd.DataFrame, smiles_column: str,
     for local_idx, (_, row) in enumerate(chunk_df.iterrows()):
         global_idx = start_idx + local_idx
         smiles = str(row[smiles_column]).strip()
+        original_smiles = smiles
 
         # Handle name column - use provided column or generate from index
         if name_available:
@@ -175,6 +178,7 @@ def _process_chunk_worker(chunk_df: pd.DataFrame, smiles_column: str,
             smiles, was_stripped = _strip_salts_from_smiles(smiles, remover)
             if smiles is None:
                 failed_count += 1
+                failed_smiles.append(original_smiles)
                 continue
             if was_stripped:
                 salts_stripped_count += 1
@@ -183,13 +187,14 @@ def _process_chunk_worker(chunk_df: pd.DataFrame, smiles_column: str,
             smiles, was_reduced = _retain_largest_fragment_from_smiles(smiles, fragment_chooser)
             if smiles is None:
                 failed_count += 1
+                failed_smiles.append(original_smiles)
                 continue
             if was_reduced:
                 fragments_retained_count += 1
 
         compounds_data.append((smiles, name, flag, flag_description))
 
-    return compounds_data, salts_stripped_count, fragments_retained_count, failed_count
+    return compounds_data, salts_stripped_count, fragments_retained_count, failed_count, failed_smiles
 
 def _compute_inchi_keys_worker(chunk_data: List[Tuple[int, str, str, str]]) -> List[Tuple[int, str, str, str]]:
     """
@@ -1541,6 +1546,7 @@ class ChemSpace:
                 salts_stripped_count = 0
                 fragments_retained_count = 0
                 cleanup_failures_count = 0
+                cleanup_failures_smiles = []
                 salt_remover = None
                 if strip_salts:
                     from rdkit.Chem import SaltRemover
@@ -1555,6 +1561,7 @@ class ChemSpace:
                     row_iterator = df.iterrows()
                 for idx, row in row_iterator:
                     smiles = str(row[smiles_column]).strip()
+                    original_smiles = smiles
                     # Handle name column - use provided column or generate from index
                     if name_available:
                         name = str(row[name_column]).strip()
@@ -1583,6 +1590,7 @@ class ChemSpace:
                         smiles, was_stripped = _strip_salts_from_smiles(smiles, salt_remover)
                         if smiles is None:
                             cleanup_failures_count += 1
+                            cleanup_failures_smiles.append(original_smiles)
                             continue
                         if was_stripped:
                             salts_stripped_count += 1
@@ -1590,6 +1598,7 @@ class ChemSpace:
                         smiles, was_reduced = _retain_largest_fragment_from_smiles(smiles, fragment_chooser)
                         if smiles is None:
                             cleanup_failures_count += 1
+                            cleanup_failures_smiles.append(original_smiles)
                             continue
                         if was_reduced:
                             fragments_retained_count += 1
@@ -1601,6 +1610,7 @@ class ChemSpace:
                 result['salts_stripped'] = salts_stripped_count
                 result['fragments_retained'] = fragments_retained_count
                 result['cleanup_failures'] = cleanup_failures_count
+                result['cleanup_failures_smiles'] = cleanup_failures_smiles
 
             if result['success']:
                 self._compounds_loaded = True
@@ -1610,6 +1620,10 @@ class ChemSpace:
                 print(f"   📋 Table: {table_name}")
                 print(f"   📊 Compounds added: {result['compounds_added']}")
                 print(f"   🔄 Duplicates skipped: {result['duplicates_skipped']}")
+                if result.get('duplicate_smiles'):
+                    print(f"      Duplicate SMILES:")
+                    for _dup_smiles in result['duplicate_smiles']:
+                        print(f"      - {_dup_smiles}")
                 print(f"   ❌ Errors: {result['errors']}")
                 print(f"   📈 Total compounds in table '{table_name}': {table_count}")
                 if strip_salts:
@@ -1618,6 +1632,10 @@ class ChemSpace:
                     print(f"   🧩 Reduced to largest fragment: {result.get('fragments_retained', 0)}")
                 if result.get('cleanup_failures', 0):
                     print(f"   🚫 Dropped (unparseable SMILES): {result.get('cleanup_failures', 0)}")
+                    if result.get('cleanup_failures_smiles'):
+                        print(f"      Unparseable SMILES:")
+                        for _bad_smiles in result['cleanup_failures_smiles']:
+                            print(f"      - {_bad_smiles}")
 
                 # Automatically compute InChI keys if requested
                 if compute_inchi and result['compounds_added'] > 0:
@@ -2318,6 +2336,8 @@ class ChemSpace:
             compounds_added = 0
             duplicates_skipped = 0
             errors = 0
+            duplicate_smiles = []
+            error_smiles = []
 
             insert_query = f"""
             INSERT INTO {table_name} (smiles, name, flag, flag_description)
@@ -2338,32 +2358,39 @@ class ChemSpace:
                 except sqlite3.IntegrityError:
                     if skip_duplicates:
                         duplicates_skipped += 1
+                        duplicate_smiles.append(compound_data[0])
                     else:
                         errors += 1
+                        error_smiles.append(compound_data[0])
                 except Exception as e:
                     print(f"⚠️  Error inserting compound {compound_data[1]}: {e}")
                     errors += 1
+                    error_smiles.append(compound_data[0])
 
             conn.commit()
             conn.close()
-            
+
             return {
                 'success': True,
                 'message': f"Inserted {compounds_added} compounds successfully",
                 'compounds_added': compounds_added,
                 'duplicates_skipped': duplicates_skipped,
-                'errors': errors
+                'errors': errors,
+                'duplicate_smiles': duplicate_smiles,
+                'error_smiles': error_smiles
             }
-            
+
         except Exception as e:
             return {
                 'success': False,
                 'message': f"Database error: {e}",
                 'compounds_added': 0,
                 'duplicates_skipped': 0,
-                'errors': len(compounds_data)
+                'errors': len(compounds_data),
+                'duplicate_smiles': [],
+                'error_smiles': [compound_data[0] for compound_data in compounds_data]
             }
-    
+
     def get_compounds(self, table_name: Optional[str] = None,
                      limit: Optional[int] = None, 
                      flag_filter: Optional[str] = None,
@@ -5947,6 +5974,8 @@ plt.show()
             total_salts_stripped = 0
             total_fragments_retained = 0
             total_cleanup_failures = 0
+            total_cleanup_failures_smiles = []
+            total_duplicate_smiles = []
             processed_rows = 0
             
             # Initialize progress bar if tqdm is available
@@ -5994,10 +6023,11 @@ plt.show()
                     try:
                         # Process chunk result
                         chunk_start_time = time.time()
-                        compounds_data, chunk_salts_stripped, chunk_fragments_retained, chunk_cleanup_failures = future.result()
+                        compounds_data, chunk_salts_stripped, chunk_fragments_retained, chunk_cleanup_failures, chunk_cleanup_failures_smiles = future.result()
                         total_salts_stripped += chunk_salts_stripped
                         total_fragments_retained += chunk_fragments_retained
                         total_cleanup_failures += chunk_cleanup_failures
+                        total_cleanup_failures_smiles.extend(chunk_cleanup_failures_smiles)
                         chunk_process_time = time.time() - chunk_start_time
 
                         if compounds_data:
@@ -6005,11 +6035,12 @@ plt.show()
                             insert_start_time = time.time()
                             chunk_result = self._insert_compounds(compounds_data, table_name, skip_duplicates)
                             insert_time = time.time() - insert_start_time
-                            
+
                             if chunk_result['success']:
                                 total_compounds_added += chunk_result['compounds_added']
                                 total_duplicates_skipped += chunk_result['duplicates_skipped']
                                 total_errors += chunk_result['errors']
+                                total_duplicate_smiles.extend(chunk_result.get('duplicate_smiles', []))
                                 
                                 # Detailed chunk statistics (only show every 5th chunk to avoid spam)
                                 if not TQDM_AVAILABLE and (processed_chunks + 1) % 5 == 0:
@@ -6090,7 +6121,9 @@ plt.show()
                 'errors': total_errors,
                 'salts_stripped': total_salts_stripped,
                 'fragments_retained': total_fragments_retained,
-                'cleanup_failures': total_cleanup_failures
+                'cleanup_failures': total_cleanup_failures,
+                'cleanup_failures_smiles': total_cleanup_failures_smiles,
+                'duplicate_smiles': total_duplicate_smiles
             }
             
         except Exception as e:
@@ -6099,7 +6132,9 @@ plt.show()
                 'message': f"Parallel processing error: {e}",
                 'compounds_added': 0,
                 'duplicates_skipped': 0,
-                'errors': len(df)
+                'errors': len(df),
+                'cleanup_failures_smiles': [],
+                'duplicate_smiles': []
             }
     
     def _split_dataframe_into_chunks(self, df: pd.DataFrame, chunk_size: int) -> List[pd.DataFrame]:
