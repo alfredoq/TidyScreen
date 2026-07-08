@@ -842,6 +842,59 @@ elif page == "ChemSpace Actions":
                     st.session_state[_acf_overwrite_key] = False
                     st.rerun()
 
+        st.markdown("**Modify Filter**")
+        if not chem_filters:
+            st.caption("No filters available to modify.")
+        else:
+            _mcf_names = [name for _id, name, _smarts in chem_filters]
+            _mcf_selected_name = st.selectbox("Select filter to modify", _mcf_names, key="mcf_selected_filter")
+            _mcf_smarts_by_name = {name: smarts for _id, name, smarts in chem_filters}
+
+            _mcf_col1, _mcf_col2 = st.columns(2)
+            with _mcf_col1:
+                _mcf_new_name = st.text_input(
+                    "Filter name", value=_mcf_selected_name, key=f"mcf_new_name_{_mcf_selected_name}"
+                )
+            with _mcf_col2:
+                _mcf_new_smarts = st.text_input(
+                    "SMARTS pattern",
+                    value=_mcf_smarts_by_name.get(_mcf_selected_name, ""),
+                    key=f"mcf_new_smarts_{_mcf_selected_name}",
+                )
+
+            _mcf_overwrite_key = "mcf_confirm_overwrite"
+            if not st.session_state.get(_mcf_overwrite_key):
+                if st.button("Save Changes", key="btn_modify_chem_filter"):
+                    _mcf_result = tidyscreen.modify_chemical_filter_entry(
+                        _mcf_selected_name, _mcf_new_name, _mcf_new_smarts, overwrite=False
+                    )
+                    if _mcf_result["exists"]:
+                        st.session_state[_mcf_overwrite_key] = True
+                        st.rerun()
+                    elif _mcf_result["success"]:
+                        st.success(f"✅ {_mcf_result['message']}")
+                        st.rerun()
+                    else:
+                        st.error(f"❌ {_mcf_result['message']}")
+            else:
+                st.warning(f"⚠️ Filter '{_mcf_new_name}' already exists. Overwrite it?")
+                _mcf_oc1, _mcf_oc2 = st.columns(2)
+                with _mcf_oc1:
+                    if st.button("Yes, overwrite", key="btn_confirm_overwrite_modify_filter"):
+                        _mcf_result = tidyscreen.modify_chemical_filter_entry(
+                            _mcf_selected_name, _mcf_new_name, _mcf_new_smarts, overwrite=True
+                        )
+                        st.session_state[_mcf_overwrite_key] = False
+                        if _mcf_result["success"]:
+                            st.success(f"✅ {_mcf_result['message']}")
+                        else:
+                            st.error(f"❌ {_mcf_result['message']}")
+                        st.rerun()
+                with _mcf_oc2:
+                    if st.button("Cancel", key="btn_cancel_overwrite_modify_filter"):
+                        st.session_state[_mcf_overwrite_key] = False
+                        st.rerun()
+
     with st.expander("🛠️ Create Filtering Workflow"):
         if "cfw_filters" not in st.session_state:
             st.session_state["cfw_filters"] = {}

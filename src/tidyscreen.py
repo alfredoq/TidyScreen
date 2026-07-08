@@ -278,6 +278,100 @@ def add_chemical_filter_entry(filter_name, smarts_pattern, overwrite=False):
     except Exception as e:
         return {'success': False, 'message': f"Error adding chemical filter: {e}", 'exists': False}
 
+def modify_chemical_filter_entry(old_filter_name, new_filter_name, new_smarts_pattern, overwrite=False):
+    """
+    Modify an existing chemical filter entry in the chem_filters.json config
+    file and refresh the chem_filters table in the projects database.
+
+    Non-interactive core used by the Streamlit GUI to edit a filter's name
+    and/or SMARTS pattern in place.
+
+    Args:
+        old_filter_name (str): Name of the filter to modify.
+        new_filter_name (str): New name for the filter (may be unchanged).
+        new_smarts_pattern (str): New SMARTS pattern for the filter.
+        overwrite (bool): If True and new_filter_name collides with a
+            different, already-existing filter, replace that filter too. If
+            False and such a collision exists, no write happens and the
+            result's 'exists' flag is set so the caller can ask the user to
+            confirm before retrying with overwrite=True.
+
+    Returns:
+        dict: {'success': bool, 'message': str, 'exists': bool}
+    """
+    old_filter_name = (old_filter_name or "").strip()
+    new_filter_name = (new_filter_name or "").strip()
+    new_smarts_pattern = (new_smarts_pattern or "").strip()
+
+    if not old_filter_name:
+        return {'success': False, 'message': "No filter selected to modify.", 'exists': False}
+
+    if not new_filter_name:
+        return {'success': False, 'message': "Filter name cannot be empty.", 'exists': False}
+
+    if not new_smarts_pattern:
+        return {'success': False, 'message': "SMARTS pattern cannot be empty.", 'exists': False}
+
+    try:
+        config_path = os.path.join(os.path.dirname(__file__), 'config', 'chem_filters.json')
+
+        if os.path.exists(config_path):
+            with open(config_path, 'r', encoding='utf-8') as f:
+                filters_data = json.load(f)
+        else:
+            filters_data = []
+
+        existing_names = [f['filter_name'] for f in filters_data]
+        if old_filter_name not in existing_names:
+            return {
+                'success': False,
+                'message': f"Filter '{old_filter_name}' was not found in the configuration file.",
+                'exists': False,
+            }
+
+        # Renaming into a different, already-existing filter is a collision
+        name_changed = new_filter_name != old_filter_name
+        collides_with_other = name_changed and new_filter_name in existing_names
+        if collides_with_other and not overwrite:
+            return {
+                'success': False,
+                'message': f"Filter '{new_filter_name}' already exists in the configuration file.",
+                'exists': True,
+            }
+
+        # Remove the original entry, and the colliding entry if overwriting
+        filters_data = [f for f in filters_data if f['filter_name'] != old_filter_name]
+        if collides_with_other:
+            filters_data = [f for f in filters_data if f['filter_name'] != new_filter_name]
+
+        filters_data.append({"filter_name": new_filter_name, "smarts": new_smarts_pattern})
+        filters_data.sort(key=lambda x: x['filter_name'])
+
+        with open(config_path, 'w', encoding='utf-8') as f:
+            json.dump(filters_data, f, indent=2, ensure_ascii=False)
+
+        print(f"✅ Filter '{old_filter_name}' modified to '{new_filter_name}' in configuration file.")
+        print(f"📍 Updated file: {config_path}")
+
+        print("\n🔄 Refreshing filters in database...")
+        success = refresh_filters()
+
+        if success:
+            return {
+                'success': True,
+                'message': f"Chemical filter '{new_filter_name}' updated and database refreshed successfully!",
+                'exists': False,
+            }
+        else:
+            return {
+                'success': False,
+                'message': f"Filter '{new_filter_name}' was updated in configuration but database update failed.",
+                'exists': False,
+            }
+
+    except Exception as e:
+        return {'success': False, 'message': f"Error modifying chemical filter: {e}", 'exists': False}
+
 def add_chemical_filter():
     """
     Add a new chemical filter by prompting user for input.
