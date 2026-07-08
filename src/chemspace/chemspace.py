@@ -324,48 +324,51 @@ def _compute_morgan_fingerprints_worker(chunk_data: List[Tuple[int, str, str]], 
 
     return results
 
-def _filter_chunk_worker_by_instances(chunk_data: List[Tuple], filters_list: List[Tuple]) -> List[Dict]:
+def _filter_chunk_worker_by_instances(chunk_data: List[Tuple], filters_list: List[Tuple]) -> Tuple[List[Dict], Dict[int, int]]:
     """
     Memory-optimized version that only returns essential data.
+
+    Every filter is evaluated for every compound (no early exit), so that
+    compounds excluded overall (because they failed at least one filter) can
+    still be checked against each *other* filter individually.
+
+    Returns:
+        Tuple[List[Dict], Dict[int, int]]: (passing compounds, removed_matching_counts)
+            where removed_matching_counts maps filter index (position in
+            `filters_list`) to the number of compounds in this chunk that were
+            removed overall but still matched that particular filter.
     """
     try:
         from rdkit import Chem, RDLogger
         RDLogger.DisableLog('rdApp.*')
     except ImportError:
-        return [{"error": "RDKit not available"}]
-    
+        return [{"error": "RDKit not available"}], {}
+
     results = []
-    sorted_filters = sorted(filters_list, key=lambda x: (x[1] == 0, x[1]))
-    
+    removed_matching_counts = {i: 0 for i in range(len(filters_list))}
+    compiled_filters = [(Chem.MolFromSmarts(smarts_pattern), required_instances)
+                        for smarts_pattern, required_instances in filters_list]
+
     for compound_id, smiles, name, flag, inchi_key in chunk_data:
         try:
             mol = Chem.MolFromSmiles(smiles)
             if mol is None:
                 continue  # Skip invalid compounds entirely
-            
-            passes_all_filters = True
-            
-            # Apply filters with early termination but minimal metadata
-            for smarts_pattern, required_instances in sorted_filters:
+
+            filter_matches = []
+            for pattern, required_instances in compiled_filters:
+                if pattern is None:
+                    filter_matches.append(False)
+                    continue
+
                 try:
-                    pattern = Chem.MolFromSmarts(smarts_pattern)
-                    if pattern is None:
-                        passes_all_filters = False
-                        break
-                    
-                    matches = mol.GetSubstructMatches(pattern)
-                    match_count = len(matches)
-                    
-                    if match_count != required_instances:
-                        passes_all_filters = False
-                        break  # Early exit - don't process more filters
-                        
+                    match_count = len(mol.GetSubstructMatches(pattern))
+                    filter_matches.append(match_count == required_instances)
                 except Exception:
-                    passes_all_filters = False
-                    break
-            
+                    filter_matches.append(False)
+
             # Only store compounds that pass ALL filters
-            if passes_all_filters:
+            if all(filter_matches):
                 results.append({
                     'id': compound_id,
                     'smiles': smiles,
@@ -374,11 +377,15 @@ def _filter_chunk_worker_by_instances(chunk_data: List[Tuple], filters_list: Lis
                     'inchi_key': inchi_key
                     # Remove all the heavy metadata
                 })
+            else:
+                for filter_idx, matched in enumerate(filter_matches):
+                    if matched:
+                        removed_matching_counts[filter_idx] += 1
 
         except Exception:
             continue  # Skip problematic compounds
 
-    return results
+    return results, removed_matching_counts
 
 def _filter_chunk_worker_by_descriptor_bounds(chunk_data: List[Tuple], descriptor_filters: List[Tuple]) -> Tuple[List[Dict], Dict[str, int]]:
     """
@@ -6248,29 +6255,43 @@ plt.show()
                 print(f"      👥 Workers: {max_workers}")
                 print(f"      📦 Chunk size: {chunk_size:,}")
             
-                filtered_df = self._apply_filters_parallel(
+                filtered_df, removed_matching_counts = self._apply_filters_parallel(
                     compounds_df, workflow_filters, max_workers, chunk_size,
                     progress_callback=progress_callback
                 )
             else:
                 print(f"   🔄 Using sequential processing")
-                filtered_df = self._apply_filters_sequential(
+                filtered_df, removed_matching_counts = self._apply_filters_sequential(
                     compounds_df, workflow_filters, progress_callback=progress_callback
                 )
-            
+
             if filtered_df.empty:
                 print("❌ No compounds passed the filtering workflow")
                 return pd.DataFrame()
-            
+
             # Calculate statistics
             compounds_removed = total_compounds - len(filtered_df)
             retention_rate = (len(filtered_df) / total_compounds) * 100
-            
+
             print(f"\n📊 Filtering Results:")
+            print(f"   📥 Compounds evaluated: {total_compounds:,}")
             print(f"   ✅ Compounds passed: {len(filtered_df):,}")
             print(f"   ❌ Compounds removed: {compounds_removed:,}")
             print(f"   📈 Retention rate: {retention_rate:.2f}%")
-            
+
+            # Per-filter breakdown: since the workflow requires ALL filters to
+            # match (AND logic), every passed compound matches every filter by
+            # definition. The informative number is how many of the *removed*
+            # compounds still individually matched each filter (i.e. they were
+            # excluded only because of a *different* filter in the workflow).
+            print(f"\n📊 Per-filter match breakdown:")
+            for i, (filter_smarts, required_instances) in enumerate(workflow_filters):
+                key = keys[i] if i < len(keys) else f"unknown_key_{i+1}"
+                removed_matching = removed_matching_counts.get(i, 0)
+                print(f"   {i+1}. {key} (requires {required_instances} match(es)):")
+                print(f"      ✅ Matching within passed compounds: {len(filtered_df):,}/{len(filtered_df):,}")
+                print(f"      ⚠️  Matching within removed compounds: {removed_matching:,}/{compounds_removed:,}")
+
             # Prompt for save_results if not provided
             if save_results is None:
                 save_choice = input("\n💾 Do you want to save the filtered results to a new table? (y/n): ").strip().lower()
@@ -6767,9 +6788,15 @@ plt.show()
     def _apply_filters_parallel(self, compounds_df: pd.DataFrame,
                                     workflow_filters: List[Tuple[str, str]],
                                     max_workers: int, chunk_size: int,
-                                    progress_callback: Optional[Callable[[int, int], None]] = None) -> pd.DataFrame:
+                                    progress_callback: Optional[Callable[[int, int], None]] = None) -> Tuple[pd.DataFrame, Dict[int, int]]:
         """
         Ultra-memory-efficient version that streams results to temporary files with progress tracking.
+
+        Returns:
+            Tuple[pd.DataFrame, Dict[int, int]]: (filtered compounds, removed_matching_counts)
+                where removed_matching_counts maps filter index (position in
+                `workflow_filters`) to the number of compounds that were removed
+                overall but still matched that particular filter.
         """
         import tempfile
         import os
@@ -6807,7 +6834,8 @@ plt.show()
             
             total_passed = 0
             processed_chunks = 0
-            
+            removed_matching_counts = {i: 0 for i in range(len(workflow_filters))}
+
             print(f"   📦 Processing {len(chunks)} chunks with {max_workers} workers...")
             
             with ProcessPoolExecutor(max_workers=max_workers) as executor:
@@ -6838,7 +6866,7 @@ plt.show()
                             chunk_idx = future_to_chunk.pop(future)
 
                             try:
-                                chunk_results = future.result()
+                                chunk_results, chunk_removed_matching_counts = future.result()
 
                                 # Write results immediately to disk
                                 chunk_passed = 0
@@ -6848,7 +6876,10 @@ plt.show()
                                         result['flag'], result.get('inchi_key', '')
                                     ])
                                     chunk_passed += 1
-                                
+
+                                for filter_idx, count in chunk_removed_matching_counts.items():
+                                    removed_matching_counts[filter_idx] = removed_matching_counts.get(filter_idx, 0) + count
+
                                 total_passed += chunk_passed
                                 processed_chunks += 1
                                 
@@ -6905,7 +6936,7 @@ plt.show()
                     result_df = pd.read_csv(temp_file)
                 
                 print(f"   ✅ Successfully loaded {len(result_df)} filtered compounds")
-                return result_df
+                return result_df, removed_matching_counts
             finally:
                 # Clean up temporary files
                 try:
@@ -6916,13 +6947,23 @@ plt.show()
                     
         except Exception as e:
             print(f"❌ Error in streaming parallel filtering: {e}")
-            return pd.DataFrame()
+            return pd.DataFrame(), {}
    
     def _apply_filters_sequential(self, compounds_df: pd.DataFrame,
                                 workflow_filters: List[Tuple[str, str]],
-                                progress_callback: Optional[Callable[[int, int], None]] = None) -> pd.DataFrame:
+                                progress_callback: Optional[Callable[[int, int], None]] = None) -> Tuple[pd.DataFrame, Dict[int, int]]:
         """
         Apply SMARTS filters using sequential processing with enhanced progress tracking.
+
+        Every filter is evaluated for every compound (no early exit), so that
+        compounds excluded overall can still be checked against each *other*
+        filter individually.
+
+        Returns:
+            Tuple[pd.DataFrame, Dict[int, int]]: (filtered compounds, removed_matching_counts)
+                where removed_matching_counts maps filter index (position in
+                `workflow_filters`) to the number of compounds that were removed
+                overall but still matched that particular filter.
         """
         # Import tqdm locally
         try:
@@ -6941,14 +6982,13 @@ plt.show()
             processed_count = 0
             compounds_passed = 0
             callback_interval = max(1, total_compounds // 100)
+            removed_matching_counts = {i: 0 for i in range(len(workflow_filters))}
 
-            # Apply filters requiring at least one match first to narrow the
-            # candidate set before running the (typically costlier) zero-instance
-            # exclusion filters, same ordering as the parallel path.
-            indexed_filters = list(enumerate(workflow_filters))
-            sorted_indexed_filters = sorted(
-                indexed_filters, key=lambda item: (item[1][1] == 0, item[1][1])
-            )
+            # Precompile SMARTS patterns once, instead of once per compound.
+            compiled_filters = [
+                (filter_idx, Chem.MolFromSmarts(smarts_pattern), required_instances)
+                for filter_idx, (smarts_pattern, required_instances) in enumerate(workflow_filters)
+            ]
 
             print(f"   🔄 Processing {total_compounds:,} compounds sequentially...")
             
@@ -6968,35 +7008,32 @@ plt.show()
             
             for _, compound in progress_bar:
                 processed_count += 1
-                passes_all_filters = True
                 match_counts = {}
-                
+                filter_matches = {}
+
                 try:
                     mol = Chem.MolFromSmiles(compound['smiles'])
                     if mol is None:
                         continue
-                    
+
                     # Apply each filter: compound must match each SMARTS exactly
                     # `required_instances` times (same semantics as the parallel path).
-                    for filter_idx, (smarts_pattern, required_instances) in sorted_indexed_filters:
+                    # Every filter is checked (no early exit) so removed compounds
+                    # can still be attributed a match against each other filter.
+                    for filter_idx, pattern, required_instances in compiled_filters:
+                        if pattern is None:
+                            filter_matches[filter_idx] = False
+                            continue
+
                         try:
-                            pattern = Chem.MolFromSmarts(smarts_pattern)
-                            if pattern is None:
-                                passes_all_filters = False
-                                break
-
-                            matches = mol.GetSubstructMatches(pattern)
-                            match_count = len(matches)
+                            match_count = len(mol.GetSubstructMatches(pattern))
                             match_counts[f"filter_{filter_idx}_matches"] = match_count
-
-                            if match_count != required_instances:
-                                passes_all_filters = False
-                                break
-
+                            filter_matches[filter_idx] = (match_count == required_instances)
                         except Exception:
-                            passes_all_filters = False
-                            break
-                    
+                            filter_matches[filter_idx] = False
+
+                    passes_all_filters = all(filter_matches.values())
+
                     if passes_all_filters:
                         compound_data = {
                             'smiles': compound['smiles'],
@@ -7007,7 +7044,11 @@ plt.show()
                         compound_data.update(match_counts)
                         filtered_compounds.append(compound_data)
                         compounds_passed += 1
-                
+                    else:
+                        for filter_idx, matched in filter_matches.items():
+                            if matched:
+                                removed_matching_counts[filter_idx] += 1
+
                 except Exception:
                     continue
                 
@@ -7030,12 +7071,12 @@ plt.show()
             final_retention_rate = (len(filtered_compounds) / total_compounds) * 100 if total_compounds > 0 else 0
             print(f"   ✅ Sequential processing completed")
             print(f"   📊 Final results: {len(filtered_compounds):,}/{total_compounds:,} compounds passed ({final_retention_rate:.2f}%)")
-            
-            return pd.DataFrame(filtered_compounds)
-            
+
+            return pd.DataFrame(filtered_compounds), removed_matching_counts
+
         except Exception as e:
             print(f"❌ Error in sequential filtering: {e}")
-            return pd.DataFrame()
+            return pd.DataFrame(), {}
 
     def _save_workflow_filtered_compounds(self, compounds_df: pd.DataFrame, 
                                     new_table_name: str, 
