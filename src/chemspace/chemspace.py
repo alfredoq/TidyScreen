@@ -14598,12 +14598,12 @@ plt.show()
                 return None
             
             print(f"\n🔬 SELECT REACTION WORKFLOW FOR APPLICATION")
-            print("=" * 70)
+            print("=" * 95)
             print(f"Available workflows ({len(workflows)} total):")
-            print("-" * 70)
-            print(f"{'#':<3} {'Workflow Name':<25} {'Reactions':<10} {'Created':<12} {'Description':<20}")
-            print("-" * 70)
-            
+            print("-" * 95)
+            print(f"{'#':<3} {'Workflow Name':<50} {'Reactions':<10} {'Created':<12} {'Description':<20}")
+            print("-" * 95)
+
             workflow_info = []
             for i, (wf_id, name, date, desc, reactions_dict_str) in enumerate(workflows, 1):
                 try:
@@ -14611,14 +14611,14 @@ plt.show()
                     reaction_count = len(reactions_dict)
                 except json.JSONDecodeError:
                     reaction_count = 0
-                
+
                 date_short = date[:10] if date else "Unknown"
-                name_display = name[:24] if len(name) <= 24 else name[:21] + "..."
+                name_display = name[:49] if len(name) <= 49 else name[:46] + "..."
                 desc_display = (desc or "No description")[:19]
                 if len(desc_display) > 19:
                     desc_display = desc_display[:16] + "..."
-                
-                print(f"{i:<3} {name_display:<25} {reaction_count:<10} {date_short:<12} {desc_display:<20}")
+
+                print(f"{i:<3} {name_display:<50} {reaction_count:<10} {date_short:<12} {desc_display:<20}")
                 workflow_info.append({
                     'id': wf_id,
                     'name': name,
@@ -14626,8 +14626,8 @@ plt.show()
                     'description': desc or "No description",
                     'date': date
                 })
-            
-            print("-" * 70)
+
+            print("-" * 95)
             print("Commands: Enter workflow number, workflow name, 'list' for details, or 'cancel' to abort")
             
             while True:

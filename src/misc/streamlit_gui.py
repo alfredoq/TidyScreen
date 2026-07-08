@@ -1551,6 +1551,36 @@ elif page == "ChemSpace Actions":
                     st.session_state[_acr_overwrite_key] = False
                     st.rerun()
 
+        st.markdown("**Delete chemical reaction**")
+        if not chem_reactions:
+            st.button("🗑️ Delete Reaction", key="btn_delete_cr", disabled=True,
+                       help="No chemical reactions available to delete.")
+        else:
+            dcr_reaction_names = [name for _, name, _ in chem_reactions]
+            dcr_selected_name = st.selectbox("Reaction to delete", dcr_reaction_names, key="dcr_selected_reaction")
+
+            _del_cr_key = f"confirm_delete_cr_{dcr_selected_name}"
+            if not st.session_state.get(_del_cr_key):
+                if st.button("🗑️ Delete Reaction", key="btn_delete_cr"):
+                    st.session_state[_del_cr_key] = True
+                    st.rerun()
+            else:
+                st.warning(f"Delete chemical reaction **{dcr_selected_name}**?")
+                _dcr_c1, _dcr_c2 = st.columns(2)
+                with _dcr_c1:
+                    if st.button("Yes, delete", key=f"btn_confirm_delete_cr_{dcr_selected_name}"):
+                        _dcr_result = tidyscreen.delete_chemical_reaction_entry(dcr_selected_name)
+                        st.session_state[_del_cr_key] = False
+                        if _dcr_result["success"]:
+                            st.success(f"✅ {_dcr_result['message']}")
+                        else:
+                            st.error(f"❌ {_dcr_result['message']}")
+                        st.rerun()
+                with _dcr_c2:
+                    if st.button("Cancel", key=f"btn_cancel_delete_cr_{dcr_selected_name}"):
+                        st.session_state[_del_cr_key] = False
+                        st.rerun()
+
     with st.expander("🛠️ Create Reactions Workflow"):
         if "crw_reactions" not in st.session_state:
             st.session_state["crw_reactions"] = {}

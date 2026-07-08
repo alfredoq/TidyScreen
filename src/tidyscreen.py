@@ -505,6 +505,56 @@ def add_chemical_reaction_entry(reaction_name, smarts_pattern, overwrite=False):
     except Exception as e:
         return {'success': False, 'message': f"Error adding chemical reaction: {e}", 'exists': False}
 
+def delete_chemical_reaction_entry(reaction_name):
+    """
+    Delete a chemical reaction entry from the chem_reactions.json config file
+    and from the chem_reactions table in the projects database.
+
+    Non-interactive core meant for the Streamlit GUI. refresh_chem_reactions()
+    is additive-only (it never removes rows absent from the JSON file), so the
+    database row is deleted explicitly here rather than relying on a refresh.
+
+    Args:
+        reaction_name (str): Name of the reaction to delete.
+
+    Returns:
+        dict: {'success': bool, 'message': str}
+    """
+    reaction_name = (reaction_name or "").strip()
+
+    if not reaction_name:
+        return {'success': False, 'message': "Reaction name cannot be empty."}
+
+    try:
+        config_path = os.path.join(os.path.dirname(__file__), 'config', 'chem_reactions.json')
+
+        if os.path.exists(config_path):
+            with open(config_path, 'r', encoding='utf-8') as f:
+                reactions_data = json.load(f)
+        else:
+            reactions_data = []
+
+        if not any(f['reaction_name'] == reaction_name for f in reactions_data):
+            return {'success': False, 'message': f"Reaction '{reaction_name}' not found in configuration file."}
+
+        reactions_data = [f for f in reactions_data if f['reaction_name'] != reaction_name]
+
+        with open(config_path, 'w', encoding='utf-8') as f:
+            json.dump(reactions_data, f, indent=2, ensure_ascii=False)
+
+        projects_db = f"{site.getsitepackages()[0]}/tidyscreen/projects_db/projects_database.db"
+        if os.path.exists(projects_db):
+            conn = sqlite3.connect(projects_db)
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM chem_reactions WHERE reaction_name = ?", (reaction_name,))
+            conn.commit()
+            conn.close()
+
+        return {'success': True, 'message': f"Chemical reaction '{reaction_name}' deleted successfully."}
+
+    except Exception as e:
+        return {'success': False, 'message': f"Error deleting chemical reaction: {e}"}
+
 def add_chemical_reaction():
     """
     Add a new chemical reaction by prompting user for input.
