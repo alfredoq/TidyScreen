@@ -511,12 +511,21 @@ def _process_bimolecular_chunk_worker(chunk_data: List[Tuple], reaction_smarts: 
                         'product_possibilities': len(reaction_results),
                     })
 
-                # Process products
+                # Process products. When a reactant pair matches at more than one
+                # site (ambiguous), different product_sets can yield the exact same
+                # product structure (e.g. a symmetric reactant reacting at either of
+                # two equivalent groups) -- dedupe by canonical SMILES within this
+                # pair so the same product isn't written to the database twice.
+                seen_product_smiles = set()
                 for product_set_idx, product_set in enumerate(reaction_results):
                     for product_idx, product_mol in enumerate(product_set):
                         try:
                             Chem.SanitizeMol(product_mol)
                             product_smiles = Chem.MolToSmiles(product_mol)
+
+                            if product_smiles in seen_product_smiles:
+                                continue
+                            seen_product_smiles.add(product_smiles)
 
                             # Generate product name
                             primary_name = primary_compound.get('name', f"cpd_{primary_compound.get('id', 'unk')}")
@@ -600,12 +609,21 @@ def _process_unimolecular_chunk_worker(chunk_data: List[Dict], reaction_smarts: 
                         'product_possibilities': len(reaction_results),
                     })
 
-                # Process products
+                # Process products. When a reactant matches at more than one site
+                # (ambiguous), different product_sets can yield the exact same
+                # product structure (e.g. a symmetric reactant reacting at either of
+                # two equivalent groups) -- dedupe by canonical SMILES within this
+                # reactant so the same product isn't written to the database twice.
+                seen_product_smiles = set()
                 for product_set_idx, product_set in enumerate(reaction_results):
                     for product_idx, product_mol in enumerate(product_set):
                         try:
                             Chem.SanitizeMol(product_mol)
                             product_smiles = Chem.MolToSmiles(product_mol)
+
+                            if product_smiles in seen_product_smiles:
+                                continue
+                            seen_product_smiles.add(product_smiles)
 
                             # Generate product name
                             original_name = compound.get('name', f"cpd_{compound.get('id', 'unk')}")
@@ -699,12 +717,22 @@ def _process_bimolecular_chunk_to_file_worker(chunk_data: List[Tuple], reaction_
                             'product_possibilities': len(reaction_results),
                         })
 
-                    # Process products and write immediately
+                    # Process products and write immediately. When a reactant pair
+                    # matches at more than one site (ambiguous), different
+                    # product_sets can yield the exact same product structure
+                    # (e.g. a symmetric reactant reacting at either of two
+                    # equivalent groups) -- dedupe by canonical SMILES within this
+                    # pair so the same product isn't written to the database twice.
+                    seen_product_smiles = set()
                     for product_set_idx, product_set in enumerate(reaction_results):
                         for product_idx, product_mol in enumerate(product_set):
                             try:
                                 Chem.SanitizeMol(product_mol)
                                 product_smiles = Chem.MolToSmiles(product_mol)
+
+                                if product_smiles in seen_product_smiles:
+                                    continue
+                                seen_product_smiles.add(product_smiles)
 
                                 # Generate product name
                                 primary_name = primary_compound.get('name', f"cpd_{primary_compound.get('id', 'unk')}")
@@ -798,12 +826,22 @@ def _process_unimolecular_chunk_to_file_worker(chunk_data: List[Dict], reaction_
                             'product_possibilities': len(reaction_results),
                         })
 
-                    # Process products and write immediately
+                    # Process products and write immediately. When a reactant
+                    # matches at more than one site (ambiguous), different
+                    # product_sets can yield the exact same product structure
+                    # (e.g. a symmetric reactant reacting at either of two
+                    # equivalent groups) -- dedupe by canonical SMILES within this
+                    # reactant so the same product isn't written to the database twice.
+                    seen_product_smiles = set()
                     for product_set_idx, product_set in enumerate(reaction_results):
                         for product_idx, product_mol in enumerate(product_set):
                             try:
                                 Chem.SanitizeMol(product_mol)
                                 product_smiles = Chem.MolToSmiles(product_mol)
+
+                                if product_smiles in seen_product_smiles:
+                                    continue
+                                seen_product_smiles.add(product_smiles)
 
                                 # Generate product name
                                 original_name = compound.get('name', f"cpd_{compound.get('id', 'unk')}")
@@ -12599,18 +12637,28 @@ plt.show()
                                     'product_possibilities': len(reaction_results),
                                 })
 
-                        # Process products
+                        # Process products. When a reactant pair matches at more
+                        # than one site (ambiguous), different product_sets can
+                        # yield the exact same product structure (e.g. a symmetric
+                        # reactant reacting at either of two equivalent groups) --
+                        # dedupe by canonical SMILES within this pair so the same
+                        # product isn't written to the database twice.
+                        seen_product_smiles = set()
                         for product_set_idx, product_set in enumerate(reaction_results):
                             for product_idx, product_mol in enumerate(product_set):
                                 try:
                                     Chem.SanitizeMol(product_mol)
                                     product_smiles = Chem.MolToSmiles(product_mol)
-                                    
+
+                                    if product_smiles in seen_product_smiles:
+                                        continue
+                                    seen_product_smiles.add(product_smiles)
+
                                     # Generate product name
                                     primary_name = primary_compound.get('name', f"cpd_{primary_compound.get('id', 'unk')}")
                                     secondary_name = secondary_compound.get('name', f"cpd_{secondary_compound.get('id', 'unk')}")
                                     product_name = f"{primary_name}+{secondary_name}_{reaction_name}_{product_set_idx}_{product_idx}"
-                                    
+
                                     products.append({
                                         'smiles': product_smiles,
                                         'name': product_name,
@@ -12623,7 +12671,7 @@ plt.show()
                                         'workflow': workflow_name
                                     })
                                     successful_reactions += 1
-                                    
+
                                 except Exception:
                                     continue  # Skip invalid products
                                     
@@ -12722,17 +12770,27 @@ plt.show()
                                 'product_possibilities': len(reaction_results),
                             })
 
-                    # Process products
+                    # Process products. When a reactant matches at more than one
+                    # site (ambiguous), different product_sets can yield the exact
+                    # same product structure (e.g. a symmetric reactant reacting at
+                    # either of two equivalent groups) -- dedupe by canonical SMILES
+                    # within this reactant so the same product isn't written to the
+                    # database twice.
+                    seen_product_smiles = set()
                     for product_set_idx, product_set in enumerate(reaction_results):
                         for product_idx, product_mol in enumerate(product_set):
                             try:
                                 Chem.SanitizeMol(product_mol)
                                 product_smiles = Chem.MolToSmiles(product_mol)
-                                
+
+                                if product_smiles in seen_product_smiles:
+                                    continue
+                                seen_product_smiles.add(product_smiles)
+
                                 # Generate product name
                                 original_name = compound.get('name', f"cpd_{compound.get('id', 'unk')}")
                                 product_name = f"{name_prefix}{original_name}_{reaction_name}_{product_set_idx}_{product_idx}"
-                                
+
                                 products.append({
                                     'smiles': product_smiles,
                                     'name': product_name,
@@ -12743,7 +12801,7 @@ plt.show()
                                     'workflow': workflow_name
                                 })
                                 successful_reactions += 1
-                                
+
                             except Exception:
                                 continue  # Skip invalid products
                                 
