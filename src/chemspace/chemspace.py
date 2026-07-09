@@ -915,7 +915,48 @@ class ChemSpace:
         # Track loaded compounds
         self._compounds_loaded = False
         self._total_compounds = 0
-    
+
+    @staticmethod
+    def _prompt(message):
+        """
+        Clipboard-safe replacement for input() for prompts that contain emoji.
+
+        Problems with plain input(emoji_prompt):
+        1. Bracketed-paste mode: terminals wrap pasted text with ESC[200~/ESC[201~
+           which appear as literal characters when readline does not strip them.
+        2. Emoji in the prompt string: readline counts each emoji as 1 column but
+           they render as 2, so its cursor model drifts — backspace and arrow keys
+           land in the wrong position.
+        3. Writing terminal escape sequences (e.g. \\x1b[?2004l) to stdout before
+           input() can interfere with readline's own terminal initialisation and
+           prevent it from recognising arrow-key sequences, causing ^[[D etc. to
+           be inserted as literal text.
+
+        Fix:
+        - Print the emoji-containing message on its own line so the cursor is at
+          column 0 before readline starts, giving it an accurate starting position.
+        - Use readline.parse_and_bind() to suppress the bracketed-paste sentinels
+          inside readline itself rather than fighting the terminal directly.
+          This keeps readline's terminal setup intact and arrow keys work normally.
+        - Strip any residual escape sequences from the result as a safety net.
+        """
+        import re as _re
+        print(message)
+        try:
+            import readline as _rl
+            # readline ≥ 8.1 exposes this variable directly; fall back to
+            # binding the two sentinel sequences to a no-op on older versions.
+            try:
+                _rl.parse_and_bind('set enable-bracketed-paste off')
+            except Exception:
+                _rl.parse_and_bind(r'"\e[200~": ""')
+                _rl.parse_and_bind(r'"\e[201~": ""')
+        except ImportError:
+            pass  # no readline — residual-strip below is the only defence
+        raw = input('> ')
+        raw = _re.sub(r'\x1b\[\d+~', '', raw)
+        return raw.strip()
+
     def _initialize_chemspace_database(self) -> bool:
         """
         Initialize the chemspace SQLite database file.
@@ -6398,11 +6439,11 @@ plt.show()
                 # Prompt for table name if not provided
                 if result_table_name is None:
                     default_name = f"{table_name}_filtered_{workflow_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-                    user_table_name = input(f"📝 Enter table name for results (default: {default_name}): ").strip()
+                    user_table_name = self._prompt(f"📝 Enter table name for results (default: {default_name}):")
                     result_table_name = user_table_name if user_table_name else default_name
-                
+
                 print(f"   💾 Saving filtered results to '{result_table_name}'...")
-                
+
                 # Create filter results summary for metadata
                 filter_results = {
                     'workflow_name': workflow_name,
