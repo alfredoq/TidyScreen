@@ -1764,6 +1764,158 @@ elif page == "ChemSpace Actions":
                         st.session_state[_del_rw_key] = False
                         st.rerun()
 
+        st.markdown("**Duplicate reactions workflow**")
+        if not reaction_workflows:
+            st.button("📄 Duplicate Workflow", key="btn_duplicate_rw", disabled=True,
+                       help="No reaction workflows available to duplicate.")
+        else:
+            durw_workflow_names = [w["workflow_name"] for w in reaction_workflows]
+            durw_selected_name = st.selectbox("Workflow to duplicate", durw_workflow_names, key="durw_selected_workflow")
+            durw_selected_wf = next(w for w in reaction_workflows if w["workflow_name"] == durw_selected_name)
+            durw_new_name = st.text_input(
+                "New workflow name", value=f"{durw_selected_name}_copy", key=f"durw_new_name_{durw_selected_name}"
+            )
+
+            durw_disabled = not durw_new_name.strip()
+            if st.button("📄 Duplicate Workflow", key="btn_duplicate_rw", disabled=durw_disabled):
+                durw_result = ChemSpace.save_reaction_workflow(
+                    chemspace_db_path, durw_new_name.strip(), durw_selected_wf["reactions_dict"],
+                    durw_selected_wf["description"], overwrite=False
+                )
+                if durw_result["success"]:
+                    st.success(f"Duplicated workflow '{durw_selected_name}' as '{durw_result['workflow_name']}' "
+                               f"({durw_result['reaction_count']} steps).")
+                    st.rerun()
+                else:
+                    st.error(durw_result["message"])
+
+    with st.expander("✏️ Edit Chemical Reaction Workflow"):
+        chemspace_db_path = os.path.join(st.session_state["active_project_path"], "chemspace", "processed_data", "chemspace.db")
+        erw_workflows = ChemSpace.get_reaction_workflows(chemspace_db_path)
+
+        if not erw_workflows:
+            st.info("No saved reaction workflows found. Create one first.")
+        else:
+            erw_workflow_names = [w["workflow_name"] for w in erw_workflows]
+            erw_selected_name = st.selectbox("Select workflow to edit", erw_workflow_names, key="erw_selected_workflow")
+            erw_selected_wf = next(w for w in erw_workflows if w["workflow_name"] == erw_selected_name)
+
+            if st.session_state.get("erw_loaded_workflow") != erw_selected_name:
+                erw_loaded_reactions = {}
+                for erw_step_key, erw_step_info in erw_selected_wf["reactions_dict"].items():
+                    erw_step = dict(erw_step_info)
+                    if erw_step.get("type") != "merge":
+                        erw_step["reaction_id"] = erw_step_key
+                    erw_loaded_reactions[erw_step_info["name"]] = erw_step
+                st.session_state["erw_reactions"] = erw_loaded_reactions
+                st.session_state["erw_loaded_workflow"] = erw_selected_name
+
+            erw_all_reactions = tidyscreen.get_chemical_reactions()
+
+            if not erw_all_reactions:
+                st.info("No chemical reactions found in database. Add some first.")
+            else:
+                erw_reactions_by_name = {name: (reaction_id, smarts) for reaction_id, name, smarts in erw_all_reactions}
+                erw_available_names = [name for name in erw_reactions_by_name if name not in st.session_state["erw_reactions"]]
+
+                st.markdown("**Add a reaction to the workflow**")
+                erw_col1, erw_col2 = st.columns([3, 1])
+                with erw_col1:
+                    erw_selected_reaction = st.selectbox(
+                        "Reaction", erw_available_names, key="erw_selected_reaction"
+                    ) if erw_available_names else None
+                with erw_col2:
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    if st.button("Add Reaction", key="btn_erw_add_reaction", disabled=not erw_available_names):
+                        erw_reaction_id, erw_smarts = erw_reactions_by_name[erw_selected_reaction]
+                        if ChemSpace._validate_reaction_smarts_pattern(erw_smarts):
+                            st.session_state["erw_reactions"][erw_selected_reaction] = {
+                                "type": "reaction",
+                                "reaction_id": erw_reaction_id,
+                                "smarts": erw_smarts,
+                                "order": len(st.session_state["erw_reactions"]) + 1,
+                            }
+                            st.rerun()
+                        else:
+                            st.error(f"Invalid SMARTS pattern for reaction '{erw_selected_reaction}'")
+
+            st.markdown("**Add a table-merge step**")
+            st.caption("Combines two tables (e.g. a product table with an existing one) into one, "
+                       "usable as input for later reaction or merge steps. The two tables are chosen "
+                       "when the workflow is applied.")
+            erw_merge_col1, erw_merge_col2 = st.columns([3, 1])
+            with erw_merge_col1:
+                erw_merge_label = st.text_input(
+                    "Merge step label (optional)", key="erw_merge_label"
+                )
+            with erw_merge_col2:
+                st.markdown("<br>", unsafe_allow_html=True)
+                if st.button("Add Merge Step", key="btn_erw_add_merge"):
+                    erw_order = len(st.session_state["erw_reactions"]) + 1
+                    erw_label = erw_merge_label.strip() or f"Merge tables #{erw_order}"
+                    erw_step_key = erw_label
+                    erw_suffix = 1
+                    while erw_step_key in st.session_state["erw_reactions"]:
+                        erw_suffix += 1
+                        erw_step_key = f"{erw_label} ({erw_suffix})"
+                    st.session_state["erw_reactions"][erw_step_key] = {
+                        "type": "merge",
+                        "order": erw_order,
+                    }
+                    st.rerun()
+
+            st.markdown("**Current workflow parameters**")
+            if st.session_state["erw_reactions"]:
+                erw_df = pd.DataFrame([
+                    {
+                        "Order": info["order"],
+                        "Step Name": name,
+                        "Type": info.get("type", "reaction"),
+                        "SMARTS": info.get("smarts", "—"),
+                    }
+                    for name, info in sorted(
+                        st.session_state["erw_reactions"].items(), key=lambda kv: kv[1]["order"]
+                    )
+                ])
+                st.dataframe(erw_df, use_container_width=True, hide_index=True)
+
+                erw_remove_name = st.selectbox(
+                    "Remove a step", list(st.session_state["erw_reactions"].keys()), key="erw_remove_reaction"
+                )
+                if st.button("Remove Step", key="btn_erw_remove_reaction"):
+                    del st.session_state["erw_reactions"][erw_remove_name]
+                    st.rerun()
+            else:
+                st.warning("No steps remaining in this workflow. Add at least one before saving.")
+
+            st.markdown("**Save changes**")
+            erw_description = st.text_area(
+                "Description", value=erw_selected_wf["description"] or "",
+                key=f"erw_description_input_{erw_selected_name}"
+            )
+
+            erw_save_disabled = not st.session_state["erw_reactions"]
+            if st.button("Save Changes", key="btn_erw_save", disabled=erw_save_disabled):
+                erw_workflow_reactions = {}
+                for erw_name, erw_info in st.session_state["erw_reactions"].items():
+                    if erw_info.get("type") == "merge":
+                        erw_workflow_reactions[f"merge_{erw_info['order']}"] = {
+                            "type": "merge", "name": erw_name, "order": erw_info["order"],
+                        }
+                    else:
+                        erw_workflow_reactions[str(erw_info["reaction_id"])] = {
+                            "type": "reaction", "name": erw_name, "smarts": erw_info["smarts"], "order": erw_info["order"],
+                        }
+                result = ChemSpace.save_reaction_workflow(
+                    chemspace_db_path, erw_selected_name, erw_workflow_reactions,
+                    erw_description or None, overwrite=True
+                )
+                if result["success"]:
+                    st.success(f"Saved reaction workflow '{result['workflow_name']}' "
+                               f"({result['reaction_count']} steps).")
+                else:
+                    st.error(result["message"])
+
     with st.expander("▶️ Apply Reaction Workflow"):
         chemspace_db_path = os.path.join(st.session_state["active_project_path"], "chemspace", "processed_data", "chemspace.db")
         arw_workflows = ChemSpace.get_reaction_workflows(chemspace_db_path)
