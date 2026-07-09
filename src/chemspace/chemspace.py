@@ -16299,7 +16299,8 @@ plt.show()
                     print(f"\n🗑️  Deleting table: '{table_name}'")
                     
                     # Use existing drop_table method with appropriate confirmation
-                    success = self.drop_table(table_name, confirm=confirm_each)
+                    # Vacuum once after the whole batch instead of after each table
+                    success = self.drop_table(table_name, confirm=confirm_each, vacuum=False)
                     results[table_name] = success
                     
                     if success:
@@ -16325,7 +16326,8 @@ plt.show()
             
             if successful_deletions > 0:
                 print(f"🗑️  {successful_deletions} table(s) have been permanently removed")
-            
+                self._vacuum_chemspace_db()
+
             if failed_deletions > 0:
                 print(f"\n❌ Failed deletions:")
                 for table_name, success in results.items():
@@ -16340,14 +16342,36 @@ plt.show()
             print(f"❌ Error executing table deletions: {e}")
             return {table: False for table in selected_tables}
 
-    def drop_table(self, table_name: Optional[str] = None, confirm: bool = True) -> bool:
+    def _vacuum_chemspace_db(self) -> bool:
+        """
+        Reclaim disk space freed by dropped tables by running VACUUM on the
+        chemspace database. This rewrites the whole file, so it should be run
+        once after a batch of drops rather than after each individual table.
+
+        Returns:
+            bool: True if VACUUM completed successfully
+        """
+        try:
+            print("🧹 Reclaiming disk space (VACUUM)...")
+            conn = sqlite3.connect(self.__chemspace_db)
+            conn.execute("VACUUM")
+            conn.close()
+            print("✅ VACUUM complete")
+            return True
+        except sqlite3.Error as e:
+            print(f"⚠️  VACUUM failed (space will be reclaimed on a future attempt): {e}")
+            return False
+
+    def drop_table(self, table_name: Optional[str] = None, confirm: bool = True, vacuum: bool = True) -> bool:
         """
         Drop a single table from the chemspace database.
-        
+
         Args:
             table_name (Optional[str]): Name of the table to drop. If None, prompts user to select one.
             confirm (bool): Whether to ask for confirmation before deletion
-            
+            vacuum (bool): Whether to VACUUM the database afterwards to reclaim freed disk space.
+                Set to False when dropping several tables in a loop and vacuum once at the end instead.
+
         Returns:
             bool: True if table was dropped successfully, False otherwise
         """
@@ -16462,6 +16486,8 @@ plt.show()
             
             if not table_still_exists:
                 print(f"✅ Successfully dropped table '{table_name}' ({compound_count:,} compounds)")
+                if vacuum:
+                    self._vacuum_chemspace_db()
                 return True
             else:
                 print(f"❌ Failed to drop table '{table_name}' (table still exists)")
@@ -16532,7 +16558,8 @@ plt.show()
             
             for table_name in all_tables:
                 try:
-                    success = self.drop_table(table_name, confirm=False)
+                    # Vacuum once after the whole batch instead of after each table
+                    success = self.drop_table(table_name, confirm=False, vacuum=False)
                     if success:
                         deleted_count += 1
                     else:
@@ -16540,12 +16567,15 @@ plt.show()
                 except Exception as e:
                     print(f"❌ Error deleting '{table_name}': {e}")
                     failed_count += 1
-            
+
+            if deleted_count > 0:
+                self._vacuum_chemspace_db()
+
             print(f"\n✅ Chemspace database cleared!")
             print(f"   🗑️  Tables deleted: {deleted_count}")
             print(f"   ❌ Deletion failures: {failed_count}")
             print(f"   📊 Compounds removed: {total_compounds:,}")
-            
+
             return failed_count == 0
             
         except Exception as e:
