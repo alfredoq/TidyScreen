@@ -9021,15 +9021,20 @@ plt.show()
                     
                     if filter_info:
                         filter_name, smarts_pattern = filter_info
-                        
+
                         # Validate SMARTS pattern
                         if self._validate_smarts_pattern(smarts_pattern):
+                            step_description = input(
+                                "   📝 Enter a description for this filter (rationale for adding it, optional): "
+                            ).strip()
+
                             workflow_filters[filter_name] = {
                                 'instances': instances,
                                 'smarts': smarts_pattern,
-                                'filter_id': filter_id
+                                'filter_id': filter_id,
+                                'description': step_description
                             }
-                            
+
                             print(f"✅ Added filter #{filter_counter}: '{filter_name}' (ID: {filter_id})")
                             print(f"   🧪 SMARTS: {smarts_pattern}")
                             print(f"   🔢 Required instances: {instances}")
@@ -9064,7 +9069,8 @@ plt.show()
                 if save_workflow in ['y', 'yes']:
                     # Convert to simple format for compatibility
                     simple_workflow = {name: info['instances'] for name, info in workflow_filters.items()}
-                    self._save_filtering_workflow(simple_workflow)
+                    filter_descriptions = {name: info.get('description', '') for name, info in workflow_filters.items()}
+                    self._save_filtering_workflow(simple_workflow, filter_descriptions=filter_descriptions)
                     
             else:
                 print("\n⚠️  No filters were added to the workflow")
@@ -9488,6 +9494,8 @@ plt.show()
             print(f"\n{i}. {name} (ID: {info['filter_id']})")
             print(f"   🔢 Required instances: {info['instances']}")
             print(f"   🧪 SMARTS: {info['smarts']}")
+            if info.get('description'):
+                print(f"   📝 Description: {info['description']}")
         
         print("-" * 60)
         
@@ -9510,10 +9518,38 @@ plt.show()
         print(f"   • Complex patterns: {complex_patterns}")
     
     @staticmethod
+    def _ensure_filter_descriptions_column(chemspace_db_path: str) -> None:
+        """
+        Back-compat migration: add the 'filter_descriptions' column to an existing
+        filtering_workflows table if it predates this column (CREATE TABLE IF NOT EXISTS
+        is a no-op on a table that already exists, so older chemspace.db files would
+        otherwise never gain it).
+
+        Args:
+            chemspace_db_path (str): Path to the project's chemspace.db
+        """
+        try:
+            conn = sqlite3.connect(chemspace_db_path)
+            cursor = conn.cursor()
+
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='filtering_workflows'")
+            if cursor.fetchone():
+                cursor.execute("PRAGMA table_info(filtering_workflows)")
+                columns = {row[1] for row in cursor.fetchall()}
+                if 'filter_descriptions' not in columns:
+                    cursor.execute("ALTER TABLE filtering_workflows ADD COLUMN filter_descriptions TEXT")
+                    conn.commit()
+
+            conn.close()
+        except Exception as e:
+            print(f"⚠️  Could not verify/migrate 'filter_descriptions' column: {e}")
+
+    @staticmethod
     def save_filtering_workflow(chemspace_db_path: str, workflow_name: str,
                                  workflow_filters: Dict[str, int],
                                  description: Optional[str] = None,
-                                 overwrite: bool = False) -> Dict[str, Any]:
+                                 overwrite: bool = False,
+                                 filter_descriptions: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         """
         Persist a filtering workflow to a chemspace database.
 
@@ -9524,6 +9560,11 @@ plt.show()
             description (Optional[str]): Optional description; a default is generated if omitted
             overwrite (bool): If a workflow with the same name exists, overwrite it when True;
                 otherwise a unique suffixed name is generated automatically.
+            filter_descriptions (Optional[Dict[str, str]]): Optional per-filter rationale, keyed by
+                filter name (why this particular filter was added to this workflow). Stored in a
+                separate column from workflow_filters so the latter's plain int-per-filter shape
+                (relied on by filter_using_workflow()/_load_workflow_filters() and by
+                sum(workflow_filters.values()) below) is left untouched.
 
         Returns:
             Dict[str, Any]: On success: {'success': True, 'workflow_name', 'filter_count',
@@ -9546,13 +9587,23 @@ plt.show()
                 creation_date TEXT NOT NULL,
                 description TEXT,
                 filter_count INTEGER DEFAULT 0,
-                total_instances INTEGER DEFAULT 0
+                total_instances INTEGER DEFAULT 0,
+                filter_descriptions TEXT
             )
             """)
 
             # Create indexes for faster searches
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_filtering_workflows_name ON filtering_workflows(workflow_name)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_filtering_workflows_date ON filtering_workflows(creation_date)")
+
+            conn.commit()
+            conn.close()
+
+            # Migrate older tables (created before filter_descriptions existed)
+            ChemSpace._ensure_filter_descriptions_column(chemspace_db_path)
+
+            conn = sqlite3.connect(chemspace_db_path)
+            cursor = conn.cursor()
 
             filter_count = len(workflow_filters)
             total_instances = sum(workflow_filters.values())
@@ -9581,12 +9632,13 @@ plt.show()
 
             creation_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             filters_json = json.dumps(workflow_filters, sort_keys=True)
+            filter_descriptions_json = json.dumps(filter_descriptions or {}, sort_keys=True)
 
             cursor.execute("""
             INSERT INTO filtering_workflows
-            (workflow_name, filters_dict, creation_date, description, filter_count, total_instances)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """, (workflow_name, filters_json, creation_date, description, filter_count, total_instances))
+            (workflow_name, filters_dict, creation_date, description, filter_count, total_instances, filter_descriptions)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (workflow_name, filters_json, creation_date, description, filter_count, total_instances, filter_descriptions_json))
 
             conn.commit()
             conn.close()
@@ -9603,13 +9655,15 @@ plt.show()
         except Exception as e:
             return {'success': False, 'message': f"Error saving filtering workflow: {e}"}
 
-    def _save_filtering_workflow(self, workflow_filters: Dict[str, int]) -> None:
+    def _save_filtering_workflow(self, workflow_filters: Dict[str, int],
+                                  filter_descriptions: Optional[Dict[str, str]] = None) -> None:
         """
         Save a filtering workflow to the chemspace database, prompting the user for
         the workflow name, description, and an overwrite decision if needed.
 
         Args:
             workflow_filters (Dict[str, int]): Dictionary mapping filter names to required instances
+            filter_descriptions (Optional[Dict[str, str]]): Per-filter rationale, keyed by filter name
         """
         if not workflow_filters:
             print("⚠️  No workflow filters to save")
@@ -9636,7 +9690,8 @@ plt.show()
         conn.close()
 
         result = self.save_filtering_workflow(self.__chemspace_db, workflow_name, workflow_filters,
-                                               description or None, overwrite)
+                                               description or None, overwrite,
+                                               filter_descriptions=filter_descriptions)
 
         if result['success']:
             print(f"✅ Successfully saved filtering workflow!")
@@ -9658,8 +9713,10 @@ plt.show()
 
         Returns:
             List[Dict[str, Any]]: One dict per workflow (workflow_name, creation_date,
-                description, filters_dict, filter_count, total_instances), ordered by
-                creation_date descending. Empty list if none found or on error.
+                description, filters_dict, filter_count, total_instances,
+                filter_descriptions), ordered by creation_date descending. Empty list if
+                none found or on error. filter_descriptions is {} for workflows saved
+                before that column existed.
         """
         try:
             if not os.path.exists(chemspace_db_path):
@@ -9674,9 +9731,17 @@ plt.show()
                 conn.close()
                 return []
 
+            conn.close()
+
+            # Migrate older tables (created before filter_descriptions existed)
+            ChemSpace._ensure_filter_descriptions_column(chemspace_db_path)
+
+            conn = sqlite3.connect(chemspace_db_path)
+            cursor = conn.cursor()
+
             # Get all workflows with summary information
             cursor.execute("""
-            SELECT workflow_name, creation_date, description, filters_dict, filter_count, total_instances
+            SELECT workflow_name, creation_date, description, filters_dict, filter_count, total_instances, filter_descriptions
             FROM filtering_workflows
             ORDER BY creation_date DESC
             """)
@@ -9685,13 +9750,18 @@ plt.show()
             conn.close()
 
             workflows = []
-            for name, date, desc, filters_dict_str, filter_count, total_instances in rows:
+            for name, date, desc, filters_dict_str, filter_count, total_instances, filter_descriptions_str in rows:
                 try:
                     filters_dict = json.loads(filters_dict_str)
                     actual_filter_count = len(filters_dict) if filters_dict else filter_count
                 except json.JSONDecodeError:
                     filters_dict = {}
                     actual_filter_count = filter_count or 0
+
+                try:
+                    filter_descriptions = json.loads(filter_descriptions_str) if filter_descriptions_str else {}
+                except json.JSONDecodeError:
+                    filter_descriptions = {}
 
                 workflows.append({
                     'workflow_name': name,
@@ -9700,6 +9770,7 @@ plt.show()
                     'filters_dict': filters_dict,
                     'filter_count': actual_filter_count,
                     'total_instances': total_instances or 0,
+                    'filter_descriptions': filter_descriptions,
                 })
 
             return workflows
@@ -9836,6 +9907,14 @@ plt.show()
             print(f"   📄 Description: {workflow['description']}")
             print(f"   🔍 Filters: {filters_summary}")
             print(f"   🔍 Filters dictionary: {filters_dict}")
+
+            # Per-filter rationale, if any was recorded (empty {} for workflows saved
+            # before filter_descriptions existed)
+            filter_descriptions = workflow.get('filter_descriptions') or {}
+            for filter_name in filter_names:
+                filter_desc = filter_descriptions.get(filter_name)
+                if filter_desc:
+                    print(f"      📝 {filter_name}: {filter_desc}")
 
         print("="*100)
 

@@ -919,22 +919,32 @@ elif page == "ChemSpace Actions":
                 )
             with col3:
                 st.markdown("<br>", unsafe_allow_html=True)
-                if st.button("Add Filter", key="btn_cfw_add_filter", disabled=not available_names):
-                    filter_id, smarts = filters_by_name[cfw_selected_name]
-                    if ChemSpace._validate_smarts_pattern(smarts):
-                        st.session_state["cfw_filters"][cfw_selected_name] = {
-                            "instances": int(cfw_instances),
-                            "smarts": smarts,
-                            "filter_id": filter_id,
-                        }
-                        st.rerun()
-                    else:
-                        st.error(f"Invalid SMARTS pattern for filter '{cfw_selected_name}'")
+                cfw_add_disabled = not available_names
+            cfw_step_description = st.text_input(
+                "Description (rationale for adding it, optional)", key="cfw_step_description"
+            )
+            if st.button("Add Filter", key="btn_cfw_add_filter", disabled=cfw_add_disabled):
+                filter_id, smarts = filters_by_name[cfw_selected_name]
+                if ChemSpace._validate_smarts_pattern(smarts):
+                    st.session_state["cfw_filters"][cfw_selected_name] = {
+                        "instances": int(cfw_instances),
+                        "smarts": smarts,
+                        "filter_id": filter_id,
+                        "description": cfw_step_description.strip(),
+                    }
+                    st.rerun()
+                else:
+                    st.error(f"Invalid SMARTS pattern for filter '{cfw_selected_name}'")
 
         st.markdown("**Current workflow**")
         if st.session_state["cfw_filters"]:
             cfw_df = pd.DataFrame([
-                {"Filter Name": name, "Required Instances": info["instances"], "SMARTS": info["smarts"]}
+                {
+                    "Filter Name": name,
+                    "Required Instances": info["instances"],
+                    "SMARTS": info["smarts"],
+                    "Description": info.get("description") or "—",
+                }
                 for name, info in st.session_state["cfw_filters"].items()
             ])
             st.dataframe(cfw_df, use_container_width=True, hide_index=True)
@@ -960,9 +970,11 @@ elif page == "ChemSpace Actions":
         if st.button("Save Workflow", key="btn_cfw_save_workflow", disabled=cfw_save_disabled):
             chemspace_db_path = os.path.join(st.session_state["active_project_path"], "chemspace", "processed_data", "chemspace.db")
             workflow_filters = {name: info["instances"] for name, info in st.session_state["cfw_filters"].items()}
+            filter_descriptions = {name: info.get("description", "") for name, info in st.session_state["cfw_filters"].items()}
             result = ChemSpace.save_filtering_workflow(
                 chemspace_db_path, cfw_workflow_name, workflow_filters,
-                cfw_description or None, cfw_overwrite
+                cfw_description or None, cfw_overwrite,
+                filter_descriptions=filter_descriptions
             )
             if result["success"]:
                 st.success(f"Saved filtering workflow '{result['workflow_name']}' "
@@ -1062,6 +1074,7 @@ elif page == "ChemSpace Actions":
 
             if st.session_state.get("efw_loaded_workflow") != efw_selected_name:
                 st.session_state["efw_filters"] = dict(efw_selected_wf["filters_dict"])
+                st.session_state["efw_filter_descriptions"] = dict(efw_selected_wf.get("filter_descriptions") or {})
                 st.session_state["efw_loaded_workflow"] = efw_selected_name
 
             efw_all_filters = tidyscreen.get_chemical_filters()
@@ -1085,18 +1098,28 @@ elif page == "ChemSpace Actions":
                     )
                 with efw_col3:
                     st.markdown("<br>", unsafe_allow_html=True)
-                    if st.button("Add / Update Filter", key="btn_efw_add_filter"):
-                        _, efw_smarts = efw_filters_by_name[efw_selected_filter]
-                        if ChemSpace._validate_smarts_pattern(efw_smarts):
-                            st.session_state["efw_filters"][efw_selected_filter] = int(efw_instances)
-                            st.rerun()
-                        else:
-                            st.error(f"Invalid SMARTS pattern for filter '{efw_selected_filter}'")
+                _efw_existing_description = st.session_state["efw_filter_descriptions"].get(efw_selected_filter, "")
+                efw_step_description = st.text_input(
+                    "Description (rationale for adding it, optional)", value=_efw_existing_description,
+                    key=f"efw_description_{efw_selected_name}_{efw_selected_filter}"
+                )
+                if st.button("Add / Update Filter", key="btn_efw_add_filter"):
+                    _, efw_smarts = efw_filters_by_name[efw_selected_filter]
+                    if ChemSpace._validate_smarts_pattern(efw_smarts):
+                        st.session_state["efw_filters"][efw_selected_filter] = int(efw_instances)
+                        st.session_state["efw_filter_descriptions"][efw_selected_filter] = efw_step_description.strip()
+                        st.rerun()
+                    else:
+                        st.error(f"Invalid SMARTS pattern for filter '{efw_selected_filter}'")
 
             st.markdown("**Current workflow parameters**")
             if st.session_state["efw_filters"]:
                 efw_df = pd.DataFrame([
-                    {"Filter Name": name, "Required Instances": instances}
+                    {
+                        "Filter Name": name,
+                        "Required Instances": instances,
+                        "Description": st.session_state["efw_filter_descriptions"].get(name) or "—",
+                    }
                     for name, instances in st.session_state["efw_filters"].items()
                 ])
                 st.dataframe(efw_df, use_container_width=True, hide_index=True)
@@ -1106,6 +1129,7 @@ elif page == "ChemSpace Actions":
                 )
                 if st.button("Remove Filter", key="btn_efw_remove_filter"):
                     del st.session_state["efw_filters"][efw_remove_name]
+                    st.session_state["efw_filter_descriptions"].pop(efw_remove_name, None)
                     st.rerun()
             else:
                 st.warning("No filters remaining in this workflow. Add at least one before saving.")
@@ -1118,9 +1142,14 @@ elif page == "ChemSpace Actions":
 
             efw_save_disabled = not st.session_state["efw_filters"]
             if st.button("Save Changes", key="btn_efw_save", disabled=efw_save_disabled):
+                efw_filter_descriptions = {
+                    name: st.session_state["efw_filter_descriptions"].get(name, "")
+                    for name in st.session_state["efw_filters"]
+                }
                 result = ChemSpace.save_filtering_workflow(
                     chemspace_db_path, efw_selected_name, st.session_state["efw_filters"],
-                    efw_description or None, overwrite=True
+                    efw_description or None, overwrite=True,
+                    filter_descriptions=efw_filter_descriptions
                 )
                 if result["success"]:
                     st.success(f"Saved filtering workflow '{result['workflow_name']}' "
