@@ -3354,15 +3354,16 @@ class ChemSpace:
             cursor.execute(f"PRAGMA table_info({table_name})")
             columns = [row[1] for row in cursor.fetchall()]
             
+            newly_added_column = False
             if 'inchi_key' not in columns:
                 try:
                     cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN inchi_key TEXT")
-                    cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_inchi_key ON {table_name}(inchi_key)")
                     print(f"   📋 Added 'inchi_key' column to existing table '{table_name}'")
+                    newly_added_column = True
                 except sqlite3.OperationalError as e:
                     print(f"   ⚠️  Warning: Could not add inchi_key column: {e}")
                     return False
-            
+
             # Update each row with computed InChI key.
             # Uses itertuples() + executemany() rather than iterrows() + per-row execute():
             # iterrows() rebuilds a pandas Series per row, and a separate execute() per row
@@ -3378,6 +3379,13 @@ class ChemSpace:
             ]
             cursor.executemany(update_query, updates)
             updates_made = len(updates)
+
+            # Build the index after the column is populated, not before: an index
+            # created on an all-NULL column forces SQLite to rebalance the b-tree on
+            # every single-row UPDATE above, which measured ~4x slower on multi-million
+            # row product tables than building the index once against populated data.
+            if newly_added_column:
+                cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_inchi_key ON {table_name}(inchi_key)")
 
             conn.commit()
             conn.close()
