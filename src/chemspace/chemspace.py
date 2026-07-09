@@ -15068,42 +15068,22 @@ plt.show()
                         'step': product_info['step']
                     })
             
-            # Select input sources
+            # Select input sources (same fine-grained picker for every step, including step 1)
             selected_sources = []
-            
-            if step_num == 1:
-                # First step: allow multiple original tables
-                print(f"\nSelect input sources (comma-separated numbers or 'all'):")
-                selection = input("Selection: ").strip().lower()
-                
-                if selection == 'all':
-                    selected_sources = all_sources
-                else:
-                    try:
-                        indices = [int(x.strip()) - 1 for x in selection.split(',')]
-                        selected_sources = [all_sources[i] for i in indices if 0 <= i < len(all_sources)]
-                    except:
-                        print("❌ Invalid selection")
-                        return {}
+
+            print(f"\nSelect input sources (comma-separated numbers or 'all'):")
+            selection = input("Selection: ").strip().lower()
+
+            if selection == 'all':
+                selected_sources = all_sources
             else:
-                # Later steps: offer choice between original tables and previous products
-                print(f"\nChoose input strategy:")
-                print(f"   1. Use original tables")
-                print(f"   2. Use products from previous steps")
-                print(f"   3. Use both original tables and previous products")
-                
-                strategy = input("Enter choice (1-3): ").strip()
-                
-                if strategy == '1':
-                    selected_sources = [s for s in all_sources if s['type'] == 'original']
-                elif strategy == '2':
-                    selected_sources = [s for s in all_sources if s['type'] == 'products']
-                elif strategy == '3':
-                    selected_sources = all_sources
-                else:
-                    print("❌ Invalid strategy selection")
+                try:
+                    indices = [int(x.strip()) - 1 for x in selection.split(',')]
+                    selected_sources = [all_sources[i] for i in indices if 0 <= i < len(all_sources)]
+                except:
+                    print("❌ Invalid selection")
                     return {}
-            
+
             if not selected_sources:
                 print("❌ No sources selected")
                 return {}
