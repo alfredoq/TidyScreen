@@ -2898,27 +2898,36 @@ class ChemSpace:
                     inchi_key TEXT
                 )
             ''')
-            
-            # Create indexes for better performance
+
+            # Insert the unique filtered compounds in a single executemany() batch
+            # rather than one execute() per compound (crossing the sqlite3 C-API
+            # boundary once per row dominates runtime for large tables). Uses
+            # INSERT OR IGNORE instead of catching IntegrityError per row, with
+            # conn.total_changes before/after to recover the exact duplicate count
+            # that the per-row try/except used to give us.
+            insert_query = f'''
+                INSERT OR IGNORE INTO {table_name} (smiles, name, flag, flag_description, inchi_key)
+                VALUES (?, ?, ?, ?, ?)
+            '''
+            batch = [
+                (compound['smiles'], compound['name'], compound['flag'],
+                 compound.get('flag_description', None), compound.get('inchi_key', None))
+                for compound in unique_compounds
+            ]
+            changes_before = conn.total_changes
+            cursor.executemany(insert_query, batch)
+            inserted_count = conn.total_changes - changes_before
+            database_duplicates = len(batch) - inserted_count
+
+            # Create indexes after the table is populated, not before: indexes
+            # created on an empty table force SQLite to rebalance their b-trees on
+            # every single-row insert above, which measured slower than building the
+            # indexes once against fully-populated data (same fix as applied to
+            # _update_table_with_inchi_keys() and _save_step_products()).
             cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_smiles ON {table_name}(smiles)")
             cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_name ON {table_name}(name)")
             cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_flag ON {table_name}(flag)")
-            
-            # Insert the unique filtered compounds
-            inserted_count = 0
-            database_duplicates = 0
-            
-            for compound in unique_compounds:
-                try:
-                    cursor.execute(f'''
-                        INSERT INTO {table_name} (smiles, name, flag, flag_description, inchi_key)
-                        VALUES (?, ?, ?, ?, ?)
-                    ''', (compound['smiles'], compound['name'], compound['flag'], compound.get('flag_description', None), compound.get('inchi_key', None)))
-                    inserted_count += 1
-                except sqlite3.IntegrityError:
-                    # Handle case where compound already exists in database
-                    database_duplicates += 1
-            
+
             conn.commit()
             conn.close()
             
@@ -7302,108 +7311,59 @@ plt.show()
                     UNIQUE(smiles)
                 )
             ''')
-            
-            # Create indexes for better performance
-            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{new_table_name}_smiles ON {new_table_name}(smiles)")
-            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{new_table_name}_name ON {new_table_name}(name)")
-            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{new_table_name}_inchi_key ON {new_table_name}(inchi_key)")
-            
+
             # Get current timestamp
             filter_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            
-            # Insert the filtered compounds with progress tracking
-            inserted_count = 0
-            database_duplicates = 0
-            errors = 0
-            
+
+            # Insert the filtered compounds in executemany() batches rather than
+            # one execute() per row (crossing the sqlite3 C-API boundary once per
+            # row dominates runtime for large filtered result sets). INSERT OR
+            # IGNORE replaces the per-row try/except IntegrityError; the table was
+            # just dropped and recreated empty above and compounds_df was already
+            # deduped by SMILES, so a real conflict here isn't expected, but
+            # conn.total_changes still gives an exact duplicate count if one occurs.
             insert_query = f'''
-                INSERT INTO {new_table_name} 
+                INSERT OR IGNORE INTO {new_table_name}
                 (smiles, name, flag, inchi_key)
                 VALUES (?, ?, ?, ?)
             '''
-            
+
             print(f"   💾 Saving {len(compounds_df)} filtered compounds to table '{new_table_name}'...")
-            
-            # Initialize progress bar for saving with proper error handling
-            use_tqdm = tqdm_available and len(compounds_df) > 1000
-            
-            if use_tqdm:
-                try:
-                    progress_bar = tqdm(
-                        compounds_df.iterrows(),
-                        total=len(compounds_df),
-                        desc="Saving compounds",
-                        unit="compounds",
-                        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] Saved: {postfix}",
-                        postfix="0"
-                    )
-                except Exception as e:
-                    print(f"   ⚠️  Progress bar initialization failed, using fallback: {e}")
-                    use_tqdm = False
-                    progress_bar = compounds_df.iterrows()
-            else:
-                progress_bar = compounds_df.iterrows()
-            
-            # Set up manual progress tracking for non-tqdm case
-            if not use_tqdm:
-                save_interval = max(1, len(compounds_df) // 10)
-                saved_count = 0
-            
-            # Process compounds
-            try:
-                for row_data in progress_bar:
-                    # Handle the unpacking based on whether we're using tqdm or not
-                    if use_tqdm:
-                        # tqdm returns (index, row) tuples
-                        try:
-                            _, compound = row_data
-                        except (ValueError, TypeError):
-                            # Fallback if unpacking fails
-                            compound = row_data
-                    else:
-                        # Direct iterrows() returns (index, row) tuples
-                        try:
-                            _, compound = row_data
-                        except (ValueError, TypeError):
-                            # Fallback if unpacking fails
-                            compound = row_data
-                    
-                    try:
-                        cursor.execute(insert_query, (
-                            compound.get('smiles', ''),
-                            compound.get('name', 'unknown'),
-                            compound.get('flag', 'nd'),
-                            compound.get('inchi_key', None)
-                        ))
-                        inserted_count += 1
-                        
-                        if use_tqdm:
-                            try:
-                                progress_bar.set_postfix(str(inserted_count))
-                            except:
-                                pass  # Ignore progress bar update errors
-                        else:
-                            saved_count += 1
-                            if saved_count % save_interval == 0:
-                                progress_pct = (saved_count / len(compounds_df)) * 100
-                                print(f"      💾 Saving progress: {progress_pct:.1f}% ({saved_count}/{len(compounds_df)})")
-                                
-                    except sqlite3.IntegrityError:
-                        # Handle duplicate SMILES
-                        database_duplicates += 1
-                    except Exception as e:
-                        errors += 1
-                        if errors <= 5:  # Show only first few errors
-                            print(f"      ⚠️  Error inserting compound '{compound.get('name', 'unknown')}': {e}")
-            
-            finally:
-                # Close progress bar if it was created successfully
-                if use_tqdm and hasattr(progress_bar, 'close'):
-                    try:
-                        progress_bar.close()
-                    except:
-                        pass  # Ignore close errors
-            
+
+            rows = [
+                (
+                    getattr(row, 'smiles', ''),
+                    getattr(row, 'name', 'unknown'),
+                    getattr(row, 'flag', 'nd'),
+                    getattr(row, 'inchi_key', None),
+                )
+                for row in compounds_df.itertuples(index=False)
+            ]
+
+            batch_size = 1000
+            num_batches = (len(rows) + batch_size - 1) // batch_size
+            batch_starts = range(0, len(rows), batch_size)
+
+            if tqdm_available and num_batches > 1:
+                batch_starts = tqdm(batch_starts, total=num_batches, desc="Saving compounds", unit="batch")
+
+            changes_before = conn.total_changes
+            for start in batch_starts:
+                cursor.executemany(insert_query, rows[start:start + batch_size])
+
+            inserted_count = conn.total_changes - changes_before
+            database_duplicates = len(rows) - inserted_count
+            errors = 0
+
+            # Create indexes after the table is populated, not before: indexes
+            # created on an empty table force SQLite to rebalance their b-trees on
+            # every single-row insert above, which measured slower than building the
+            # indexes once against fully-populated data (same fix as applied to
+            # _update_table_with_inchi_keys() and _save_step_products()).
+            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{new_table_name}_smiles ON {new_table_name}(smiles)")
+            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{new_table_name}_name ON {new_table_name}(name)")
+            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{new_table_name}_inchi_key ON {new_table_name}(inchi_key)")
+
             conn.commit()
             conn.close()
             
@@ -17667,24 +17627,24 @@ plt.show()
                     {full_schema}
                 )
             ''')
-            
-            # Create indexes for better performance (no model index)
-            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_smiles ON {table_name}(smiles)")
-            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_name ON {table_name}(name)")
-            
+
             # Prepare insert query with prefixed column names (no metadata columns)
             columns = ['smiles', 'name', 'flag', 'inchi_key'] + list(prefixed_column_mapping.values())
             placeholders = ', '.join(['?'] * len(columns))
-            
+
             insert_query = f'''
-                INSERT OR REPLACE INTO {table_name} 
+                INSERT OR REPLACE INTO {table_name}
                 ({', '.join(columns)})
                 VALUES ({placeholders})
             '''
-            
-            # Insert data (no metadata)
-            inserted_count = 0
-            
+
+            # Prepare row data first (NaN/float coercion is per-row data validation,
+            # not a DB call, so malformed rows are still skipped individually here),
+            # then insert everything in a single executemany() batch rather than one
+            # execute() per row: a separate execute() per row crosses the sqlite3
+            # C-API boundary once per row, which dominates runtime for large
+            # prediction tables.
+            rows = []
             for _, row in merged_df.iterrows():
                 try:
                     # Prepare row data (no metadata columns)
@@ -17694,7 +17654,7 @@ plt.show()
                         row.get('flag', 'nd'),
                         row.get('inchi_key', None)
                     ]
-                    
+
                     # Add prediction values only with original column names
                     for original_col in prediction_columns:
                         value = row.get(original_col)
@@ -17706,15 +17666,24 @@ plt.show()
                                 row_data.append(float(value))
                             except (ValueError, TypeError):
                                 row_data.append(None)
-                    
-                    # No metadata added here
-                    cursor.execute(insert_query, row_data)
-                    inserted_count += 1
-                    
+
+                    rows.append(tuple(row_data))
+
                 except Exception as e:
-                    print(f"⚠️  Error inserting row: {e}")
+                    print(f"⚠️  Error preparing row: {e}")
                     continue
-            
+
+            cursor.executemany(insert_query, rows)
+            inserted_count = len(rows)
+
+            # Create indexes after the table is populated, not before: indexes
+            # created on an empty table force SQLite to rebalance their b-trees on
+            # every single-row insert above, which measured slower than building the
+            # indexes once against fully-populated data (same fix as applied to
+            # _update_table_with_inchi_keys() and _save_step_products()).
+            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_smiles ON {table_name}(smiles)")
+            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_name ON {table_name}(name)")
+
             conn.commit()
             conn.close()
             
@@ -18416,44 +18385,51 @@ plt.show()
                 )
             ''')
             
-            # Create indexes for better performance (excluding stereocenter_atoms)
+            # Prepare insert query with stereochemical columns (excluding stereocenter_atoms)
+            insert_query = f'''
+                INSERT OR IGNORE INTO {table_name}
+                (smiles, name, flag, inchi_key, total_stereoisomers, stereochemical_config,
+                num_stereocenters)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            '''
+
+            # Prepare row data first (stereochemical config cleanup is per-row data
+            # transformation, not a DB call), then insert everything in a single
+            # executemany() batch rather than one execute() per row: a separate
+            # execute() per row crosses the sqlite3 C-API boundary once per row,
+            # which dominates runtime for large stereoisomer enumeration results.
+            # conn.total_changes before/after recovers the exact inserted count that
+            # the per-row try/except IntegrityError used to give us.
+            rows = [
+                (
+                    row['stereoisomer_smiles'],
+                    row['stereoisomer_name'],
+                    row.get('flag', 'nd'),  # ← Use original flag or default to 'nd'
+                    row.get('inchi_key'),
+                    row.get('total_stereoisomers', 1),
+                    self._clean_stereochemical_config(row.get('stereochemical_config', 'unknown')),
+                    row.get('num_stereocenters', 0)
+                )
+                for _, row in results_df.iterrows()
+            ]
+
+            changes_before = conn.total_changes
+            cursor.executemany(insert_query, rows)
+            inserted_count = conn.total_changes - changes_before
+
+            # Create indexes after the table is populated, not before: indexes
+            # created on an empty table force SQLite to rebalance their b-trees on
+            # every single-row insert above, which measured slower than building the
+            # indexes once against fully-populated data (same fix as applied to
+            # _update_table_with_inchi_keys() and _save_step_products()). This table
+            # has six indexes, so the win from reordering is largest here.
             cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_smiles ON {table_name}(smiles)")
             cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_name ON {table_name}(name)")
             cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_flag ON {table_name}(flag)")
             cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_inchi_key ON {table_name}(inchi_key)")
             cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_stereocenters ON {table_name}(num_stereocenters)")
             cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_total_stereo ON {table_name}(total_stereoisomers)")
-            
-            # Prepare insert query with stereochemical columns (excluding stereocenter_atoms)
-            insert_query = f'''
-                INSERT OR IGNORE INTO {table_name} 
-                (smiles, name, flag, inchi_key, total_stereoisomers, stereochemical_config, 
-                num_stereocenters)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            '''
-            
-            # Insert stereoisomer data including stereochemical information
-            inserted_count = 0
-            
-            for _, row in results_df.iterrows():
-                try:
-                    # Clean up the stereochemical configuration format
-                    config = row.get('stereochemical_config', 'unknown')
-                    clean_config = self._clean_stereochemical_config(config)
-                    
-                    cursor.execute(insert_query, (
-                        row['stereoisomer_smiles'],
-                        row['stereoisomer_name'],
-                        row.get('flag', 'nd'),  # ← Use original flag or default to 'nd'
-                        row.get('inchi_key'),
-                        row.get('total_stereoisomers', 1),
-                        clean_config,
-                        row.get('num_stereocenters', 0)
-                    ))
-                    inserted_count += 1
-                except sqlite3.IntegrityError:
-                    continue  # Skip duplicates
-            
+
             conn.commit()
             conn.close()
             
@@ -20195,25 +20171,34 @@ plt.show()
                 create_table_sql = f"CREATE TABLE {output_table_name} ({', '.join(column_defs)}{unique_constraint})"
 
                 cursor.execute(create_table_sql)
-                
-                # Create indexes
-                cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{output_table_name}_smiles ON {output_table_name}(smiles)")
-                cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{output_table_name}_name ON {output_table_name}(name)")
-                
-                # Insert subset data
+
+                # Insert subset data in a single executemany() batch rather than one
+                # execute() per row (crossing the sqlite3 C-API boundary once per row
+                # dominates runtime for large subsets). INSERT OR IGNORE replaces the
+                # per-row try/except IntegrityError (a no-op when the source table
+                # had no UNIQUE(smiles, name) constraint to carry over); total_changes
+                # before/after still gives an exact duplicate count either way.
                 insert_columns = [col[1] for col in columns_info if col[1] != 'id']  # Exclude auto-increment id
                 placeholders = ', '.join(['?'] * len(insert_columns))
-                insert_sql = f"INSERT INTO {output_table_name} ({', '.join(insert_columns)}) VALUES ({placeholders})"
-                
-                inserted_count = 0
-                for _, row in subset_df.iterrows():
-                    try:
-                        values = [row[col] for col in insert_columns]
-                        cursor.execute(insert_sql, values)
-                        inserted_count += 1
-                    except sqlite3.IntegrityError:
-                        continue  # Skip duplicates
-                
+                insert_sql = f"INSERT OR IGNORE INTO {output_table_name} ({', '.join(insert_columns)}) VALUES ({placeholders})"
+
+                rows = [
+                    tuple(row[col] for col in insert_columns)
+                    for _, row in subset_df.iterrows()
+                ]
+                changes_before = conn.total_changes
+                cursor.executemany(insert_sql, rows)
+                inserted_count = conn.total_changes - changes_before
+
+                # Create indexes after the table is populated, not before: indexes
+                # created on an empty table force SQLite to rebalance their b-trees
+                # on every single-row insert above, which measured slower than
+                # building the indexes once against fully-populated data (same fix
+                # as applied to _update_table_with_inchi_keys() and
+                # _save_step_products()).
+                cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{output_table_name}_smiles ON {output_table_name}(smiles)")
+                cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{output_table_name}_name ON {output_table_name}(name)")
+
                 conn.commit()
                 conn.close()
                 
