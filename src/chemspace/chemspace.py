@@ -13341,8 +13341,15 @@ plt.show()
             
             # Reuse existing cleanup and summary methods
             self._query_and_delete_prev_step_tables(workflow_state)
+
+            # InChI keys were skipped for each step's table as it was created (see
+            # compute_inchi=False in _save_step_products()/_consolidate_temp_files_to_table())
+            # to avoid computing them for intermediate tables that get discarded above.
+            # Compute them now, once, for whatever tables actually survived cleanup.
+            self._compute_inchi_keys_for_surviving_tables(workflow_state)
+
             self._display_streaming_workflow_summary(workflow_state, workflow_name)
-            
+
             return True
             
         except Exception as e:
@@ -13532,12 +13539,13 @@ plt.show()
                         output_table_name = self._sanitize_table_name(chosen_name)
 
                         success = self._consolidate_temp_files_to_table(
-                            temp_files_created, output_table_name, workflow_name, step_num
+                            temp_files_created, output_table_name, workflow_name, step_num,
+                            compute_inchi=False
                         )
 
                         if not success:
                             output_table_name = None
-                    
+
                     result = {
                         'success': True,
                         'products_generated': total_products,
@@ -13594,12 +13602,13 @@ plt.show()
                     output_table_name = self._sanitize_table_name(chosen_name)
 
                     success = self._save_step_products(
-                        products, output_table_name, workflow_name, step_num
+                        products, output_table_name, workflow_name, step_num,
+                        compute_inchi=False
                     )
 
                     if not success:
                         output_table_name = None
-                
+
                 result = {
                     'success': True,
                     'products_generated': len(products),
@@ -13711,12 +13720,13 @@ plt.show()
                         output_table_name = self._sanitize_table_name(chosen_name)
 
                         success = self._consolidate_temp_files_to_table(
-                            temp_files_created, output_table_name, workflow_name, step_num
+                            temp_files_created, output_table_name, workflow_name, step_num,
+                            compute_inchi=False
                         )
 
                         if not success:
                             output_table_name = None
-                    
+
                     result = {
                         'success': True,
                         'products_generated': total_products,
@@ -13791,12 +13801,13 @@ plt.show()
                     output_table_name = self._sanitize_table_name(chosen_name)
 
                     success = self._save_step_products(
-                        all_products, output_table_name, workflow_name, step_num
+                        all_products, output_table_name, workflow_name, step_num,
+                        compute_inchi=False
                     )
 
                     if not success:
                         output_table_name = None
-                
+
                 result = {
                     'success': True,
                     'products_generated': len(all_products),
@@ -14047,16 +14058,21 @@ plt.show()
             return 0
 
     def _consolidate_temp_files_to_table(self, temp_files: List[str], output_table_name: str,
-                                        workflow_name: str, step_num: int) -> bool:
+                                        workflow_name: str, step_num: int,
+                                        compute_inchi: bool = True) -> bool:
         """
         Consolidate temporary CSV files into a database table with streaming to avoid memory issues.
-        
+
         Args:
             temp_files (List[str]): List of temporary file paths
             output_table_name (str): Name for the output table
             workflow_name (str): Workflow name
             step_num (int): Step number
-            
+            compute_inchi (bool): Whether to compute InChI keys for this table right away.
+                Reaction-workflow steps pass False here to avoid computing (and discarding)
+                InChI keys for intermediate tables; the workflow computes them once at the
+                end for whichever tables survive the end-of-workflow cleanup prompt.
+
         Returns:
             bool: True if consolidation was successful
         """
@@ -14148,7 +14164,7 @@ plt.show()
 
             # Compute InChI keys for the newly consolidated products, mirroring the same
             # post-save step used by load_csv_file() and _save_step_products()
-            if total_inserted > 0:
+            if compute_inchi and total_inserted > 0:
                 try:
                     print(f"   🧪 Computing InChI keys for table '{output_table_name}'...")
                     self.compute_inchi_keys(output_table_name, update_database=True)
@@ -15485,7 +15501,8 @@ plt.show()
                 output_table_name = self._sanitize_table_name(chosen_name)
 
                 success = self._save_step_products(
-                    products, output_table_name, workflow_name, step_num
+                    products, output_table_name, workflow_name, step_num,
+                    compute_inchi=False
                 )
 
                 if not success:
@@ -15709,17 +15726,21 @@ plt.show()
                 'error': str(e)
             }
 
-    def _save_step_products(self, products: List[Dict[str, Any]], table_name: str, 
-                        workflow_name: str, step_num: int) -> bool:
+    def _save_step_products(self, products: List[Dict[str, Any]], table_name: str,
+                        workflow_name: str, step_num: int, compute_inchi: bool = True) -> bool:
         """
         Save products from a reaction step to a new table.
-        
+
         Args:
             products (List[Dict]): List of product dictionaries
             table_name (str): Name for the new table
             workflow_name (str): Name of the workflow
             step_num (int): Current step number
-            
+            compute_inchi (bool): Whether to compute InChI keys for this table right away.
+                Reaction-workflow steps pass False here to avoid computing (and discarding)
+                InChI keys for intermediate tables; the workflow computes them once at the
+                end for whichever tables survive the end-of-workflow cleanup prompt.
+
         Returns:
             bool: True if saved successfully
         """
@@ -15781,7 +15802,7 @@ plt.show()
 
             # Compute InChI keys for the newly stored products, mirroring the same
             # post-save step used by load_csv_file()
-            if inserted_count > 0:
+            if compute_inchi and inserted_count > 0:
                 try:
                     print(f"   🧪 Computing InChI keys for table '{table_name}'...")
                     self.compute_inchi_keys(table_name, update_database=True)
@@ -15861,7 +15882,42 @@ plt.show()
             
         except Exception as e:
             print(f"❌ Error displaying workflow summary: {e}")
-            
+
+    def _compute_inchi_keys_for_surviving_tables(self, state: Dict[str, Any]) -> None:
+        """
+        Compute InChI keys for the workflow's step-product tables that survived
+        _query_and_delete_prev_step_tables() — the final step's table plus any
+        intermediate tables the user chose to keep. Must be called after that
+        cleanup step so deleted tables are excluded.
+
+        Args:
+            state (Dict[str, Any]): Workflow state, as populated by apply_reaction_workflow()
+                ('step_products' mapping step -> {'table_name', 'product_count', ...}) and by
+                _query_and_delete_prev_step_tables() ('deleted_step_tables' list).
+        """
+        try:
+            step_products = state.get('step_products', {})
+            if not step_products:
+                return
+
+            deleted_tables = set(state.get('deleted_step_tables', []))
+            surviving_tables = [
+                info['table_name'] for info in step_products.values()
+                if info.get('table_name') and info['table_name'] not in deleted_tables
+            ]
+
+            if not surviving_tables:
+                return
+
+            print(f"\n🧪 Computing InChI keys for {len(surviving_tables)} surviving table(s)...")
+            for table_name in surviving_tables:
+                try:
+                    self.compute_inchi_keys(table_name, update_database=True)
+                except Exception as inchi_error:
+                    print(f"   ⚠️  Warning: InChI key computation failed for '{table_name}': {inchi_error}")
+        except Exception as e:
+            print(f"⚠️  Error computing InChI keys for surviving tables: {e}")
+
     def _query_and_delete_prev_step_tables(self, state: Dict[str, Any]) -> None:
                 try:
                     step_products = state.get('step_products', {})
