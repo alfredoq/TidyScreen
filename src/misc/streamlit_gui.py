@@ -1605,6 +1605,7 @@ elif page == "ChemSpace Actions":
                     reaction_id, smarts = reactions_by_name[crw_selected_name]
                     if ChemSpace._validate_reaction_smarts_pattern(smarts):
                         st.session_state["crw_reactions"][crw_selected_name] = {
+                            "type": "reaction",
                             "reaction_id": reaction_id,
                             "smarts": smarts,
                             "order": len(st.session_state["crw_reactions"]) + 1,
@@ -1613,22 +1614,54 @@ elif page == "ChemSpace Actions":
                     else:
                         st.error(f"Invalid SMARTS pattern for reaction '{crw_selected_name}'")
 
+        st.markdown("**Add a table-merge step**")
+        st.caption("Combines two tables (e.g. a product table with an existing one) into one, "
+                   "usable as input for later reaction or merge steps. The two tables are chosen "
+                   "when the workflow is applied.")
+        crw_merge_col1, crw_merge_col2 = st.columns([3, 1])
+        with crw_merge_col1:
+            crw_merge_label = st.text_input(
+                "Merge step label (optional)", key="crw_merge_label"
+            )
+        with crw_merge_col2:
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button("Add Merge Step", key="btn_crw_add_merge"):
+                crw_order = len(st.session_state["crw_reactions"]) + 1
+                crw_label = crw_merge_label.strip() or f"Merge tables #{crw_order}"
+                crw_step_key = crw_label
+                crw_suffix = 1
+                while crw_step_key in st.session_state["crw_reactions"]:
+                    crw_suffix += 1
+                    crw_step_key = f"{crw_label} ({crw_suffix})"
+                st.session_state["crw_reactions"][crw_step_key] = {
+                    "type": "merge",
+                    "order": crw_order,
+                }
+                st.rerun()
+
         st.markdown("**Current workflow**")
         if st.session_state["crw_reactions"]:
             crw_df = pd.DataFrame([
-                {"Order": info["order"], "Reaction Name": name, "SMARTS": info["smarts"]}
-                for name, info in st.session_state["crw_reactions"].items()
+                {
+                    "Order": info["order"],
+                    "Step Name": name,
+                    "Type": info.get("type", "reaction"),
+                    "SMARTS": info.get("smarts", "—"),
+                }
+                for name, info in sorted(
+                    st.session_state["crw_reactions"].items(), key=lambda kv: kv[1]["order"]
+                )
             ])
             st.dataframe(crw_df, use_container_width=True, hide_index=True)
 
             crw_remove_name = st.selectbox(
-                "Remove a reaction", list(st.session_state["crw_reactions"].keys()), key="crw_remove_reaction"
+                "Remove a step", list(st.session_state["crw_reactions"].keys()), key="crw_remove_reaction"
             )
-            if st.button("Remove Reaction", key="btn_crw_remove_reaction"):
+            if st.button("Remove Step", key="btn_crw_remove_reaction"):
                 del st.session_state["crw_reactions"][crw_remove_name]
                 st.rerun()
         else:
-            st.info("No reactions added to the workflow yet.")
+            st.info("No steps added to the workflow yet.")
 
         st.markdown("**Save workflow**")
         crw_workflow_name = st.text_input("Workflow name", key="crw_workflow_name")
@@ -1641,17 +1674,23 @@ elif page == "ChemSpace Actions":
 
         if st.button("Save Workflow", key="btn_crw_save_workflow", disabled=crw_save_disabled):
             chemspace_db_path = os.path.join(st.session_state["active_project_path"], "chemspace", "processed_data", "chemspace.db")
-            workflow_reactions = {
-                str(info["reaction_id"]): {"name": name, "smarts": info["smarts"], "order": info["order"]}
-                for name, info in st.session_state["crw_reactions"].items()
-            }
+            workflow_reactions = {}
+            for name, info in st.session_state["crw_reactions"].items():
+                if info.get("type") == "merge":
+                    workflow_reactions[f"merge_{info['order']}"] = {
+                        "type": "merge", "name": name, "order": info["order"],
+                    }
+                else:
+                    workflow_reactions[str(info["reaction_id"])] = {
+                        "type": "reaction", "name": name, "smarts": info["smarts"], "order": info["order"],
+                    }
             result = ChemSpace.save_reaction_workflow(
                 chemspace_db_path, crw_workflow_name, workflow_reactions,
                 crw_description or None, crw_overwrite
             )
             if result["success"]:
                 st.success(f"Saved reaction workflow '{result['workflow_name']}' "
-                           f"({result['reaction_count']} reactions).")
+                           f"({result['reaction_count']} steps).")
                 st.session_state["crw_reactions"] = {}
                 st.rerun()
             else:
@@ -1755,11 +1794,18 @@ elif page == "ChemSpace Actions":
                         st.rerun()
                 else:
                     _arw_reaction_id, arw_reaction_raw = arw_run["steps"][arw_step_idx]
-                    arw_reaction_info = {"name": arw_reaction_raw["name"], "smarts": arw_reaction_raw["smarts"]}
-                    arw_reaction_type = arw_chemspace_obj._analyze_single_reaction_type(arw_reaction_info["smarts"])
+                    arw_step_type = arw_reaction_raw.get("type", "reaction")
 
-                    st.markdown(f"**Step {arw_step_idx + 1}/{arw_total_steps}: {arw_reaction_info['name']}** ({arw_reaction_type})")
-                    st.code(arw_reaction_info["smarts"])
+                    if arw_step_type == "merge":
+                        arw_reaction_info = {"name": arw_reaction_raw["name"]}
+                        st.markdown(f"**Step {arw_step_idx + 1}/{arw_total_steps}: {arw_reaction_info['name']}** (merge)")
+                        st.caption("Merge step: combines two tables into one.")
+                    else:
+                        arw_reaction_info = {"name": arw_reaction_raw["name"], "smarts": arw_reaction_raw["smarts"]}
+                        arw_reaction_type = arw_chemspace_obj._analyze_single_reaction_type(arw_reaction_info["smarts"])
+
+                        st.markdown(f"**Step {arw_step_idx + 1}/{arw_total_steps}: {arw_reaction_info['name']}** ({arw_reaction_type})")
+                        st.code(arw_reaction_info["smarts"])
 
                     # Available reactant sources: original tables plus product tables saved by earlier steps
                     arw_original_tables = [
@@ -1783,6 +1829,70 @@ elif page == "ChemSpace Actions":
 
                     if not arw_source_options:
                         st.warning("No reactant tables available for this step.")
+                    elif arw_step_type == "merge":
+                        st.caption("Select the two tables to combine.")
+                        arw_mcol1, arw_mcol2 = st.columns(2)
+                        with arw_mcol1:
+                            arw_table_a = st.selectbox(
+                                "Table A", arw_source_options,
+                                format_func=lambda t: arw_source_labels[t], key=f"arw_merge_a_{arw_step_idx}"
+                            )
+                        with arw_mcol2:
+                            arw_table_b = st.selectbox(
+                                "Table B", arw_source_options,
+                                format_func=lambda t: arw_source_labels[t], key=f"arw_merge_b_{arw_step_idx}"
+                            )
+
+                        arw_save_products = st.checkbox(
+                            "Save merged compounds to a new table (required for use in later steps)",
+                            value=True, key=f"arw_save_{arw_step_idx}"
+                        )
+                        arw_output_table_name = ""
+                        if arw_save_products:
+                            arw_default_name = f"step{arw_step_idx + 1}_{arw_reaction_info['name']}"
+                            arw_output_table_name = st.text_input(
+                                "Output table name", value=arw_default_name, key=f"arw_output_name_{arw_step_idx}"
+                            )
+
+                        arw_run_disabled = arw_save_products and not arw_output_table_name.strip()
+                        if st.button("Run Step", key=f"btn_arw_run_step_{arw_step_idx}", disabled=arw_run_disabled):
+                            arw_log = io.StringIO()
+                            with contextlib.redirect_stdout(arw_log):
+                                arw_result = arw_chemspace_obj.apply_reaction_workflow_merge_step(
+                                    workflow_name=arw_run["workflow_name"],
+                                    step_num=arw_step_idx + 1,
+                                    table_a=arw_table_a,
+                                    table_b=arw_table_b,
+                                    output_table_name=arw_output_table_name.strip() if arw_save_products else None,
+                                )
+
+                            if arw_result["success"] and arw_result["output_table"]:
+                                arw_run["step_products"][arw_step_idx + 1] = {
+                                    "table_name": arw_result["output_table"],
+                                    "product_count": arw_result["products_generated"],
+                                    "reaction_name": arw_reaction_info["name"],
+                                }
+
+                            if arw_result["success"]:
+                                st.success(f"Combined {arw_result['products_generated']} compound row(s).")
+                                if arw_result["output_table"]:
+                                    st.info(f"Saved to table '{arw_result['output_table']}'.")
+                                elif arw_save_products:
+                                    st.warning("No compounds were generated; nothing was saved.")
+                                if arw_result["products"]:
+                                    st.dataframe(
+                                        pd.DataFrame(arw_result["products"][:20]),
+                                        use_container_width=True, hide_index=True
+                                    )
+                            else:
+                                st.error(f"Step failed, workflow halted: {arw_result['message']}")
+
+                            with st.expander("Execution log", expanded=not arw_result["success"]):
+                                st.code(arw_log.getvalue() or "(no output)")
+
+                            if arw_result["success"]:
+                                arw_run["step_idx"] += 1
+                            st.session_state["arw_run"] = arw_run
                     else:
                         if arw_reaction_type == "bimolecular":
                             st.caption("Bimolecular reaction: select a primary and a secondary reactant table "

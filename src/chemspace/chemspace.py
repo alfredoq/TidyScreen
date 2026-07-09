@@ -8080,72 +8080,100 @@ plt.show()
             if not os.path.exists(projects_db):
                 print(f"❌ Projects database not found: {projects_db}")
                 return {}
-            
+
             print("🧪 Creating Reaction Workflow")
             print("=" * 80)
+            tidyscreen.list_chemical_reactions()
+            print("=" * 80)
             print("Enter reaction IDs to build your reaction workflow.")
+            print("Enter 'merge' to add a step that combines two tables (e.g. a product table with an existing one).")
             print("Enter -1 when you're done adding reactions.")
             print("=" * 80)
-            
+
             workflow_reactions = {}
             reaction_counter = 1
-            
+
             while True:
                 try:
-                    # Request reaction ID from user
-                    user_input = input(f"\n🔬 Enter reaction ID #{reaction_counter} (or -1 to finish): ").strip()
-                    
+                    # Request reaction ID (or 'merge') from user
+                    user_input = input(f"\n🔬 Enter reaction ID #{reaction_counter}, 'merge' to add a table-merge step, or -1 to finish: ").strip()
+
                     # Check if user wants to finish
                     if user_input == "-1":
                         break
-                    
+
+                    # Handle a table-merge step
+                    if user_input.lower() == "merge":
+                        label = input("   📝 Enter a label for this merge step (optional): ").strip()
+                        if not label:
+                            label = f"Merge tables #{reaction_counter}"
+
+                        step_key = f"merge_{reaction_counter}"
+                        workflow_reactions[step_key] = {
+                            'type': 'merge',
+                            'name': label,
+                            'order': reaction_counter
+                        }
+
+                        print(f"✅ Added merge step: '{label}'")
+                        print(f"   🔀 The two tables to combine will be selected when the workflow is applied.")
+                        reaction_counter += 1
+                        continue
+
                     # Validate input is a number
                     try:
                         reaction_id = int(user_input)
                     except ValueError:
-                        print("❌ Please enter a valid number or -1 to finish")
+                        print("❌ Please enter a valid number, 'merge', or -1 to finish")
                         continue
-                    
+
                     # Skip if already added
-                    if reaction_id in workflow_reactions:
+                    if str(reaction_id) in workflow_reactions:
                         print(f"⚠️  Reaction ID {reaction_id} is already in the workflow")
                         continue
-                    
+
                     # Retrieve reaction from projects database
                     reaction_info = self._get_reaction_by_id(projects_db, reaction_id)
-                    
+
                     if reaction_info:
                         reaction_name, reaction_smarts = reaction_info
-                        workflow_reactions[reaction_id] = {
+                        # Use a string key (JSON would coerce it to one anyway on save/reload,
+                        # and mixing int/str keys here breaks json.dumps(sort_keys=True) below
+                        # once merge steps — which use string keys — are also present).
+                        workflow_reactions[str(reaction_id)] = {
+                            'type': 'reaction',
                             'name': reaction_name,
                             'smarts': reaction_smarts,
                             'order': reaction_counter
                         }
-                        
+
                         print(f"✅ Added reaction: '{reaction_name}' (ID: {reaction_id})")
                         print(f"   🧪 Reaction SMARTS: {reaction_smarts}")
                         reaction_counter += 1
                     else:
                         print(f"❌ No reaction found with ID {reaction_id}")
-                        
+
                 except KeyboardInterrupt:
                     print("\n\n⏹️  Reaction workflow creation cancelled by user")
                     return {}
                 except Exception as e:
                     print(f"❌ Error processing input: {e}")
                     continue
-            
+
             # Display final workflow summary
             if workflow_reactions:
                 print(f"\n✅ Reaction Workflow Created!")
                 print("=" * 80)
-                print(f"🧪 Total reactions: {len(workflow_reactions)}")
+                print(f"🧪 Total steps: {len(workflow_reactions)}")
                 print("\n📋 Workflow Summary:")
-                
+
                 for reaction_id, info in workflow_reactions.items():
-                    print(f"   {info['order']}. '{info['name']}' (ID: {reaction_id})")
-                    print(f"      🧪 SMARTS: {info['smarts']}")
-                
+                    if info.get('type') == 'merge':
+                        print(f"   {info['order']}. '{info['name']}' (merge step)")
+                    else:
+                        print(f"   {info['order']}. '{info['name']}' (ID: {reaction_id})")
+                        print(f"      🧪 SMARTS: {info['smarts']}")
+
                 print("=" * 80)
                 
                 # Ask if user wants to save the workflow
@@ -12925,6 +12953,63 @@ plt.show()
             'ambiguous_reactants': ambiguous_reactants,
         }
 
+    def apply_reaction_workflow_merge_step(self, workflow_name: str, step_num: int,
+                                            table_a: str, table_b: str,
+                                            output_table_name: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Apply a single 'merge' workflow step to two explicitly selected tables.
+
+        Non-interactive counterpart to _process_merge_step() (used inside
+        apply_reaction_workflow()), with the two source tables passed in directly
+        instead of prompted via input(). Lets a caller (e.g. the Streamlit GUI) drive
+        a merge step, letting a previous step's saved product table be selected as
+        one of the two sources.
+
+        Args:
+            workflow_name (str): Name of the workflow being applied
+            step_num (int): 1-based step number, used to tag saved products
+            table_a (str): First table to combine
+            table_b (str): Second table to combine (may be the same as table_a)
+            output_table_name (Optional[str]): If provided, the combined compounds are
+                persisted to a new table with this name (sanitized); otherwise they are
+                returned without being saved, and therefore unavailable as a source for
+                later steps.
+
+        Returns:
+            Dict[str, Any]: {'success': bool, 'reaction_type': 'merge', 'products_generated': int,
+                'products': List[Dict], 'output_table': Optional[str], 'message': Optional[str],
+                'ambiguous_reactants': List[Dict]} — 'ambiguous_reactants' is always empty; the
+                key is kept only for shape-compatibility with apply_reaction_workflow_step().
+        """
+        if not table_a or not table_b:
+            return {
+                'success': False,
+                'reaction_type': 'merge',
+                'products_generated': 0,
+                'products': [],
+                'output_table': None,
+                'message': 'Both tables to merge must be specified.',
+                'ambiguous_reactants': [],
+            }
+
+        products = self._merge_two_tables_to_products(table_a, table_b)
+
+        output_table = None
+        if products and output_table_name:
+            sanitized_name = self._sanitize_table_name(output_table_name)
+            if self._save_step_products(products, sanitized_name, workflow_name, step_num):
+                output_table = sanitized_name
+
+        return {
+            'success': True,
+            'reaction_type': 'merge',
+            'products_generated': len(products),
+            'products': products,
+            'output_table': output_table,
+            'message': None,
+            'ambiguous_reactants': [],
+        }
+
     def apply_reaction_workflow(self, workflow_id: Optional[int] = None,
                                         max_workers: Optional[int] = None,
                                         chunk_size: Optional[int] = None,
@@ -12985,8 +13070,11 @@ plt.show()
             print(f"\n🔄 STREAMING REACTION WORKFLOW ANALYSIS")
             print("=" * 60)
             for i, (reaction_id, reaction_info) in enumerate(sorted_reactions, 1):
-                reaction_type = self._analyze_single_reaction_type(reaction_info['smarts'])
-                print(f"   Step {i}: {reaction_info['name']} ({reaction_type})")
+                if reaction_info.get('type') == 'merge':
+                    print(f"   Step {i}: {reaction_info['name']} (merge)")
+                else:
+                    reaction_type = self._analyze_single_reaction_type(reaction_info['smarts'])
+                    print(f"   Step {i}: {reaction_info['name']} ({reaction_type})")
             print("=" * 60)
             
             # Confirm execution
@@ -13080,12 +13168,15 @@ plt.show()
             Dict[str, Any]: Step execution results
         """
         try:
+            if reaction_info.get('type') == 'merge':
+                return self._process_merge_step(step_num, reaction_info, workflow_name, workflow_state)
+
             reaction_name = reaction_info['name']
             reaction_smarts = reaction_info['smarts']
-            
+
             # Reuse existing reaction analysis
             reaction_type = self._analyze_single_reaction_type(reaction_smarts)
-            
+
             print(f"🔍 Streaming Reaction Analysis:")
             print(f"   📋 Name: {reaction_name}")
             print(f"   🧪 Type: {reaction_type}")
@@ -13222,21 +13313,24 @@ plt.show()
                     output_table_name = None
                     if total_products > 0:
                         print(f"\n💾 Consolidating {total_products:,} products from {len(temp_files_created)} files...")
-                        
-                        save_choice = input("Save consolidated products to a new table? (y/n): ").strip().lower()
-                        if save_choice in ['y', 'yes']:
-                            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                            default_name = f"stream_step{step_num}_{reaction_info['name']}_{timestamp}"
-                            user_table_name = input(f"Enter table name (default: {default_name}): ").strip()
-                            chosen_name = user_table_name if user_table_name else default_name
-                            output_table_name = self._sanitize_table_name(chosen_name)
-                            
-                            success = self._consolidate_temp_files_to_table(
-                                temp_files_created, output_table_name, workflow_name, step_num
-                            )
-                            
-                            if not success:
-                                output_table_name = None
+
+                        # Always persist this step's products to a table (needed so they remain
+                        # available as an input source for later workflow steps); the user can
+                        # discard unwanted intermediate tables in the end-of-workflow cleanup prompt.
+                        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                        default_name = f"stream_step{step_num}_{reaction_info['name']}_{timestamp}"
+                        user_table_name = input(
+                            f"Table name for this step's products (default: {default_name}): "
+                        ).strip()
+                        chosen_name = user_table_name if user_table_name else default_name
+                        output_table_name = self._sanitize_table_name(chosen_name)
+
+                        success = self._consolidate_temp_files_to_table(
+                            temp_files_created, output_table_name, workflow_name, step_num
+                        )
+
+                        if not success:
+                            output_table_name = None
                     
                     result = {
                         'success': True,
@@ -13283,21 +13377,22 @@ plt.show()
                 output_table_name = None
                 if products:
                     print(f"\n💾 Generated {len(products)} products from bimolecular reaction")
-                    
-                    save_choice = input("Save products to a new table? (y/n): ").strip().lower()
-                    if save_choice in ['y', 'yes']:
-                        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                        default_name = f"step{step_num}_{reaction_info['name']}_{timestamp}"
-                        user_table_name = input(f"Enter table name (default: {default_name}): ").strip()
-                        chosen_name = user_table_name if user_table_name else default_name
-                        output_table_name = self._sanitize_table_name(chosen_name)
-                        
-                        success = self._save_step_products(
-                            products, output_table_name, workflow_name, step_num
-                        )
-                        
-                        if not success:
-                            output_table_name = None
+
+                    # Always persist this step's products to a table (needed so they remain
+                    # available as an input source for later workflow steps); the user can
+                    # discard unwanted intermediate tables in the end-of-workflow cleanup prompt.
+                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    default_name = f"step{step_num}_{reaction_info['name']}_{timestamp}"
+                    user_table_name = input(f"Table name for this step's products (default: {default_name}): ").strip()
+                    chosen_name = user_table_name if user_table_name else default_name
+                    output_table_name = self._sanitize_table_name(chosen_name)
+
+                    success = self._save_step_products(
+                        products, output_table_name, workflow_name, step_num
+                    )
+
+                    if not success:
+                        output_table_name = None
                 
                 result = {
                     'success': True,
@@ -13397,21 +13492,24 @@ plt.show()
                     output_table_name = None
                     if total_products > 0:
                         print(f"\n💾 Consolidating {total_products:,} products from {len(temp_files_created)} files...")
-                        
-                        save_choice = input("Save consolidated products to a new table? (y/n): ").strip().lower()
-                        if save_choice in ['y', 'yes']:
-                            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                            default_name = f"stream_step{step_num}_{reaction_info['name']}_{timestamp}"
-                            user_table_name = input(f"Enter table name (default: {default_name}): ").strip()
-                            chosen_name = user_table_name if user_table_name else default_name
-                            output_table_name = self._sanitize_table_name(chosen_name)
-                            
-                            success = self._consolidate_temp_files_to_table(
-                                temp_files_created, output_table_name, workflow_name, step_num
-                            )
-                            
-                            if not success:
-                                output_table_name = None
+
+                        # Always persist this step's products to a table (needed so they remain
+                        # available as an input source for later workflow steps); the user can
+                        # discard unwanted intermediate tables in the end-of-workflow cleanup prompt.
+                        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                        default_name = f"stream_step{step_num}_{reaction_info['name']}_{timestamp}"
+                        user_table_name = input(
+                            f"Table name for this step's products (default: {default_name}): "
+                        ).strip()
+                        chosen_name = user_table_name if user_table_name else default_name
+                        output_table_name = self._sanitize_table_name(chosen_name)
+
+                        success = self._consolidate_temp_files_to_table(
+                            temp_files_created, output_table_name, workflow_name, step_num
+                        )
+
+                        if not success:
+                            output_table_name = None
                     
                     result = {
                         'success': True,
@@ -13476,21 +13574,22 @@ plt.show()
                 output_table_name = None
                 if all_products:
                     print(f"\n💾 Total products generated: {len(all_products)}")
-                    
-                    save_choice = input("Save products to a new table? (y/n): ").strip().lower()
-                    if save_choice in ['y', 'yes']:
-                        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                        default_name = f"step{step_num}_{reaction_info['name']}_{timestamp}"
-                        user_table_name = input(f"Enter table name (default: {default_name}): ").strip()
-                        chosen_name = user_table_name if user_table_name else default_name
-                        output_table_name = self._sanitize_table_name(chosen_name)
-                        
-                        success = self._save_step_products(
-                            all_products, output_table_name, workflow_name, step_num
-                        )
-                        
-                        if not success:
-                            output_table_name = None
+
+                    # Always persist this step's products to a table (needed so they remain
+                    # available as an input source for later workflow steps); the user can
+                    # discard unwanted intermediate tables in the end-of-workflow cleanup prompt.
+                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    default_name = f"step{step_num}_{reaction_info['name']}_{timestamp}"
+                    user_table_name = input(f"Table name for this step's products (default: {default_name}): ").strip()
+                    chosen_name = user_table_name if user_table_name else default_name
+                    output_table_name = self._sanitize_table_name(chosen_name)
+
+                    success = self._save_step_products(
+                        all_products, output_table_name, workflow_name, step_num
+                    )
+
+                    if not success:
+                        output_table_name = None
                 
                 result = {
                     'success': True,
@@ -15028,6 +15127,198 @@ plt.show()
         except Exception as e:
             print(f"❌ Error selecting tables for unimolecular step: {e}")
             return {}
+
+    def _select_tables_for_step_merge(self, input_sources: Dict[str, Any],
+                                       step_num: int, step_name: str) -> Dict[str, Any]:
+        """
+        Select the two tables to combine for a 'merge' workflow step.
+
+        Args:
+            input_sources (Dict): Available input sources
+            step_num (int): Current step number
+            step_name (str): Label of the merge step
+
+        Returns:
+            Dict[str, Any]: Table configuration
+        """
+        try:
+            print(f"\n🔀 MERGE STEP {step_num} SETUP")
+            print("=" * 60)
+            print(f"Step: {step_name}")
+            print("This step combines compounds from two tables into one.")
+
+            # Display available sources
+            print(f"\n📋 Available Input Sources:")
+            all_sources = []
+
+            print(f"\n🗂️  Original Tables:")
+            for table in input_sources['original_tables']:
+                compound_count = self.get_compound_count(table_name=table)
+                print(f"   {len(all_sources)+1}. {table} ({compound_count} compounds) [Original]")
+                all_sources.append({
+                    'name': table,
+                    'type': 'original',
+                    'count': compound_count
+                })
+
+            if input_sources['previous_products']:
+                print(f"\n🔬 Previous Step Products:")
+                for product_info in input_sources['previous_products']:
+                    print(f"   {len(all_sources)+1}. {product_info['table_name']} "
+                        f"({product_info['count']} products from Step {product_info['step']}: "
+                        f"{product_info['reaction_name']}) [Products]")
+                    all_sources.append({
+                        'name': product_info['table_name'],
+                        'type': 'products',
+                        'count': product_info['count'],
+                        'step': product_info['step']
+                    })
+
+            if not all_sources:
+                print("❌ No tables available to merge")
+                return {}
+
+            # Select first table
+            print(f"\n📋 Select FIRST table to merge:")
+            first_idx = self._select_source_by_index(all_sources, "first table")
+            if first_idx is None:
+                return {}
+
+            first_source = all_sources[first_idx]
+
+            # Select second table (allow the same table, though that just duplicates it)
+            print(f"\n📋 Select SECOND table to merge:")
+            second_idx = self._select_source_by_index(all_sources, "second table")
+            if second_idx is None:
+                return {}
+
+            second_source = all_sources[second_idx]
+
+            print(f"\n✅ Merge Step Configuration:")
+            print(f"   🅰️  Table A: '{first_source['name']}' ({first_source['count']} compounds)")
+            print(f"   🅱️  Table B: '{second_source['name']}' ({second_source['count']} compounds)")
+
+            return {
+                'type': 'merge',
+                'table_a': first_source['name'],
+                'table_b': second_source['name'],
+                'step_num': step_num
+            }
+
+        except Exception as e:
+            print(f"❌ Error selecting tables for merge step: {e}")
+            return {}
+
+    def _merge_two_tables_to_products(self, table_a: str, table_b: str) -> List[Dict[str, Any]]:
+        """
+        Combine compounds from two tables into a single product list.
+
+        Reuses the same product shape produced by _apply_bimolecular_reaction /
+        _apply_unimolecular_reaction ({'smiles', 'name', 'flag'}) so the result can be
+        saved via _save_step_products() and consumed as an input source by later steps.
+
+        Args:
+            table_a (str): First table to combine
+            table_b (str): Second table to combine (may be the same as table_a)
+
+        Returns:
+            List[Dict[str, Any]]: Combined list of compound dicts
+        """
+        products = []
+        for table_name in (table_a, table_b):
+            df = self._get_table_as_dataframe(table_name)
+            for _, row in df.iterrows():
+                products.append({
+                    'smiles': row['smiles'],
+                    'name': row.get('name'),
+                    'flag': 'merged'
+                })
+        return products
+
+    def _process_merge_step(self, step_num: int, reaction_info: Dict[str, Any],
+                             workflow_name: str, workflow_state: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Process a single 'merge' workflow step: combine two selected tables into one
+        output table that later steps can use as an input source.
+
+        Args:
+            step_num (int): Current step number
+            reaction_info (Dict): Merge step info ({'type': 'merge', 'name', 'order'})
+            workflow_name (str): Name of the workflow
+            workflow_state (Dict): Current workflow state
+
+        Returns:
+            Dict[str, Any]: Step execution results, shaped like the reaction step results
+                so downstream summary/cleanup code needs no special-casing.
+        """
+        try:
+            step_name = reaction_info.get('name', 'Merge tables')
+
+            print(f"🔍 Merge Step Analysis:")
+            print(f"   📋 Name: {step_name}")
+
+            # Reuse existing input source detection
+            input_sources = self._get_available_input_sources(step_num, workflow_state)
+
+            if not input_sources['original_tables'] and not input_sources['previous_products']:
+                return {
+                    'success': False,
+                    'message': 'No input sources available',
+                    'products_generated': 0,
+                    'streaming_used': False
+                }
+
+            table_config = self._select_tables_for_step_merge(input_sources, step_num, step_name)
+
+            if not table_config:
+                return {
+                    'success': False,
+                    'message': 'No tables selected for merge step',
+                    'products_generated': 0,
+                    'streaming_used': False
+                }
+
+            products = self._merge_two_tables_to_products(table_config['table_a'], table_config['table_b'])
+
+            output_table_name = None
+            if products:
+                print(f"\n💾 Combined {len(products)} compound row(s) from "
+                      f"'{table_config['table_a']}' and '{table_config['table_b']}'")
+
+                # Always persist this step's products to a table (needed so they remain
+                # available as an input source for later workflow steps); the user can
+                # discard unwanted intermediate tables in the end-of-workflow cleanup prompt.
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                default_name = f"step{step_num}_{step_name}_{timestamp}"
+                user_table_name = input(f"Table name for this step's products (default: {default_name}): ").strip()
+                chosen_name = user_table_name if user_table_name else default_name
+                output_table_name = self._sanitize_table_name(chosen_name)
+
+                success = self._save_step_products(
+                    products, output_table_name, workflow_name, step_num
+                )
+
+                if not success:
+                    output_table_name = None
+
+            return {
+                'success': True,
+                'products_generated': len(products),
+                'reaction_type': 'merge',
+                'step_num': step_num,
+                'streaming_used': False,
+                'output_table': output_table_name,
+                'ambiguous_reactants': []
+            }
+
+        except Exception as e:
+            print(f"❌ Error processing merge step {step_num}: {e}")
+            return {
+                'success': False,
+                'message': f'Error in merge step {step_num}: {e}',
+                'products_generated': 0,
+                'streaming_used': False
+            }
 
     def _select_source_by_index(self, sources: List[Dict], source_type: str) -> Optional[int]:
         """
