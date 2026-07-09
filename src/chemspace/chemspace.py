@@ -929,6 +929,8 @@ class ChemSpace:
         try:
             # Simply connect to create the database file if it doesn't exist
             conn = sqlite3.connect(self.__chemspace_db)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
             conn.close()
             
             return True
@@ -979,6 +981,8 @@ class ChemSpace:
         try:
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             # Create compounds table
             create_table_query = f"""
@@ -1066,6 +1070,8 @@ class ChemSpace:
             
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             # SQLite doesn't support RENAME TABLE directly, so we need to:
             # 1. Create new table with same structure
@@ -1368,6 +1374,8 @@ class ChemSpace:
         # Load the dataframe into the database table
         try:
             conn = sqlite3.connect(self.__chemspace_db)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
             df.to_sql(table_name, conn, if_exists='append', index=False)
             conn.close()
         except Exception as e:
@@ -1459,6 +1467,8 @@ class ChemSpace:
                     try:
                         conn = sqlite3.connect(self.__chemspace_db)
                         cursor = conn.cursor()
+                        cursor.execute("PRAGMA journal_mode=WAL")
+                        cursor.execute("PRAGMA synchronous=NORMAL")
                         cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
                         conn.commit()
                         conn.close()
@@ -1875,6 +1885,8 @@ class ChemSpace:
                 # Drop the existing table
                 conn = sqlite3.connect(self.__chemspace_db)
                 cursor = conn.cursor()
+                cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.execute("PRAGMA synchronous=NORMAL")
                 cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
                 conn.commit()
                 conn.close()
@@ -1898,6 +1910,8 @@ class ChemSpace:
             # Create table
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             cursor.execute(create_table_query)
             conn.commit()
 
@@ -1950,6 +1964,8 @@ class ChemSpace:
                         # Update table with inchi_key column
                         conn = sqlite3.connect(self.__chemspace_db)
                         cursor = conn.cursor()
+                        cursor.execute("PRAGMA journal_mode=WAL")
+                        cursor.execute("PRAGMA synchronous=NORMAL")
                         cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN inchi_key TEXT")
                         for idx, row in df_loaded.iterrows():
                             cursor.execute(f"UPDATE {table_name} SET inchi_key = ? WHERE id = ?", (row['inchi_key'], row['id']))
@@ -2000,6 +2016,8 @@ class ChemSpace:
         try:
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
 
             # Get current schema
             cursor.execute(f"PRAGMA table_info({table_name})")
@@ -2377,6 +2395,8 @@ class ChemSpace:
         try:
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
 
             compounds_added = 0
             duplicates_skipped = 0
@@ -2455,6 +2475,8 @@ class ChemSpace:
         try:
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             # Use default table if none specified
             if table_name is None:
@@ -2513,6 +2535,8 @@ class ChemSpace:
         try:
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             # Use default table if none specified
             if table_name is None:
@@ -2698,6 +2722,8 @@ class ChemSpace:
             # Connect to chemspace database and retrieve the table
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             query = f"SELECT id, smiles, name, flag, flag_description, inchi_key FROM {table_name}"
             cursor.execute(query)
             compounds = cursor.fetchall()
@@ -2816,6 +2842,8 @@ class ChemSpace:
             
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             # Create the new table with the same schema as other compound tables
             # Add UNIQUE constraint on SMILES to prevent future duplicates
@@ -2887,6 +2915,8 @@ class ChemSpace:
         try:
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             if table_name:
                 # Clear specific table
@@ -2931,7 +2961,9 @@ class ChemSpace:
                     return pd.DataFrame()
             
             conn = sqlite3.connect(self.__chemspace_db)
-            
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+
             # Build query with filters
             query = f"SELECT * FROM {table_name}"
             
@@ -2959,6 +2991,8 @@ class ChemSpace:
         try:
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             cursor.execute(f"PRAGMA table_info({table_name})")
             columns = [row[1] for row in cursor.fetchall()]
             conn.close()
@@ -3272,6 +3306,8 @@ class ChemSpace:
         try:
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             # Check if inchi_key column exists, add if it doesn't (for backward compatibility)
             cursor.execute(f"PRAGMA table_info({table_name})")
@@ -3767,6 +3803,8 @@ class ChemSpace:
         try:
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
 
             # Check if the fingerprint column exists, add it if it doesn't
             cursor.execute(f"PRAGMA table_info({table_name})")
@@ -4124,6 +4162,8 @@ class ChemSpace:
 
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             self._ensure_dim_reduction_models_table(cursor)
             cursor.execute(f"""
                 INSERT INTO {self._DIM_REDUCTION_MODELS_TABLE}
@@ -4156,6 +4196,8 @@ class ChemSpace:
         try:
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             self._ensure_dim_reduction_models_table(cursor)
             cursor.execute(f"SELECT DISTINCT table_name FROM {self._DIM_REDUCTION_MODELS_TABLE} ORDER BY table_name")
             tables = [row[0] for row in cursor.fetchall()]
@@ -4183,6 +4225,8 @@ class ChemSpace:
         try:
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             self._ensure_dim_reduction_models_table(cursor)
             cursor.execute(
                 f"SELECT DISTINCT method FROM {self._DIM_REDUCTION_MODELS_TABLE} WHERE table_name = ?",
@@ -4220,6 +4264,8 @@ class ChemSpace:
 
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             self._ensure_dim_reduction_models_table(cursor)
 
             if method and method != 'all':
@@ -4554,6 +4600,8 @@ class ChemSpace:
         try:
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
 
             cursor.execute(f"PRAGMA table_info({table_name})")
             existing_columns = [row[1] for row in cursor.fetchall()]
@@ -5323,6 +5371,8 @@ plt.show()
 
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
 
             cursor.execute(f"PRAGMA table_info({table_name})")
             columns_info = cursor.fetchall()
@@ -5522,6 +5572,8 @@ plt.show()
         try:
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             self._ensure_dim_reduction_models_table(cursor)
             placeholders = ', '.join('?' for _ in methods)
             cursor.execute(
@@ -5660,6 +5712,8 @@ plt.show()
         try:
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             # Create sql_registers table
             create_table_query = """
@@ -5714,6 +5768,8 @@ plt.show()
             
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             # Get current timestamp
             creation_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -5766,6 +5822,8 @@ plt.show()
             
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             # Build query with filters
             query = "SELECT * FROM sql_registers WHERE 1=1"
@@ -6599,6 +6657,8 @@ plt.show()
             # Get available filtering workflows
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             # Check if filtering_workflows table exists
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='filtering_workflows'")
@@ -6746,6 +6806,8 @@ plt.show()
             # Connect to chemspace database to retrieve the workflow
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             # Retrieve the workflow by name
             cursor.execute(
@@ -7173,6 +7235,8 @@ plt.show()
 
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
 
             # Drop any existing table with this name so the filtered results replace
             # previously stored data instead of being appended to it
@@ -8235,6 +8299,8 @@ plt.show()
             
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             # Create reaction_workflows table if it doesn't exist
             create_table_query = """
@@ -8510,6 +8576,8 @@ plt.show()
         try:
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             # Check if reaction_workflows table exists
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='reaction_workflows'")
@@ -8561,6 +8629,8 @@ plt.show()
         try:
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             cursor.execute("""
             SELECT id, workflow_name, creation_date, description
@@ -8827,6 +8897,8 @@ plt.show()
             # Create table
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             # Create products table with extended schema
             cursor.execute(f'''
@@ -9681,6 +9753,8 @@ plt.show()
         overwrite = False
         conn = sqlite3.connect(self.__chemspace_db)
         cursor = conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='filtering_workflows'")
         if cursor.fetchone():
             cursor.execute("SELECT COUNT(*) FROM filtering_workflows WHERE workflow_name = ?", (workflow_name,))
@@ -10264,6 +10338,8 @@ plt.show()
         overwrite = False
         conn = sqlite3.connect(self.__chemspace_db)
         cursor = conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='physicochemical_filtering_workflows'")
         if cursor.fetchone():
             cursor.execute("SELECT COUNT(*) FROM physicochemical_filtering_workflows WHERE workflow_name = ?", (workflow_name,))
@@ -10558,6 +10634,8 @@ plt.show()
         try:
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
 
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='physicochemical_filtering_workflows'")
             if not cursor.fetchone():
@@ -11401,6 +11479,8 @@ plt.show()
             
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             # Get duplicate entries to remove
             if keep_first:
@@ -11775,6 +11855,8 @@ plt.show()
             # Check if reaction_workflows table exists
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='reaction_workflows'")
             if not cursor.fetchone():
@@ -12032,6 +12114,8 @@ plt.show()
         try:
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             cursor.execute("SELECT COUNT(*) FROM reaction_workflows")
             count = cursor.fetchone()[0]
@@ -12098,6 +12182,8 @@ plt.show()
             # Check if table exists and get workflow count
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='reaction_workflows'")
             if not cursor.fetchone():
@@ -13941,6 +14027,8 @@ plt.show()
             
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             # Create products table
             cursor.execute(f'''
@@ -14753,6 +14841,8 @@ plt.show()
             # Check if reaction_workflows table exists
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='reaction_workflows'")
             if not cursor.fetchone():
@@ -15598,6 +15688,8 @@ plt.show()
             
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             # Create products table with step metadata
             cursor.execute(f'''
@@ -16339,7 +16431,9 @@ plt.show()
             # Connect to database and drop table
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
-            
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+
             # Drop associated indexes first (if any)
             index_prefixes = [f"idx_{table_name}_", f"index_{table_name}_"]
             for prefix in index_prefixes:
@@ -16473,6 +16567,8 @@ plt.show()
             # Check if filtering_workflows table exists
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='filtering_workflows'")
             if not cursor.fetchone():
@@ -16736,6 +16832,8 @@ plt.show()
         try:
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             cursor.execute("""
             SELECT id, workflow_name, creation_date, description, filter_count, total_instances
@@ -16775,6 +16873,8 @@ plt.show()
         try:
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             cursor.execute("SELECT COUNT(*) FROM filtering_workflows")
             count = cursor.fetchone()[0]
@@ -16843,6 +16943,8 @@ plt.show()
             # Check if table exists and get workflow count
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='filtering_workflows'")
             if not cursor.fetchone():
@@ -17370,6 +17472,8 @@ plt.show()
         try:
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             # Create table with extended schema including prediction columns (no metadata columns)
             base_schema = """
@@ -18139,6 +18243,8 @@ plt.show()
         try:
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             # Create stereoisomers table with extended schema (excluding stereocenter_atoms column)
             cursor.execute(f'''
@@ -19232,6 +19338,8 @@ plt.show()
             # Check if sdf_blob column exists
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             cursor.execute(f"PRAGMA table_info({source_table})")
             columns = [row[1] for row in cursor.fetchall()]
@@ -19245,6 +19353,8 @@ plt.show()
                 # Count existing blobs
                 conn = sqlite3.connect(self.__chemspace_db)
                 cursor = conn.cursor()
+                cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.execute("PRAGMA synchronous=NORMAL")
                 cursor.execute(f"SELECT COUNT(*) FROM {source_table} WHERE sdf_blob IS NOT NULL")
                 existing_blobs = cursor.fetchone()[0]
                 conn.close()
@@ -19306,6 +19416,8 @@ plt.show()
         try:
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             # Get current table schema
             cursor.execute(f"PRAGMA table_info({table_name})")
@@ -19484,6 +19596,8 @@ plt.show()
             # Connect to database and update the table
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             # First, check if the table has a 'sdf_blob' column, add it if it doesn't exist
             cursor.execute(f"PRAGMA table_info({source_table})")
@@ -19876,6 +19990,8 @@ plt.show()
             try:
                 conn = sqlite3.connect(self.__chemspace_db)
                 cursor = conn.cursor()
+                cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.execute("PRAGMA synchronous=NORMAL")
                 
                 # Create new table with same schema as original
                 # Get original table schema
@@ -20058,6 +20174,8 @@ plt.show()
             try:
                 conn = sqlite3.connect(self.__chemspace_db)
                 cursor = conn.cursor()
+                cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.execute("PRAGMA synchronous=NORMAL")
                 # Create table with basic schema
                 columns = merged_df.columns
                 schema_parts = []
@@ -20232,6 +20350,8 @@ plt.show()
             try:
                 conn = sqlite3.connect(self.__chemspace_db)
                 cursor = conn.cursor()
+                cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.execute("PRAGMA synchronous=NORMAL")
                 # Save result_df to the database
                 columns = result_df.columns
                 schema_parts = []
@@ -20455,6 +20575,8 @@ plt.show()
                 # Check if table has 'sdf_blob' column
                 conn = sqlite3.connect(self.__chemspace_db)
                 cursor = conn.cursor()
+                cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.execute("PRAGMA synchronous=NORMAL")
                 cursor.execute(f"PRAGMA table_info({table})")
                 columns = [row[1] for row in cursor.fetchall()]
                 conn.close()
@@ -20499,6 +20621,8 @@ plt.show()
             # Query all rows with sdf_blob
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             cursor.execute(f"SELECT id, name, inchi_key, sdf_blob FROM {selected_table} WHERE sdf_blob IS NOT NULL")
             rows = cursor.fetchall()
             conn.close()
