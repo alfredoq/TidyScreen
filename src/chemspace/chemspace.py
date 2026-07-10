@@ -4414,7 +4414,8 @@ class ChemSpace:
     def project_dimensionality_on_table(self, table_name: Optional[str] = None,
                                         reference_table: Optional[str] = None,
                                         method: Optional[str] = None,
-                                        update_database: bool = True) -> pd.DataFrame:
+                                        update_database: bool = True,
+                                        run_in_background: Optional[bool] = None) -> pd.DataFrame:
         """
         Project a table's already-computed Morgan fingerprints into a dimensionality-reduction
         embedding previously fit (and auto-saved by reduce_dimensionality()) on another table.
@@ -4431,10 +4432,16 @@ class ChemSpace:
                 actually saved for reference_table. Note t-SNE has no .transform(); a saved t-SNE
                 model is always skipped with a warning.
             update_database (bool): Whether to store the projected coordinates back into table_name
+            run_in_background (Optional[bool]): If True, retrieve the table and run the projection
+                in a separate background process, returning immediately (progress and results are
+                written to a log file instead of stdout). If False, run in the foreground as usual.
+                If None, prompts an interactive fg/bg selection.
 
         Returns:
-            pd.DataFrame: DataFrame with added '<method>_from_<reference_table>_1'..'_<n>' columns,
-                empty DataFrame if error occurs
+            pd.DataFrame: DataFrame with added '<method>_from_<reference_table>_1'..'_<n>' columns.
+                Empty DataFrame if an error occurs, or if run_in_background is True (the projected
+                data is only available in the database table / log file once the background process
+                completes).
         """
         try:
             try:
@@ -4504,6 +4511,39 @@ class ChemSpace:
                     print("❌ No table selected for dimensionality projection")
                     return pd.DataFrame()
 
+            if run_in_background is None:
+                run_mode = input(
+                    "\n⚙️  Do you want to run the dimensionality projection in the foreground "
+                    "or background? (fg/bg) [default: fg]: "
+                ).strip().lower() or 'fg'
+                run_in_background = run_mode in ['bg', 'background']
+
+            if run_in_background:
+                return self._project_dimensionality_in_background(
+                    table_name, reference_table, methods_to_run, available_models, update_database
+                )
+
+            return self._run_dimensionality_projection(
+                table_name, reference_table, methods_to_run, available_models, update_database
+            )
+
+        except Exception as e:
+            print(f"❌ Error projecting dimensionality for table '{table_name}': {e}")
+            return pd.DataFrame()
+
+    def _run_dimensionality_projection(self, table_name: str, reference_table: str,
+                                       methods_to_run: List[str], available_models: Dict[str, Dict],
+                                       update_database: bool) -> pd.DataFrame:
+        """
+        Performs the actual retrieval, projection, and (optional) database update for
+        project_dimensionality_on_table(), once table/reference/method(s) have already been
+        resolved. Split out so it can be run either directly (foreground) or inside a
+        separate process (background) via _project_dimensionality_in_background().
+
+        Returns:
+            pd.DataFrame: DataFrame with added projected coordinate columns, empty on error.
+        """
+        try:
             print(f"📊 Retrieving table '{table_name}' for dimensionality projection...")
             df = self._get_table_as_dataframe(table_name)
 
@@ -4592,6 +4632,76 @@ class ChemSpace:
         except Exception as e:
             print(f"❌ Error projecting dimensionality for table '{table_name}': {e}")
             return pd.DataFrame()
+
+    def _project_dimensionality_in_background(self, table_name: str, reference_table: str,
+                                               methods_to_run: List[str], available_models: Dict[str, Dict],
+                                               update_database: bool) -> pd.DataFrame:
+        """
+        Launches the projection as a fully independent OS process via subprocess.Popen (the
+        same fg/bg pattern used by MolDyn's MD/MM-GBSA runs) and returns immediately, so long
+        projections on large tables don't block the caller.
+
+        multiprocessing.Process was tried first, but non-daemon children it spawns are joined
+        at interpreter exit (multiprocessing.util._exit_function walks active_children() and
+        blocks on them), so the terminal stayed locked until the projection finished -- exactly
+        what backgrounding is meant to avoid. A plain Popen child is simply orphaned instead:
+        Python does not wait for it, so control returns immediately and the terminal is free.
+
+        The child re-activates the project and reloads the saved reducer model(s) from disk on
+        its own (rather than being handed the already-loaded 'available_models' objects), since
+        those can't be carried across a Popen boundary the way they could with an in-process
+        fork; reloading is cheap compared to the projection itself.
+
+        Returns:
+            pd.DataFrame: Always empty; the projected data is only available in the database
+                table (if update_database) and the log file once the background process completes.
+        """
+        import subprocess
+
+        logs_dir = os.path.join(os.path.dirname(self.__chemspace_db), 'logs')
+        os.makedirs(logs_dir, exist_ok=True)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        base_name = f'projection_{table_name}_from_{reference_table}_{timestamp}'
+        log_file_path = os.path.join(logs_dir, f'{base_name}.log')
+        script_path = os.path.join(logs_dir, f'{base_name}.py')
+
+        script = f"""
+from tidyscreen import tidyscreen
+from tidyscreen.chemspace.chemspace import ChemSpace
+
+project = tidyscreen.ActivateProject({self.name!r})
+cs = ChemSpace(project)
+
+for method in {methods_to_run!r}:
+    cs.project_dimensionality_on_table(
+        table_name={table_name!r},
+        reference_table={reference_table!r},
+        method=method,
+        update_database={update_database!r},
+        run_in_background=False,
+    )
+"""
+        with open(script_path, 'w') as f:
+            f.write(script)
+
+        try:
+            with open(log_file_path, 'w') as log_file:
+                process = subprocess.Popen(
+                    [sys.executable, script_path],
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    cwd=self.path,
+                    start_new_session=True
+                )
+        except Exception as e:
+            print(f"❌ Error launching background projection: {e}")
+            return pd.DataFrame()
+
+        print(f"🚀 Dimensionality projection launched in the background (PID {process.pid})")
+        print(f"   Projecting '{table_name}' using {methods_to_run} model(s) from '{reference_table}'...")
+        print(f"   Progress/results log: {log_file_path}")
+
+        return pd.DataFrame()
 
     def _select_morgan_fp_column_interactive(self, available_columns: List[str],
                                              allow_all: bool = False) -> Optional[str]:
