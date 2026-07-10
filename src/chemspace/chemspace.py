@@ -1,6 +1,5 @@
 import os
 import csv
-import io
 import sqlite3
 import pandas as pd
 import re
@@ -4148,9 +4147,12 @@ class ChemSpace:
                 processing_time = time.time() - start_time
                 print(f"   ⏱️  {label} completed in {processing_time:.2f}s")
 
-                # Always persist the newly fitted reducer alongside the x/y values it produced
-                self._save_reduction_model_to_db(table_name, fp_column, current_method,
-                                                  embedding.shape[1], reducer)
+                # Persist the newly fitted reducer alongside the x/y values it produced, except
+                # for t-SNE: it has no out-of-sample transform(), so project_dimensionality_on_table()
+                # can never reuse a saved t-SNE model — nothing would ever read the blob back.
+                if current_method != 'tsne':
+                    self._save_reduction_model_to_db(table_name, fp_column, current_method,
+                                                      embedding.shape[1], reducer)
 
                 # Initialize output columns and assign computed coordinates (component count
                 # taken from the actual embedding, in case it ever differs from n_components)
@@ -4186,8 +4188,12 @@ class ChemSpace:
 
     def _ensure_dim_reduction_models_table(self, cursor: sqlite3.Cursor) -> None:
         """
-        Create the table that stores fitted dimensionality-reduction models, if it
-        doesn't already exist. One row per (table_name, fp_column, method) combination.
+        Create the table that indexes fitted dimensionality-reduction models, if it doesn't
+        already exist. One row per (table_name, fp_column, method) combination; the fitted
+        reducer itself is joblib-dumped to a file (see _get_dim_reduction_models_dir()) and
+        only its path is stored here — a pickled UMAP model retains its full training data
+        (plus a second copy inside its pynndescent index) and can exceed SQLite's ~2 GiB
+        per-value BLOB limit for large tables, which storing it as a BLOB column doesn't.
         """
         cursor.execute(f"""
             CREATE TABLE IF NOT EXISTS {self._DIM_REDUCTION_MODELS_TABLE} (
@@ -4196,17 +4202,62 @@ class ChemSpace:
                 fp_column TEXT NOT NULL,
                 method TEXT NOT NULL,
                 n_components INTEGER NOT NULL,
-                model_blob BLOB NOT NULL,
+                model_path TEXT NOT NULL,
                 created_date TEXT NOT NULL,
                 UNIQUE(table_name, fp_column, method)
             )
         """)
+        self._migrate_legacy_model_blob_column(cursor)
+
+    def _migrate_legacy_model_blob_column(self, cursor: sqlite3.Cursor) -> None:
+        """
+        One-time migration for databases created before model pickles were moved out of
+        SQLite: dumps any existing 'model_blob' values to files under
+        _get_dim_reduction_models_dir(), backfills 'model_path' to point at them, then drops
+        the now-unused 'model_blob' column.
+        """
+        cursor.execute(f"PRAGMA table_info({self._DIM_REDUCTION_MODELS_TABLE})")
+        columns = {row[1] for row in cursor.fetchall()}
+        if 'model_blob' not in columns:
+            return
+
+        if 'model_path' not in columns:
+            cursor.execute(f"ALTER TABLE {self._DIM_REDUCTION_MODELS_TABLE} ADD COLUMN model_path TEXT")
+
+        cursor.execute(f"""
+            SELECT id, table_name, fp_column, method, model_blob
+            FROM {self._DIM_REDUCTION_MODELS_TABLE}
+            WHERE model_blob IS NOT NULL AND (model_path IS NULL OR model_path = '')
+        """)
+        rows = cursor.fetchall()
+        if rows:
+            models_dir = self._get_dim_reduction_models_dir()
+            os.makedirs(models_dir, exist_ok=True)
+            for row_id, t_name, fp_col, method, blob in rows:
+                model_path = os.path.join(models_dir, f"{t_name}__{fp_col}__{method}.joblib")
+                with open(model_path, 'wb') as f:
+                    f.write(blob)
+                cursor.execute(
+                    f"UPDATE {self._DIM_REDUCTION_MODELS_TABLE} SET model_path = ? WHERE id = ?",
+                    (model_path, row_id)
+                )
+            print(f"   🔄 Migrated {len(rows)} legacy in-database model(s) to files under '{models_dir}'")
+
+        cursor.execute(f"ALTER TABLE {self._DIM_REDUCTION_MODELS_TABLE} DROP COLUMN model_blob")
+
+    def _get_dim_reduction_models_dir(self) -> str:
+        """
+        Directory where fitted dimensionality-reduction models are joblib-dumped, next to
+        chemspace.db.
+        """
+        return os.path.join(os.path.dirname(self.__chemspace_db), 'dim_reduction_models')
 
     def _save_reduction_model_to_db(self, table_name: str, fp_column: str, method: str,
                                     n_components: int, reducer) -> bool:
         """
-        Serialize a fitted reducer (via joblib) and persist it to the 'dim_reduction_models'
-        table, replacing any previously saved model for the same (table_name, fp_column, method).
+        Serialize a fitted reducer (via joblib) to a file under _get_dim_reduction_models_dir()
+        and record its path in the 'dim_reduction_models' table, replacing any previously saved
+        model for the same (table_name, fp_column, method).
 
         Returns:
             bool: True if the model was saved successfully
@@ -4214,9 +4265,10 @@ class ChemSpace:
         try:
             import joblib
 
-            buffer = io.BytesIO()
-            joblib.dump(reducer, buffer)
-            model_blob = buffer.getvalue()
+            models_dir = self._get_dim_reduction_models_dir()
+            os.makedirs(models_dir, exist_ok=True)
+            model_path = os.path.join(models_dir, f"{table_name}__{fp_column}__{method}.joblib")
+            joblib.dump(reducer, model_path)
 
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
@@ -4225,22 +4277,22 @@ class ChemSpace:
             self._ensure_dim_reduction_models_table(cursor)
             cursor.execute(f"""
                 INSERT INTO {self._DIM_REDUCTION_MODELS_TABLE}
-                    (table_name, fp_column, method, n_components, model_blob, created_date)
+                    (table_name, fp_column, method, n_components, model_path, created_date)
                 VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(table_name, fp_column, method) DO UPDATE SET
                     n_components = excluded.n_components,
-                    model_blob = excluded.model_blob,
+                    model_path = excluded.model_path,
                     created_date = excluded.created_date
-            """, (table_name, fp_column, method, n_components, model_blob, datetime.now().isoformat()))
+            """, (table_name, fp_column, method, n_components, model_path, datetime.now().isoformat()))
             conn.commit()
             conn.close()
 
             print(f"   💾 Saved {self._DIM_REDUCTION_LABELS[method]} model for '{table_name}' "
-                  f"to '{self._DIM_REDUCTION_MODELS_TABLE}'")
+                  f"to '{model_path}'")
             return True
 
         except Exception as e:
-            print(f"⚠️  Could not save {method} model for '{table_name}' to the database: {e}")
+            print(f"⚠️  Could not save {method} model for '{table_name}': {e}")
             return False
 
     def _get_tables_with_saved_reduction_models(self) -> List[str]:
@@ -4328,13 +4380,13 @@ class ChemSpace:
 
             if method and method != 'all':
                 cursor.execute(f"""
-                    SELECT method, fp_column, n_components, model_blob
+                    SELECT method, fp_column, n_components, model_path
                     FROM {self._DIM_REDUCTION_MODELS_TABLE}
                     WHERE table_name = ? AND method = ?
                 """, (source_table_name, method))
             else:
                 cursor.execute(f"""
-                    SELECT method, fp_column, n_components, model_blob
+                    SELECT method, fp_column, n_components, model_path
                     FROM {self._DIM_REDUCTION_MODELS_TABLE}
                     WHERE table_name = ?
                 """, (source_table_name,))
@@ -4343,9 +4395,9 @@ class ChemSpace:
             conn.close()
 
             models = {}
-            for saved_method, fp_col, n_comp, model_blob in rows:
+            for saved_method, fp_col, n_comp, model_path in rows:
                 models[saved_method] = {
-                    'reducer': joblib.load(io.BytesIO(model_blob)),
+                    'reducer': joblib.load(model_path),
                     'fp_column': fp_col,
                     'n_components': n_comp
                 }
@@ -5618,7 +5670,8 @@ plt.show()
 
     def _delete_reduction_models_from_db(self, table_name: str, methods: List[str]) -> int:
         """
-        Delete saved reduction model(s) for a table from 'dim_reduction_models'.
+        Delete saved reduction model(s) for a table from 'dim_reduction_models', including
+        the joblib-dumped model file(s) on disk each row points to.
 
         Args:
             table_name (str): Name of the table whose model(s) to delete
@@ -5634,6 +5687,14 @@ plt.show()
             cursor.execute("PRAGMA synchronous=NORMAL")
             self._ensure_dim_reduction_models_table(cursor)
             placeholders = ', '.join('?' for _ in methods)
+
+            cursor.execute(
+                f"SELECT model_path FROM {self._DIM_REDUCTION_MODELS_TABLE} "
+                f"WHERE table_name = ? AND method IN ({placeholders})",
+                (table_name, *methods)
+            )
+            model_paths = [row[0] for row in cursor.fetchall()]
+
             cursor.execute(
                 f"DELETE FROM {self._DIM_REDUCTION_MODELS_TABLE} "
                 f"WHERE table_name = ? AND method IN ({placeholders})",
@@ -5642,6 +5703,14 @@ plt.show()
             deleted = cursor.rowcount
             conn.commit()
             conn.close()
+
+            for model_path in model_paths:
+                try:
+                    if model_path:
+                        os.remove(model_path)
+                except OSError as e:
+                    print(f"⚠️  Could not remove model file '{model_path}': {e}")
+
             return deleted
 
         except Exception as e:
