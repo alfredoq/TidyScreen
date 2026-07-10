@@ -3991,6 +3991,10 @@ class ChemSpace:
     _DIM_REDUCTION_METHODS = ('pca', 'tsne', 'umap')
     _DIM_REDUCTION_LABELS = {'pca': 'PCA', 'tsne': 't-SNE', 'umap': 'UMAP'}
     _MORGAN_FP_COLUMN_PATTERN = re.compile(r'^morgan_fp_r\d+_\d+$')
+    # Row batch size used by project_dimensionality_on_table() when unpacking fingerprint bits
+    # to float32 for reducer.transform(); bounds peak memory to ~size * n_bits * 4 bytes
+    # regardless of table size (e.g. 50_000 x 2048 x 4 bytes ~= 410 MiB per chunk).
+    _PROJECTION_CHUNK_SIZE = 50_000
 
     def reduce_dimensionality(self, table_name: Optional[str] = None,
                               fp_column: Optional[str] = None,
@@ -4508,9 +4512,6 @@ class ChemSpace:
                 return pd.DataFrame()
 
             all_output_columns = []
-            # Different methods could have been fit on different fp_columns, so their matrices
-            # are built lazily and cached by column name.
-            fp_matrix_cache: Dict[str, Tuple[Any, Any, int]] = {}
 
             for current_method in methods_to_run:
                 label = self._DIM_REDUCTION_LABELS[current_method]
@@ -4532,37 +4533,44 @@ class ChemSpace:
                           f"this model on '{reference_table}') is not present in table '{table_name}'.")
                     continue
 
-                if fp_column not in fp_matrix_cache:
-                    valid_mask = ~df[fp_column].isin(['INVALID_SMILES', 'ERROR']) & df[fp_column].notna()
-                    num_valid = int(valid_mask.sum())
-                    X = None
-                    if num_valid > 0:
-                        fp_blobs = df.loc[valid_mask, fp_column].tolist()
-                        X = np.array(
-                            [np.unpackbits(np.frombuffer(b, dtype=np.uint8)) for b in fp_blobs],
-                            dtype=np.float32
-                        )
-                    fp_matrix_cache[fp_column] = (valid_mask, X, num_valid)
-
-                valid_mask, X, num_valid = fp_matrix_cache[fp_column]
-                if X is None:
+                valid_mask = ~df[fp_column].isin(['INVALID_SMILES', 'ERROR']) & df[fp_column].notna()
+                valid_indices = df.index[valid_mask]
+                num_valid = len(valid_indices)
+                if num_valid == 0:
                     print(f"⚠️  Skipping {label}: no valid fingerprints found in column '{fp_column}'.")
                     continue
 
                 print(f"🔬 Projecting '{fp_column}' ({num_valid} compounds) into the saved "
                       f"{label} embedding fit on '{reference_table}'...")
                 start_time = time.time()
-                embedding = reducer.transform(X)
+
+                # Unpacking bits to a float32 matrix for the whole table at once doesn't scale
+                # (e.g. 11.6M rows x 2048 bits x 4 bytes = ~88 GiB, enough to OOM outright), so
+                # the fingerprints are unpacked and transformed in bounded-size chunks instead;
+                # only one chunk's worth of expanded floats is ever resident at a time.
+                output_columns = None
+                for chunk_start in range(0, num_valid, self._PROJECTION_CHUNK_SIZE):
+                    chunk_idx = valid_indices[chunk_start:chunk_start + self._PROJECTION_CHUNK_SIZE]
+                    fp_blobs = df.loc[chunk_idx, fp_column].tolist()
+                    X_chunk = np.array(
+                        [np.unpackbits(np.frombuffer(b, dtype=np.uint8)) for b in fp_blobs],
+                        dtype=np.float32
+                    )
+                    embedding_chunk = reducer.transform(X_chunk)
+
+                    if output_columns is None:
+                        # Column names reference the reference table the loaded model was fit on;
+                        # component count taken from the actual embedding, in case it ever
+                        # differs from the model's recorded n_components
+                        output_columns = [f"{current_method}_from_{reference_table}_{i + 1}"
+                                          for i in range(embedding_chunk.shape[1])]
+                        for col in output_columns:
+                            df[col] = None
+
+                    df.loc[chunk_idx, output_columns] = embedding_chunk
+
                 processing_time = time.time() - start_time
                 print(f"   ⏱️  {label} projection completed in {processing_time:.2f}s")
-
-                # Column names reference the reference table the loaded model was fit on
-                output_columns = [f"{current_method}_from_{reference_table}_{i + 1}"
-                                  for i in range(embedding.shape[1])]
-                for col in output_columns:
-                    df[col] = None
-                df.loc[valid_mask, output_columns] = embedding
-
                 print(f"✅ {label} completed: {num_valid} compounds embedded into {output_columns}")
 
                 all_output_columns.extend(output_columns)
