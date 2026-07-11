@@ -11354,6 +11354,168 @@ plt.show()
             print(f"❌ Error in filter_using_physicochemical_workflow: {e}")
             return pd.DataFrame()
 
+    def inform_table_physicochemical_profile(self, table_name: Optional[str] = None,
+                    workflow_name: Optional[str] = None) -> pd.DataFrame:
+        """
+        Report the observed range of physicochemical descriptors (as defined by a
+        saved physicochemical filtering workflow) for the compounds in a given table.
+
+        Unlike filter_using_physicochemical_workflow(), this does not filter or save
+        anything -- it computes each descriptor listed in the workflow for every
+        parseable compound in the table and prints an on-screen summary (min, max,
+        mean, median, std) alongside the workflow's configured [min, max] bounds and
+        how many compounds currently fall outside that range.
+
+        Args:
+            table_name (Optional[str]): Name of the table containing compounds to profile.
+                If None, shows interactive selection.
+            workflow_name (Optional[str]): Name of the physicochemical workflow whose
+                descriptors should be profiled. If None, shows interactive selection.
+
+        Returns:
+            pd.DataFrame: One row per descriptor with columns
+                ['descriptor', 'min', 'max', 'mean', 'median', 'std', 'workflow_min',
+                'workflow_max', 'within_range', 'out_of_range', 'n']. Empty DataFrame
+                on error or if no compounds/descriptors could be evaluated.
+        """
+        try:
+            print(f"\n📊 Starting physicochemical profile report...")
+
+            # Interactive workflow selection if not provided
+            if workflow_name is None:
+                workflow_name = self._select_physicochemical_workflow_for_filtering()
+                if not workflow_name:
+                    print("❌ No workflow selected for profiling")
+                    return pd.DataFrame()
+
+            # Interactive table selection if not provided
+            if table_name is None:
+                table_name = self._select_table_for_filtering()
+                if not table_name:
+                    print("❌ No table selected for profiling")
+                    return pd.DataFrame()
+
+            print(f"   📋 Table: '{table_name}'")
+            print(f"   🧪 Workflow: '{workflow_name}'")
+
+            # Load workflow filters (descriptor names + configured bounds)
+            print(f"   🔍 Loading workflow filters...")
+            workflow_filters = self._load_physicochemical_workflow_filters(workflow_name)
+            if not workflow_filters:
+                print(f"❌ No filters found for workflow '{workflow_name}'")
+                return pd.DataFrame()
+
+            # Load compounds from table
+            print(f"   📊 Loading compounds from table '{table_name}'...")
+            compounds_df = self._get_table_as_dataframe(table_name)
+            if compounds_df.empty:
+                print(f"❌ No compounds found in table '{table_name}'")
+                return pd.DataFrame()
+
+            total_compounds = len(compounds_df)
+            print(f"   ✅ Loaded {total_compounds:,} compounds")
+
+            from rdkit import Chem
+            from rdkit.Chem import Descriptors
+            from rdkit import RDLogger
+            RDLogger.DisableLog('rdApp.*')
+
+            descriptor_funcs = {name: func for name, func in Descriptors._descList}
+            descriptor_names = [name for name, _, _ in workflow_filters]
+            configured_bounds = {name: (lower, upper) for name, lower, upper in workflow_filters}
+
+            descriptor_values: Dict[str, List[float]] = {name: [] for name in descriptor_names}
+            invalid_smiles_count = 0
+
+            print(f"   🧮 Computing {len(descriptor_names)} descriptor(s) for {total_compounds:,} compounds...")
+
+            if TQDM_AVAILABLE:
+                iterator = tqdm(compounds_df.iterrows(), total=total_compounds,
+                                desc="Computing descriptors", unit="compounds")
+            else:
+                iterator = compounds_df.iterrows()
+
+            for _, compound in iterator:
+                mol = Chem.MolFromSmiles(compound.get('smiles', None))
+                if mol is None:
+                    invalid_smiles_count += 1
+                    continue
+
+                for descriptor_name in descriptor_names:
+                    descriptor_func = descriptor_funcs.get(descriptor_name)
+                    if descriptor_func is None:
+                        continue
+                    try:
+                        descriptor_values[descriptor_name].append(descriptor_func(mol))
+                    except Exception:
+                        continue
+
+            valid_compounds = total_compounds - invalid_smiles_count
+            if valid_compounds == 0:
+                print(f"❌ No valid compounds (parseable SMILES) found in table '{table_name}'")
+                return pd.DataFrame()
+
+            report_rows = []
+            for descriptor_name in descriptor_names:
+                values = descriptor_values[descriptor_name]
+                if not values:
+                    print(f"   ⚠️  Descriptor '{descriptor_name}' could not be computed for any compound (skipped)")
+                    continue
+
+                values_array = np.array(values, dtype=float)
+                lower_bound, upper_bound = configured_bounds[descriptor_name]
+                out_of_range = int(np.sum((values_array < lower_bound) | (values_array > upper_bound)))
+                within_range = len(values) - out_of_range
+
+                report_rows.append({
+                    'descriptor': descriptor_name,
+                    'min': float(np.min(values_array)),
+                    'max': float(np.max(values_array)),
+                    'mean': float(np.mean(values_array)),
+                    'median': float(np.median(values_array)),
+                    'std': float(np.std(values_array)),
+                    'workflow_min': lower_bound,
+                    'workflow_max': upper_bound,
+                    'within_range': within_range,
+                    'out_of_range': out_of_range,
+                    'n': len(values)
+                })
+
+            if not report_rows:
+                print(f"❌ No descriptors from workflow '{workflow_name}' could be evaluated on table '{table_name}'")
+                return pd.DataFrame()
+
+            report_df = pd.DataFrame(report_rows)
+
+            # Print the on-screen report
+            print(f"\n{'=' * 130}")
+            print(f"📊 PHYSICOCHEMICAL PROFILE  |  Table: '{table_name}'  |  Workflow: '{workflow_name}'")
+            print(f"{'=' * 130}")
+            print(f"   Total compounds in table: {total_compounds:,}")
+            print(f"   Valid (parseable) compounds: {valid_compounds:,}")
+            if invalid_smiles_count:
+                print(f"   ⚠️  Invalid/unparseable SMILES skipped: {invalid_smiles_count:,}")
+            print(f"{'-' * 130}")
+            print(f"{'Descriptor':<25}{'Min':>10}{'Max':>10}{'Mean':>10}{'Median':>10}{'Std':>10}"
+                    f"{'Workflow Range':>22}{'Within range':>17}{'Out-of-range':>17}")
+            print(f"{'-' * 130}")
+            for row in report_rows:
+                workflow_range_str = f"[{row['workflow_min']}, {row['workflow_max']}]"
+                within_range_pct = (row['within_range'] / row['n']) * 100 if row['n'] else 0
+                out_of_range_pct = (row['out_of_range'] / row['n']) * 100 if row['n'] else 0
+                within_range_str = f"{row['within_range']:,} ({within_range_pct:.1f}%)"
+                out_of_range_str = f"{row['out_of_range']:,} ({out_of_range_pct:.1f}%)"
+                print(f"{row['descriptor']:<25}{row['min']:>10.3f}{row['max']:>10.3f}{row['mean']:>10.3f}"
+                        f"{row['median']:>10.3f}{row['std']:>10.3f}{workflow_range_str:>22}"
+                        f"{within_range_str:>17}{out_of_range_str:>17}")
+            print(f"{'=' * 130}\n")
+
+            return report_df
+
+        except Exception as e:
+            print(f"❌ Error generating physicochemical profile report: {e}")
+            return pd.DataFrame()
+
     def check_duplicates(self, table_name: Optional[str] = None,
                     duplicate_by: str = 'smiles',
                     show_duplicates: bool = True,
