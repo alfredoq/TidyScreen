@@ -16600,8 +16600,10 @@ plt.show()
                     deleted = []
                     for tbl in to_delete:
                         try:
-                            # Use confirm=False to avoid nested prompts; drop_table already prints status
-                            success = self.drop_table(tbl, confirm=False)
+                            # Use confirm=False to avoid nested prompts; drop_table already prints status.
+                            # vacuum=False since VACUUM rewrites the whole DB file -- do it once below
+                            # instead of once per dropped table.
+                            success = self.drop_table(tbl, confirm=False, vacuum=False)
                             if success:
                                 deleted.append(tbl)
                         except Exception as e:
@@ -16611,6 +16613,9 @@ plt.show()
                     state.setdefault('deleted_step_tables', []).extend(deleted)
 
                     print(f"🗑️  Deleted {len(deleted)}/{len(to_delete)} requested tables.")
+
+                    if deleted:
+                        self._vacuum_chemspace_db()
                 except Exception as e:
                     print(f"⚠️  Error during deletion query: {e}")
 
