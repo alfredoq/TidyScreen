@@ -5266,10 +5266,12 @@ plt.show()
             if output_path is None:
                 output_dir = os.path.join(self.path, 'chemspace', 'misc', 'dim_reduction')
                 os.makedirs(output_dir, exist_ok=True)
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                output_path = os.path.join(output_dir, f"{table_name}_{method}_{timestamp}.png")
+                output_path = os.path.join(output_dir, f"{table_name}_{method}.png")
             else:
                 os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+
+            if os.path.exists(output_path):
+                print(f"⚠️  '{output_path}' already exists -- overwriting.")
 
             fig.savefig(output_path, dpi=300, bbox_inches='tight')
 
@@ -5507,7 +5509,7 @@ plt.show()
             if ref_df is not None and not ref_df.empty:
                 ax.scatter(ref_df[ref_x_col], ref_df[ref_y_col], s=reference_point_size,
                           alpha=reference_alpha, color='lightgray',
-                          label=f"Reference ({selected_reference_table})")
+                          label=f"Reference ({selected_reference_table}) — n={len(ref_df):,}")
 
             target_colors: Dict[str, Any] = {}
             if multi_target:
@@ -5517,7 +5519,7 @@ plt.show()
 
             for entry in target_plot_data:
                 t_name, proj_df = entry['table_name'], entry['proj_df']
-                plot_label = f"Projected ({t_name})"
+                plot_label = f"Projected ({t_name}) — n={len(proj_df):,}"
 
                 if multi_target:
                     ax.scatter(proj_df[proj_x_col], proj_df[proj_y_col], s=point_size, alpha=alpha,
@@ -5536,7 +5538,8 @@ plt.show()
                     for cat in categories:
                         mask = color_values.astype(str) == cat
                         ax.scatter(proj_df.loc[mask, proj_x_col], proj_df.loc[mask, proj_y_col],
-                                  s=point_size, alpha=alpha, color=category_colors[cat], label=cat)
+                                  s=point_size, alpha=alpha, color=category_colors[cat],
+                                  label=f"{cat} — n={mask.sum():,}")
 
             ax.set_xlabel(proj_x_col)
             ax.set_ylabel(proj_y_col)
@@ -5549,16 +5552,18 @@ plt.show()
             if output_path is None:
                 output_dir = os.path.join(self.path, 'chemspace', 'misc', 'dim_reduction')
                 os.makedirs(output_dir, exist_ok=True)
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 base_table_label = target_plot_data[0]['table_name']
                 if multi_target:
                     base_table_label += f"_and_{len(target_plot_data) - 1}_more"
                 output_path = os.path.join(
                     output_dir,
-                    f"{base_table_label}_projected_{selected_method}_from_{selected_reference_table}_{timestamp}.png"
+                    f"{base_table_label}_projected_{selected_method}_from_{selected_reference_table}.png"
                 )
             else:
                 os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+
+            if os.path.exists(output_path):
+                print(f"⚠️  '{output_path}' already exists -- overwriting.")
 
             fig.savefig(output_path, dpi=300, bbox_inches='tight')
 
@@ -5696,7 +5701,7 @@ REF_Y_COL = {ref_y_col!r}
 
 ref_df = pd.read_csv(REF_CSV_PATH)
 ax.scatter(ref_df[REF_X_COL], ref_df[REF_Y_COL], s={reference_point_size!r}, alpha={reference_alpha!r},
-          color='lightgray', label={reference_label!r})
+          color='lightgray', label={reference_label!r} + f" — n={{len(ref_df)}}")
 '''
 
         proj_csv_names = ', '.join(repr(d['csv_name']) for d in proj_datasets)
@@ -5728,13 +5733,13 @@ if len(PROJ_DATASETS) > 1:
     for i, dataset in enumerate(PROJ_DATASETS):
         proj_df = pd.read_csv(os.path.join(SCRIPT_DIR, dataset['csv_name']))
         ax.scatter(proj_df[PROJ_X_COL], proj_df[PROJ_Y_COL], s=POINT_SIZE, alpha=ALPHA,
-                  color=cmap(i % cmap.N), label=dataset['label'])
+                  color=cmap(i % cmap.N), label=dataset['label'] + f" — n={{len(proj_df)}}")
 else:
     proj_df = pd.read_csv(os.path.join(SCRIPT_DIR, PROJ_DATASETS[0]['csv_name']))
     proj_label = PROJ_DATASETS[0]['label']
     if COLOR_BY is None:
         ax.scatter(proj_df[PROJ_X_COL], proj_df[PROJ_Y_COL], s=POINT_SIZE, alpha=ALPHA,
-                  color='crimson', label=proj_label)
+                  color='crimson', label=proj_label + f" — n={{len(proj_df)}}")
     elif pd.api.types.is_numeric_dtype(proj_df[COLOR_BY]):
         scatter = ax.scatter(proj_df[PROJ_X_COL], proj_df[PROJ_Y_COL], s=POINT_SIZE, alpha=ALPHA,
                              c=proj_df[COLOR_BY], cmap='viridis', label=proj_label)
@@ -5746,7 +5751,8 @@ else:
         for cat in categories:
             mask = proj_df[COLOR_BY].astype(str) == cat
             ax.scatter(proj_df.loc[mask, PROJ_X_COL], proj_df.loc[mask, PROJ_Y_COL],
-                      s=POINT_SIZE, alpha=ALPHA, color=category_colors[cat], label=cat)
+                      s=POINT_SIZE, alpha=ALPHA, color=category_colors[cat],
+                      label=f"{{cat}} — n={{mask.sum()}}")
 
 ax.set_xlabel(PROJ_X_COL)
 ax.set_ylabel(PROJ_Y_COL)
