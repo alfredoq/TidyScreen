@@ -8544,8 +8544,9 @@ plt.show()
                     
                     depiction_success = self.depict_table(temp_table_name, **depiction_kwargs)
                     
-                    # Clean up temporary table
-                    self.drop_table(temp_table_name, confirm=False)
+                    # Clean up temporary table (vacuum=False: this is a scratch table used only for
+                    # depiction, not worth a full-DB rewrite every time it's discarded)
+                    self.drop_table(temp_table_name, confirm=False, vacuum=False)
                     
                     if depiction_success:
                         print(f"✅ Filtered compounds depicted successfully")
