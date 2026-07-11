@@ -1,6 +1,6 @@
 import streamlit as st
 from tidyscreen import tidyscreen
-from tidyscreen.chemspace.chemspace import ChemSpace
+from tidyscreen.chemspace.chemspace import ChemSpace, _get_descriptor_funcs
 from tidyscreen.moldock.moldock import MolDock
 from tidyscreen.moldyn.moldyn import MolDyn
 from tidyscreen.ml.ml_functions import MachineLearning
@@ -1220,8 +1220,7 @@ elif page == "ChemSpace Actions":
     st.subheader("Chemical Filtering: physicochemical properties based")
 
     with st.expander("🔬 Available Physicochemical Filters"):
-        from rdkit.Chem import Descriptors
-        apf_descriptor_names = [name for name, _ in Descriptors._descList]
+        apf_descriptor_names = list(_get_descriptor_funcs().keys())
 
         apf_search = st.text_input("Search descriptors", key="apf_search")
         if apf_search.strip():
@@ -1237,8 +1236,7 @@ elif page == "ChemSpace Actions":
         if "cpfw_filters" not in st.session_state:
             st.session_state["cpfw_filters"] = {}
 
-        from rdkit.Chem import Descriptors
-        cpfw_descriptor_names = [name for name, _ in Descriptors._descList]
+        cpfw_descriptor_names = list(_get_descriptor_funcs().keys())
         cpfw_available_names = [name for name in cpfw_descriptor_names if name not in st.session_state["cpfw_filters"]]
 
         st.markdown("**Add a descriptor to the workflow**")
@@ -1408,8 +1406,7 @@ elif page == "ChemSpace Actions":
                 st.session_state["epfw_filters"] = dict(epfw_selected_wf["filters_dict"])
                 st.session_state["epfw_loaded_workflow"] = epfw_selected_name
 
-            from rdkit.Chem import Descriptors
-            epfw_descriptor_names = [name for name, _ in Descriptors._descList]
+            epfw_descriptor_names = list(_get_descriptor_funcs().keys())
 
             st.markdown("**Add or update a descriptor**")
             epfw_col1, epfw_col2, epfw_col3 = st.columns(3)
@@ -6264,8 +6261,8 @@ elif page == "Mol Viewer":
     smiles_input = st.text_input("Enter a SMILES string:", key="mv_smiles")
     smarts_input = st.text_input("Optional SMARTS to highlight:", key="mv_smarts")
 
-    from rdkit.Chem import Descriptors as _mv_Descriptors
-    _mv_descriptor_names = [name for name, _ in _mv_Descriptors._descList]
+    _mv_descriptor_funcs = _get_descriptor_funcs()
+    _mv_descriptor_names = list(_mv_descriptor_funcs.keys())
     mv_descriptor_name = st.selectbox("Select an RDKit descriptor to compute:", _mv_descriptor_names, key="mv_descriptor")
 
     if smiles_input:
@@ -6285,7 +6282,7 @@ elif page == "Mol Viewer":
                         st.warning("No SMARTS match found in this molecule.")
 
                 mv_mol = Chem.MolFromSmiles(smiles_input)
-                mv_descriptor_func = dict(_mv_Descriptors._descList).get(mv_descriptor_name)
+                mv_descriptor_func = _mv_descriptor_funcs.get(mv_descriptor_name)
                 if mv_mol is not None and mv_descriptor_func is not None:
                     try:
                         mv_descriptor_value = mv_descriptor_func(mv_mol)

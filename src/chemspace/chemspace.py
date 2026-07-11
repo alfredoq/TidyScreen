@@ -31,6 +31,39 @@ ActivateProject = tidyscreen.ActivateProject
 
 ## Module level helper functions for multiprocessing workers
 
+def _count_stereocenters(mol) -> int:
+    """
+    Count stereocenters (both assigned and unassigned) in a molecule, for use as a
+    physicochemical descriptor alongside RDKit's built-in Descriptors._descList.
+
+    Unassigned centers are included because they are still stereogenic -- a compound
+    with unspecified stereo at a center is exactly as synthetically/analytically
+    complex as one with it defined.
+    """
+    from rdkit import Chem
+
+    return len(Chem.FindMolChiralCenters(mol, includeUnassigned=True, useLegacyImplementation=False))
+
+# Custom descriptors not present in rdkit.Chem.Descriptors._descList, merged in
+# wherever physicochemical descriptor functions are looked up by name.
+CUSTOM_DESCRIPTOR_FUNCS: Dict[str, Callable] = {
+    'NumStereocenters': _count_stereocenters,
+}
+
+def _get_descriptor_funcs() -> Dict[str, Callable]:
+    """
+    Build the full name -> function lookup for physicochemical descriptors: RDKit's
+    built-in Descriptors._descList plus TidyScreen's CUSTOM_DESCRIPTOR_FUNCS (e.g.
+    NumStereocenters). Use this instead of building the dict from Descriptors._descList
+    alone, so custom descriptors are available for workflow creation, filtering, and
+    profiling consistently.
+    """
+    from rdkit.Chem import Descriptors
+
+    descriptor_funcs = {name: func for name, func in Descriptors._descList}
+    descriptor_funcs.update(CUSTOM_DESCRIPTOR_FUNCS)
+    return descriptor_funcs
+
 def _strip_salts_from_smiles(smiles: str, remover) -> Tuple[Optional[str], bool]:
     """
     Strip salt/counter-ion fragments (e.g. Cl-, Na+) from a SMILES string using
@@ -402,13 +435,12 @@ def _filter_chunk_worker_by_descriptor_bounds(chunk_data: List[Tuple], descripto
     """
     try:
         from rdkit import Chem
-        from rdkit.Chem import Descriptors
         from rdkit import RDLogger
         RDLogger.DisableLog('rdApp.*')
     except ImportError:
         return [{"error": "RDKit not available"}], {}
 
-    descriptor_funcs = {name: func for name, func in Descriptors._descList}
+    descriptor_funcs = _get_descriptor_funcs()
     results = []
     removed_counts = {name: 0 for name, _, _ in descriptor_filters}
 
@@ -10258,8 +10290,7 @@ plt.show()
             dict: Dictionary mapping descriptor name to {'min': ..., 'max': ...}
         """
         try:
-            from rdkit.Chem import Descriptors
-            descriptor_names = [name for name, _ in Descriptors._descList]
+            descriptor_names = list(_get_descriptor_funcs().keys())
 
             self._display_rdkit_descriptors(descriptor_names)
 
@@ -11104,11 +11135,10 @@ plt.show()
 
         try:
             from rdkit import Chem
-            from rdkit.Chem import Descriptors
             from rdkit import RDLogger
             RDLogger.DisableLog('rdApp.*')
 
-            descriptor_funcs = {name: func for name, func in Descriptors._descList}
+            descriptor_funcs = _get_descriptor_funcs()
 
             filtered_compounds = []
             total_compounds = len(compounds_df)
@@ -11376,7 +11406,11 @@ plt.show()
             pd.DataFrame: One row per descriptor with columns
                 ['descriptor', 'min', 'max', 'mean', 'median', 'std', 'workflow_min',
                 'workflow_max', 'within_range', 'out_of_range', 'n']. Empty DataFrame
-                on error or if no compounds/descriptors could be evaluated.
+                on error or if no compounds/descriptors could be evaluated. The count
+                of compounds matching all filters simultaneously is available via
+                `report_df.attrs['matching_all_filters']` (and the valid compound
+                count via `report_df.attrs['valid_compounds']`), and is printed in
+                the on-screen summary.
         """
         try:
             print(f"\n📊 Starting physicochemical profile report...")
@@ -11416,16 +11450,16 @@ plt.show()
             print(f"   ✅ Loaded {total_compounds:,} compounds")
 
             from rdkit import Chem
-            from rdkit.Chem import Descriptors
             from rdkit import RDLogger
             RDLogger.DisableLog('rdApp.*')
 
-            descriptor_funcs = {name: func for name, func in Descriptors._descList}
+            descriptor_funcs = _get_descriptor_funcs()
             descriptor_names = [name for name, _, _ in workflow_filters]
             configured_bounds = {name: (lower, upper) for name, lower, upper in workflow_filters}
 
             descriptor_values: Dict[str, List[float]] = {name: [] for name in descriptor_names}
             invalid_smiles_count = 0
+            matching_all_filters = 0
 
             print(f"   🧮 Computing {len(descriptor_names)} descriptor(s) for {total_compounds:,} compounds...")
 
@@ -11441,14 +11475,22 @@ plt.show()
                     invalid_smiles_count += 1
                     continue
 
+                compound_values = {}
                 for descriptor_name in descriptor_names:
                     descriptor_func = descriptor_funcs.get(descriptor_name)
                     if descriptor_func is None:
                         continue
                     try:
-                        descriptor_values[descriptor_name].append(descriptor_func(mol))
+                        value = descriptor_func(mol)
+                        descriptor_values[descriptor_name].append(value)
+                        compound_values[descriptor_name] = value
                     except Exception:
                         continue
+
+                if len(compound_values) == len(descriptor_names) and all(
+                        configured_bounds[name][0] <= value <= configured_bounds[name][1]
+                        for name, value in compound_values.items()):
+                    matching_all_filters += 1
 
             valid_compounds = total_compounds - invalid_smiles_count
             if valid_compounds == 0:
@@ -11486,6 +11528,8 @@ plt.show()
                 return pd.DataFrame()
 
             report_df = pd.DataFrame(report_rows)
+            report_df.attrs['matching_all_filters'] = matching_all_filters
+            report_df.attrs['valid_compounds'] = valid_compounds
 
             # Print the on-screen report
             print(f"\n{'=' * 130}")
@@ -11495,6 +11539,9 @@ plt.show()
             print(f"   Valid (parseable) compounds: {valid_compounds:,}")
             if invalid_smiles_count:
                 print(f"   ⚠️  Invalid/unparseable SMILES skipped: {invalid_smiles_count:,}")
+            matching_all_pct = (matching_all_filters / valid_compounds) * 100 if valid_compounds else 0
+            print(f"   ✅ Compounds matching ALL filters simultaneously: {matching_all_filters:,} "
+                    f"({matching_all_pct:.1f}% of valid compounds)")
             print(f"{'-' * 130}")
             print(f"{'Descriptor':<25}{'Min':>10}{'Max':>10}{'Mean':>10}{'Median':>10}{'Std':>10}"
                     f"{'Workflow Range':>22}{'Within range':>17}{'Out-of-range':>17}")
