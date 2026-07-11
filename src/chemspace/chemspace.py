@@ -4,7 +4,7 @@ import sqlite3
 import pandas as pd
 import re
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional, Any, Callable, Set
+from typing import Dict, List, Tuple, Optional, Any, Callable, Set, Union
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import cpu_count
@@ -5304,7 +5304,7 @@ plt.show()
             print(f"❌ Error plotting reduced coordinates for table '{table_name}': {e}")
             return None
 
-    def plot_projected_chemical_space(self, table_name: Optional[str] = None,
+    def plot_projected_chemical_space(self, table_names: Optional[Union[str, List[str]]] = None,
                                       method: Optional[str] = None,
                                       reference_table: Optional[str] = None,
                                       color_by: Optional[str] = None,
@@ -5316,27 +5316,34 @@ plt.show()
                                       reference_alpha: float = 0.25,
                                       show: bool = False) -> Optional[str]:
         """
-        Visualize a table's projected dimensionality-reduction coordinates (from
-        project_dimensionality_on_table()) as a 2D scatter plot, overlaid on top of the
+        Visualize one or more target tables' projected dimensionality-reduction coordinates
+        (from project_dimensionality_on_table()) as a 2D scatter plot, overlaid on top of the
         reference table's own coordinates (from reduce_dimensionality()) that were used to
         fit the embedding. Saved as a PNG.
 
         Args:
-            table_name (Optional[str]): Name of the table containing projected coordinates
-                ('<method>_from_<reference_table>_1'/'_2' columns). If None, prompts an
-                interactive table selection restricted to tables with such columns.
+            table_names (Optional[Union[str, List[str]]]): Name(s) of the target table(s)
+                containing projected coordinates ('<method>_from_<reference_table>_1'/'_2'
+                columns). A single string plots one target chemical space; a list overlays
+                multiple target chemical spaces (each in its own color) on top of the same
+                reference. If None, prompts an interactive multi-selection restricted to
+                tables with such columns. All target tables must share a common projected
+                (method, reference_table) embedding to be overlaid together.
             method (Optional[str]): Restrict to a projected embedding fit with this method
                 ('pca', 'tsne', 'umap'). Combined with reference_table to disambiguate when
-                a table holds more than one projection.
+                the target table(s) hold more than one shared projection.
             reference_table (Optional[str]): Restrict to a projected embedding that was fit
                 on this particular reference table.
-            color_by (Optional[str]): Name of a column (in table_name) to color the projected
-                points by. Numeric columns use a continuous colormap with a colorbar;
-                non-numeric columns use discrete colors with a legend. The reference points
-                are always drawn in a single neutral background color. If None, all projected
-                points share a single color.
+            color_by (Optional[str]): Name of a column (in the target table) to color the
+                projected points by. Numeric columns use a continuous colormap with a
+                colorbar; non-numeric columns use discrete colors with a legend. Only
+                applies when a single target table is plotted -- ignored (with a warning)
+                when multiple target tables are given, since each is instead colored by
+                its own identity so the overlaid chemical spaces stay distinguishable. The
+                reference points are always drawn in a single neutral background color.
             output_path (Optional[str]): Path to save the PNG. If None, defaults to
-                '<project>/chemspace/misc/dim_reduction/<table_name>_projected_<method>_from_<reference_table>_<timestamp>.png'
+                '<project>/chemspace/misc/dim_reduction/<table>_projected_<method>_from_<reference_table>_<timestamp>.png'
+                (based on the first target table's name)
             figsize (Tuple[int, int]): Matplotlib figure size in inches
             point_size (float): Marker size for the projected points
             reference_point_size (float): Marker size for the reference points
@@ -5355,55 +5362,71 @@ plt.show()
                 print("   pip install matplotlib")
                 return None
 
-            # Resolve table interactively if not provided, restricted to tables that
+            tables_with_projections = [
+                t for t in self.get_all_tables()
+                if self._detect_projected_reduction_columns_in_columns(self._get_table_columns(t))
+            ]
+
+            # Resolve target table(s) interactively if not provided, restricted to tables that
             # already have projected-coordinate columns from project_dimensionality_on_table()
-            if table_name is None:
-                tables_with_projections = [
-                    t for t in self.get_all_tables()
-                    if self._detect_projected_reduction_columns_in_columns(self._get_table_columns(t))
-                ]
+            if table_names is None:
                 if not tables_with_projections:
                     print("❌ No tables with projected-coordinate columns found.")
                     print("   Run project_dimensionality_on_table() on a table first.")
                     return None
 
-                table_name = self._select_table_interactive(
-                    "SELECT TABLE FOR PROJECTED-COORDINATE PLOT", tables_override=tables_with_projections
-                )
-                if not table_name:
-                    print("❌ No table selected for plotting")
+                target_tables = self._select_target_tables_interactive(tables_with_projections)
+                if not target_tables:
+                    print("❌ No target table(s) selected for plotting")
+                    return None
+            else:
+                target_tables = [table_names] if isinstance(table_names, str) else list(dict.fromkeys(table_names))
+                if not target_tables:
+                    print("❌ No target table(s) provided for plotting")
                     return None
 
-            print(f"📊 Retrieving table '{table_name}' for plotting...")
-            df = self._get_table_as_dataframe(table_name)
+            # Load each target table and its available projected-coordinate combinations
+            target_dfs: Dict[str, pd.DataFrame] = {}
+            target_projections: Dict[str, Dict[Tuple[str, str], List[str]]] = {}
+            for t in target_tables:
+                print(f"📊 Retrieving table '{t}' for plotting...")
+                t_df = self._get_table_as_dataframe(t)
+                if t_df.empty:
+                    print(f"⚠️  No data retrieved from table '{t}' -- skipping")
+                    continue
+                t_projections = self._detect_projected_reduction_columns_in_columns(t_df.columns)
+                if not t_projections:
+                    print(f"⚠️  No projected-coordinate columns found in table '{t}' -- skipping")
+                    continue
+                target_dfs[t] = t_df
+                target_projections[t] = t_projections
 
-            if df.empty:
-                print(f"⚠️  No data retrieved from table '{table_name}'")
+            if not target_dfs:
+                print("❌ None of the requested target table(s) have projected coordinates to plot.")
+                print("   Run project_dimensionality_on_table() on them first.")
                 return None
 
-            # Resolve which projected (method, reference_table) combination to plot
-            available_projections = self._detect_projected_reduction_columns_in_columns(df.columns)
+            # Resolve which projected (method, reference_table) combination to plot: it must be
+            # present in every surviving target table, since they all overlay the same embedding
+            candidate_keys = list(set.intersection(*(set(p.keys()) for p in target_projections.values())))
 
-            if not available_projections:
-                print(f"❌ No projected-coordinate columns found in table '{table_name}'.")
-                print("   Run project_dimensionality_on_table() on this table first.")
+            if not candidate_keys:
+                print("❌ The target table(s) do not share a common projected embedding.")
+                for t, p in target_projections.items():
+                    print(f"   '{t}': {sorted(p.keys())}")
                 return None
-
-            candidate_keys = list(available_projections.keys())
 
             if method is not None:
                 candidate_keys = [k for k in candidate_keys if k[0] == method]
                 if not candidate_keys:
-                    print(f"❌ No projected '{method}' coordinates found in table '{table_name}'.")
-                    print(f"   Available: {sorted({k[0] for k in available_projections})}")
+                    print(f"❌ No shared projected '{method}' coordinates found across the target table(s).")
                     return None
 
             if reference_table is not None:
                 candidate_keys = [k for k in candidate_keys if k[1] == reference_table]
                 if not candidate_keys:
-                    print(f"❌ No projected coordinates from reference table '{reference_table}' found "
-                          f"in table '{table_name}'.")
-                    print(f"   Available: {available_projections.keys()}")
+                    print(f"❌ No shared projected coordinates from reference table '{reference_table}' "
+                          f"found across the target table(s).")
                     return None
 
             if len(candidate_keys) == 1:
@@ -5415,13 +5438,46 @@ plt.show()
                     return None
                 selected_method, selected_reference_table = selected_key
 
-            proj_x_col, proj_y_col = available_projections[(selected_method, selected_reference_table)][:2]
+            # Build each target table's plotted DataFrame; the coordinate column names are
+            # identical across target tables since they are named '<method>_from_<reference>_i'
+            proj_x_col = proj_y_col = None
+            target_plot_data: List[Dict[str, Any]] = []
+            for t in target_tables:
+                if t not in target_dfs:
+                    continue
+                proj_x_col, proj_y_col = target_projections[t][(selected_method, selected_reference_table)][:2]
+                t_proj_df = target_dfs[t].dropna(subset=[proj_x_col, proj_y_col]).copy()
+                if t_proj_df.empty:
+                    print(f"⚠️  No rows with valid projected coordinates in table '{t}' -- skipping")
+                    continue
+                target_plot_data.append({'table_name': t, 'proj_df': t_proj_df})
 
-            proj_df = df.dropna(subset=[proj_x_col, proj_y_col]).copy()
-
-            if proj_df.empty:
-                print(f"❌ No rows with valid projected coordinates in table '{table_name}'")
+            if not target_plot_data:
+                print("❌ No target table(s) have valid projected coordinates to plot")
                 return None
+
+            multi_target = len(target_plot_data) > 1
+
+            # color_by only makes sense for a single target table's own column; with multiple
+            # target tables, color instead distinguishes which table each point came from
+            if multi_target and color_by is not None:
+                print(f"⚠️  'color_by' is ignored when plotting {len(target_plot_data)} target tables; "
+                      f"coloring by table identity instead.")
+                color_by = None
+
+            color_values = None
+            is_numeric_color = False
+            if not multi_target and color_by is not None:
+                entry = target_plot_data[0]
+                if color_by not in entry['proj_df'].columns:
+                    print(f"❌ Column '{color_by}' not found in table '{entry['table_name']}'")
+                    return None
+                entry['proj_df'] = entry['proj_df'].dropna(subset=[color_by])
+                if entry['proj_df'].empty:
+                    print(f"❌ No rows with valid '{color_by}' values to color by")
+                    return None
+                color_values = entry['proj_df'][color_by]
+                is_numeric_color = pd.api.types.is_numeric_dtype(color_values)
 
             # Load the reference table's own embedding coordinates for the same method
             ref_df = None
@@ -5439,23 +5495,10 @@ plt.show()
                     ref_x_col, ref_y_col = ref_methods[selected_method][:2]
                     ref_df = ref_full_df.dropna(subset=[ref_x_col, ref_y_col]).copy()
 
-            # Resolve coloring for the projected points only; reference points always use a
-            # single neutral background color
-            color_values = None
-            is_numeric_color = False
-            if color_by is not None:
-                if color_by not in df.columns:
-                    print(f"❌ Column '{color_by}' not found in table '{table_name}'")
-                    return None
-                proj_df = proj_df.dropna(subset=[color_by])
-                if proj_df.empty:
-                    print(f"❌ No rows with valid '{color_by}' values to color by")
-                    return None
-                color_values = proj_df[color_by]
-                is_numeric_color = pd.api.types.is_numeric_dtype(color_values)
-
             label = self._DIM_REDUCTION_LABELS[selected_method]
-            print(f"🎨 Plotting {len(proj_df)} projected compounds from '{table_name}' on top of "
+            target_names_summary = ', '.join(f"'{d['table_name']}'" for d in target_plot_data)
+            print(f"🎨 Plotting {sum(len(d['proj_df']) for d in target_plot_data)} projected compounds "
+                  f"from {target_names_summary} on top of "
                   f"{len(ref_df) if ref_df is not None else 0} reference compounds from "
                   f"'{selected_reference_table}' ({label})...")
 
@@ -5466,25 +5509,40 @@ plt.show()
                           alpha=reference_alpha, color='lightgray',
                           label=f"Reference ({selected_reference_table})")
 
-            if color_values is None:
-                ax.scatter(proj_df[proj_x_col], proj_df[proj_y_col], s=point_size, alpha=alpha,
-                          color='crimson', label=f"Projected ({table_name})")
-            elif is_numeric_color:
-                scatter = ax.scatter(proj_df[proj_x_col], proj_df[proj_y_col], s=point_size, alpha=alpha,
-                                     c=color_values, cmap='viridis', label=f"Projected ({table_name})")
-                fig.colorbar(scatter, ax=ax, label=color_by)
-            else:
-                categories = sorted(color_values.astype(str).unique())
-                cmap = plt.get_cmap('tab20' if len(categories) > 10 else 'tab10')
-                category_colors = {cat: cmap(i % cmap.N) for i, cat in enumerate(categories)}
-                for cat in categories:
-                    mask = color_values.astype(str) == cat
-                    ax.scatter(proj_df.loc[mask, proj_x_col], proj_df.loc[mask, proj_y_col],
-                              s=point_size, alpha=alpha, color=category_colors[cat], label=cat)
+            target_colors: Dict[str, Any] = {}
+            if multi_target:
+                target_cmap = plt.get_cmap('tab20' if len(target_plot_data) > 10 else 'tab10')
+                target_colors = {d['table_name']: target_cmap(i % target_cmap.N)
+                                 for i, d in enumerate(target_plot_data)}
+
+            for entry in target_plot_data:
+                t_name, proj_df = entry['table_name'], entry['proj_df']
+                plot_label = f"Projected ({t_name})"
+
+                if multi_target:
+                    ax.scatter(proj_df[proj_x_col], proj_df[proj_y_col], s=point_size, alpha=alpha,
+                              color=target_colors[t_name], label=plot_label)
+                elif color_values is None:
+                    ax.scatter(proj_df[proj_x_col], proj_df[proj_y_col], s=point_size, alpha=alpha,
+                              color='crimson', label=plot_label)
+                elif is_numeric_color:
+                    scatter = ax.scatter(proj_df[proj_x_col], proj_df[proj_y_col], s=point_size, alpha=alpha,
+                                         c=color_values, cmap='viridis', label=plot_label)
+                    fig.colorbar(scatter, ax=ax, label=color_by)
+                else:
+                    categories = sorted(color_values.astype(str).unique())
+                    cmap = plt.get_cmap('tab20' if len(categories) > 10 else 'tab10')
+                    category_colors = {cat: cmap(i % cmap.N) for i, cat in enumerate(categories)}
+                    for cat in categories:
+                        mask = color_values.astype(str) == cat
+                        ax.scatter(proj_df.loc[mask, proj_x_col], proj_df.loc[mask, proj_y_col],
+                                  s=point_size, alpha=alpha, color=category_colors[cat], label=cat)
 
             ax.set_xlabel(proj_x_col)
             ax.set_ylabel(proj_y_col)
-            ax.set_title(f"{label} — {table_name} projected onto {selected_reference_table}")
+            title_targets = target_names_summary if multi_target else f"'{target_plot_data[0]['table_name']}'"
+            plot_title = f"{label} — {title_targets} projected onto {selected_reference_table}"
+            ax.set_title(plot_title)
             ax.grid(True, alpha=0.3)
             ax.legend(loc='best', fontsize=8)
 
@@ -5492,9 +5550,12 @@ plt.show()
                 output_dir = os.path.join(self.path, 'chemspace', 'misc', 'dim_reduction')
                 os.makedirs(output_dir, exist_ok=True)
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                base_table_label = target_plot_data[0]['table_name']
+                if multi_target:
+                    base_table_label += f"_and_{len(target_plot_data) - 1}_more"
                 output_path = os.path.join(
                     output_dir,
-                    f"{table_name}_projected_{selected_method}_from_{selected_reference_table}_{timestamp}.png"
+                    f"{base_table_label}_projected_{selected_method}_from_{selected_reference_table}_{timestamp}.png"
                 )
             else:
                 os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
@@ -5510,11 +5571,21 @@ plt.show()
             # regenerates the plot from them, named consistently (same base name) with the PNG
             base_name = os.path.splitext(os.path.basename(output_path))[0]
 
-            proj_csv_columns = (['id'] if 'id' in proj_df.columns else []) + [proj_x_col, proj_y_col]
-            if color_by is not None and color_by not in proj_csv_columns:
-                proj_csv_columns.append(color_by)
+            datasets: Dict[str, pd.DataFrame] = {}
+            proj_datasets_for_script: List[Dict[str, str]] = []
+            for entry in target_plot_data:
+                t_name, proj_df = entry['table_name'], entry['proj_df']
+                proj_csv_columns = (['id'] if 'id' in proj_df.columns else []) + [proj_x_col, proj_y_col]
+                if not multi_target and color_by is not None and color_by not in proj_csv_columns:
+                    proj_csv_columns.append(color_by)
 
-            datasets = {'_projected': proj_df[proj_csv_columns]}
+                suffix = '_projected' if not multi_target else f"_projected_{t_name}"
+                datasets[suffix] = proj_df[proj_csv_columns]
+                proj_datasets_for_script.append({
+                    'csv_name': f"{base_name}{suffix}.csv",
+                    'label': f"Projected ({t_name})",
+                })
+
             ref_csv_name = None
             if ref_df is not None and not ref_df.empty:
                 ref_csv_columns = (['id'] if 'id' in ref_df.columns else []) + [ref_x_col, ref_y_col]
@@ -5524,7 +5595,7 @@ plt.show()
             csv_paths, script_path = self._export_plot_data_and_script(
                 output_path, datasets,
                 self._render_projected_chemical_space_plot_script(
-                    proj_csv_name=f"{base_name}_projected.csv",
+                    proj_datasets=proj_datasets_for_script,
                     ref_csv_name=ref_csv_name,
                     png_name=os.path.basename(output_path),
                     proj_x_col=proj_x_col, proj_y_col=proj_y_col,
@@ -5532,9 +5603,8 @@ plt.show()
                     color_by=color_by, figsize=figsize,
                     point_size=point_size, reference_point_size=reference_point_size,
                     alpha=alpha, reference_alpha=reference_alpha,
-                    title=f"{label} — {table_name} projected onto {selected_reference_table}",
-                    reference_label=f"Reference ({selected_reference_table})",
-                    projected_label=f"Projected ({table_name})"
+                    title=plot_title,
+                    reference_label=f"Reference ({selected_reference_table})"
                 )
             )
 
@@ -5544,19 +5614,78 @@ plt.show()
             return output_path
 
         except Exception as e:
-            print(f"❌ Error plotting projected chemical space for table '{table_name}': {e}")
+            print(f"❌ Error plotting projected chemical space for table(s) '{table_names}': {e}")
             return None
 
-    def _render_projected_chemical_space_plot_script(self, proj_csv_name: str, ref_csv_name: Optional[str],
+    def _select_target_tables_interactive(self, tables_with_projections: List[str]) -> Optional[List[str]]:
+        """
+        Interactive multi-selection of target table(s) with projected coordinates, for
+        plot_projected_chemical_space(). Selecting more than one overlays multiple target
+        chemical spaces on top of the same reference embedding.
+
+        Args:
+            tables_with_projections (List[str]): Candidate table names to choose from
+
+        Returns:
+            Optional[List[str]]: Selected table names (in the order chosen, de-duplicated),
+                or None if cancelled
+        """
+        print(f"\n🔍 SELECT TARGET TABLE(S) FOR PROJECTED-COORDINATE PLOT")
+        print("=" * 70)
+        for i, t in enumerate(tables_with_projections, 1):
+            try:
+                compound_count = self.get_compound_count(table_name=t)
+                print(f"{i:3d}. {t:<30} ({compound_count:>6,} compounds)")
+            except Exception:
+                print(f"{i:3d}. {t}")
+        print("-" * 70)
+        print("Commands: Enter option number(s) (comma-separated) to overlay multiple targets, "
+              "'all', or 'cancel' to abort")
+
+        while True:
+            try:
+                selection = input(f"\n🔍 Select target table(s): ").strip()
+
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    return None
+
+                if selection.lower() == 'all':
+                    return list(tables_with_projections)
+
+                try:
+                    indices = [int(part.strip()) - 1 for part in selection.split(',') if part.strip()]
+                    if indices and all(0 <= idx < len(tables_with_projections) for idx in indices):
+                        seen = set()
+                        selected = []
+                        for idx in indices:
+                            if idx not in seen:
+                                seen.add(idx)
+                                selected.append(tables_with_projections[idx])
+                        return selected
+                    print(f"❌ Invalid selection. Please enter number(s) between 1-{len(tables_with_projections)}")
+                except ValueError:
+                    print(f"❌ Invalid input '{selection}'")
+
+            except KeyboardInterrupt:
+                print("\n❌ Selection cancelled")
+                return None
+
+    def _render_projected_chemical_space_plot_script(self, proj_datasets: List[Dict[str, str]],
+                                                      ref_csv_name: Optional[str],
                                                       png_name: str, proj_x_col: str, proj_y_col: str,
                                                       ref_x_col: Optional[str], ref_y_col: Optional[str],
                                                       color_by: Optional[str], figsize: Tuple[int, int],
                                                       point_size: float, reference_point_size: float,
                                                       alpha: float, reference_alpha: float, title: str,
-                                                      reference_label: str, projected_label: str) -> str:
+                                                      reference_label: str) -> str:
         """
         Render a standalone Python script that reproduces a plot_projected_chemical_space() plot
         from its exported CSV(s), with no dependency on TidyScreen.
+
+        Args:
+            proj_datasets (List[Dict[str, str]]): One entry per target table, in plotted order,
+                each with 'csv_name' and 'label'. A single entry with color_by set reproduces
+                the per-column coloring; multiple entries reproduce the per-table color palette.
         """
         ref_block = ""
         if ref_csv_name is not None:
@@ -5570,9 +5699,11 @@ ax.scatter(ref_df[REF_X_COL], ref_df[REF_Y_COL], s={reference_point_size!r}, alp
           color='lightgray', label={reference_label!r})
 '''
 
+        proj_csv_names = ', '.join(repr(d['csv_name']) for d in proj_datasets)
+
         return f'''#!/usr/bin/env python3
 """
-Regenerates '{png_name}' from '{proj_csv_name}'{f" and '{ref_csv_name}'" if ref_csv_name else ""}.
+Regenerates '{png_name}' from {proj_csv_names}{f" and '{ref_csv_name}'" if ref_csv_name else ""}.
 Generated by ChemSpace.plot_projected_chemical_space().
 """
 import os
@@ -5580,7 +5711,6 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJ_CSV_PATH = os.path.join(SCRIPT_DIR, {proj_csv_name!r})
 OUTPUT_PATH = os.path.join(SCRIPT_DIR, {png_name!r})
 
 PROJ_X_COL = {proj_x_col!r}
@@ -5589,25 +5719,34 @@ COLOR_BY = {color_by!r}
 POINT_SIZE = {point_size!r}
 ALPHA = {alpha!r}
 
-proj_df = pd.read_csv(PROJ_CSV_PATH)
+PROJ_DATASETS = {proj_datasets!r}  # one entry per target table: {{'csv_name': ..., 'label': ...}}
 
 fig, ax = plt.subplots(figsize={tuple(figsize)!r})
 {ref_block}
-if COLOR_BY is None:
-    ax.scatter(proj_df[PROJ_X_COL], proj_df[PROJ_Y_COL], s=POINT_SIZE, alpha=ALPHA,
-              color='crimson', label={projected_label!r})
-elif pd.api.types.is_numeric_dtype(proj_df[COLOR_BY]):
-    scatter = ax.scatter(proj_df[PROJ_X_COL], proj_df[PROJ_Y_COL], s=POINT_SIZE, alpha=ALPHA,
-                         c=proj_df[COLOR_BY], cmap='viridis', label={projected_label!r})
-    fig.colorbar(scatter, ax=ax, label=COLOR_BY)
+if len(PROJ_DATASETS) > 1:
+    cmap = plt.get_cmap('tab20' if len(PROJ_DATASETS) > 10 else 'tab10')
+    for i, dataset in enumerate(PROJ_DATASETS):
+        proj_df = pd.read_csv(os.path.join(SCRIPT_DIR, dataset['csv_name']))
+        ax.scatter(proj_df[PROJ_X_COL], proj_df[PROJ_Y_COL], s=POINT_SIZE, alpha=ALPHA,
+                  color=cmap(i % cmap.N), label=dataset['label'])
 else:
-    categories = sorted(proj_df[COLOR_BY].astype(str).unique())
-    cmap = plt.get_cmap('tab20' if len(categories) > 10 else 'tab10')
-    category_colors = {{cat: cmap(i % cmap.N) for i, cat in enumerate(categories)}}
-    for cat in categories:
-        mask = proj_df[COLOR_BY].astype(str) == cat
-        ax.scatter(proj_df.loc[mask, PROJ_X_COL], proj_df.loc[mask, PROJ_Y_COL],
-                  s=POINT_SIZE, alpha=ALPHA, color=category_colors[cat], label=cat)
+    proj_df = pd.read_csv(os.path.join(SCRIPT_DIR, PROJ_DATASETS[0]['csv_name']))
+    proj_label = PROJ_DATASETS[0]['label']
+    if COLOR_BY is None:
+        ax.scatter(proj_df[PROJ_X_COL], proj_df[PROJ_Y_COL], s=POINT_SIZE, alpha=ALPHA,
+                  color='crimson', label=proj_label)
+    elif pd.api.types.is_numeric_dtype(proj_df[COLOR_BY]):
+        scatter = ax.scatter(proj_df[PROJ_X_COL], proj_df[PROJ_Y_COL], s=POINT_SIZE, alpha=ALPHA,
+                             c=proj_df[COLOR_BY], cmap='viridis', label=proj_label)
+        fig.colorbar(scatter, ax=ax, label=COLOR_BY)
+    else:
+        categories = sorted(proj_df[COLOR_BY].astype(str).unique())
+        cat_cmap = plt.get_cmap('tab20' if len(categories) > 10 else 'tab10')
+        category_colors = {{cat: cat_cmap(i % cat_cmap.N) for i, cat in enumerate(categories)}}
+        for cat in categories:
+            mask = proj_df[COLOR_BY].astype(str) == cat
+            ax.scatter(proj_df.loc[mask, PROJ_X_COL], proj_df.loc[mask, PROJ_Y_COL],
+                      s=POINT_SIZE, alpha=ALPHA, color=category_colors[cat], label=cat)
 
 ax.set_xlabel(PROJ_X_COL)
 ax.set_ylabel(PROJ_Y_COL)
