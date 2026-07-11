@@ -4,7 +4,7 @@ import sqlite3
 import pandas as pd
 import re
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional, Any, Callable
+from typing import Dict, List, Tuple, Optional, Any, Callable, Set
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import cpu_count
@@ -4543,6 +4543,7 @@ class ChemSpace:
         Returns:
             pd.DataFrame: DataFrame with added projected coordinate columns, empty on error.
         """
+        conn = None
         try:
             print(f"📊 Retrieving table '{table_name}' for dimensionality projection...")
             df = self._get_table_as_dataframe(table_name)
@@ -4550,6 +4551,20 @@ class ChemSpace:
             if df.empty:
                 print(f"⚠️  No data retrieved from table '{table_name}'")
                 return pd.DataFrame()
+
+            # Chunks are written to the DB as they are computed (see below) instead of once
+            # at the end, so a killed/crashed background run keeps whatever chunks already
+            # landed, and the log shows real incremental progress rather than a single
+            # completion line per method. One connection is kept open across every method's
+            # chunks to avoid re-opening it dozens of times.
+            existing_columns: Set[str] = set()
+            if update_database:
+                conn = sqlite3.connect(self.__chemspace_db)
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                cursor = conn.cursor()
+                cursor.execute(f"PRAGMA table_info({table_name})")
+                existing_columns = {row[1] for row in cursor.fetchall()}
 
             all_output_columns = []
 
@@ -4589,6 +4604,9 @@ class ChemSpace:
                 # the fingerprints are unpacked and transformed in bounded-size chunks instead;
                 # only one chunk's worth of expanded floats is ever resident at a time.
                 output_columns = None
+                total_chunks = (num_valid + self._PROJECTION_CHUNK_SIZE - 1) // self._PROJECTION_CHUNK_SIZE
+                db_write_failed = False
+                rows_written = 0
                 for chunk_start in range(0, num_valid, self._PROJECTION_CHUNK_SIZE):
                     chunk_idx = valid_indices[chunk_start:chunk_start + self._PROJECTION_CHUNK_SIZE]
                     fp_blobs = df.loc[chunk_idx, fp_column].tolist()
@@ -4606,8 +4624,34 @@ class ChemSpace:
                                           for i in range(embedding_chunk.shape[1])]
                         for col in output_columns:
                             df[col] = None
+                        if update_database:
+                            self._ensure_reduction_columns_exist(
+                                conn, table_name, output_columns, existing_columns
+                            )
 
                     df.loc[chunk_idx, output_columns] = embedding_chunk
+
+                    chunk_num = chunk_start // self._PROJECTION_CHUNK_SIZE + 1
+                    if update_database and not db_write_failed:
+                        try:
+                            chunk_ids = df.loc[chunk_idx, 'id'].tolist()
+                            set_clause = ", ".join(f"{col} = ?" for col in output_columns)
+                            update_query = f"UPDATE {table_name} SET {set_clause} WHERE id = ?"
+                            updates = [
+                                tuple(row) + (row_id,)
+                                for row, row_id in zip(embedding_chunk.tolist(), chunk_ids)
+                            ]
+                            conn.cursor().executemany(update_query, updates)
+                            conn.commit()
+                            rows_written += len(updates)
+                            print(f"   📦 Chunk {chunk_num}/{total_chunks}: {len(chunk_idx)} compounds "
+                                  f"projected and written to DB ({rows_written}/{num_valid} total)")
+                        except Exception as e:
+                            db_write_failed = True
+                            print(f"   ⚠️  Chunk {chunk_num}/{total_chunks} DB write failed, continuing "
+                                  f"in-memory only for the rest of this method: {e}")
+                    else:
+                        print(f"   📦 Chunk {chunk_num}/{total_chunks}: {len(chunk_idx)} compounds projected")
 
                 processing_time = time.time() - start_time
                 print(f"   ⏱️  {label} projection completed in {processing_time:.2f}s")
@@ -4619,19 +4663,14 @@ class ChemSpace:
                 print("❌ No dimensionality projection was performed (all requested methods were skipped)")
                 return pd.DataFrame()
 
-            if update_database:
-                print(f"💾 Updating database table '{table_name}' with projected coordinates...")
-                success = self._update_table_with_reduced_coordinates(table_name, df, all_output_columns)
-                if success:
-                    print(f"✅ Database table '{table_name}' updated with columns {all_output_columns}")
-                else:
-                    print(f"❌ Failed to update database table '{table_name}'")
-
             return df
 
         except Exception as e:
             print(f"❌ Error projecting dimensionality for table '{table_name}': {e}")
             return pd.DataFrame()
+        finally:
+            if conn is not None:
+                conn.close()
 
     def _project_dimensionality_in_background(self, table_name: str, reference_table: str,
                                                methods_to_run: List[str], available_models: Dict[str, Dict],
@@ -4810,6 +4849,25 @@ for method in {methods_to_run!r}:
             except KeyboardInterrupt:
                 print("\n❌ Method selection cancelled")
                 return None
+
+    def _ensure_reduction_columns_exist(self, conn: sqlite3.Connection, table_name: str,
+                                        output_columns: List[str], existing_columns: Set[str]) -> None:
+        """
+        Adds any of output_columns not yet present in table_name via ALTER TABLE, updating
+        existing_columns in place so callers writing many chunks in a row (e.g. the per-chunk
+        DB writes in _run_dimensionality_projection()) don't re-query PRAGMA table_info or
+        retry an ALTER for a column already confirmed to exist.
+        """
+        cursor = conn.cursor()
+        for col in output_columns:
+            if col not in existing_columns:
+                try:
+                    cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {col} REAL")
+                    conn.commit()
+                    existing_columns.add(col)
+                    print(f"   📋 Added '{col}' column to existing table '{table_name}'")
+                except sqlite3.OperationalError as e:
+                    print(f"   ⚠️  Warning: Could not add {col} column: {e}")
 
     def _update_table_with_reduced_coordinates(self, table_name: str, df: pd.DataFrame,
                                                output_columns: List[str]) -> bool:
