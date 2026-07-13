@@ -129,6 +129,46 @@ def _retain_largest_fragment_from_smiles(smiles: str, chooser) -> Tuple[Optional
 
     return Chem.MolToSmiles(largest_mol), True
 
+def _compute_structure_dedup_key(smiles: str, salt_remover, fragment_chooser) -> Optional[str]:
+    """
+    Compute a canonical structure key used purely to detect duplicate molecules,
+    independent of the compound's name and of how its SMILES happens to be written.
+
+    Two rows are considered the same molecule here even when their raw SMILES
+    differ syntactically (e.g. atom/ring-closure ordering) or represent different
+    salt forms of the same parent structure (e.g. a free base vs. its HCl salt) --
+    this always strips salts/counter-ions and reduces to the largest fragment for
+    the purpose of the comparison, regardless of the strip_salts/retain_largest_fragment
+    options controlling what is actually *stored*.
+
+    Args:
+        smiles (str): SMILES string to key
+        salt_remover: An `rdkit.Chem.SaltRemover.SaltRemover` instance
+        fragment_chooser: An `rdkit.Chem.MolStandardize.rdMolStandardize.LargestFragmentChooser` instance
+
+    Returns:
+        Optional[str]: Canonical parent-structure SMILES, or None if the SMILES can't be parsed
+    """
+    from rdkit import Chem
+
+    working_smiles = smiles
+
+    stripped, _ = _strip_salts_from_smiles(working_smiles, salt_remover)
+    if stripped is None:
+        return None
+    working_smiles = stripped
+
+    reduced, _ = _retain_largest_fragment_from_smiles(working_smiles, fragment_chooser)
+    if reduced is None:
+        return None
+    working_smiles = reduced
+
+    mol = Chem.MolFromSmiles(working_smiles)
+    if mol is None:
+        return None
+
+    return Chem.MolToSmiles(mol)
+
 def _process_chunk_worker(chunk_df: pd.DataFrame, smiles_column: str,
                          name_column: Optional[str], flag_column: Optional[str],
                          name_available: bool, flag_available: bool,
@@ -2448,7 +2488,8 @@ class ChemSpace:
         return df
     
     def _insert_compounds(self, compounds_data: List[Tuple], table_name: str, skip_duplicates: bool = True,
-                         show_progress: bool = False) -> Dict[str, Any]:
+                         show_progress: bool = False,
+                         structure_keys: Optional[Set[str]] = None) -> Dict[str, Any]:
         """
         Insert compounds data into the database.
 
@@ -2460,6 +2501,15 @@ class ChemSpace:
                 Only meaningful when called with a large, un-chunked batch (e.g. the sequential
                 load_csv_file path); left off for per-chunk inserts in the parallel path since an
                 outer progress bar already tracks overall row throughput there.
+            structure_keys (Optional[Set[str]]): Set of canonical structure keys (see
+                _compute_structure_dedup_key()) already present, used to catch duplicate
+                molecules regardless of name or of salt-form/SMILES-string differences
+                (e.g. a free base and its HCl salt loaded under different names) --
+                the UNIQUE(name, smiles) constraint alone misses these. Mutated in place
+                so callers making repeated calls for the same table (e.g. per parallel
+                chunk) can share one set across calls instead of re-scanning the table
+                each time. If None, it is seeded once from the table's current contents
+                for this call only.
 
         Returns:
             dict: Results containing counts and status
@@ -2481,6 +2531,22 @@ class ChemSpace:
             VALUES (?, ?, ?, ?)
             """
 
+            salt_remover = None
+            fragment_chooser = None
+            if skip_duplicates:
+                from rdkit.Chem import SaltRemover
+                from rdkit.Chem.MolStandardize import rdMolStandardize
+                salt_remover = SaltRemover.SaltRemover()
+                fragment_chooser = rdMolStandardize.LargestFragmentChooser()
+
+                if structure_keys is None:
+                    structure_keys = set()
+                    cursor.execute(f"SELECT smiles FROM {table_name}")
+                    for (existing_smiles,) in cursor.fetchall():
+                        existing_key = _compute_structure_dedup_key(existing_smiles, salt_remover, fragment_chooser)
+                        if existing_key is not None:
+                            structure_keys.add(existing_key)
+
             if show_progress and TQDM_AVAILABLE:
                 compound_iterator = tqdm(compounds_data, desc="Inserting compounds", unit="cmpd")
             else:
@@ -2489,6 +2555,15 @@ class ChemSpace:
                     print(f"   💾 Inserting {len(compounds_data)} compounds into '{table_name}'...")
 
             for compound_data in compound_iterator:
+                if skip_duplicates:
+                    structure_key = _compute_structure_dedup_key(compound_data[0], salt_remover, fragment_chooser)
+                    if structure_key is not None:
+                        if structure_key in structure_keys:
+                            duplicates_skipped += 1
+                            duplicate_smiles.append(compound_data[0])
+                            continue
+                        structure_keys.add(structure_key)
+
                 try:
                     cursor.execute(insert_query, compound_data)
                     compounds_added += 1
@@ -6560,7 +6635,13 @@ plt.show()
             total_cleanup_failures_smiles = []
             total_duplicate_smiles = []
             processed_rows = 0
-            
+
+            # Shared across all chunk inserts below (rather than re-seeded from the
+            # table's contents on every call) so per-chunk cost doesn't grow with the
+            # table size, and so a duplicate split across two different chunks is
+            # still caught (see _insert_compounds()'s structure_keys parameter).
+            structure_keys: Set[str] = set()
+
             # Initialize progress bar if tqdm is available
             if TQDM_AVAILABLE:
                 progress_bar = tqdm(
@@ -6616,7 +6697,8 @@ plt.show()
                         if compounds_data:
                             # Insert this chunk's data into database
                             insert_start_time = time.time()
-                            chunk_result = self._insert_compounds(compounds_data, table_name, skip_duplicates)
+                            chunk_result = self._insert_compounds(compounds_data, table_name, skip_duplicates,
+                                                                    structure_keys=structure_keys)
                             insert_time = time.time() - insert_start_time
 
                             if chunk_result['success']:
@@ -14679,6 +14761,15 @@ plt.show()
             creation_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             total_inserted = 0
 
+            # Track (smiles, name) keys already seen -- both rows already present in
+            # the table and rows seen earlier across temp files/batches in this same
+            # consolidation -- so a product about to be silently dropped by the
+            # UNIQUE(smiles, name) constraint can be reported with its SMILES instead
+            # of only being reflected as a count mismatch (mirrors _save_step_products()).
+            cursor.execute(f"SELECT smiles, name FROM {output_table_name}")
+            seen_keys = set(cursor.fetchall())
+            duplicate_products = []
+
             # Process files in batches to avoid memory issues
             batch_size = 1000
 
@@ -14707,6 +14798,11 @@ plt.show()
                         for row in reader:
                             if not row:
                                 continue
+                            key = (row[0], row[1])
+                            if key in seen_keys:
+                                duplicate_products.append({'smiles': row[0], 'name': row[1]})
+                                continue
+                            seen_keys.add(key)
                             batch.append((
                                 row[0],
                                 row[1],
@@ -14718,13 +14814,13 @@ plt.show()
 
                             if len(batch) >= batch_size:
                                 cursor.executemany(insert_query, batch)
-                                total_inserted += len(batch)
+                                total_inserted += cursor.rowcount
                                 batch = []
 
                         # Insert remaining items in batch
                         if batch:
                             cursor.executemany(insert_query, batch)
-                            total_inserted += len(batch)
+                            total_inserted += cursor.rowcount
 
                 except Exception as e:
                     print(f"   ⚠️  Error processing file {temp_file}: {e}")
@@ -14742,6 +14838,11 @@ plt.show()
             conn.close()
 
             print(f"   💾 Consolidated {total_inserted:,} products to table '{output_table_name}'")
+            if duplicate_products:
+                print(f"   ⚠️  {len(duplicate_products):,} product(s) skipped: duplicate (smiles, name) "
+                      f"already present in this batch/table")
+                for dup in duplicate_products:
+                    print(f"      - {dup['name']}: {dup['smiles']}")
 
             # Compute InChI keys for the newly consolidated products, mirroring the same
             # post-save step used by load_csv_file() and _save_step_products()
@@ -16361,19 +16462,33 @@ plt.show()
 
             creation_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-            batch = [
-                (
+            # Track (smiles, name) keys already seen -- both rows already present in
+            # the table (e.g. an existing table name being reused) and rows seen
+            # earlier in this same products list -- so that a product about to be
+            # silently dropped by the UNIQUE(smiles, name) constraint can be reported
+            # with its SMILES instead of only being reflected as a count mismatch.
+            cursor.execute(f"SELECT smiles, name FROM {table_name}")
+            seen_keys = set(cursor.fetchall())
+
+            batch = []
+            duplicate_products = []
+            for product in products:
+                key = (product['smiles'], product['name'])
+                if key in seen_keys:
+                    duplicate_products.append(product)
+                    continue
+                seen_keys.add(key)
+                batch.append((
                     product['smiles'],
                     product['name'],
                     product.get('flag', 'step_product'),
                     step_num,
                     workflow_name,
                     creation_date
-                )
-                for product in products
-            ]
+                ))
+
             cursor.executemany(insert_query, batch)
-            inserted_count = len(batch)
+            inserted_count = cursor.rowcount
 
             # Build the indexes after the table is populated, not before: indexes
             # created on an empty table force SQLite to rebalance their b-trees on
@@ -16387,6 +16502,11 @@ plt.show()
             conn.close()
 
             print(f"   💾 Saved {inserted_count} products to table '{table_name}'")
+            if duplicate_products:
+                print(f"   ⚠️  {len(duplicate_products)} product(s) skipped: duplicate (smiles, name) "
+                      f"already present in this batch/table")
+                for dup in duplicate_products:
+                    print(f"      - {dup['name']}: {dup['smiles']}")
 
             # Compute InChI keys for the newly stored products, mirroring the same
             # post-save step used by load_csv_file()
@@ -17032,16 +17152,33 @@ plt.show()
             print(f"❌ Error executing table deletions: {e}")
             return {table: False for table in selected_tables}
 
-    def _vacuum_chemspace_db(self) -> bool:
+    def _vacuum_chemspace_db(self, ask: bool = True) -> bool:
         """
         Reclaim disk space freed by dropped tables by running VACUUM on the
         chemspace database. This rewrites the whole file, so it should be run
         once after a batch of drops rather than after each individual table.
 
+        Args:
+            ask (bool): Whether to prompt the user before running VACUUM. VACUUM
+                rewrites the entire database file and can be noticeably slow on
+                large databases (e.g. mid-workflow table cleanup), so by default
+                the user is asked whether to pay that cost now or defer it -
+                skipping is safe, since the freed space is simply reclaimed by a
+                future VACUUM.
+
         Returns:
-            bool: True if VACUUM completed successfully
+            bool: True if VACUUM completed successfully, False if it failed or was skipped
         """
         try:
+            if ask:
+                response = input(
+                    "🧹 Reclaim disk space now by running VACUUM? This rewrites the whole "
+                    "database file and can be slow on large databases (y/n): "
+                ).strip().lower()
+                if response not in ('y', 'yes'):
+                    print("⏭️  Skipping VACUUM. Space will be reclaimed on a future VACUUM run.")
+                    return False
+
             print("🧹 Reclaiming disk space (VACUUM)...")
             conn = sqlite3.connect(self.__chemspace_db)
             conn.execute("VACUUM")
