@@ -2484,34 +2484,34 @@ elif page == "MolDock assays":
                                 st.session_state[_del_dm_key] = False
                                 st.rerun()
 
-        ## Inspector — always visible, collapsed expander above does not hide it
-        _export_dm_name = st.session_state.get("export_dm_selected_name")
-        _sp, _col_dm_insp = st.columns([1, 9])
-        with _col_dm_insp:
-            method_names = df_methods["method_name"].dropna().unique().tolist()
+            ## Inspector — nested inside the same expander as the table above
+            _export_dm_name = st.session_state.get("export_dm_selected_name")
+            _sp, _col_dm_insp = st.columns([1, 9])
+            with _col_dm_insp:
+                method_names = df_methods["method_name"].dropna().unique().tolist()
 
-            if st.session_state.get("selected_docking_method") not in method_names:
-                st.session_state["selected_docking_method"] = method_names[0] if method_names else None
+                if st.session_state.get("selected_docking_method") not in method_names:
+                    st.session_state["selected_docking_method"] = method_names[0] if method_names else None
 
-            selected_method = st.selectbox(
-                "Select a docking method to inspect:",
-                method_names,
-                key="select_docking_method",
-                index=method_names.index(st.session_state["selected_docking_method"]) if st.session_state.get("selected_docking_method") in method_names else 0,
-            )
-            if selected_method != st.session_state.get("selected_docking_method"):
-                st.session_state["selected_docking_method"] = selected_method
+                selected_method = st.selectbox(
+                    "Select a docking method to inspect:",
+                    method_names,
+                    key="select_docking_method",
+                    index=method_names.index(st.session_state["selected_docking_method"]) if st.session_state.get("selected_docking_method") in method_names else 0,
+                )
+                if selected_method != st.session_state.get("selected_docking_method"):
+                    st.session_state["selected_docking_method"] = selected_method
 
-            method_row = df_methods[df_methods["method_name"] == selected_method].iloc[0]
+                method_row = df_methods[df_methods["method_name"] == selected_method].iloc[0]
 
-            st.markdown(f"### Method: `{method_row['method_name']}`")
-            st.markdown(f"**Docking Engine:** {method_row['docking_engine']}")
-            st.markdown(f"**Description:** {method_row['description'] or 'N/A'}")
-            st.markdown(f"**Created:** {method_row['created_date']}")
-            with st.expander("Docking Parameters", expanded=False):
-                st.code(method_row["parameters"] or "N/A", language="json")
-            with st.expander("Ligand Preparation Parameters", expanded=False):
-                st.code(method_row["ligand_prep_params"] or "N/A", language="json")
+                st.markdown(f"### Method: `{method_row['method_name']}`")
+                st.markdown(f"**Docking Engine:** {method_row['docking_engine']}")
+                st.markdown(f"**Description:** {method_row['description'] or 'N/A'}")
+                st.markdown(f"**Created:** {method_row['created_date']}")
+                with st.expander("Docking Parameters", expanded=False):
+                    st.code(method_row["parameters"] or "N/A", language="json")
+                with st.expander("Ligand Preparation Parameters", expanded=False):
+                    st.code(method_row["ligand_prep_params"] or "N/A", language="json")
 
     st.divider()
 
@@ -2532,30 +2532,23 @@ elif page == "MolDock assays":
         )
         
     else:
-        ## Create a button to show/hide the docking assays DataFrame
-        if "show_assays" not in st.session_state:
-            st.session_state["show_assays"] = False
-
-        if st.button(f"{'Hide' if st.session_state['show_assays'] else 'Show'} Docking Assays Details"):
-            st.session_state["show_assays"] = not st.session_state["show_assays"]
-
-        if st.session_state["show_assays"]:
+        with st.expander("Docking Assays Details", expanded=False):
             st.dataframe(df)
 
-        # Selection box for assay_name
-        if "assay_name" in df.columns:
-            assay_names = df["assay_name"].dropna().unique().tolist()
-            if "selected_assay_name" not in st.session_state and assay_names:
-                st.session_state["selected_assay_name"] = assay_names[0]
-            selected_assay = st.selectbox(
-                "Select a docking assay:",
-                assay_names,
-                key="select_assay_name",
-                index=assay_names.index(st.session_state.get("selected_assay_name", assay_names[0])) if assay_names else 0
-            )
-            if selected_assay != st.session_state.get("selected_assay_name", None):
-                st.session_state["selected_assay_name"] = selected_assay
-            st.success(f"Selected assay: {selected_assay}")
+            # Selection box for assay_name
+            if "assay_name" in df.columns:
+                assay_names = df["assay_name"].dropna().unique().tolist()
+                if "selected_assay_name" not in st.session_state and assay_names:
+                    st.session_state["selected_assay_name"] = assay_names[0]
+                selected_assay = st.selectbox(
+                    "Select a docking assay:",
+                    assay_names,
+                    key="select_assay_name",
+                    index=assay_names.index(st.session_state.get("selected_assay_name", assay_names[0])) if assay_names else 0
+                )
+                if selected_assay != st.session_state.get("selected_assay_name", None):
+                    st.session_state["selected_assay_name"] = selected_assay
+                st.success(f"Selected assay: {selected_assay}")
 
         st.write(f"Selected Docking Assay: {st.session_state.get('selected_assay_name', 'None')}")
 
@@ -2586,17 +2579,7 @@ elif page == "MolDyn assays":
                 unsafe_allow_html=True
             )
         else:
-            ## Show/hide summary table
-            if "show_md_methods" not in st.session_state:
-                st.session_state["show_md_methods"] = False
-
-            if st.button(f"{'Hide' if st.session_state['show_md_methods'] else 'Show'} MD Methods Table"):
-                st.session_state["show_md_methods"] = not st.session_state["show_md_methods"]
-                if not st.session_state["show_md_methods"]:
-                    st.session_state["export_mdm_selected_name"] = None
-                st.rerun()
-
-            if st.session_state["show_md_methods"]:
+            with st.expander("MD Methods Table", expanded=False):
                 _df_mdm = df_md_methods[["method_id", "method_name", "engine", "description"]].copy()
                 _df_mdm.insert(0, "Select", False)
                 _edited_mdm = st.data_editor(
@@ -2769,8 +2752,7 @@ elif page == "MolDyn assays":
                                     st.session_state[_del_mdm_key] = False
                                     st.rerun()
 
-            ## Select a method to inspect details (visible only when table is shown)
-            if st.session_state.get("show_md_methods"):
+                ## Inspector — nested inside the same expander as the table above
                 _sp, _col_mdm_insp = st.columns([1, 9])
                 with _col_mdm_insp:
                     _mdm_names = df_md_methods["method_name"].dropna().unique().tolist()
