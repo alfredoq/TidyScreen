@@ -1689,7 +1689,7 @@ class MolDyn:
             f.write(f"  iwrap=1,\n")
             f.write(f"  ntr=1,\n")
             f.write(f"  restraint_wt={md_parameters_dict.get('first_minimization').get('min1_restraint_wt')},\n")
-            f.write(f"  restraintmask={md_parameters_dict.get('first_minimization').get('min1_restraint_selector')},\n")
+            f.write(f"  restraintmask='{md_parameters_dict.get('first_minimization').get('min1_restraint_selector')}',\n")
             f.write(f"/\n")
             f.write(f"END\n")
             
@@ -1711,7 +1711,7 @@ class MolDyn:
             f.write(f"  iwrap=1,\n")
             f.write(f"  ntr=1,\n")
             f.write(f"  restraint_wt={md_parameters_dict.get('second_minimization').get('min2_restraint_wt')},\n")
-            f.write(f"  restraintmask={md_parameters_dict.get('second_minimization').get('min2_restraint_selector')},\n")
+            f.write(f"  restraintmask='{md_parameters_dict.get('second_minimization').get('min2_restraint_selector')}',\n")
             f.write(f"/\n")
             f.write(f"END\n")
 
@@ -1740,7 +1740,7 @@ class MolDyn:
             f.write(f"  ntwx={md_parameters_dict.get('heating_params').get('heating_trajectory_write')},\n")
             f.write(f"  ntwr={md_parameters_dict.get('heating_params').get('heating_restart_write')},\n")
             f.write(f"  restraint_wt={md_parameters_dict.get('heating_params').get('heating_restraint_wt')},\n")
-            f.write(f"  restraintmask={md_parameters_dict.get('heating_params').get('heating_restraint_selector')},\n")
+            f.write(f"  restraintmask='{md_parameters_dict.get('heating_params').get('heating_restraint_selector')}',\n")
             f.write(f"  iwrap=1,\n")
             f.write(f"  nmropt=1,\n")
             f.write(f"&end\n")
@@ -1782,7 +1782,7 @@ class MolDyn:
             if eq_restraint_selector:
                 f.write(f"  ntr=1,\n")
                 f.write(f"  restraint_wt={md_parameters_dict.get('equilibration_params').get('equilibration_restraint_wt')},\n")
-                f.write(f"  restraintmask={eq_restraint_selector},\n")
+                f.write(f"  restraintmask='{eq_restraint_selector}',\n")
             f.write(f"/\n")
             f.write(f"END\n")
 
@@ -1812,7 +1812,7 @@ class MolDyn:
             if prod_restraint_selector:
                 f.write(f"  ntr=1,\n")
                 f.write(f"  restraint_wt={md_parameters_dict.get('production_params').get('production_restraint_wt')},\n")
-                f.write(f"  restraintmask={prod_restraint_selector},\n")
+                f.write(f"  restraintmask='{prod_restraint_selector}',\n")
             f.write(f"/\n")
             f.write(f"END\n")
 
@@ -1944,7 +1944,7 @@ class MolDyn:
                 if heat_ref:
                     f.write("  ntr=1,\n")
                     f.write(f"  restraint_wt={hp.get('heating_restraint_wt')},\n")
-                    f.write(f"  restraintmask={heat_ref},\n")
+                    f.write(f"  restraintmask='{heat_ref}',\n")
                 f.write("  iwrap=1,\n")
                 f.write("/\n")
                 f.write("END\n")
@@ -3000,5 +3000,77 @@ class MolDyn:
 
         except Exception as e:
             print(f"❌ Error listing MD assays: {e}")
-            
-            
+
+    def delete_md_assay(self):
+        """Delete an MD assay as created by perform_md_assay(), removing both its
+        assay folder on disk and its registry entry in the md_assays table."""
+        try:
+            import sqlite3
+            import shutil
+
+            conn = sqlite3.connect(self.__md_registers_db)
+            cursor = conn.cursor()
+
+            # Check if md_assays table exists
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='md_assays';")
+            if not cursor.fetchone():
+                print("❌ No MD assays found. The 'md_assays' table does not exist.")
+                conn.close()
+                return
+
+            # Fetch all MD assays
+            cursor.execute("SELECT assay_id, md_assay, description, assay_folder_path FROM md_assays;")
+            assays = cursor.fetchall()
+
+            if not assays:
+                print("❌ No MD assays found.")
+                conn.close()
+                return
+
+            print(f"\n🧬 MOLECULAR DYNAMICS ASSAYS IN PROJECT '{self.name}':")
+            print("=" * 70)
+            for assay_id, md_assay, description, assay_folder_path in assays:
+                print(f"🏷️  Assay ID: {assay_id}")
+                print(f"🏷️  Assay Name: {md_assay}")
+                print(f"📝 Description: {description}")
+                print(f"📁 Folder: {assay_folder_path}")
+                print("-" * 70)
+
+            # Prompt user to select an assay to delete
+            assay_ids = [str(a[0]) for a in assays]
+            while True:
+                selection = input("\n🗑️  Enter the Assay ID to delete (or 'cancel' to exit): ").strip()
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    print("❌ Operation cancelled.")
+                    conn.close()
+                    return
+                if selection in assay_ids:
+                    selected_assay = next(a for a in assays if str(a[0]) == selection)
+                    _, md_assay_name, _, assay_folder_path = selected_assay
+                    confirm = input(
+                        f"⚠️  Are you sure you want to delete Assay ID {selection} "
+                        f"('{md_assay_name}') and its folder '{assay_folder_path}'? (yes/no): "
+                    ).strip().lower()
+                    if confirm in ['yes', 'y']:
+                        if assay_folder_path and os.path.isdir(assay_folder_path):
+                            try:
+                                shutil.rmtree(assay_folder_path)
+                                print(f"✅ Deleted assay folder: {assay_folder_path}")
+                            except Exception as e:
+                                print(f"⚠️  Could not delete assay folder '{assay_folder_path}': {e}")
+                        else:
+                            print(f"⚠️  Assay folder not found on disk, skipping: {assay_folder_path}")
+
+                        cursor.execute("DELETE FROM md_assays WHERE assay_id = ?", (selection,))
+                        conn.commit()
+                        print(f"✅ Assay ID {selection} deleted from the registry.")
+                    else:
+                        print("❌ Deletion cancelled.")
+                    break
+                else:
+                    print("❌ Invalid Assay ID. Please try again.")
+
+            conn.close()
+
+        except Exception as e:
+            print(f"❌ Error deleting MD assay: {e}")
