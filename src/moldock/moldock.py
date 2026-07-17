@@ -9936,7 +9936,7 @@ class MolDock:
             return None
         pass
     
-    def extract_docked_poses(self, assay=None, selection=None):
+    def extract_docked_poses(self, assay=None, selection=None, score_column=None):
         """
         Extract docked poses from a docking assay and save them as PDB files based on user-selected criteria.
         This method allows users to select a docking assay from the registry and extract poses based on three
@@ -10053,12 +10053,12 @@ class MolDock:
 
         ## Evaluate the docking engine in order to use the corresponding pose extraction method
         if docking_engine == "AutoDockGPU":
-            return self._extract_docked_poses_autodockgpu(db_path, selection=selection)
+            return self._extract_docked_poses_autodockgpu(db_path, selection=selection, score_column=score_column)
 
         else:
-            return self._extract_docked_poses_autodockvina(db_path, selection=selection)
-    
-    def _extract_docked_poses_autodockgpu(self, db_path, selection=None):
+            return self._extract_docked_poses_autodockvina(db_path, selection=selection, score_column=score_column)
+
+    def _extract_docked_poses_autodockgpu(self, db_path, selection=None, score_column=None):
         ## Start the analysis
         print("Starting poses extraction for engine AutoDockGPU")
         print("")
@@ -10086,7 +10086,7 @@ class MolDock:
             output_dir = os.path.join(os.path.dirname(os.path.abspath(db_path)), "most_stable_poses")
             if not self._prepare_output_dir(output_dir):
                 return None
-            df = self._select_most_stable_poses(db_path)
+            df = self._select_most_stable_poses(db_path, score_column=score_column)
 
         elif selection == "2":
             print("You selected: most populated poses")
@@ -10100,7 +10100,7 @@ class MolDock:
             output_dir = os.path.join(os.path.dirname(os.path.abspath(db_path)), "most_populated_and_stable_poses")
             if not self._prepare_output_dir(output_dir):
                 return None
-            df = self._select_most_populated_and_stable_poses(db_path)
+            df = self._select_most_populated_and_stable_poses(db_path, score_column=score_column)
 
         elif selection == "4":
             print("You selected: ALL poses")
@@ -10130,7 +10130,7 @@ class MolDock:
 
         return output_dir
 
-    def _extract_docked_poses_autodockvina(self, db_path, selection=None):
+    def _extract_docked_poses_autodockvina(self, db_path, selection=None, score_column=None):
 
         ## Start the analysis
         print("Starting poses extraction for engine Vina")
@@ -10157,7 +10157,7 @@ class MolDock:
             output_dir = os.path.join(os.path.dirname(os.path.abspath(db_path)), "most_stable_poses")
             if not self._prepare_output_dir(output_dir):
                 return None
-            df = self._select_most_stable_poses(db_path)
+            df = self._select_most_stable_poses(db_path, score_column=score_column)
 
         elif selection == "2":
             print("You selected: all poses")
@@ -10196,10 +10196,24 @@ class MolDock:
             os.makedirs(output_dir)
             return True
 
+        ## An existing-but-empty directory (e.g. left over from a previous
+        ## extraction that was interrupted before writing any PDB files) is
+        ## safe to reuse as-is — nothing would be lost by proceeding.
+        if not os.listdir(output_dir):
+            return True
+
         print(f"\n⚠️  Output directory already exists:\n   {output_dir}")
+
+        ## input() has no source when this runs non-interactively (e.g. from the
+        ## Streamlit GUI subprocess), which raises EOFError. Default to the safe
+        ## choice (cancel, do not delete) in that case.
+        if not sys.stdin.isatty():
+            print("❌ Non-interactive session — refusing to overwrite without confirmation. Operation cancelled.")
+            return False
+
         try:
             answer = input("Delete it and proceed? [y/N]: ").strip().lower()
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, EOFError):
             print("\n❌ Operation cancelled.")
             return False
 
@@ -10251,6 +10265,14 @@ class MolDock:
             'mmgbsa_gas_energy':   'MMGBSA gas-phase energy  (kcal/mol)',
         }
 
+        ## input() has no source when this runs non-interactively (e.g. from the
+        ## Streamlit GUI subprocess), which raises EOFError. Default to the
+        ## highest-priority candidate (docking_score, when present) in that case.
+        if not sys.stdin.isatty():
+            chosen = candidates[0]
+            print(f"\nMultiple scoring columns available; defaulting to '{chosen}' (non-interactive session).")
+            return chosen
+
         print("\nMultiple scoring columns are available in this assay:")
         for i, col in enumerate(candidates, 1):
             print(f"  {i}. {labels.get(col, col)}")
@@ -10264,22 +10286,23 @@ class MolDock:
                     print(f"Using: {chosen}")
                     return chosen
                 print("Invalid selection. Try again.")
-            except (ValueError, KeyboardInterrupt):
+            except (ValueError, KeyboardInterrupt, EOFError):
                 print("Defaulting to docking_score.")
                 return 'docking_score'
 
-    def _select_most_stable_poses(self, db_path):
+    def _select_most_stable_poses(self, db_path, score_column=None):
         """
         Select the most stable pose (lowest score) for each ligand from the Ringtail
         database at db_path.  When secondary scoring columns (mmgbsa_total_energy,
-        mmgbsa_gas_energy) are populated the user is asked which column to minimise.
+        mmgbsa_gas_energy) are populated the user is asked which column to minimise,
+        unless score_column is passed explicitly (e.g. chosen via the GUI).
         Returns a DataFrame with LigName, Pose_ID, the chosen score column, and run_number.
         """
         import sqlite3
         import pandas as pd
 
         conn = sqlite3.connect(db_path)
-        score_col = self._prompt_score_column(conn)
+        score_col = score_column or self._prompt_score_column(conn)
 
         query = f"""
         SELECT LigName, Pose_ID, {score_col}, run_number
@@ -10340,13 +10363,14 @@ class MolDock:
         
         return df
 
-    def _select_most_populated_and_stable_poses(self, db_path):
+    def _select_most_populated_and_stable_poses(self, db_path, score_column=None):
         """
         Selects the most populated and stable docking poses for each ligand from a SQLite database.
         This method connects to the specified SQLite database, queries the 'Results' table,
         and retrieves the pose(s) for each ligand that have the largest cluster size (most populated)
         and the lowest score (most stable). When secondary scoring columns are populated the user
-        is asked which column to use for the stability criterion.
+        is asked which column to use for the stability criterion, unless score_column is passed
+        explicitly (e.g. chosen via the GUI).
         Args:
             db_path (str): Path to the SQLite database file containing the docking results.
         Returns:
@@ -10358,7 +10382,7 @@ class MolDock:
         import pandas as pd
 
         conn = sqlite3.connect(db_path)
-        score_col = self._prompt_score_column(conn)
+        score_col = score_column or self._prompt_score_column(conn)
 
         query = f"""
         SELECT LigName, Pose_ID, cluster_size, {score_col}, run_number

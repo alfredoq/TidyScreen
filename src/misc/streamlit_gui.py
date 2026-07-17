@@ -10,6 +10,7 @@ import inspect
 import sys
 import os
 import glob
+import shutil
 import json
 import sqlite3
 import py3Dmol
@@ -56,6 +57,35 @@ def _toggle_ts_set_viewer():
 def _toggle_ts_snapshot_inspector():
     key = "show_ts_snapshot_inspector"
     st.session_state[key] = not st.session_state.get(key, False)
+
+
+def _clear_docking_assay_scoped_state():
+    """
+    Drop session_state entries scoped to the previously selected docking assay.
+    Docking analysis widgets (pose browser, ProLIF filters, ligand/pose selectors,
+    Classified Poses Viewer) key their selection lists off the active assay's data
+    (e.g. LigName, pose_id). Left in place after switching assays, a stale value
+    looked up via list.index() against the new assay's option list raises
+    "'<value>' is not in list" — call this whenever selected_assay_name changes.
+    """
+    _exact_keys = {
+        "selected_lig_name", "select_lig_name",
+        "selected_pose_id", "select_pose_id",
+        "reference_pdb_data",
+        "confirm_delete_all_poses",
+        "extract_poses_criteria", "extract_poses_score_column",
+        "select_prolif_table", "select_prolif_pose",
+        "show_all_prolif",
+    }
+    _prefixes = (
+        "btn_poses_", "pose_idx_",
+        "show_prolif_", "select_prolif_table_", "select_prolif_pose_",
+        "prolif_filter_", "show_all_prolif_",
+        "cpv_",
+    )
+    for _key in list(st.session_state.keys()):
+        if _key in _exact_keys or _key.startswith(_prefixes):
+            del st.session_state[_key]
 
 
 # ── GridSearch hyperparameter input callbacks ──────────────────────────────
@@ -2547,6 +2577,7 @@ elif page == "MolDock assays":
                     index=assay_names.index(st.session_state.get("selected_assay_name", assay_names[0])) if assay_names else 0
                 )
                 if selected_assay != st.session_state.get("selected_assay_name", None):
+                    _clear_docking_assay_scoped_state()
                     st.session_state["selected_assay_name"] = selected_assay
                 st.success(f"Selected assay: {selected_assay}")
 
@@ -3707,57 +3738,79 @@ elif page == "Docking analysis":
                             else:
                                 st.info("No poses were updated.")
 
-            ## Single "View Poses" button that expands to show the four folder buttons
+            ## Single "View Poses" collapsible menu — always shown; extraction controls
+            ## are nested inside when no poses have been extracted yet.
             extracted_poses = st_funcs.get_extracted_poses_info(results_db_path)
             any_active = any(e["active"] for e in extracted_poses)
 
-            if not any_active:
-                _vp_col, _ep_col = st.columns([2, 5])
-                with _vp_col:
-                    st.button("View Poses", disabled=True, key="btn_view_poses_disabled")
-                with _ep_col:
-                    _engine = st_funcs.get_assay_engine(
-                        st.session_state["active_project_path"],
-                        st.session_state["selected_assay_name"]
-                    )
-                    if _engine == "AutoDockGPU":
-                        _criteria_labels = [
-                            "1 - Most stable poses",
-                            "2 - Most populated poses",
-                            "3 - Most stable + most populated",
-                            "4 - All poses",
-                        ]
-                    else:
-                        _criteria_labels = [
-                            "1 - Most stable poses",
-                            "2 - All poses",
-                        ]
-                    _ep_inner_left, _ep_inner_right = st.columns([3, 2])
-                    with _ep_inner_left:
-                        _criteria = st.selectbox(
-                            "Extraction criteria:",
-                            _criteria_labels,
-                            key="extract_poses_criteria",
+            with st.expander("🔍 View Poses", expanded=False):
+                if not any_active:
+                    _sp, _ep_col = st.columns([1, 9])
+                    with _ep_col:
+                        _engine = st_funcs.get_assay_engine(
+                            st.session_state["active_project_path"],
+                            st.session_state["selected_assay_name"]
                         )
-                    with _ep_inner_right:
-                        st.write("")
-                        st.write("")
-                        if st.button("Extract Poses", key="btn_extract_poses"):
-                            _selection = _criteria[0]  # leading digit "1", "2", "3", or "4"
-                            with st.spinner("Extracting poses..."):
-                                _ok, _msg = st_funcs.extract_poses_for_assay(
-                                    st.session_state["selected_project"],
-                                    st.session_state["active_project_path"],
-                                    st.session_state["selected_assay_name"],
-                                    _selection,
-                                )
-                            if _ok:
-                                st.success(_msg)
-                                st.rerun()
-                            else:
-                                st.error(_msg)
-            else:
-                with st.expander("🔍 View Poses", expanded=False):
+                        if _engine == "AutoDockGPU":
+                            _criteria_labels = [
+                                "1 - Most stable poses",
+                                "2 - Most populated poses",
+                                "3 - Most stable + most populated",
+                                "4 - All poses",
+                            ]
+                        else:
+                            _criteria_labels = [
+                                "1 - Most stable poses",
+                                "2 - All poses",
+                            ]
+                        _ep_inner_left, _ep_inner_mid, _ep_inner_right = st.columns([3, 3, 2])
+                        with _ep_inner_left:
+                            _criteria = st.selectbox(
+                                "Extraction criteria:",
+                                _criteria_labels,
+                                key="extract_poses_criteria",
+                            )
+
+                        ## "Most stable" (1) and "Most stable + most populated" (3) rank by a
+                        ## numeric score column; offer a choice when more than one is available,
+                        ## mirroring MolDock._prompt_score_column() from the interactive CLI.
+                        _needs_score_col = _criteria.startswith("1") or _criteria.startswith("3")
+                        _score_col_labels = {
+                            'docking_score': 'Docking score',
+                            'mmgbsa_total_energy': 'MMGBSA total energy',
+                            'mmgbsa_gas_energy': 'MMGBSA gas energy',
+                        }
+                        _selected_score_col = None
+                        with _ep_inner_mid:
+                            if _needs_score_col:
+                                _score_col_candidates = st_funcs.get_available_score_columns(results_db_path)
+                                if len(_score_col_candidates) > 1:
+                                    _selected_score_col = st.selectbox(
+                                        "Scoring column:",
+                                        _score_col_candidates,
+                                        format_func=lambda c: _score_col_labels.get(c, c),
+                                        key="extract_poses_score_column",
+                                    )
+
+                        with _ep_inner_right:
+                            st.write("")
+                            st.write("")
+                            if st.button("Extract Poses", key="btn_extract_poses"):
+                                _selection = _criteria[0]  # leading digit "1", "2", "3", or "4"
+                                with st.spinner("Extracting poses..."):
+                                    _ok, _msg = st_funcs.extract_poses_for_assay(
+                                        st.session_state["selected_project"],
+                                        st.session_state["active_project_path"],
+                                        st.session_state["selected_assay_name"],
+                                        _selection,
+                                        score_column=_selected_score_col,
+                                    )
+                                if _ok:
+                                    st.success(_msg)
+                                    st.rerun()
+                                else:
+                                    st.error(_msg)
+                else:
                     ## Reference PDB uploader (shared across all pose folders)
                     _sp, _col = st.columns([1, 9])
                     with _col:
@@ -3771,6 +3824,30 @@ elif page == "Docking analysis":
                             st.success(f"Reference loaded: {ref_file.name}")
                         elif "reference_pdb_data" not in st.session_state:
                             st.session_state["reference_pdb_data"] = None
+
+                    ## Delete all extracted poses (PDB files + folders)
+                    _sp, _col = st.columns([1, 9])
+                    with _col:
+                        _del_poses_key = "confirm_delete_all_poses"
+                        if not st.session_state.get(_del_poses_key):
+                            if st.button("🗑️ Delete all poses", key="btn_delete_all_poses"):
+                                st.session_state[_del_poses_key] = True
+                                st.rerun()
+                        else:
+                            st.warning("Delete all extracted poses and their folders? This cannot be undone.")
+                            _dpc1, _dpc2 = st.columns(2)
+                            with _dpc1:
+                                if st.button("Yes, delete all poses", key="btn_confirm_delete_all_poses"):
+                                    for entry in extracted_poses:
+                                        if os.path.isdir(entry["path"]):
+                                            shutil.rmtree(entry["path"])
+                                    st.session_state[_del_poses_key] = False
+                                    st.success("All extracted poses deleted.")
+                                    st.rerun()
+                            with _dpc2:
+                                if st.button("Cancel", key="btn_cancel_delete_all_poses"):
+                                    st.session_state[_del_poses_key] = False
+                                    st.rerun()
 
                     for entry in extracted_poses:
                         label = f"{entry['directory']} ({entry['count']} PDB files)" if entry["active"] else entry["directory"]
@@ -4418,13 +4495,13 @@ elif page == "Docking analysis":
                     # Create a selectbox for unique LigName values if present
                     if 'LigName' in df_results.columns:
                         lig_names = df_results['LigName'].dropna().unique().tolist()
-                        if 'selected_lig_name' not in st.session_state and lig_names:
-                            st.session_state['selected_lig_name'] = lig_names[0]
+                        if st.session_state.get('selected_lig_name') not in lig_names:
+                            st.session_state['selected_lig_name'] = lig_names[0] if lig_names else None
                         selected_lig = st.selectbox(
                             f"Select a Ligand (LigName) in Assay: {st.session_state['selected_assay_name']}",
                             lig_names,
                             key="select_lig_name",
-                            index=lig_names.index(st.session_state.get('selected_lig_name', lig_names[0])) if lig_names else 0
+                            index=lig_names.index(st.session_state['selected_lig_name']) if lig_names else 0
                         )
                         # Always update session state and plot on selection change
                         if selected_lig != st.session_state.get('selected_lig_name', None):

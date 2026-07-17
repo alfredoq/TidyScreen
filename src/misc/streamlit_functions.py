@@ -403,7 +403,7 @@ def _load_moldock_class():
     return mod.MolDock
 
 
-def extract_poses_for_assay(project_name, project_path, assay_name, selection):
+def extract_poses_for_assay(project_name, project_path, assay_name, selection, score_column=None):
     """
     Extract docked poses for *assay_name* using the native MolDock method.
 
@@ -411,17 +411,47 @@ def extract_poses_for_assay(project_name, project_path, assay_name, selection):
       AutoDockGPU — "1" most stable, "2" most populated, "3" both, "4" all
       AutoDock Vina — "1" most stable, "2" all
 
+    *score_column*, when given, is used as the "lowest energy" criterion for
+    selections "1" and "3" instead of prompting interactively (which cannot
+    happen from this non-interactive GUI subprocess).
+
     Returns (success: bool, message: str).
     """
     try:
         MolDock = _load_moldock_class()
         moldock = MolDock.from_path(project_name, project_path)
-        output_dir = moldock.extract_docked_poses(assay=assay_name, selection=selection)
+        output_dir = moldock.extract_docked_poses(assay=assay_name, selection=selection, score_column=score_column)
         if output_dir:
             return (True, f"Poses extracted to: {output_dir}")
         return (False, "Extraction returned no output directory — check console for details.")
     except Exception as e:
         return (False, str(e))
+
+
+def get_available_score_columns(results_db_path):
+    """
+    Return the scoring columns in the assay's Results table that have at least one
+    valid (non-NULL, non -1) value, in priority order: docking_score,
+    mmgbsa_total_energy, mmgbsa_gas_energy. Mirrors MolDock._prompt_score_column(),
+    so the GUI can offer the same choice as the interactive CLI prompt.
+    """
+    try:
+        conn = sqlite3.connect(results_db_path)
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(Results)")
+        existing = {row[1] for row in cursor.fetchall()}
+        candidates = []
+        for col in ['docking_score', 'mmgbsa_total_energy', 'mmgbsa_gas_energy']:
+            if col in existing:
+                cursor.execute(
+                    f"SELECT COUNT(*) FROM Results WHERE {col} IS NOT NULL AND {col} != -1"
+                )
+                if cursor.fetchone()[0] > 0:
+                    candidates.append(col)
+        conn.close()
+        return candidates
+    except Exception:
+        return []
 
 
 def get_compounds_for_lig_names(project_path, assay_name, lig_names):
