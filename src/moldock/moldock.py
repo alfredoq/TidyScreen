@@ -1801,7 +1801,16 @@ class MolDock:
             if not receptor_info:
                 print("❌ No receptor selected. Docking cancelled.")
                 return None
-            
+
+            ## Fail fast if the receptor PDBQT is missing: docking with the 'ad4' scoring
+            ## function never reads this file (it only uses the AutoGrid4 maps), so a
+            ## missing/stale path would otherwise only surface after the full docking run,
+            ## when Ringtail's results processing needs it for save_receptor/add_interactions.
+            if selected_method['docking_engine'] == 'Vina' and not self._resolve_receptor_pdbqt_file(receptor_info):
+                print("❌ Receptor PDBQT file could not be located on disk (neither in 'processed/' nor alongside the grid maps).")
+                print("   Docking cancelled before running, since results processing would fail on this receptor later.")
+                return None
+
             print(f"✅ Selected receptor: '{receptor_info['template_name']}'")
 
             if selected_table:
@@ -8703,14 +8712,14 @@ class MolDock:
         receptor_main_path = self.__receptor_path + f"/{receptor_info.get('pdb_name', None)}"
         receptor_charge_model = receptor_info.get('configs', None).get('receptor_charge_model', 'unknown')
         #receptor_pdbqt_file = receptor_main_path + f"/processed/receptor_checked.pdbqt"
-        receptor_pdbqt_file = self._remap_project_path(receptor_info.get('pdbqt_file', None))
+        receptor_pdbqt_file = self._resolve_receptor_pdbqt_file(receptor_info)
         #fld_file = receptor_main_path + f"/grid_files/receptor_checked.maps.fld"
         grids_path = self._remap_project_path(receptor_info.get('configs', None).get('grids_path', None))
         fld_file = grids_path + f"/receptor_checked_{receptor_charge_model}.maps.fld"
         assay_folder = assay_registry['assay_folder_path']
-    
+
         if not receptor_pdbqt_file:
-            print("❌ No receptor .pdbqt file found.")
+            print("❌ No receptor .pdbqt file found (checked 'processed/' and the grid maps folder).")
             return
         
         if not fld_file:
@@ -9127,7 +9136,10 @@ class MolDock:
             rtc = RingtailCore(db_file = results_db_file, docking_mode=docking_mode )
             # If Vina docking engine, add computation of fingerprints
             if selected_method['docking_engine'] == 'Vina':
-                receptor_file = self._remap_project_path(assay_registry.get('receptor_info').get('pdbqt_file'))
+                receptor_file = self._resolve_receptor_pdbqt_file(assay_registry.get('receptor_info') or {})
+                if not receptor_file:
+                    print("❌ Receptor PDBQT file could not be located on disk (neither in 'processed/' nor alongside the grid maps).")
+                    return None
                 rtc.add_results_from_files(file_path = f"{assay_folder}/results", recursive = True, save_receptor = True, max_poses=max_poses, add_interactions = True, receptor_file = receptor_file)
             elif selected_method['docking_engine'] == 'AutoDockGPU':
                 rtc.add_results_from_files(file_path = f"{assay_folder}/results", recursive = True, save_receptor = False, max_poses=max_poses) # Interactions already computed
@@ -10587,14 +10599,14 @@ class MolDock:
         # Select the receptor to be used for docking
         receptor_conditions = self._get_receptor_conditions(receptor_info.get('id', None))
         
-        receptor_pdbqt_file = self._remap_project_path(receptor_info.get('pdbqt_file', None))
+        receptor_pdbqt_file = self._resolve_receptor_pdbqt_file(receptor_info)
         charge_model = receptor_info.get('configs', None).get('receptor_charge_model', None)
         grids_path = self._remap_project_path(receptor_info.get('configs', {}).get('grids_path', None))
         fld_file = f"{grids_path}/receptor_checked_{charge_model}.maps.fld"
         assay_folder = assay_registry['assay_folder_path']
 
         if not receptor_pdbqt_file:
-            print("❌ No receptor .pdbqt file found.")
+            print("❌ No receptor .pdbqt file found (checked 'processed/' and the grid maps folder).")
             return
 
         if not fld_file:
@@ -10699,14 +10711,14 @@ class MolDock:
         # Select the receptor to be used for docking
         receptor_conditions = self._get_receptor_conditions(receptor_info.get('id', None))
         
-        receptor_pdbqt_file = self._remap_project_path(receptor_info.get('pdbqt_file', None))
+        receptor_pdbqt_file = self._resolve_receptor_pdbqt_file(receptor_info)
         charge_model = receptor_info.get('configs', None).get('receptor_charge_model', None)
         grids_path = self._remap_project_path(receptor_info.get('configs', {}).get('grids_path', None))
         fld_file = f"{grids_path}/receptor_checked_{charge_model}.maps.fld"
         assay_folder = assay_registry['assay_folder_path']
 
         if not receptor_pdbqt_file:
-            print("❌ No receptor .pdbqt file found.")
+            print("❌ No receptor .pdbqt file found (checked 'processed/' and the grid maps folder).")
             return
 
         if not fld_file:
@@ -10818,14 +10830,14 @@ class MolDock:
         # Select the receptor to be used for docking
         receptor_conditions = self._get_receptor_conditions(receptor_info.get('id', None))
         
-        receptor_pdbqt_file = self._remap_project_path(receptor_info.get('pdbqt_file', None))
+        receptor_pdbqt_file = self._resolve_receptor_pdbqt_file(receptor_info)
         charge_model = receptor_info.get('configs', None).get('receptor_charge_model', None)
         grids_path = self._remap_project_path(receptor_info.get('configs', {}).get('grids_path', None))
         fld_file = f"{grids_path}/receptor_checked_{charge_model}.maps.fld"
         assay_folder = assay_registry['assay_folder_path']
 
         if not receptor_pdbqt_file:
-            print("❌ No receptor .pdbqt file found.")
+            print("❌ No receptor .pdbqt file found (checked 'processed/' and the grid maps folder).")
             return
 
         if not fld_file:
@@ -12190,6 +12202,30 @@ class MolDock:
                 relative = stored_path[pos + 1:]  # strip the leading '/'
                 return os.path.join(self.path, relative)
         return stored_path
+
+    def _resolve_receptor_pdbqt_file(self, receptor_info: Dict[str, Any]) -> Optional[str]:
+        """
+        Resolve the on-disk receptor PDBQT path for a receptor_info dict.
+
+        receptor_info['pdbqt_file'] points at 'processed/receptor_checked_<charge>.pdbqt',
+        which is only ever read there when sf_name == 'vina'. When the AD4 scoring
+        function is used, docking runs entirely off the AutoGrid4 maps and never
+        touches that file, so a missing/stale path goes unnoticed until Ringtail's
+        results processing needs it for save_receptor/add_interactions. Fall back to
+        the copy _create_receptor_grids() places alongside the maps (grids_path) so
+        a missing 'processed' copy doesn't fail the whole assay after docking is done.
+        """
+        pdbqt_file = self._remap_project_path(receptor_info.get('pdbqt_file'))
+        if pdbqt_file and os.path.exists(pdbqt_file):
+            return pdbqt_file
+
+        grids_path = self._remap_project_path((receptor_info.get('configs') or {}).get('grids_path'))
+        if pdbqt_file and grids_path:
+            fallback = os.path.join(grids_path, os.path.basename(pdbqt_file))
+            if os.path.exists(fallback):
+                return fallback
+
+        return None
 
     def _restore_single_docked_pose(self, results_db, ligname, run_number):
         """
