@@ -711,14 +711,15 @@ elif page == "ChemSpace Inspection":
             ## Load columns for the selected table to let the user pick the label
             table_columns = st_funcs.get_table_columns(db_path, selected_table, mtime=_chemspace_table_sigs.get(selected_table))
             default_label = "id" if "id" in table_columns else (table_columns[0] if table_columns else None)
-            default_idx = table_columns.index(default_label) if default_label in table_columns else 0
+            default_labels = [default_label] if default_label else []
 
-            label_col = st.selectbox(
-                "Column to use as molecule label:",
+            label_cols = st.multiselect(
+                "Column(s) to use as molecule label:",
                 table_columns,
-                index=default_idx,
-                key="depict_label_col"
-            ) if table_columns else None
+                default=default_labels,
+                key="depict_label_cols",
+                help="If multiple columns are selected, the label is composed by joining their values with '_'."
+            ) if table_columns else []
 
             col1, col2, col3 = st.columns(3)
             with col1:
@@ -743,7 +744,7 @@ elif page == "ChemSpace Inspection":
                                 max_molecules=int(max_mols),
                                 molecules_per_image=int(mols_per_image),
                                 mol_image_size=(int(mol_size), int(mol_size)),
-                                legend_col=label_col
+                                legend_cols=label_cols
                             )
                             if images:
                                 st.session_state["depiction_images"] = images

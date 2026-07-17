@@ -2051,7 +2051,7 @@ def depict_table_to_images(db_path: str, table_name: str,
                            max_molecules: int = 25,
                            molecules_per_image: int = 25,
                            mol_image_size: tuple = (300, 300),
-                           legend_col: str = None) -> list:
+                           legend_cols: "list[str] | str | None" = None) -> list:
     """
     Generate in-memory molecule grid images from a chemspace table for Streamlit display.
 
@@ -2064,8 +2064,10 @@ def depict_table_to_images(db_path: str, table_name: str,
         max_molecules (int): Maximum number of molecules to render (-1 for all).
         molecules_per_image (int): Number of molecules per grid image.
         mol_image_size (tuple): (width, height) of each molecule cell in the grid.
-        legend_col (str): Column to use as molecule label. Defaults to 'id' if present,
-                          otherwise the first column.
+        legend_cols (list[str] | str): Column(s) to use as molecule label. When multiple
+                          columns are given, the label is composed by joining their
+                          values with '_'. Defaults to 'id' if present, otherwise the
+                          first column.
 
     Returns:
         list[PIL.Image.Image]: List of grid images ready for st.image(). Empty on error.
@@ -2095,13 +2097,15 @@ def depict_table_to_images(db_path: str, table_name: str,
     else:
         subset = df.head(max_molecules)
 
-    # Determine legend column: use caller's choice, else 'id', else first column
-    if legend_col and legend_col in subset.columns:
-        effective_legend_col = legend_col
-    elif 'id' in subset.columns:
-        effective_legend_col = 'id'
-    else:
-        effective_legend_col = subset.columns[0]
+    # Determine legend column(s): use caller's choice (str or list), else 'id', else first column
+    if isinstance(legend_cols, str):
+        legend_cols = [legend_cols]
+    effective_legend_cols = [c for c in (legend_cols or []) if c in subset.columns]
+    if not effective_legend_cols:
+        if 'id' in subset.columns:
+            effective_legend_cols = ['id']
+        else:
+            effective_legend_cols = [subset.columns[0]]
 
     # Calculate grid column count from molecules_per_image
     grid_cols = max(1, int(molecules_per_image ** 0.5))
@@ -2123,7 +2127,7 @@ def depict_table_to_images(db_path: str, table_name: str,
             if mol is None:
                 continue
             mols.append(mol)
-            legend_val = str(getattr(row, effective_legend_col, ''))[:40]
+            legend_val = '_'.join(str(getattr(row, c, '')) for c in effective_legend_cols)[:40]
             legends.append(legend_val)
 
         if not mols:
