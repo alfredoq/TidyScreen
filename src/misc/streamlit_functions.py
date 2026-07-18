@@ -782,51 +782,6 @@ def get_prolif_fingerprint_for_pose(db_path, table_name, pose_id):
     except Exception:
         return None
 
-def get_pose_ids_for_directory(db_path, directory_name):
-    """
-    Return the list of Pose_IDs from the Results table that correspond to the given
-    extracted-poses directory (mirrors the logic used when extracting PDB files).
-    """
-    _queries = {
-        "most_stable_poses": """
-            SELECT Pose_ID FROM Results AS R1
-            WHERE docking_score = (
-                SELECT MIN(docking_score) FROM Results AS R2
-                WHERE R1.LigName = R2.LigName
-            )
-        """,
-        "most_populated_poses": """
-            SELECT Pose_ID FROM Results AS R1
-            WHERE cluster_size = (
-                SELECT MAX(cluster_size) FROM Results AS R2
-                WHERE R1.LigName = R2.LigName
-            )
-        """,
-        "most_populated_and_stable_poses": """
-            SELECT Pose_ID FROM Results AS R1
-            WHERE cluster_size = (
-                SELECT MAX(cluster_size) FROM Results AS R2
-                WHERE R1.LigName = R2.LigName
-            ) AND docking_score = (
-                SELECT MIN(docking_score) FROM Results AS R3
-                WHERE R1.LigName = R3.LigName
-            )
-        """,
-        "all_poses": "SELECT Pose_ID FROM Results",
-    }
-    query = _queries.get(directory_name)
-    if query is None:
-        return []
-    try:
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        cursor.execute(query)
-        ids = [row[0] for row in cursor.fetchall()]
-        conn.close()
-        return ids
-    except Exception:
-        return []
-
 def get_filename_to_pose_id_map(db_path):
     """
     Return a dict mapping PDB filename -> pose info dict for every row in Results.
@@ -892,24 +847,6 @@ def get_prolif_tables_by_pose_ids(db_path, pose_ids):
         return matching
     except Exception:
         return []
-
-def get_prolif_poses_by_pose_ids(db_path, table_name, pose_ids):
-    """
-    Return a DataFrame with pose_id for entries in table_name whose pose_id is in pose_ids.
-    """
-    if not pose_ids:
-        return None
-    try:
-        placeholders = ",".join("?" * len(pose_ids))
-        conn = sqlite3.connect(db_path)
-        df = pd.read_sql_query(
-            f"SELECT pose_id FROM {table_name} WHERE pose_id IN ({placeholders}) ORDER BY pose_id",
-            conn, params=pose_ids
-        )
-        conn.close()
-        return df
-    except Exception:
-        return None
 
 def get_prolif_all_column_names_by_pose_ids(db_path, table_name, pose_ids):
     """

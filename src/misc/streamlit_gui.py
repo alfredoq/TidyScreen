@@ -3998,9 +3998,15 @@ elif page == "Docking analysis":
                                             except Exception as _e:
                                                 st.error(f"Could not save VMD script: {_e}")
 
-                                ## ProLIF Fingerprints for this pose directory
+                                ## ProLIF Fingerprints for this pose directory — always follows
+                                ## the pose currently selected above (no separate pose picker),
+                                ## so the FPS shown can never drift from the extracted pose set,
+                                ## regardless of which score column was used to extract it.
                                 dir_name = entry['directory']
-                                dir_pose_ids = st_funcs.get_pose_ids_for_directory(results_db_path, dir_name)
+                                dir_pose_ids = [
+                                    filename_to_pose_id[f]["pose_id"]
+                                    for f in pdb_names if f in filename_to_pose_id
+                                ]
                                 prolif_tables_dir = st_funcs.get_prolif_tables_by_pose_ids(results_db_path, dir_pose_ids)
                                 prolif_dir_key = f"show_prolif_{dir_name}"
                                 if not prolif_tables_dir:
@@ -4030,63 +4036,56 @@ elif page == "Docking analysis":
                                             prolif_tables_dir,
                                             key=f"select_prolif_table_{dir_name}"
                                         )
-                                        prolif_poses_dir_df = st_funcs.get_prolif_poses_by_pose_ids(results_db_path, selected_table_dir, dir_pose_ids)
-                                        if prolif_poses_dir_df is not None and not prolif_poses_dir_df.empty:
-                                            pose_options_dir = prolif_poses_dir_df["pose_id"].tolist()
-                                            pose_label_map = st_funcs.get_pose_labels_for_pose_ids(results_db_path, pose_options_dir)
-                                            pose_options_dir = sorted(pose_options_dir, key=lambda pid: pose_label_map.get(pid, str(pid)))
-                                            selected_prolif_pose_dir = st.selectbox(
-                                                "Select a pose to display fingerprints:",
-                                                pose_options_dir,
-                                                format_func=lambda pid: pose_label_map.get(pid, str(pid)),
-                                                key=f"select_prolif_pose_{dir_name}"
-                                            )
-                                            fps_dir_df = st_funcs.get_prolif_fingerprint_for_pose(results_db_path, selected_table_dir, selected_prolif_pose_dir)
-                                            reserved_dir = {"pose_id"}
-                                            all_columns_dir = st_funcs.get_prolif_all_column_names_by_pose_ids(results_db_path, selected_table_dir, dir_pose_ids)
-                                            all_itypes_dir = sorted(set(
-                                                col.split("_")[-1] for col in all_columns_dir if col not in reserved_dir
-                                            ))
-                                            if fps_dir_df is not None and not fps_dir_df.empty:
-                                                st.markdown("**Filter by interaction type:**")
-                                                filter_cols_dir = st.columns(min(len(all_itypes_dir), 6))
-                                                selected_types_dir = []
-                                                for i, itype in enumerate(all_itypes_dir):
-                                                    ck_key = f"prolif_filter_{dir_name}_{itype}"
-                                                    if ck_key not in st.session_state:
-                                                        st.session_state[ck_key] = True
-                                                    if filter_cols_dir[i % len(filter_cols_dir)].checkbox(itype, key=ck_key):
-                                                        selected_types_dir.append(itype)
-                                                keep_dir = [c for c in fps_dir_df.columns
-                                                            if c in reserved_dir or c.split("_")[-1] in selected_types_dir]
-                                                st.dataframe(fps_dir_df[keep_dir], use_container_width=True)
-                                            else:
-                                                st.warning(f"No fingerprint data found for pose {selected_prolif_pose_dir}.")
-                                                selected_types_dir = []
-
-                                            show_all_dir_key = f"show_all_prolif_{dir_name}"
-                                            if show_all_dir_key not in st.session_state:
-                                                st.session_state[show_all_dir_key] = False
-                                            _sp, _col = st.columns([3, 7])
-                                            with _col:
-                                                if st.button(
-                                                    f"{'Hide' if st.session_state[show_all_dir_key] else 'Show'} all fingerprints for {selected_table_dir}",
-                                                    key=f"btn_all_prolif_{dir_name}"
-                                                ):
-                                                    st.session_state[show_all_dir_key] = not st.session_state[show_all_dir_key]
-                                                    st.rerun()
-                                            if st.session_state[show_all_dir_key]:
-                                                all_fps_dir_df = st_funcs.get_all_prolif_fingerprints_by_pose_ids(results_db_path, selected_table_dir, dir_pose_ids)
-                                                if all_fps_dir_df is not None and not all_fps_dir_df.empty:
-                                                    all_fps_dir_df.insert(1, "pose_name", all_fps_dir_df["pose_id"].map(lambda pid: pose_label_map.get(pid, str(pid))))
-                                                    all_fps_dir_df = all_fps_dir_df.sort_values("pose_name").reset_index(drop=True)
-                                                    keep_all_dir = [c for c in all_fps_dir_df.columns
-                                                                    if c in reserved_dir | {"pose_name"} or c.split("_")[-1] in selected_types_dir]
-                                                    st.dataframe(all_fps_dir_df[keep_all_dir], use_container_width=True)
-                                                else:
-                                                    st.warning("Could not retrieve fingerprints for all poses.")
+                                        pose_label_map = st_funcs.get_pose_labels_for_pose_ids(results_db_path, dir_pose_ids)
+                                        selected_prolif_pose_dir = filename_to_pose_id.get(selected_file, {}).get("pose_id")
+                                        st.caption(
+                                            f"Fingerprints for the pose selected above: "
+                                            f"{pose_label_map.get(selected_prolif_pose_dir, selected_file)}"
+                                        )
+                                        fps_dir_df = st_funcs.get_prolif_fingerprint_for_pose(results_db_path, selected_table_dir, selected_prolif_pose_dir)
+                                        reserved_dir = {"pose_id"}
+                                        all_columns_dir = st_funcs.get_prolif_all_column_names_by_pose_ids(results_db_path, selected_table_dir, dir_pose_ids)
+                                        all_itypes_dir = sorted(set(
+                                            col.split("_")[-1] for col in all_columns_dir if col not in reserved_dir
+                                        ))
+                                        if fps_dir_df is not None and not fps_dir_df.empty:
+                                            st.markdown("**Filter by interaction type:**")
+                                            filter_cols_dir = st.columns(min(len(all_itypes_dir), 6))
+                                            selected_types_dir = []
+                                            for i, itype in enumerate(all_itypes_dir):
+                                                ck_key = f"prolif_filter_{dir_name}_{itype}"
+                                                if ck_key not in st.session_state:
+                                                    st.session_state[ck_key] = True
+                                                if filter_cols_dir[i % len(filter_cols_dir)].checkbox(itype, key=ck_key):
+                                                    selected_types_dir.append(itype)
+                                            keep_dir = [c for c in fps_dir_df.columns
+                                                        if c in reserved_dir or c.split("_")[-1] in selected_types_dir]
+                                            st.dataframe(fps_dir_df[keep_dir], use_container_width=True)
                                         else:
-                                            st.warning(f"No ProLIF poses found for {dir_name}.")
+                                            st.warning(f"No fingerprint data found for pose {selected_file} in table {selected_table_dir}.")
+                                            selected_types_dir = []
+
+                                        show_all_dir_key = f"show_all_prolif_{dir_name}"
+                                        if show_all_dir_key not in st.session_state:
+                                            st.session_state[show_all_dir_key] = False
+                                        _sp, _col = st.columns([3, 7])
+                                        with _col:
+                                            if st.button(
+                                                f"{'Hide' if st.session_state[show_all_dir_key] else 'Show'} all fingerprints for {selected_table_dir}",
+                                                key=f"btn_all_prolif_{dir_name}"
+                                            ):
+                                                st.session_state[show_all_dir_key] = not st.session_state[show_all_dir_key]
+                                                st.rerun()
+                                        if st.session_state[show_all_dir_key]:
+                                            all_fps_dir_df = st_funcs.get_all_prolif_fingerprints_by_pose_ids(results_db_path, selected_table_dir, dir_pose_ids)
+                                            if all_fps_dir_df is not None and not all_fps_dir_df.empty:
+                                                all_fps_dir_df.insert(1, "pose_name", all_fps_dir_df["pose_id"].map(lambda pid: pose_label_map.get(pid, str(pid))))
+                                                all_fps_dir_df = all_fps_dir_df.sort_values("pose_name").reset_index(drop=True)
+                                                keep_all_dir = [c for c in all_fps_dir_df.columns
+                                                                if c in reserved_dir | {"pose_name"} or c.split("_")[-1] in selected_types_dir]
+                                                st.dataframe(all_fps_dir_df[keep_all_dir], use_container_width=True)
+                                            else:
+                                                st.warning("Could not retrieve fingerprints for all poses.")
                                 st.divider()
                         else:
                             _sp, _col = st.columns([1, 9])
