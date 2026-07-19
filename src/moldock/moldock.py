@@ -13248,25 +13248,41 @@ class MolDock:
                 print(f"✅ Using all {len(default_interactions)} interaction types")
                 return default_interactions
             elif choice == '2':
-                print("\nEnter interaction numbers separated by commas (e.g., 1,3,7,8):")
+                print("\nEnter interaction numbers separated by commas, ranges allowed (e.g., 1,3,5-7):")
                 selection = input("Selection: ").strip()
-                
+
                 if not selection:
                     print("❌ No selection made, using defaults")
                     return default_interactions
-                
+
                 try:
-                    indices = [int(x.strip()) - 1 for x in selection.split(',')]
-                    selected = [default_interactions[i] for i in indices 
+                    indices = []
+                    for token in selection.split(','):
+                        token = token.strip()
+                        if not token:
+                            continue
+                        if '-' in token:
+                            start_str, end_str = token.split('-', 1)
+                            start, end = int(start_str.strip()), int(end_str.strip())
+                            if start > end:
+                                start, end = end, start
+                            indices.extend(range(start - 1, end))
+                        else:
+                            indices.append(int(token) - 1)
+
+                    seen = set()
+                    ordered_indices = [i for i in indices if not (i in seen or seen.add(i))]
+
+                    selected = [default_interactions[i] for i in ordered_indices
                             if 0 <= i < len(default_interactions)]
-                    
+
                     if selected:
                         print(f"✅ Selected {len(selected)} interactions: {', '.join(selected)}")
                         return selected
                     else:
                         print("❌ Invalid selection, using defaults")
                         return default_interactions
-                        
+
                 except (ValueError, IndexError):
                     print("❌ Invalid input format, using defaults")
                     return default_interactions
