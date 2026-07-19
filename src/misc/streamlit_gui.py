@@ -5354,9 +5354,8 @@ elif page == "ML features management":
                     )
                 else:
                     _export_ts_id = _selected_snaps["training_set_id"].iloc[0]
-                    _csv_bytes = st_funcs.export_training_set_fingerprints_as_csv_bytes(project_path, _export_ts_id)
-                    _safe_ts_id = _export_ts_id.replace(' ', '_')
-                    if _csv_bytes is None:
+                    _cond_options = st_funcs.get_training_set_prolif_condition_options(project_path, _export_ts_id)
+                    if not _cond_options:
                         st.button(
                             "⬇️ Export Fingerprints CSV",
                             key="btn_export_fps_csv",
@@ -5364,14 +5363,25 @@ elif page == "ML features management":
                             help=f"No fingerprints computed for '{_export_ts_id}' yet. Run compute_training_set_fingerprints() first.",
                         )
                     else:
+                        _cond_labels = {
+                            (f"ID {c['id']}: {c['description']}" if c['description'] else f"ID {c['id']}"): c['id']
+                            for c in _cond_options
+                        }
+                        _cond_label_sel = st.selectbox(
+                            "ProLIF conditions", list(_cond_labels.keys()),
+                            key=f"export_fps_cond_{_export_ts_id}",
+                        )
+                        _export_cond_id = _cond_labels[_cond_label_sel]
+                        _csv_bytes = st_funcs.export_training_set_fingerprints_as_csv_bytes(project_path, _export_ts_id, _export_cond_id)
+                        _safe_ts_id = _export_ts_id.replace(' ', '_')
                         _default_csv_path = os.path.join(
                             project_path, 'ml', 'training_sets',
-                            f'{_safe_ts_id}_fingerprints.csv'
+                            f'{_safe_ts_id}_cond{_export_cond_id}_fingerprints.csv'
                         )
                         _export_path = st.text_input(
                             "Output CSV path:",
                             value=_default_csv_path,
-                            key=f"export_fps_csv_path_{_export_ts_id}",
+                            key=f"export_fps_csv_path_{_export_ts_id}_{_export_cond_id}",
                         )
                         if st.button("⬇️ Export Fingerprints CSV", key="btn_export_fps_csv"):
                             try:
@@ -5864,13 +5874,26 @@ elif page == "RF model training":
                     selected_snap = st.selectbox("Training set snapshot", snap_ids, key="rf_snap_select")
                     fp_status = st_funcs.get_training_set_fingerprint_status(project_path)
                     st.caption(f"Fingerprint status: {fp_status.get(selected_snap, '❌ None')}")
-                    if st.button("Load fingerprints", key="rf_load_btn"):
-                        csv_bytes = st_funcs.export_training_set_fingerprints_as_csv_bytes(project_path, selected_snap)
-                        if csv_bytes is None:
-                            st.error("No fingerprints found for this snapshot. Compute fingerprints first in the ML features management page.")
-                        else:
-                            st.session_state.rf_df = pd.read_csv(io.BytesIO(csv_bytes))
-                            st.success(f"Loaded fingerprints from snapshot '{selected_snap}'.")
+                    _rf_cond_options = st_funcs.get_training_set_prolif_condition_options(project_path, selected_snap)
+                    if not _rf_cond_options:
+                        st.info("No fingerprints computed for this snapshot. Compute fingerprints first in the ML features management page.")
+                    else:
+                        _rf_cond_labels = {
+                            (f"ID {c['id']}: {c['description']}" if c['description'] else f"ID {c['id']}"): c['id']
+                            for c in _rf_cond_options
+                        }
+                        _rf_cond_label_sel = st.selectbox(
+                            "ProLIF conditions", list(_rf_cond_labels.keys()),
+                            key=f"rf_cond_select_{selected_snap}",
+                        )
+                        _rf_cond_id = _rf_cond_labels[_rf_cond_label_sel]
+                        if st.button("Load fingerprints", key="rf_load_btn"):
+                            csv_bytes = st_funcs.export_training_set_fingerprints_as_csv_bytes(project_path, selected_snap, _rf_cond_id)
+                            if csv_bytes is None:
+                                st.error("No fingerprints found for this snapshot/conditions combination.")
+                            else:
+                                st.session_state.rf_df = pd.read_csv(io.BytesIO(csv_bytes))
+                                st.success(f"Loaded fingerprints from snapshot '{selected_snap}' (ProLIF conditions ID {_rf_cond_id}).")
 
         else:
             file_path = st.text_input("CSV file path", placeholder="/path/to/dataset.csv", key="rf_csv_path")

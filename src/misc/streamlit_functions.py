@@ -1603,6 +1603,50 @@ def get_training_set_prolif_conditions_used(project_path: str) -> "dict":
     return result
 
 
+def get_training_set_prolif_condition_options(project_path: str, training_set_id: str) -> "list[dict]":
+    """
+    Return the distinct ProLIF conditions for which fingerprints have been
+    computed on a given training set snapshot.
+
+    Args:
+        project_path (str): Root path of the active project.
+        training_set_id (str): ID of the training set snapshot.
+
+    Returns:
+        list[dict]: [{'id': <prolif_conditions_id>, 'description': <str or None>}, ...]
+                    ordered by id. Empty list if none found.
+    """
+    db_path = os.path.join(project_path, "ml", "training_sets", "training_sets_snapshots.db")
+    if not os.path.exists(db_path):
+        return []
+    try:
+        conn = sqlite3.connect(db_path)
+        rows = pd.read_sql_query(
+            "SELECT DISTINCT prolif_conditions_id FROM training_set_fingerprints WHERE training_set_id = ? ORDER BY prolif_conditions_id",
+            conn, params=(training_set_id,),
+        )
+        conn.close()
+    except Exception:
+        return []
+
+    if rows.empty:
+        return []
+
+    ids = rows["prolif_conditions_id"].tolist()
+    desc_map = {}
+    params_db = os.path.join(project_path, "docking", "params", "params.db")
+    try:
+        if os.path.exists(params_db):
+            conn = sqlite3.connect(params_db)
+            conds = pd.read_sql_query("SELECT id, description FROM ProLIF_Conditions", conn)
+            conn.close()
+            desc_map = dict(zip(conds["id"], conds["description"]))
+    except Exception:
+        pass
+
+    return [{"id": cid, "description": desc_map.get(cid)} for cid in ids]
+
+
 def get_training_set_fingerprints_for_pose(project_path: str, training_set_id: str, assay_name: str, pose_file: str, directory: str) -> "list[dict] | None":
     """
     Retrieve all computed ProLIF fingerprints for a specific pose in a training set snapshot.
@@ -2198,10 +2242,14 @@ def generate_vmd_script(pose_path: str, ref_pdb_path: str = None) -> str:
     return "\n".join(lines)
 
 
-def export_training_set_fingerprints_as_csv_bytes(project_path: str, training_set_id: str) -> "bytes | None":
+def export_training_set_fingerprints_as_csv_bytes(project_path: str, training_set_id: str, prolif_conditions_id: int) -> "bytes | None":
     """
-    Build a CSV of all precomputed fingerprints for the given training set snapshot
-    and return it as UTF-8 bytes suitable for st.download_button.
+    Build a CSV of the precomputed fingerprints for the given training set snapshot
+    and ProLIF conditions, and return it as UTF-8 bytes suitable for st.download_button.
+
+    A pose may have multiple fingerprints if computed under different ProLIF
+    conditions; prolif_conditions_id selects which one to export so that rows
+    from incompatible feature spaces are never mixed in the same CSV.
 
     Returns None if no fingerprints are found or the database is missing.
     """
@@ -2213,9 +2261,9 @@ def export_training_set_fingerprints_as_csv_bytes(project_path: str, training_se
         rows = pd.read_sql_query(
             """SELECT assay_name, pose_file, label, fingerprint_json
                FROM training_set_fingerprints
-               WHERE training_set_id = ?
+               WHERE training_set_id = ? AND prolif_conditions_id = ?
                ORDER BY binder_type DESC, assay_name, pose_file""",
-            conn, params=(training_set_id,)
+            conn, params=(training_set_id, prolif_conditions_id)
         )
         conn.close()
     except Exception:

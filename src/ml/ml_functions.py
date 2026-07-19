@@ -600,6 +600,11 @@ class MachineLearning:
             except ValueError:
                 print("❌ Enter a valid number")
 
+        # ── Select ProLIF conditions ──────────────────────────────────────────
+        _, condition_selection = self._prompt_prolif_conditions()
+        if condition_selection is None:
+            return
+
         # ── Load fingerprint rows ─────────────────────────────────────────────
         if not os.path.exists(self.__training_sets_db):
             print("\n❌ Training sets database not found.")
@@ -609,14 +614,15 @@ class MachineLearning:
         rows = pd.read_sql_query(
             """SELECT assay_name, pose_file, label, fingerprint_json
                FROM training_set_fingerprints
-               WHERE training_set_id = ?
+               WHERE training_set_id = ? AND prolif_conditions_id = ?
                ORDER BY binder_type DESC, assay_name, pose_file""",
-            conn, params=(training_set_id,)
+            conn, params=(training_set_id, condition_selection)
         )
         conn.close()
 
         if rows.empty:
-            print(f"\n❌ No fingerprints found for training set '{training_set_id}'. "
+            print(f"\n❌ No fingerprints found for training set '{training_set_id}' "
+                  f"with conditions ID {condition_selection}. "
                   f"Run compute_training_set_fingerprints() first.")
             return
 
@@ -640,7 +646,7 @@ class MachineLearning:
         safe_id = training_set_id.replace(' ', '_')
         default_csv = os.path.join(
             self.path, 'ml', 'training_sets',
-            f'{safe_id}_fingerprints.csv'
+            f'{safe_id}_cond{condition_selection}_fingerprints.csv'
         )
         path_input = input(
             f"\nOutput CSV path [default: {default_csv}]: "
