@@ -4560,6 +4560,22 @@ elif page == "Docking analysis":
                                     f"{r['LigName']}_{r['run_number']}  (prob: {r['rf_prob_positive']:.2f})"
                                     for _, r in _cpv_df_pos.iterrows()
                                 ]
+                                if (st.session_state.get("cpv_pos_selectbox") not in _cpv_pos_labels):
+                                    st.session_state["cpv_pos_selectbox"] = _cpv_pos_labels[0]
+
+                                _cpv_pos_cur_idx = _cpv_pos_labels.index(st.session_state["cpv_pos_selectbox"])
+                                _cpv_pos_prev_col, _cpv_pos_mid_col, _cpv_pos_next_col = st.columns([1, 4, 1])
+                                with _cpv_pos_prev_col:
+                                    if st.button("◀ Prev", key="cpv_pos_prev_btn", disabled=(_cpv_pos_cur_idx == 0)):
+                                        st.session_state["cpv_pos_selectbox"] = _cpv_pos_labels[_cpv_pos_cur_idx - 1]
+                                        st.rerun()
+                                with _cpv_pos_next_col:
+                                    if st.button("Next ▶", key="cpv_pos_next_btn", disabled=(_cpv_pos_cur_idx == len(_cpv_pos_labels) - 1)):
+                                        st.session_state["cpv_pos_selectbox"] = _cpv_pos_labels[_cpv_pos_cur_idx + 1]
+                                        st.rerun()
+                                with _cpv_pos_mid_col:
+                                    st.caption(f"Pose {_cpv_pos_cur_idx + 1} of {len(_cpv_pos_labels)}")
+
                                 _cpv_pos_sel = st.selectbox(
                                     "Select a positive pose:",
                                     _cpv_pos_labels,
@@ -4634,6 +4650,22 @@ elif page == "Docking analysis":
                                     f"{r['LigName']}_{r['run_number']}  (prob: {r['rf_prob_positive']:.2f})"
                                     for _, r in _cpv_df_neg.iterrows()
                                 ]
+                                if (st.session_state.get("cpv_neg_selectbox") not in _cpv_neg_labels):
+                                    st.session_state["cpv_neg_selectbox"] = _cpv_neg_labels[0]
+
+                                _cpv_neg_cur_idx = _cpv_neg_labels.index(st.session_state["cpv_neg_selectbox"])
+                                _cpv_neg_prev_col, _cpv_neg_mid_col, _cpv_neg_next_col = st.columns([1, 4, 1])
+                                with _cpv_neg_prev_col:
+                                    if st.button("◀ Prev", key="cpv_neg_prev_btn", disabled=(_cpv_neg_cur_idx == 0)):
+                                        st.session_state["cpv_neg_selectbox"] = _cpv_neg_labels[_cpv_neg_cur_idx - 1]
+                                        st.rerun()
+                                with _cpv_neg_next_col:
+                                    if st.button("Next ▶", key="cpv_neg_next_btn", disabled=(_cpv_neg_cur_idx == len(_cpv_neg_labels) - 1)):
+                                        st.session_state["cpv_neg_selectbox"] = _cpv_neg_labels[_cpv_neg_cur_idx + 1]
+                                        st.rerun()
+                                with _cpv_neg_mid_col:
+                                    st.caption(f"Pose {_cpv_neg_cur_idx + 1} of {len(_cpv_neg_labels)}")
+
                                 _cpv_neg_sel = st.selectbox(
                                     "Select a negative pose:",
                                     _cpv_neg_labels,
@@ -4698,6 +4730,37 @@ elif page == "Docking analysis":
                                                 st.session_state["cpv_show_subset_neg"] = False
                                             else:
                                                 st.error(_msg)
+
+                        st.divider()
+                        st.markdown("### 🧬 Per-Ligand Predicted Label Summary")
+                        st.caption(
+                            "A ligand's poses (run_number) can each get a different "
+                            "predicted label — this shows how consistently each ligand "
+                            "was classified across its poses."
+                        )
+                        _cpv_lig_summary = st_funcs.get_rf_ligand_summary(results_db_path, _cpv_model)
+                        if _cpv_lig_summary.empty:
+                            st.info("No per-ligand summary available.")
+                        else:
+                            _cpv_lig_min_positive = st.slider(
+                                "Minimum positive poses per ligand:", 0,
+                                int(_cpv_lig_summary["n_poses"].max()), 0,
+                                key="cpv_lig_min_positive",
+                            )
+                            _cpv_lig_filtered = _cpv_lig_summary[
+                                _cpv_lig_summary["n_positive"] >= _cpv_lig_min_positive
+                            ].reset_index(drop=True)
+                            st.dataframe(_cpv_lig_filtered, use_container_width=True)
+                            st.bar_chart(
+                                _cpv_lig_filtered.set_index("LigName")["frac_positive"].head(30)
+                            )
+                            st.download_button(
+                                "📥 Export per-ligand summary as CSV",
+                                data=_cpv_lig_filtered.to_csv(index=False),
+                                file_name=f"{_cpv_assay}_{_cpv_model}_ligand_summary.csv",
+                                mime="text/csv",
+                                key="cpv_export_ligand_summary",
+                            )
 
                 else:
                     ## ── Fallback: manual positive/negative binder flags ───────────

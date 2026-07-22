@@ -651,6 +651,62 @@ def get_rf_classified_poses(results_db_path, model_suffix):
         return empty
 
 
+def get_rf_ligand_summary(results_db_path, model_suffix):
+    """
+    Aggregate RF pose-level predictions per LigName.
+
+    A ligand can have multiple docked poses (distinct run_number values), each
+    classified independently by the RF model — a ligand is not guaranteed to
+    get the same predicted label across all of its poses. This summarizes,
+    per LigName, how many poses were predicted positive/negative.
+
+    Returns a DataFrame with columns:
+        LigName, n_poses, n_positive, n_negative, frac_positive,
+        consensus_label, best_docking_score, max_rf_prob_positive
+    sorted by frac_positive DESC, then n_poses DESC.
+    consensus_label is 1 when frac_positive >= 0.5, else 0.
+    best_docking_score is the minimum (most favorable) docking_score among
+    the ligand's poses.
+    Returns an empty DataFrame if the DB/table is missing or has no rows.
+    """
+    table = f"rf_predictions_{model_suffix}"
+    if not os.path.exists(results_db_path):
+        return pd.DataFrame()
+    try:
+        conn = sqlite3.connect(results_db_path)
+        df = pd.read_sql_query(
+            f"""
+            SELECT R.LigName, R.run_number, R.docking_score,
+                   P.rf_label, P.rf_prob_positive
+            FROM Results AS R
+            JOIN "{table}" AS P ON R.Pose_ID = P.Pose_ID
+            """,
+            conn,
+        )
+        conn.close()
+    except Exception:
+        return pd.DataFrame()
+
+    if df.empty:
+        return df
+
+    summary = df.groupby("LigName").agg(
+        n_poses=("rf_label", "size"),
+        n_positive=("rf_label", "sum"),
+        best_docking_score=("docking_score", "min"),
+        max_rf_prob_positive=("rf_prob_positive", "max"),
+    ).reset_index()
+    summary["n_positive"] = summary["n_positive"].astype(int)
+    summary["n_negative"] = summary["n_poses"] - summary["n_positive"]
+    summary["frac_positive"] = summary["n_positive"] / summary["n_poses"]
+    summary["consensus_label"] = (summary["frac_positive"] >= 0.5).astype(int)
+    summary = summary[
+        ["LigName", "n_poses", "n_positive", "n_negative", "frac_positive",
+         "consensus_label", "best_docking_score", "max_rf_prob_positive"]
+    ].sort_values(["frac_positive", "n_poses"], ascending=False).reset_index(drop=True)
+    return summary
+
+
 def find_pose_pdb(results_db_path, ligname, run_number):
     """
     Search extracted pose directories adjacent to results_db_path for
