@@ -1,6 +1,7 @@
 from tidyscreen import tidyscreen
 import sys
 import os
+import contextlib
 import sqlite3
 import json
 import pandas as pd
@@ -832,6 +833,33 @@ class MachineLearning:
                 return os.path.join(self.path, relative)
         return stored_path
 
+    @contextlib.contextmanager
+    def _suppress_output(self):
+        """
+        Redirect stdout/stderr to devnull at the OS file-descriptor level.
+
+        Several MolDock steps (tleap, sander, ambpdb) shell out via subprocess
+        with inherited stdio, so redirecting sys.stdout alone would not silence
+        them — the fd itself must be swapped.
+        """
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        saved_stdout_fd = os.dup(1)
+        saved_stderr_fd = os.dup(2)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        try:
+            os.dup2(devnull_fd, 1)
+            os.dup2(devnull_fd, 2)
+            yield
+        finally:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os.dup2(saved_stdout_fd, 1)
+            os.dup2(saved_stderr_fd, 2)
+            os.close(saved_stdout_fd)
+            os.close(saved_stderr_fd)
+            os.close(devnull_fd)
+
     def _ensure_fingerprints_table(self):
         """Create the training_set_fingerprints table in the snapshots DB if absent.
         Also migrates existing tables that pre-date the 'minimized' column."""
@@ -867,13 +895,17 @@ class MachineLearning:
     # RF predictions on docking assays
     # -------------------------------------------------------------------------
 
-    def make_rf_predictions_on_docking_assay(self):
+    def make_rf_predictions_on_docking_assay(self, verbose: bool = False):
         """
         Apply a trained RF model to all poses in a selected docking assay.
 
         The user is prompted to select a docking assay from the project registry.
-        Further steps (model selection, fingerprint computation, prediction) will
-        be added incrementally.
+
+        Args:
+            verbose (bool): If True, print full per-pose processing details,
+                including output from the tleap/sander/ambpdb subprocess calls
+                made while preparing each pose. If False (default), all of that
+                output is suppressed and a tqdm progress counter is shown instead.
         """
 
         if not os.path.exists(self.__docking_assays_db):
@@ -1034,70 +1066,99 @@ class MachineLearning:
         processed_ligands = {}   # {ligname: (prepin_file, frcmod_file)}
         fp_records = []           # [{pose_id, lig_name, docking_score, **fp_dict}, ...]
         output_dir = None
+        n_ok = 0
+        n_failed = 0
+
+        # When quiet, tqdm writes through a duplicated stdout fd so the progress
+        # counter keeps displaying even while fd 1/2 are redirected to devnull
+        # below (needed to silence subprocess-inherited tleap/sander/ambpdb output).
+        original_stdout = os.fdopen(os.dup(1), 'w') if not verbose else sys.stdout
 
         try:
-            for _, row in poses_df.iterrows():
+            pbar = tqdm(
+                poses_df.iterrows(), total=len(poses_df),
+                desc="Classifying docked poses", file=original_stdout,
+                dynamic_ncols=True, disable=verbose,
+            )
+            for _, row in pbar:
                 pose_id       = row['Pose_ID']
                 run_number    = row['run_number']
                 ligname       = row['LigName']
                 docking_score = row['docking_score']
 
-                print(f"\n  🔬 Processing Pose_ID: {pose_id}  LigName: {ligname}")
+                if verbose:
+                    print(f"\n  🔬 Processing Pose_ID: {pose_id}  LigName: {ligname}")
 
+                suppress = contextlib.nullcontext() if verbose else self._suppress_output()
                 try:
-                    output_dir, output_file = moldock._restore_single_docked_pose(
-                        results_db, ligname, run_number
-                    )
-
-                    if ligname not in processed_ligands:
-                        prepin_file, frcmod_file = moldock._prepare_ligand_tleap_files(
-                            ligname, selected_assay, output_dir
+                    with suppress:
+                        output_dir, output_file = moldock._restore_single_docked_pose(
+                            results_db, ligname, run_number
                         )
-                        processed_ligands[ligname] = (prepin_file, frcmod_file)
-                    else:
-                        prepin_file, frcmod_file = processed_ligands[ligname]
 
-                    prmtop_file, inpcrd_file, output_pdb_file = moldock._prepare_complex_prmtop_inpcrd(
-                        prepin_file, frcmod_file, selected_assay, output_dir,
-                        output_file, pose_id, ligname=ligname
-                    )
-
-                    if minimize:
-                        try:
-                            print("    MINIMIZING COMPLEX...")
-                            _, output_pdb_file = moldock._minimize_complex(
-                                prmtop_file, inpcrd_file, output_dir, ligname, pose_id, output_pdb_file
+                        if ligname not in processed_ligands:
+                            prepin_file, frcmod_file = moldock._prepare_ligand_tleap_files(
+                                ligname, selected_assay, output_dir
                             )
-                        except Exception as e:
-                            print(f"    ⚠️  Minimization failed: {e}. Using original structure.")
+                            processed_ligands[ligname] = (prepin_file, frcmod_file)
+                        else:
+                            prepin_file, frcmod_file = processed_ligands[ligname]
 
-                    fps_df = moldock._compute_prolif_fingerprints3(
-                        prolif_params_dict, output_pdb_file, receptor_file,
-                        prmtop_file, inpcrd_file, ligname, pose_id
-                    )
+                        prmtop_file, inpcrd_file, output_pdb_file = moldock._prepare_complex_prmtop_inpcrd(
+                            prepin_file, frcmod_file, selected_assay, output_dir,
+                            output_file, pose_id, ligname=ligname
+                        )
 
-                    fps_df.columns = fps_df.columns.droplevel(0)
-                    if renumbering_dict:
-                        fps_df = fps_df.rename(columns=renumbering_dict, level=0)
-                    fps_df.columns = [f"{a}_{b}" for a, b in fps_df.columns]
+                        if minimize:
+                            try:
+                                if verbose:
+                                    print("    MINIMIZING COMPLEX...")
+                                _, output_pdb_file = moldock._minimize_complex(
+                                    prmtop_file, inpcrd_file, output_dir, ligname, pose_id, output_pdb_file
+                                )
+                            except Exception as e:
+                                if verbose:
+                                    print(f"    ⚠️  Minimization failed: {e}. Using original structure.")
 
-                    fp_row = fps_df.iloc[0].to_dict()
-                    fp_records.append({
-                        'pose_id':       pose_id,
-                        'lig_name':      ligname,
-                        'docking_score': docking_score,
-                        **{k: bool(v) for k, v in fp_row.items()},
-                    })
-                    print(f"    ✅ Fingerprint computed for Pose_ID {pose_id}")
+                        fps_df = moldock._compute_prolif_fingerprints3(
+                            prolif_params_dict, output_pdb_file, receptor_file,
+                            prmtop_file, inpcrd_file, ligname, pose_id
+                        )
+
+                        fps_df.columns = fps_df.columns.droplevel(0)
+                        if renumbering_dict:
+                            fps_df = fps_df.rename(columns=renumbering_dict, level=0)
+                        fps_df.columns = [f"{a}_{b}" for a, b in fps_df.columns]
+
+                        fp_row = fps_df.iloc[0].to_dict()
+                        fp_records.append({
+                            'pose_id':       pose_id,
+                            'lig_name':      ligname,
+                            'docking_score': docking_score,
+                            **{k: bool(v) for k, v in fp_row.items()},
+                        })
+
+                    n_ok += 1
+                    if verbose:
+                        print(f"    ✅ Fingerprint computed for Pose_ID {pose_id}")
 
                 except Exception as e:
-                    print(f"    ❌ Error processing Pose_ID {pose_id} ({ligname}): {e} — skipping")
+                    n_failed += 1
+                    if verbose:
+                        print(f"    ❌ Error processing Pose_ID {pose_id} ({ligname}): {e} — skipping")
                     continue
+                finally:
+                    if not verbose:
+                        pbar.set_postfix(classified=n_ok, failed=n_failed)
 
         finally:
+            pbar.close()
+            if not verbose:
+                original_stdout.close()
             if output_dir:
                 shutil.rmtree(output_dir, ignore_errors=True)
-                print("\n✅ Temporary files cleaned up.")
+                if verbose:
+                    print("\n✅ Temporary files cleaned up.")
 
         if not fp_records:
             print("\n❌ No fingerprints were successfully computed. Aborting prediction.")
