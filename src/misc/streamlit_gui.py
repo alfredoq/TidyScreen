@@ -4915,7 +4915,7 @@ elif page == "ML features management":
                     pos_viewer_key = "show_ml_positive_poses"
                     if pos_viewer_key not in st.session_state:
                         st.session_state[pos_viewer_key] = False
-                    _col_pos_view, _col_pos_clear, _col_pos_delete = st.columns([3, 2, 2])
+                    _col_pos_view, _col_pos_clear, _col_pos_delete, _col_pos_move = st.columns([3, 2, 2, 3])
                     with _col_pos_view:
                         st.button(
                             f"{'Hide' if st.session_state[pos_viewer_key] else 'View'} Positive Poses",
@@ -4971,6 +4971,40 @@ elif page == "ML features management":
                             with _cdpos2:
                                 if st.button("❌ Cancel", key="btn_cancel_delete_selected_positive"):
                                     st.session_state["confirm_delete_selected_positive"] = False
+                                    st.rerun()
+                    with _col_pos_move:
+                        _n_sel_pos_move = len(_selected_pos)
+                        if not st.session_state.get("confirm_move_selected_positive"):
+                            if st.button(
+                                f"➡️ Send to Negative Binder Table ({_n_sel_pos_move})",
+                                key="btn_move_selected_positive",
+                                disabled=(_n_sel_pos_move == 0),
+                            ):
+                                st.session_state["confirm_move_selected_positive"] = True
+                                st.rerun()
+                        else:
+                            st.warning(f"⚠️ Move **{_n_sel_pos_move}** selected row(s) to the Negative Binders table?")
+                            _cmpos1, _cmpos2 = st.columns(2)
+                            with _cmpos1:
+                                if st.button("✅ Yes, move", key="btn_confirm_move_selected_positive"):
+                                    _move_errors = []
+                                    for _, _row in _selected_pos.iterrows():
+                                        _mv_result = st_funcs.move_binder_to_negative(
+                                            project_path=project_path,
+                                            assay_name=_row["assay_name"],
+                                            pose_file=_row["pose_file"],
+                                            directory=_row["directory"],
+                                            pose_full_path=_row["pose_full_path"],
+                                        )
+                                        if _mv_result not in ("moved", "duplicate"):
+                                            _move_errors.append(f"{_row['pose_file']}: {_mv_result}")
+                                    st.session_state["confirm_move_selected_positive"] = False
+                                    if _move_errors:
+                                        st.error("Some rows could not be moved: " + "; ".join(_move_errors))
+                                    st.rerun()
+                            with _cmpos2:
+                                if st.button("❌ Cancel", key="btn_cancel_move_selected_positive"):
+                                    st.session_state["confirm_move_selected_positive"] = False
                                     st.rerun()
 
                     if st.session_state[pos_viewer_key]:
@@ -5110,7 +5144,7 @@ elif page == "ML features management":
                     neg_viewer_key = "show_ml_negative_poses"
                     if neg_viewer_key not in st.session_state:
                         st.session_state[neg_viewer_key] = False
-                    _col_neg_view, _col_neg_clear, _col_neg_delete = st.columns([3, 2, 2])
+                    _col_neg_view, _col_neg_clear, _col_neg_delete, _col_neg_move = st.columns([3, 2, 2, 3])
                     with _col_neg_view:
                         st.button(
                             f"{'Hide' if st.session_state[neg_viewer_key] else 'View'} Negative Poses",
@@ -5166,6 +5200,40 @@ elif page == "ML features management":
                             with _cdneg2:
                                 if st.button("❌ Cancel", key="btn_cancel_delete_selected_negative"):
                                     st.session_state["confirm_delete_selected_negative"] = False
+                                    st.rerun()
+                    with _col_neg_move:
+                        _n_sel_neg_move = len(_selected_neg)
+                        if not st.session_state.get("confirm_move_selected_negative"):
+                            if st.button(
+                                f"➡️ Send to Positive Binder Table ({_n_sel_neg_move})",
+                                key="btn_move_selected_negative",
+                                disabled=(_n_sel_neg_move == 0),
+                            ):
+                                st.session_state["confirm_move_selected_negative"] = True
+                                st.rerun()
+                        else:
+                            st.warning(f"⚠️ Move **{_n_sel_neg_move}** selected row(s) to the Positive Binders table?")
+                            _cmneg1, _cmneg2 = st.columns(2)
+                            with _cmneg1:
+                                if st.button("✅ Yes, move", key="btn_confirm_move_selected_negative"):
+                                    _move_errors_neg = []
+                                    for _, _row in _selected_neg.iterrows():
+                                        _mv_result = st_funcs.move_binder_to_positive(
+                                            project_path=project_path,
+                                            assay_name=_row["assay_name"],
+                                            pose_file=_row["pose_file"],
+                                            directory=_row["directory"],
+                                            pose_full_path=_row["pose_full_path"],
+                                        )
+                                        if _mv_result not in ("moved", "duplicate"):
+                                            _move_errors_neg.append(f"{_row['pose_file']}: {_mv_result}")
+                                    st.session_state["confirm_move_selected_negative"] = False
+                                    if _move_errors_neg:
+                                        st.error("Some rows could not be moved: " + "; ".join(_move_errors_neg))
+                                    st.rerun()
+                            with _cmneg2:
+                                if st.button("❌ Cancel", key="btn_cancel_move_selected_negative"):
+                                    st.session_state["confirm_move_selected_negative"] = False
                                     st.rerun()
 
                     if st.session_state[neg_viewer_key]:
@@ -5874,7 +5942,8 @@ elif page == "RF model training":
 
     # ── Session state defaults ─────────────────────────────────────────────
     for _k in ("rf_df", "rf_model", "rf_eval_results", "rf_fi", "rf_cv_scores",
-               "rf_best_params", "rf_best_cv_score"):
+               "rf_best_params", "rf_best_cv_score", "rf_accuracy", "rf_macro_f1",
+               "rf_test_predictions"):
         if _k not in st.session_state:
             st.session_state[_k] = None
 
@@ -6124,6 +6193,35 @@ elif page == "RF model training":
                 st.session_state.rf_eval_results = evaluate_model(model, X_test, y_test)
                 st.session_state.rf_fi           = feature_importances(model, X.columns.tolist(), top_n=top_n)
                 st.session_state.rf_model        = model
+                _trained_report = st.session_state.rf_eval_results["classification_report"]
+                st.session_state.rf_accuracy = _trained_report["accuracy"]
+                st.session_state.rf_macro_f1 = _trained_report["macro avg"]["f1-score"]
+
+                # Per-test-pose predictions, so the Results tab can show which
+                # poses fall in each confusion-matrix quadrant (TP/FP/FN/TN).
+                # X_test keeps the original DataFrame index, so identity columns
+                # (whatever the user dropped as non-feature columns) can be
+                # looked back up from _df_train and stay row-aligned with
+                # y_test/y_pred/y_prob (all in X_test's row order).
+                _id_cols = [c for c in drop_cols if c in _df_train.columns]
+                _test_df = (
+                    _df_train.loc[X_test.index, _id_cols].reset_index(drop=True)
+                    if _id_cols else pd.DataFrame(index=range(len(X_test)))
+                )
+                _test_df["true_label"] = y_test.to_numpy()
+                _test_df["pred_label"] = st.session_state.rf_eval_results["y_pred"]
+                _test_df["pred_prob"]  = st.session_state.rf_eval_results["y_prob"]
+                _test_df["quadrant"] = np.select(
+                    [
+                        (_test_df["true_label"] == 1) & (_test_df["pred_label"] == 1),
+                        (_test_df["true_label"] == 0) & (_test_df["pred_label"] == 1),
+                        (_test_df["true_label"] == 1) & (_test_df["pred_label"] == 0),
+                    ],
+                    ["TP", "FP", "FN"],
+                    default="TN",
+                )
+                st.session_state.rf_test_predictions = _test_df
+
                 st.success("Model trained successfully! See the **Results** tab.")
 
     # ══ Tab 3 — Results ═══════════════════════════════════════════════════
@@ -6133,12 +6231,14 @@ elif page == "RF model training":
         else:
             ev     = st.session_state.rf_eval_results
             fi     = st.session_state.rf_fi
-            report = ev["classification_report"]
+            report = ev.get("classification_report")
+            _accuracy = report["accuracy"] if report else st.session_state.get("rf_accuracy")
+            _macro_f1 = report["macro avg"]["f1-score"] if report else st.session_state.get("rf_macro_f1")
 
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("Test ROC-AUC", f"{ev['roc_auc']:.4f}")
-            m2.metric("Accuracy",     f"{report['accuracy']:.4f}")
-            m3.metric("Macro F1",     f"{report['macro avg']['f1-score']:.4f}")
+            m2.metric("Accuracy",     f"{_accuracy:.4f}" if _accuracy is not None else "—")
+            m3.metric("Macro F1",     f"{_macro_f1:.4f}" if _macro_f1 is not None else "—")
             if st.session_state.rf_cv_scores is not None:
                 _cv = st.session_state.rf_cv_scores
                 m4.metric("Mean CV ROC-AUC", f"{_cv.mean():.4f} ± {_cv.std():.4f}")
@@ -6175,54 +6275,188 @@ elif page == "RF model training":
             col_cm, col_fi = st.columns(2)
             with col_cm:
                 st.subheader("Confusion Matrix")
-                cm = ev["confusion_matrix"]
-                fig, ax = plt.subplots(figsize=(4, 3))
-                sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", cbar=False, linewidths=0.5, ax=ax)
-                ax.set_xlabel("Predicted label")
-                ax.set_ylabel("True label")
-                fig.tight_layout()
-                st.pyplot(fig)
-                plt.close(fig)
+                cm = ev.get("confusion_matrix")
+                if cm is None:
+                    st.info("Not available for this stored model (saved before detailed results were tracked).")
+                else:
+                    fig, ax = plt.subplots(figsize=(4, 3))
+                    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", cbar=False, linewidths=0.5, ax=ax)
+                    ax.set_xlabel("Predicted label")
+                    ax.set_ylabel("True label")
+                    fig.tight_layout()
+                    st.pyplot(fig)
+                    plt.close(fig)
             with col_fi:
-                st.subheader(f"Top {len(fi)} Feature Importances")
-                fig, ax = plt.subplots(figsize=(5, max(3, len(fi) * 0.28)))
-                colors = plt.cm.viridis_r(np.linspace(0.2, 0.85, len(fi)))
-                ax.barh(fi.index[::-1], fi.values[::-1], color=colors[::-1])
-                ax.set_xlabel("Mean decrease in impurity")
-                ax.spines[["top", "right"]].set_visible(False)
-                fig.tight_layout()
-                st.pyplot(fig)
-                plt.close(fig)
+                if fi is None or fi.empty:
+                    st.subheader("Feature Importances")
+                    st.info("Not available for this stored model (saved before detailed results were tracked).")
+                else:
+                    st.subheader(f"Top {len(fi)} Feature Importances")
+                    fig, ax = plt.subplots(figsize=(5, max(3, len(fi) * 0.28)))
+                    colors = plt.cm.viridis_r(np.linspace(0.2, 0.85, len(fi)))
+                    ax.barh(fi.index[::-1], fi.values[::-1], color=colors[::-1])
+                    ax.set_xlabel("Mean decrease in impurity")
+                    ax.spines[["top", "right"]].set_visible(False)
+                    fig.tight_layout()
+                    st.pyplot(fig)
+                    plt.close(fig)
+
+            with st.expander("🔍 Poses by Confusion Matrix Quadrant", expanded=False):
+                _tp_df = st.session_state.get("rf_test_predictions")
+                if _tp_df is None or _tp_df.empty:
+                    st.info("Not available for this stored model (saved before detailed results were tracked).")
+                else:
+                    _quad_labels = {
+                        "TP": "✅ True Positive",
+                        "FP": "❌ False Positive",
+                        "FN": "❌ False Negative",
+                        "TN": "✅ True Negative",
+                    }
+                    _quad_counts = _tp_df["quadrant"].value_counts()
+                    _qc1, _qc2, _qc3, _qc4 = st.columns(4)
+                    for _qcol, _q in zip((_qc1, _qc2, _qc3, _qc4), ("TP", "FP", "FN", "TN")):
+                        _qcol.metric(_quad_labels[_q], int(_quad_counts.get(_q, 0)))
+
+                    _sel_quad = st.radio(
+                        "Show test-set poses classified as:",
+                        ["TP", "FP", "FN", "TN"],
+                        format_func=lambda q: _quad_labels[q],
+                        horizontal=True,
+                        key="rf_quadrant_select",
+                    )
+                    _quad_df = _tp_df[_tp_df["quadrant"] == _sel_quad].reset_index(drop=True)
+                    if _quad_df.empty:
+                        st.info(f"No poses in the {_quad_labels[_sel_quad]} quadrant.")
+                    else:
+                        st.dataframe(_quad_df, use_container_width=True)
+                        st.download_button(
+                            f"Download {_sel_quad} poses (.csv)",
+                            data=_quad_df.to_csv(index=False).encode(),
+                            file_name=f"{_sel_quad.lower()}_poses.csv",
+                            mime="text/csv",
+                            key=f"rf_dl_quad_{_sel_quad}",
+                        )
+
+                        st.markdown("---")
+                        st.subheader("Pose Viewer")
+                        if "ligpose" not in _quad_df.columns:
+                            st.caption(
+                                "Pose viewer unavailable — no 'ligpose' identity column found "
+                                "(only present when training data was loaded from a TidyScreen "
+                                "training set snapshot)."
+                            )
+                        else:
+                            _rfq_ref_sp, _rfq_ref_col = st.columns([1, 9])
+                            with _rfq_ref_col:
+                                _rfq_ref_file = st.file_uploader(
+                                    "Load a reference PDB for superimposition (optional):",
+                                    type=["pdb"],
+                                    key="rfq_reference_pdb_uploader",
+                                )
+                                if _rfq_ref_file is not None:
+                                    st.session_state["rfq_reference_pdb_data"] = _rfq_ref_file.read().decode("utf-8")
+                                    st.success(f"Reference loaded: {_rfq_ref_file.name}")
+                                elif "rfq_reference_pdb_data" not in st.session_state:
+                                    st.session_state["rfq_reference_pdb_data"] = None
+
+                            _rfq_project_path = st.session_state.get("active_project_path")
+                            if not _rfq_project_path:
+                                st.warning("No active project. Activate a project in the TidyScreen page first.")
+                            else:
+                                _rfq_labels = [
+                                    f"{r['ligpose']}  (true={int(r['true_label'])}, "
+                                    f"pred={int(r['pred_label'])}, prob={r['pred_prob']:.2f})"
+                                    for _, r in _quad_df.iterrows()
+                                ]
+                                _rfq_key = f"rfq_pose_selectbox_{_sel_quad}"
+                                if st.session_state.get(_rfq_key) not in _rfq_labels:
+                                    st.session_state[_rfq_key] = _rfq_labels[0]
+
+                                _rfq_cur_idx = _rfq_labels.index(st.session_state[_rfq_key])
+                                _rfq_prev_col, _rfq_mid_col, _rfq_next_col = st.columns([1, 4, 1])
+                                with _rfq_prev_col:
+                                    if st.button("◀ Prev", key=f"rfq_prev_btn_{_sel_quad}",
+                                                 disabled=(_rfq_cur_idx == 0)):
+                                        st.session_state[_rfq_key] = _rfq_labels[_rfq_cur_idx - 1]
+                                        st.rerun()
+                                with _rfq_next_col:
+                                    if st.button("Next ▶", key=f"rfq_next_btn_{_sel_quad}",
+                                                 disabled=(_rfq_cur_idx == len(_rfq_labels) - 1)):
+                                        st.session_state[_rfq_key] = _rfq_labels[_rfq_cur_idx + 1]
+                                        st.rerun()
+                                with _rfq_mid_col:
+                                    st.caption(f"Pose {_rfq_cur_idx + 1} of {len(_rfq_labels)}")
+
+                                _rfq_sel_label = st.selectbox(
+                                    "Select a pose:", _rfq_labels, key=_rfq_key,
+                                )
+                                _rfq_row = _quad_df.iloc[_rfq_labels.index(_rfq_sel_label)]
+
+                                _rfq_pdb_path, _rfq_assay, _rfq_ligname, _rfq_run = st_funcs.resolve_ligpose_to_pdb(
+                                    _rfq_project_path, _rfq_row["ligpose"]
+                                )
+                                if not _rfq_pdb_path:
+                                    st.warning(
+                                        f"PDB not found for pose '{_rfq_row['ligpose']}'. "
+                                        "Extract poses first."
+                                    )
+                                else:
+                                    with open(_rfq_pdb_path, "r") as _f:
+                                        _rfq_pdb = _f.read()
+                                    _rfq_view = py3Dmol.view(width=800, height=500)
+                                    _rfq_view.addModel(_rfq_pdb, "pdb")
+                                    _rfq_view.setStyle({"model": 0}, {"stick": {}, "cartoon": {"color": "spectrum"}})
+                                    if st.session_state.get("rfq_reference_pdb_data"):
+                                        _rfq_view.addModel(st.session_state["rfq_reference_pdb_data"], "pdb")
+                                        _rfq_view.setStyle(
+                                            {"model": 1},
+                                            {"sphere": {"colorscheme": "elementColors", "scale": 0.3, "opacity": 0.6},
+                                             "stick": {"colorscheme": "elementColors", "opacity": 0.6}},
+                                        )
+                                    _rfq_view.zoomTo()
+                                    st.components.v1.html(_rfq_view.write_html(), height=510)
+                                    st.caption(
+                                        f"Assay: {_rfq_assay}  |  Ligand: {_rfq_ligname}  |  Run: {_rfq_run}  |  "
+                                        f"True: {int(_rfq_row['true_label'])}  |  "
+                                        f"Pred: {int(_rfq_row['pred_label'])}  |  "
+                                        f"Prob: {_rfq_row['pred_prob']:.3f}"
+                                    )
 
             st.subheader("Classification Report")
-            _rows = [{"class": cls, **vals} for cls, vals in report.items() if isinstance(vals, dict)]
-            rep_df = (
-                pd.DataFrame(_rows)
-                .set_index("class")
-                .rename(columns={"precision": "Precision", "recall": "Recall",
-                                 "f1-score": "F1-score", "support": "Support"})
-            )
-            rep_df["Support"] = rep_df["Support"].astype(int)
-            st.dataframe(
-                rep_df.style.format({"Precision": "{:.4f}", "Recall": "{:.4f}", "F1-score": "{:.4f}"}),
-                use_container_width=True,
-            )
+            if report is None:
+                st.info("Not available for this stored model (saved before detailed results were tracked).")
+            else:
+                _rows = [{"class": cls, **vals} for cls, vals in report.items() if isinstance(vals, dict)]
+                rep_df = (
+                    pd.DataFrame(_rows)
+                    .set_index("class")
+                    .rename(columns={"precision": "Precision", "recall": "Recall",
+                                     "f1-score": "F1-score", "support": "Support"})
+                )
+                rep_df["Support"] = rep_df["Support"].astype(int)
+                st.dataframe(
+                    rep_df.style.format({"Precision": "{:.4f}", "Recall": "{:.4f}", "F1-score": "{:.4f}"}),
+                    use_container_width=True,
+                )
 
             st.subheader("Feature Importance Table")
-            fi_df = fi.reset_index()
-            fi_df.columns = ["Feature", "Importance"]
-            fi_df.insert(0, "Rank", range(1, len(fi_df) + 1))
-            st.dataframe(
-                fi_df.style.format({"Importance": "{:.6f}"}),
-                use_container_width=True, hide_index=True, height=400,
-            )
-            st.download_button(
-                "Download feature importances (.csv)",
-                data=fi_df.to_csv(index=False).encode(),
-                file_name="feature_importances.csv",
-                mime="text/csv",
-                key="rf_dl_fi",
-            )
+            if fi is None or fi.empty:
+                st.info("Not available for this stored model (saved before detailed results were tracked).")
+            else:
+                fi_df = fi.reset_index()
+                fi_df.columns = ["Feature", "Importance"]
+                fi_df.insert(0, "Rank", range(1, len(fi_df) + 1))
+                st.dataframe(
+                    fi_df.style.format({"Importance": "{:.6f}"}),
+                    use_container_width=True, hide_index=True, height=400,
+                )
+                st.download_button(
+                    "Download feature importances (.csv)",
+                    data=fi_df.to_csv(index=False).encode(),
+                    file_name="feature_importances.csv",
+                    mime="text/csv",
+                    key="rf_dl_fi",
+                )
 
             st.markdown("---")
             st.subheader("Export Trained Model")
@@ -6273,32 +6507,44 @@ elif page == "RF model training":
                             _cv_mean = float(st.session_state.rf_cv_scores.mean()) if st.session_state.rf_cv_scores is not None else None
                             _cv_std  = float(st.session_state.rf_cv_scores.std())  if st.session_state.rf_cv_scores is not None else None
 
+                            # Full Results-tab data, serialised as JSON so it can be
+                            # reconstructed later via the "Stored models" load button.
+                            _cm_json = json.dumps(_ev["confusion_matrix"].tolist())
+                            _rpt_json = json.dumps(_rpt)
+                            _fi_json = json.dumps(st.session_state.rf_fi.to_dict())
+                            _cv_json = (
+                                json.dumps(st.session_state.rf_cv_scores.tolist())
+                                if st.session_state.rf_cv_scores is not None else None
+                            )
+                            _bp_json = (
+                                json.dumps(st.session_state.rf_best_params)
+                                if st.session_state.rf_best_params is not None else None
+                            )
+                            _best_cv = (
+                                float(st.session_state.rf_best_cv_score)
+                                if st.session_state.rf_best_cv_score is not None else None
+                            )
+                            _tp_json = (
+                                st.session_state.rf_test_predictions.to_json(orient="records")
+                                if st.session_state.get("rf_test_predictions") is not None else None
+                            )
+
                             _models_dir = os.path.join(_save_project_path, "ml", "models")
                             os.makedirs(_models_dir, exist_ok=True)
                             _db_path = os.path.join(_models_dir, "rf_trained_models.db")
 
+                            st_funcs.ensure_rf_trained_models_schema(_db_path)
+
                             _conn = sqlite3.connect(_db_path)
                             _cur  = _conn.cursor()
-                            _cur.execute("""
-                                CREATE TABLE IF NOT EXISTS rf_trained_models (
-                                    model_id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                                    model_name       TEXT NOT NULL,
-                                    description      TEXT,
-                                    training_set_id  TEXT,
-                                    roc_auc          REAL,
-                                    accuracy         REAL,
-                                    macro_f1         REAL,
-                                    cv_roc_mean      REAL,
-                                    cv_roc_std       REAL,
-                                    model_pkl        BLOB NOT NULL,
-                                    created_at       TEXT NOT NULL
-                                )
-                            """)
                             _cur.execute(
                                 """INSERT INTO rf_trained_models
                                    (model_name, description, training_set_id, roc_auc, accuracy, macro_f1,
-                                    cv_roc_mean, cv_roc_std, model_pkl, created_at)
-                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                    cv_roc_mean, cv_roc_std, model_pkl, created_at,
+                                    confusion_matrix_json, classification_report_json,
+                                    feature_importances_json, cv_scores_json,
+                                    best_params_json, best_cv_score, test_predictions_json)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                                 (
                                     _rf_save_name.strip(),
                                     _rf_save_desc.strip(),
@@ -6307,6 +6553,8 @@ elif page == "RF model training":
                                     _cv_mean, _cv_std,
                                     _pkl_bytes,
                                     datetime.datetime.now().isoformat(timespec="seconds"),
+                                    _cm_json, _rpt_json, _fi_json, _cv_json,
+                                    _bp_json, _best_cv, _tp_json,
                                 ),
                             )
                             _conn.commit()
@@ -6322,6 +6570,11 @@ elif page == "RF model training":
     # ══ Tab 4 — Stored models ═════════════════════════════════════════════
     with rf_tab_stored:
         st.subheader("Stored RF Models")
+
+        if "rf_stored_load_message" in st.session_state:
+            _msg_kind, _msg_text = st.session_state.pop("rf_stored_load_message")
+            getattr(st, _msg_kind)(_msg_text)
+
         _stored_project_path = st.session_state.get("active_project_path")
         if not _stored_project_path:
             st.warning("No active project. Activate a project in the TidyScreen page first.")
@@ -6331,11 +6584,12 @@ elif page == "RF model training":
                 st.info("No stored models found for this project yet. Train and save a model first.")
             else:
                 try:
+                    st_funcs.ensure_rf_trained_models_schema(_stored_db_path)
                     _sc = sqlite3.connect(_stored_db_path)
                     _sm_df = pd.read_sql_query(
                         """SELECT model_id, model_name, description, training_set_id,
                                   roc_auc, accuracy, macro_f1, cv_roc_mean, cv_roc_std,
-                                  created_at
+                                  created_at, confusion_matrix_json
                            FROM rf_trained_models
                            ORDER BY model_id DESC""",
                         _sc,
@@ -6346,7 +6600,7 @@ elif page == "RF model training":
                         st.info("No models stored yet.")
                     else:
                         st.dataframe(
-                            _sm_df.style.format({
+                            _sm_df.drop(columns=["confusion_matrix_json"]).style.format({
                                 "roc_auc":    "{:.4f}",
                                 "accuracy":   "{:.4f}",
                                 "macro_f1":   "{:.4f}",
@@ -6357,6 +6611,125 @@ elif page == "RF model training":
                             hide_index=True,
                         )
 
+                        st.markdown("---")
+                        st.subheader("Load a Stored Model")
+                        st.caption(
+                            "Loads a stored model's data into the **Results** tab, exactly as it "
+                            "appeared right after training."
+                        )
+                        _sm_labels = [
+                            f"[{r.model_id}] {r.model_name}  ({r.created_at})"
+                            + ("" if pd.notna(r.confusion_matrix_json) else "  — summary only")
+                            for r in _sm_df.itertuples()
+                        ]
+                        _sm_sel_label = st.selectbox(
+                            "Select a model to load:", _sm_labels, key="rf_stored_load_select",
+                        )
+                        _sm_sel_id = int(_sm_df.iloc[_sm_labels.index(_sm_sel_label)]["model_id"])
+                        _sm_sel_name = str(_sm_df.iloc[_sm_labels.index(_sm_sel_label)]["model_name"])
+
+                        _sm_load_col, _sm_del_col = st.columns(2)
+                        with _sm_load_col:
+                            _sm_load_clicked = st.button("📂 Load into Results tab", key="rf_stored_load_btn")
+                        with _sm_del_col:
+                            _sm_del_clicked = st.button("🗑️ Delete Model", key="rf_stored_delete_btn")
+
+                        if _sm_load_clicked:
+                            try:
+                                _lc = sqlite3.connect(_stored_db_path)
+                                _lrow = _lc.execute(
+                                    """SELECT model_name, roc_auc, accuracy, macro_f1,
+                                              model_pkl, confusion_matrix_json,
+                                              classification_report_json, feature_importances_json,
+                                              cv_scores_json, best_params_json, best_cv_score,
+                                              test_predictions_json
+                                       FROM rf_trained_models WHERE model_id = ?""",
+                                    (_sm_sel_id,),
+                                ).fetchone()
+                                _lc.close()
+
+                                if _lrow is None:
+                                    st.session_state["rf_stored_load_message"] = (
+                                        "error", "Selected model could not be found (it may have been deleted)."
+                                    )
+                                else:
+                                    (_l_name, _l_roc, _l_acc, _l_f1, _l_pkl,
+                                     _l_cm_json, _l_rep_json, _l_fi_json,
+                                     _l_cv_json, _l_bp_json, _l_best_cv, _l_tp_json) = _lrow
+
+                                    import pickle as _pickle
+                                    _l_model = _pickle.loads(_l_pkl)
+                                    _l_cm = np.array(json.loads(_l_cm_json)) if _l_cm_json else None
+                                    _l_report = json.loads(_l_rep_json) if _l_rep_json else None
+                                    _l_fi_dict = json.loads(_l_fi_json) if _l_fi_json else None
+                                    _l_fi = pd.Series(_l_fi_dict, dtype=float) if _l_fi_dict else pd.Series(dtype=float)
+                                    _l_cv_scores = np.array(json.loads(_l_cv_json)) if _l_cv_json else None
+                                    _l_best_params = json.loads(_l_bp_json) if _l_bp_json else None
+                                    _l_test_preds = (
+                                        pd.read_json(io.StringIO(_l_tp_json), orient="records")
+                                        if _l_tp_json else None
+                                    )
+
+                                    st.session_state.rf_model = _l_model
+                                    st.session_state.rf_eval_results = {
+                                        "confusion_matrix": _l_cm,
+                                        "classification_report": _l_report,
+                                        "roc_auc": _l_roc,
+                                    }
+                                    st.session_state.rf_fi = _l_fi
+                                    st.session_state.rf_cv_scores = _l_cv_scores
+                                    st.session_state.rf_best_params = _l_best_params
+                                    st.session_state.rf_best_cv_score = (
+                                        float(_l_best_cv) if _l_best_cv is not None else None
+                                    )
+                                    st.session_state.rf_accuracy = _l_acc
+                                    st.session_state.rf_macro_f1 = _l_f1
+                                    st.session_state.rf_test_predictions = _l_test_preds
+
+                                    if _l_cm_json is None:
+                                        st.session_state["rf_stored_load_message"] = (
+                                            "warning",
+                                            f"Loaded **{_l_name}**, but it was saved before detailed "
+                                            "results (confusion matrix, classification report, feature "
+                                            "importances, per-fold CV scores) were tracked — only the "
+                                            "summary metrics are available. Retrain and re-save to "
+                                            "capture full details.",
+                                        )
+                                    else:
+                                        st.session_state["rf_stored_load_message"] = (
+                                            "success",
+                                            f"Loaded **{_l_name}**. Switch to the **Results** tab to view it.",
+                                        )
+                                st.rerun()
+                            except Exception as _exc:
+                                st.error(f"Failed to load model: {_exc}")
+
+                        _sm_del_confirm_key = f"confirm_delete_rf_model_{_sm_sel_id}"
+                        if _sm_del_clicked:
+                            st.session_state[_sm_del_confirm_key] = True
+                            st.rerun()
+
+                        if st.session_state.get(_sm_del_confirm_key):
+                            st.warning(f"Delete model **{_sm_sel_name}** (ID {_sm_sel_id})? This cannot be undone.")
+                            _sm_del_yes_col, _sm_del_no_col = st.columns(2)
+                            with _sm_del_yes_col:
+                                if st.button("Yes, delete", key=f"btn_confirm_delete_rf_{_sm_sel_id}"):
+                                    try:
+                                        _dc = sqlite3.connect(_stored_db_path)
+                                        _dc.execute("DELETE FROM rf_trained_models WHERE model_id = ?", (_sm_sel_id,))
+                                        _dc.commit()
+                                        _dc.close()
+                                        st.session_state[_sm_del_confirm_key] = False
+                                        st.session_state["rf_stored_load_message"] = (
+                                            "success", f"Deleted model **{_sm_sel_name}** (ID {_sm_sel_id})."
+                                        )
+                                        st.rerun()
+                                    except Exception as _exc:
+                                        st.error(f"Failed to delete model: {_exc}")
+                            with _sm_del_no_col:
+                                if st.button("Cancel", key=f"btn_cancel_delete_rf_{_sm_sel_id}"):
+                                    st.session_state[_sm_del_confirm_key] = False
+                                    st.rerun()
 
                 except Exception as _exc:
                     st.error(f"Failed to load stored models: {_exc}")

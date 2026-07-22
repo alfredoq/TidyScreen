@@ -235,7 +235,7 @@ class MachineLearning:
     # ProLIF fingerprint computation on training set snapshots
     # -------------------------------------------------------------------------
 
-    def compute_training_set_fingerprints(self, minimize=True, clean_files=True):
+    def compute_training_set_fingerprints(self, minimize=True, clean_files=True, verbose: bool = False):
         """
         Compute ProLIF fingerprints for all poses in a consolidated training set
         snapshot, following the same AMBER + ProLIF pipeline as
@@ -256,6 +256,13 @@ class MachineLearning:
         Pose_ID from the Ringtail Results table.
         The assay_name column is used to look up assay metadata (receptor path,
         renumbering dict, results DB path) from the docking registers.
+
+        Args:
+            verbose (bool): If True, print full per-pose processing details,
+                including output from the tleap/sander/ambpdb subprocess calls
+                made while preparing each pose. If False (default), all of that
+                output is suppressed and a tqdm progress counter is shown instead
+                (same behaviour as make_rf_predictions_on_docking_assay()).
         """
 
         import shutil
@@ -346,144 +353,184 @@ class MachineLearning:
 
         output_dirs = []
         processed_ligands_by_assay = {}  # {assay_name: {ligname: (prepin_file, frcmod_file)}}
+        n_computed = 0
+        n_skipped = 0
+        n_failed = 0
+
+        # When quiet, tqdm writes through a duplicated stdout fd so the progress
+        # counter keeps displaying even while fd 1/2 are redirected to devnull
+        # below (needed to silence subprocess-inherited tleap/sander/ambpdb output).
+        original_stdout = os.fdopen(os.dup(1), 'w') if not verbose else sys.stdout
 
         try:
-            for _, row in entries_df.iterrows():
+            pbar = tqdm(
+                entries_df.iterrows(), total=len(entries_df),
+                desc="Computing fingerprints", file=original_stdout,
+                dynamic_ncols=True, disable=verbose,
+            )
+            for _, row in pbar:
                 assay_name = row['assay_name']
                 pose_file  = row['pose_file']
                 directory  = row['directory']
                 binder_type = row['binder_type']
                 label = 1 if binder_type == 'positive' else 0
 
-                # Skip if already computed for this conditions set
-                conn = sqlite3.connect(self.__training_sets_db)
-                existing = conn.execute(
-                    """SELECT id FROM training_set_fingerprints
-                       WHERE training_set_id=? AND assay_name=? AND pose_file=?
-                         AND directory=? AND prolif_conditions_id=?""",
-                    (training_set_id, assay_name, pose_file, directory, condition_selection)
-                ).fetchone()
-                conn.close()
-                if existing:
-                    print(f"  ⏭️  Already computed, skipping: {pose_file}")
-                    continue
-
-                assay_info = assay_info_by_name.get(assay_name)
-                if not assay_info:
-                    print(f"  ❌ Assay '{assay_name}' not found in registry — skipping {pose_file}")
-                    continue
-
-                # Parse LigName and run_number from pose_file ({LigName}_{run_number}.pdb).
-                # The suffix is the per-ligand run_number used during pose extraction,
-                # NOT the global Pose_ID from the Ringtail Results table.
-                stem = os.path.splitext(pose_file)[0]
-                parts = stem.rsplit('_', 1)
-                if len(parts) != 2:
-                    print(f"  ❌ Cannot parse pose_file '{pose_file}' — skipping")
-                    continue
-                ligname, pose_id_str = parts
                 try:
-                    pose_id = int(pose_id_str)  # this is the run_number
-                except ValueError:
-                    print(f"  ❌ Cannot parse run_number from '{pose_id_str}' — skipping {pose_file}")
-                    continue
-
-                # Derive receptor_checked.pdb path from the pdbqt_file stored in assay info
-                receptor_pdbqt = assay_info.get('receptor_info', {}).get('pdbqt_file')
-                if not receptor_pdbqt:
-                    print(f"  ❌ No receptor pdbqt_file for assay '{assay_name}' — skipping {pose_file}")
-                    continue
-                receptor_pdbqt = self._remap_project_path(receptor_pdbqt)
-                receptor_file = os.path.join(os.path.dirname(receptor_pdbqt), 'receptor_checked.pdb')
-
-                assay_folder_path = assay_info['assay_folder_path']
-                assay_id = assay_info['assay_id']
-                results_db = os.path.join(assay_folder_path, 'results', f'assay_{assay_id}.db')
-
-                renumbering_dict = renumbering_dict_by_name.get(assay_name, {})
-
-                print(f"\n  🔬 Processing {pose_file} ({binder_type}) — assay: {assay_name}")
-
-                try:
-                    # Step A: Restore docked pose PDB from the assay results DB
-                    output_dir, output_file = moldock._restore_single_docked_pose(results_db, ligname, pose_id)
-                    
-                    if output_dir not in output_dirs:
-                        output_dirs.append(output_dir)
-
-                    # Step B: Prepare ligand AMBER files (once per unique ligname per assay)
-                    processed_ligands_by_assay.setdefault(assay_name, {})
-                    if ligname not in processed_ligands_by_assay[assay_name]:
-                        prepin_file, frcmod_file = moldock._prepare_ligand_tleap_files(
-                            ligname, assay_info, output_dir
-                        )
-                        processed_ligands_by_assay[assay_name][ligname] = (prepin_file, frcmod_file)
-                    else:
-                        prepin_file, frcmod_file = processed_ligands_by_assay[assay_name][ligname]
-
-                    # Step C: Prepare complex prmtop and inpcrd files using tleap
-                    prmtop_file, inpcrd_file, output_pdb_file = moldock._prepare_complex_prmtop_inpcrd(
-                        prepin_file, frcmod_file, assay_info, output_dir, output_file, pose_id, ligname=ligname
-                    )
-
-                    # Step D: Optionally minimize complex (mirrors compute_fingerprints behaviour)
-                    if minimize:
-                        try:
-                            print("    MINIMIZING COMPLEX...")
-                            min_rst_cpptraj_file, output_pdb_file = moldock._minimize_complex(
-                                prmtop_file, inpcrd_file, output_dir, ligname, pose_id, output_pdb_file
-                            )
-                            rst_cpptraj_file = min_rst_cpptraj_file
-                        except Exception as e:
-                            print(f"    ⚠️  Minimization failed: {e}. Using original inpcrd.")
-                            rst_cpptraj_file = inpcrd_file
-                    else:
-                        rst_cpptraj_file = inpcrd_file
-
-                    # Step E: Compute ProLIF fingerprints via ambpdb + MDAnalysis + ProLIF
-                    fps_df = moldock._compute_prolif_fingerprints3(
-                        prolif_params_dict, output_pdb_file, receptor_file,
-                        prmtop_file, inpcrd_file, ligname, pose_id
-                    )
-
-                    # Step F: Flatten MultiIndex columns and apply residue renumbering
-                    fps_df.columns = fps_df.columns.droplevel(0)
-                    if renumbering_dict:
-                        fps_df = fps_df.rename(columns=renumbering_dict, level=0)
-                    fps_df.columns = [f"{a}_{b}" for a, b in fps_df.columns]
-
-                    # Step G: Serialise the single fingerprint row to JSON
-                    fp_row = fps_df.iloc[0].to_dict()
-                    fp_json = json.dumps({k: bool(v) for k, v in fp_row.items()})
-
-                    # Step H: Store in training_set_fingerprints table
+                    # Skip if already computed for this conditions set
                     conn = sqlite3.connect(self.__training_sets_db)
-                    conn.execute(
-                        """INSERT OR REPLACE INTO training_set_fingerprints
-                           (training_set_id, assay_name, pose_file, directory,
-                            binder_type, label, prolif_conditions_id, minimized,
-                            fingerprint_json, computed_at)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                        (training_set_id, assay_name, pose_file, directory,
-                         binder_type, label, condition_selection, int(minimize),
-                         fp_json, datetime.now().isoformat())
-                    )
-                    conn.commit()
+                    existing = conn.execute(
+                        """SELECT id FROM training_set_fingerprints
+                           WHERE training_set_id=? AND assay_name=? AND pose_file=?
+                             AND directory=? AND prolif_conditions_id=?""",
+                        (training_set_id, assay_name, pose_file, directory, condition_selection)
+                    ).fetchone()
                     conn.close()
+                    if existing:
+                        n_skipped += 1
+                        if verbose:
+                            print(f"  ⏭️  Already computed, skipping: {pose_file}")
+                        continue
 
-                    print(f"    ✅ Fingerprint stored for {pose_file}")
+                    assay_info = assay_info_by_name.get(assay_name)
+                    if not assay_info:
+                        n_skipped += 1
+                        if verbose:
+                            print(f"  ❌ Assay '{assay_name}' not found in registry — skipping {pose_file}")
+                        continue
+
+                    # Parse LigName and run_number from pose_file ({LigName}_{run_number}.pdb).
+                    # The suffix is the per-ligand run_number used during pose extraction,
+                    # NOT the global Pose_ID from the Ringtail Results table.
+                    stem = os.path.splitext(pose_file)[0]
+                    parts = stem.rsplit('_', 1)
+                    if len(parts) != 2:
+                        n_skipped += 1
+                        if verbose:
+                            print(f"  ❌ Cannot parse pose_file '{pose_file}' — skipping")
+                        continue
+                    ligname, pose_id_str = parts
+                    try:
+                        pose_id = int(pose_id_str)  # this is the run_number
+                    except ValueError:
+                        n_skipped += 1
+                        if verbose:
+                            print(f"  ❌ Cannot parse run_number from '{pose_id_str}' — skipping {pose_file}")
+                        continue
+
+                    # Derive receptor_checked.pdb path from the pdbqt_file stored in assay info
+                    receptor_pdbqt = assay_info.get('receptor_info', {}).get('pdbqt_file')
+                    if not receptor_pdbqt:
+                        n_skipped += 1
+                        if verbose:
+                            print(f"  ❌ No receptor pdbqt_file for assay '{assay_name}' — skipping {pose_file}")
+                        continue
+                    receptor_pdbqt = self._remap_project_path(receptor_pdbqt)
+                    receptor_file = os.path.join(os.path.dirname(receptor_pdbqt), 'receptor_checked.pdb')
+
+                    assay_folder_path = assay_info['assay_folder_path']
+                    assay_id = assay_info['assay_id']
+                    results_db = os.path.join(assay_folder_path, 'results', f'assay_{assay_id}.db')
+
+                    renumbering_dict = renumbering_dict_by_name.get(assay_name, {})
+
+                    if verbose:
+                        print(f"\n  🔬 Processing {pose_file} ({binder_type}) — assay: {assay_name}")
+
+                    suppress = contextlib.nullcontext() if verbose else self._suppress_output()
+                    with suppress:
+                        # Step A: Restore docked pose PDB from the assay results DB
+                        output_dir, output_file = moldock._restore_single_docked_pose(results_db, ligname, pose_id)
+
+                        if output_dir not in output_dirs:
+                            output_dirs.append(output_dir)
+
+                        # Step B: Prepare ligand AMBER files (once per unique ligname per assay)
+                        processed_ligands_by_assay.setdefault(assay_name, {})
+                        if ligname not in processed_ligands_by_assay[assay_name]:
+                            prepin_file, frcmod_file = moldock._prepare_ligand_tleap_files(
+                                ligname, assay_info, output_dir
+                            )
+                            processed_ligands_by_assay[assay_name][ligname] = (prepin_file, frcmod_file)
+                        else:
+                            prepin_file, frcmod_file = processed_ligands_by_assay[assay_name][ligname]
+
+                        # Step C: Prepare complex prmtop and inpcrd files using tleap
+                        prmtop_file, inpcrd_file, output_pdb_file = moldock._prepare_complex_prmtop_inpcrd(
+                            prepin_file, frcmod_file, assay_info, output_dir, output_file, pose_id, ligname=ligname
+                        )
+
+                        # Step D: Optionally minimize complex (mirrors compute_fingerprints behaviour)
+                        if minimize:
+                            try:
+                                if verbose:
+                                    print("    MINIMIZING COMPLEX...")
+                                min_rst_cpptraj_file, output_pdb_file = moldock._minimize_complex(
+                                    prmtop_file, inpcrd_file, output_dir, ligname, pose_id, output_pdb_file
+                                )
+                                rst_cpptraj_file = min_rst_cpptraj_file
+                            except Exception as e:
+                                if verbose:
+                                    print(f"    ⚠️  Minimization failed: {e}. Using original inpcrd.")
+                                rst_cpptraj_file = inpcrd_file
+                        else:
+                            rst_cpptraj_file = inpcrd_file
+
+                        # Step E: Compute ProLIF fingerprints via ambpdb + MDAnalysis + ProLIF
+                        fps_df = moldock._compute_prolif_fingerprints3(
+                            prolif_params_dict, output_pdb_file, receptor_file,
+                            prmtop_file, inpcrd_file, ligname, pose_id
+                        )
+
+                        # Step F: Flatten MultiIndex columns and apply residue renumbering
+                        fps_df.columns = fps_df.columns.droplevel(0)
+                        if renumbering_dict:
+                            fps_df = fps_df.rename(columns=renumbering_dict, level=0)
+                        fps_df.columns = [f"{a}_{b}" for a, b in fps_df.columns]
+
+                        # Step G: Serialise the single fingerprint row to JSON
+                        fp_row = fps_df.iloc[0].to_dict()
+                        fp_json = json.dumps({k: bool(v) for k, v in fp_row.items()})
+
+                        # Step H: Store in training_set_fingerprints table
+                        conn = sqlite3.connect(self.__training_sets_db)
+                        conn.execute(
+                            """INSERT OR REPLACE INTO training_set_fingerprints
+                               (training_set_id, assay_name, pose_file, directory,
+                                binder_type, label, prolif_conditions_id, minimized,
+                                fingerprint_json, computed_at)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (training_set_id, assay_name, pose_file, directory,
+                             binder_type, label, condition_selection, int(minimize),
+                             fp_json, datetime.now().isoformat())
+                        )
+                        conn.commit()
+                        conn.close()
+
+                    n_computed += 1
+                    if verbose:
+                        print(f"    ✅ Fingerprint stored for {pose_file}")
 
                 except Exception as e:
-                    print(f"    ❌ Error processing {pose_file}: {e} — skipping")
+                    n_failed += 1
+                    if verbose:
+                        print(f"    ❌ Error processing {pose_file}: {e} — skipping")
                     continue
+                finally:
+                    if not verbose:
+                        pbar.set_postfix(computed=n_computed, skipped=n_skipped, failed=n_failed)
 
         finally:
+            pbar.close()
+            if not verbose:
+                original_stdout.close()
             if clean_files:
                 for d in output_dirs:
                     shutil.rmtree(d, ignore_errors=True)
-                print("\n✅ Temporary files cleaned up.")
+                if verbose:
+                    print("\n✅ Temporary files cleaned up.")
 
-        print(f"\n🎉 Fingerprint computation complete for training set '{training_set_id}'")
+        print(f"\n🎉 Fingerprint computation complete for training set '{training_set_id}' "
+              f"({n_computed} computed, {n_skipped} skipped, {n_failed} failed)")
 
     def load_training_set_features(self) -> tuple:
         """

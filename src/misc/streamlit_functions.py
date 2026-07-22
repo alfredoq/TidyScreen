@@ -723,6 +723,53 @@ def find_pose_pdb(results_db_path, ligname, run_number):
     return None
 
 
+def resolve_ligpose_to_pdb(project_path, ligpose):
+    """
+    Resolve a 'ligpose' identifier (format '{pose_file_stem}_{assay_name}',
+    produced by export_training_set_fingerprints_as_csv_bytes /
+    MachineLearning.export_training_set_fingerprints_csv) back to an actual
+    pose PDB file on disk.
+
+    The merge is ambiguous in general (both the pose stem and the assay name
+    may contain underscores), so this tries every known assay_name in the
+    project as a suffix match, longest name first to minimise false matches.
+
+    Returns (pdb_path, assay_name, ligname, run_number), or
+    (None, None, None, None) if the identifier can't be resolved (unknown
+    assay, malformed string, or the pose hasn't been extracted to disk yet).
+    """
+    registry_db = os.path.join(project_path, "docking", "docking_registers", "docking_assays.db")
+    if not ligpose or not os.path.exists(registry_db):
+        return None, None, None, None
+    try:
+        conn = sqlite3.connect(registry_db)
+        assay_names = [r[0] for r in conn.execute("SELECT assay_name FROM docking_assays").fetchall()]
+        conn.close()
+    except Exception:
+        return None, None, None, None
+
+    for assay_name in sorted(assay_names, key=len, reverse=True):
+        suffix = f"_{assay_name}"
+        if not ligpose.endswith(suffix):
+            continue
+        pose_stem = ligpose[: -len(suffix)]
+        parts = pose_stem.rsplit("_", 1)
+        if len(parts) != 2:
+            continue
+        ligname, run_number_str = parts
+        try:
+            run_number = int(run_number_str)
+        except ValueError:
+            continue
+        results_db_path = os.path.join(
+            project_path, "docking", "docking_assays", assay_name, "results", f"{assay_name}.db"
+        )
+        pdb_path = find_pose_pdb(results_db_path, ligname, run_number)
+        if pdb_path:
+            return pdb_path, assay_name, ligname, run_number
+    return None, None, None, None
+
+
 def get_extracted_poses_info(results_db_path):
     """
     Check for extracted docked poses in the four known output subdirectories adjacent to the results DB.
@@ -1379,6 +1426,61 @@ def remove_binder(project_path: str, binder_type: str, assay_name: str, pose_fil
         removed = cursor.rowcount > 0
         conn.close()
         return "removed" if removed else "not_found"
+    except Exception as e:
+        return f"error:{e}"
+
+
+def move_binder_to_negative(project_path: str, assay_name: str, pose_file: str, directory: str, pose_full_path: str) -> str:
+    """
+    Move a pose from the positive binders registry to the negative binders registry.
+
+    Removes the (assay_name, pose_file, directory) row from positive_binders.db first,
+    then inserts it into negative_binders.db — removing first means
+    save_negative_binder()'s own "already a positive binder" conflict check no
+    longer sees the row, so the insert isn't blocked.
+
+    Returns 'moved', 'not_found' (nothing to remove from positive), 'duplicate'
+    (already present in negative_binders — still removed from positive), or
+    'error:<message>'.
+    """
+    try:
+        remove_status = remove_binder(project_path, "positive", assay_name, pose_file, directory)
+        if remove_status == "not_found":
+            return "not_found"
+        if remove_status.startswith("error:"):
+            return remove_status
+        save_status = save_negative_binder(project_path, assay_name, pose_file, directory, pose_full_path)
+        if save_status.startswith("error:"):
+            return save_status
+        return "moved" if save_status == "saved" else save_status
+    except Exception as e:
+        return f"error:{e}"
+
+
+def move_binder_to_positive(project_path: str, assay_name: str, pose_file: str, directory: str, pose_full_path: str) -> str:
+    """
+    Move a pose from the negative binders registry to the positive binders registry.
+
+    Mirror of move_binder_to_negative(): removes the (assay_name, pose_file,
+    directory) row from negative_binders.db first, then inserts it into
+    positive_binders.db — removing first means save_positive_binder()'s own
+    "already a negative binder" conflict check no longer sees the row, so the
+    insert isn't blocked.
+
+    Returns 'moved', 'not_found' (nothing to remove from negative), 'duplicate'
+    (already present in positive_binders — still removed from negative), or
+    'error:<message>'.
+    """
+    try:
+        remove_status = remove_binder(project_path, "negative", assay_name, pose_file, directory)
+        if remove_status == "not_found":
+            return "not_found"
+        if remove_status.startswith("error:"):
+            return remove_status
+        save_status = save_positive_binder(project_path, assay_name, pose_file, directory, pose_full_path)
+        if save_status.startswith("error:"):
+            return save_status
+        return "moved" if save_status == "saved" else save_status
     except Exception as e:
         return f"error:{e}"
 
@@ -2455,3 +2557,55 @@ def populate_results_with_mmgbsa_energies(db_path):
         errors.append(f"Database error: {e}")
 
     return updated, errors
+
+
+def ensure_rf_trained_models_schema(db_path):
+    """
+    Create/migrate the rf_trained_models table so it carries everything needed
+    to fully reconstruct the RF training "Results" tab for a stored model, not
+    just the summary scalars (roc_auc/accuracy/macro_f1/cv_roc_mean/cv_roc_std).
+
+    sklearn/numpy objects aren't natively storable in SQLite, so the confusion
+    matrix, classification report, feature importances, per-fold CV scores and
+    GridSearchCV best params are persisted as JSON text columns. Models saved
+    before this migration will have NULL in these columns; callers should treat
+    that as "detailed results unavailable for this model" rather than an error.
+    """
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS rf_trained_models (
+            model_id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            model_name                  TEXT NOT NULL,
+            description                 TEXT,
+            training_set_id             TEXT,
+            roc_auc                     REAL,
+            accuracy                    REAL,
+            macro_f1                    REAL,
+            cv_roc_mean                 REAL,
+            cv_roc_std                  REAL,
+            model_pkl                   BLOB NOT NULL,
+            created_at                  TEXT NOT NULL,
+            confusion_matrix_json       TEXT,
+            classification_report_json  TEXT,
+            feature_importances_json    TEXT,
+            cv_scores_json              TEXT,
+            best_params_json            TEXT,
+            best_cv_score                REAL,
+            test_predictions_json       TEXT
+        )
+    """)
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(rf_trained_models)").fetchall()}
+    migrations = {
+        "confusion_matrix_json":      "TEXT",
+        "classification_report_json": "TEXT",
+        "feature_importances_json":   "TEXT",
+        "cv_scores_json":             "TEXT",
+        "best_params_json":           "TEXT",
+        "best_cv_score":              "REAL",
+        "test_predictions_json":      "TEXT",
+    }
+    for col, col_type in migrations.items():
+        if col not in existing_cols:
+            conn.execute(f"ALTER TABLE rf_trained_models ADD COLUMN {col} {col_type}")
+    conn.commit()
+    conn.close()
