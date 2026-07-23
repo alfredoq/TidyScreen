@@ -638,11 +638,59 @@ def update_tidyscreen():
         ]
         
         subprocess.run(cmd, check=True)
-        
+
         print("✅ TidyScreen updated successfully.")
+
+        # The Streamlit GUI (tidyscreen.gui()) is launched via `conda run -n streamlit`,
+        # which resolves `import tidyscreen` against that environment's OWN site-packages,
+        # not the one just updated above. If that env also has tidyscreen installed, it
+        # must be refreshed too, otherwise the GUI subprocess keeps importing a stale copy
+        # (e.g. missing functions added on this branch) while the launcher script itself
+        # looks up to date.
+        _update_tidyscreen_in_streamlit_env(branch)
+
         print("🔄 Please restart your Python session for changes to take effect.")
     except subprocess.CalledProcessError as e:
-        print(f"❌ Failed to update TidyScreen: {e}")  
+        print(f"❌ Failed to update TidyScreen: {e}")
+
+def _update_tidyscreen_in_streamlit_env(branch):
+    """
+    If a conda environment named 'streamlit' exists and has tidyscreen installed,
+    refresh it too, so the GUI subprocess (run via `conda run -n streamlit`) doesn't
+    import a stale copy of the package from its own separate site-packages.
+    """
+    import subprocess
+
+    try:
+        check_cmd = [
+            "conda", "run", "-n", "streamlit",
+            "python", "-c", "import tidyscreen"
+        ]
+        result = subprocess.run(check_cmd, capture_output=True)
+
+        if result.returncode != 0:
+            # Either the 'streamlit' conda env doesn't exist, or it doesn't have
+            # tidyscreen installed (GUI never used from it) - nothing to update.
+            return
+
+        print("🔄 Updating TidyScreen in the 'streamlit' conda environment (used by tidyscreen.gui())...")
+
+        install_cmd = [
+            "conda", "run", "-n", "streamlit",
+            "python", "-m", "pip", "install",
+            "--upgrade", "--force-reinstall", "--no-deps",
+            f"git+https://github.com/alfredoq/TidyScreen.git@{branch}"
+        ]
+        subprocess.run(install_cmd, check=True)
+
+        print("✅ TidyScreen updated in the 'streamlit' conda environment as well.")
+    except FileNotFoundError:
+        # conda not on PATH - skip silently, the primary env update already succeeded.
+        pass
+    except subprocess.CalledProcessError as e:
+        print(f"⚠️  Failed to update TidyScreen in the 'streamlit' conda environment: {e}")
+        print("   The GUI (tidyscreen.gui()) may keep failing to import until you run manually:")
+        print(f"   conda run -n streamlit pip install --upgrade --force-reinstall git+https://github.com/alfredoq/TidyScreen.git@{branch}")
 
 def gui():
     """
