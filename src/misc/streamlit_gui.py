@@ -3717,6 +3717,9 @@ elif page == "Docking analysis":
         results_db_path = os.path.join(st.session_state["active_project_path"], "docking", "docking_assays", st.session_state["selected_assay_name"], "results", f"{st.session_state['selected_assay_name']}.db")
 
         df_results = st_funcs.get_docking_results(results_db_path)
+        df_results = st_funcs.add_ligand_name_column(
+            df_results, st.session_state["active_project_path"], st.session_state["selected_assay_name"]
+        )
 
         df_mmpbsa_poses_results = st_funcs.get_mmpbsa_results(results_db_path)
 
@@ -4543,6 +4546,20 @@ elif page == "Docking analysis":
                     _cpv_classified = st_funcs.get_rf_classified_poses(results_db_path, _cpv_model)
                     _cpv_df_pos = _cpv_classified["positive"]
                     _cpv_df_neg = _cpv_classified["negative"]
+                    _cpv_df_pos = st_funcs.add_ligand_name_column(_cpv_df_pos, _cpv_project_path, _cpv_assay)
+                    _cpv_df_neg = st_funcs.add_ligand_name_column(_cpv_df_neg, _cpv_project_path, _cpv_assay)
+
+                    _cpv_ligname_filter = st.text_input(
+                        "Filter by LigName (substring):", key="cpv_ligname_filter"
+                    )
+                    if _cpv_ligname_filter:
+                        _cpv_df_pos = _cpv_df_pos[
+                            _cpv_df_pos["LigName"].str.contains(_cpv_ligname_filter, case=False, na=False)
+                        ].reset_index(drop=True)
+                        _cpv_df_neg = _cpv_df_neg[
+                            _cpv_df_neg["LigName"].str.contains(_cpv_ligname_filter, case=False, na=False)
+                        ].reset_index(drop=True)
+
                     _cpv_has_pos = not _cpv_df_pos.empty
                     _cpv_has_neg = not _cpv_df_neg.empty
 
@@ -4750,6 +4767,13 @@ elif page == "Docking analysis":
                             _cpv_lig_filtered = _cpv_lig_summary[
                                 _cpv_lig_summary["n_positive"] >= _cpv_lig_min_positive
                             ].reset_index(drop=True)
+                            _cpv_lig_filtered = st_funcs.add_ligand_name_column(
+                                _cpv_lig_filtered, _cpv_project_path, _cpv_assay
+                            )
+                            if _cpv_ligname_filter:
+                                _cpv_lig_filtered = _cpv_lig_filtered[
+                                    _cpv_lig_filtered["LigName"].str.contains(_cpv_ligname_filter, case=False, na=False)
+                                ].reset_index(drop=True)
                             st.dataframe(_cpv_lig_filtered, use_container_width=True)
                             st.bar_chart(
                                 _cpv_lig_filtered.set_index("LigName")["frac_positive"].head(30)

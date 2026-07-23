@@ -528,6 +528,78 @@ def get_compounds_for_lig_names(project_path, assay_name, lig_names):
     return df[["smiles", "name", "flag"]], None
 
 
+def get_ligand_name_map(project_path, assay_name, lig_names):
+    """
+    Resolve a LigName (chemspace inchi_key) -> compound 'name' map for the
+    given *lig_names*, using the chemspace table associated with *assay_name*.
+
+    Returns {} if the docking registry, chemspace database, table, or the
+    'inchi_key'/'name' columns cannot be resolved.
+    """
+    if not lig_names:
+        return {}
+
+    registry_db = os.path.join(
+        project_path, "docking", "docking_registers", "docking_assays.db"
+    )
+    if not os.path.exists(registry_db):
+        return {}
+    try:
+        conn = sqlite3.connect(registry_db)
+        row = conn.execute(
+            "SELECT table_name FROM docking_assays WHERE assay_name = ?", (assay_name,)
+        ).fetchone()
+        conn.close()
+    except Exception:
+        return {}
+    if not row:
+        return {}
+    table_name = row[0]
+
+    chemspace_db = os.path.join(
+        project_path, "chemspace", "processed_data", "chemspace.db"
+    )
+    if not os.path.exists(chemspace_db):
+        return {}
+    try:
+        conn = sqlite3.connect(chemspace_db)
+        cursor = conn.cursor()
+        cursor.execute(f'PRAGMA table_info("{table_name}")')
+        available = {r[1].lower() for r in cursor.fetchall()}
+        if "inchi_key" not in available or "name" not in available:
+            conn.close()
+            return {}
+        placeholders = ",".join("?" * len(lig_names))
+        df = pd.read_sql_query(
+            f'SELECT inchi_key, name FROM "{table_name}" WHERE inchi_key IN ({placeholders})',
+            conn,
+            params=list(lig_names),
+        )
+        conn.close()
+    except Exception:
+        return {}
+    return dict(zip(df["inchi_key"], df["name"]))
+
+
+def add_ligand_name_column(df, project_path, assay_name, ligname_col="LigName"):
+    """
+    Insert a 'name' column right after *ligname_col*, mapping each LigName
+    (chemspace inchi_key) to its compound name via the chemspace table linked
+    to *assay_name*. Returns *df* unchanged if it is None/empty, lacks
+    *ligname_col*, or the chemspace lookup cannot be resolved.
+    """
+    if df is None or df.empty or ligname_col not in df.columns:
+        return df
+    name_map = get_ligand_name_map(
+        project_path, assay_name, df[ligname_col].dropna().unique().tolist()
+    )
+    if not name_map:
+        return df
+    df = df.copy()
+    df.insert(df.columns.get_loc(ligname_col) + 1, "name", df[ligname_col].map(name_map))
+    return df
+
+
 def create_chemspace_subset(project_path, assay_name, inchi_keys, new_table_name):
     """
     Create a new table in chemspace.db as a subset of the compound table used for
