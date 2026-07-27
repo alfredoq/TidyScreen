@@ -21453,7 +21453,7 @@ plt.show()
             print("=" * 60)
             print("Available tables with SDF blobs:")
             tables_with_sdf = []
-            for i, table in enumerate(available_tables, 1):
+            for table in available_tables:
                 # Check if table has 'sdf_blob' column
                 conn = sqlite3.connect(self.__chemspace_db)
                 cursor = conn.cursor()
@@ -21464,7 +21464,8 @@ plt.show()
                 conn.close()
                 if 'sdf_blob' in columns:
                     tables_with_sdf.append(table)
-                    print(f"  {i}. {table}")
+            for i, table in enumerate(tables_with_sdf, 1):
+                print(f"  {i}. {table}")
             if not tables_with_sdf:
                 print("❌ No tables with 'sdf_blob' column found. Generate molecules with SDF first.")
                 return False
