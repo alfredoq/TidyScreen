@@ -9027,6 +9027,7 @@ class MolDock:
             merge_atoms = eval(ligand_prep_params.get('merge_these_atom_types', '')) # The eval method is required to convert a string defining the atoms into a tuple as required by MoleculePreparation
             charge = ligand_prep_params.get('charge', '')
             hydrate = ligand_prep_params.get('hydrate', '')
+            rigid_macrocycles = ligand_prep_params.get('rigid_macrocycles', True)
             add_atom_types = ligand_prep_params.get('add_atom_types', '')
 
             # evaluate the type of add_atom_types to end with a list type as required by MoleculePreparation
@@ -9040,6 +9041,7 @@ class MolDock:
             mk_prep = MoleculePreparation(merge_these_atom_types=merge_atoms,
                                           charge_model=charge,
                                           hydrate=hydrate,
+                                          rigid_macrocycles=rigid_macrocycles,
                                           add_atom_types=add_atom_types
                                          )
             try:
@@ -9926,7 +9928,17 @@ class MolDock:
                 [False, True],
                 default=False
             )
-            
+
+            ligand_prep_parameters['rigid_macrocycles'] = self._get_parameter_choice(
+                "Keep rings rigid instead of letting Meeko break rings >= 7 atoms into flexible "
+                "macrocycles (glue 'G'/'CG' pseudo-atoms). Fused/bridged polycyclic scaffolds that "
+                "merely happen to contain a 7+ atom ring should normally stay rigid; only set to "
+                "False for genuine flexible macrocycles (e.g. macrolactones) and a macrocycle-aware "
+                "docking engine.",
+                [True, False],
+                default=True
+            )
+
             ligand_prep_parameters['add_atom_types'] = self._input_parameter_choice(
                 "Specify additional atom types to assign in JSON format, with SMARTS patterns and atom type names. (i.e.: '[{'smarts': '[#1][#6X3]:[#6X3]([#6])[#7]:[#7][#7][#6]', 'atype': 'HD'}]' for 1,2,3-triazole donor HD in 4 position. Default: None)",
                 default=None
