@@ -1568,7 +1568,8 @@ class ChemSpace:
                      retain_largest_fragment: Optional[bool] = None,
                      parallel_threshold: int = 10000,
                      max_workers: Optional[int] = None,
-                     chunk_size: Optional[int] = None) -> Dict[str, Any]:
+                     chunk_size: Optional[int] = None,
+                     run_in_background: Optional[bool] = None) -> Dict[str, Any]:
         """
         Load compounds from a CSV file into the chemspace database.
         Creates a table named after the CSV file prefix.
@@ -1594,9 +1595,16 @@ class ChemSpace:
             parallel_threshold (int): Number of rows above which parallel processing is used (default: 10000)
             max_workers (Optional[int]): Maximum number of parallel workers. If None, uses cpu_count()
             chunk_size (Optional[int]): Size of each chunk for parallel processing. If None, automatically calculated
+            run_in_background (Optional[bool]): If True, once the table/column/cleanup options are
+                resolved, hand the actual row parsing/insertion/InChI computation off to a separate
+                background process and return immediately (progress and results are written to a
+                log file instead of stdout). If False, run in the foreground as usual. If None,
+                prompts an interactive fg/bg selection.
 
         Returns:
-            dict: Results containing success status, counts, and messages
+            dict: Results containing success status, counts, and messages. If run_in_background is
+                True, 'compounds_added'/'duplicates_skipped' are 0 and the real counts are only
+                available in the database table / log file once the background process completes.
         """
         try:
             # Prompt for file path if not provided
@@ -1753,6 +1761,60 @@ class ChemSpace:
                 ).strip().lower()
                 retain_largest_fragment = retain_largest_fragment_choice in ['y', 'yes']
 
+            # Every interactive decision (table name/replace, column mapping, cleanup options)
+            # has now been resolved, so this is the last point where it's still cheap to ask
+            # whether the actual (potentially long-running) parsing/insertion/InChI work should
+            # be handed off to a background process instead of blocking the caller.
+            if run_in_background is None:
+                run_mode = input(
+                    "\n⚙️  Do you want to run the CSV loading in the foreground "
+                    "or background? (fg/bg) [default: fg]: "
+                ).strip().lower() or 'fg'
+                run_in_background = run_mode in ['bg', 'background']
+
+            if run_in_background:
+                return self._load_csv_file_in_background(
+                    df, table_name, csv_filename, smiles_column, name_column, flag_column,
+                    name_available, flag_available, flag_description_available,
+                    skip_duplicates, compute_inchi, strip_salts, retain_largest_fragment,
+                    parallel_threshold, max_workers, chunk_size
+                )
+
+            return self._execute_csv_load(
+                df, table_name, csv_filename, smiles_column, name_column, flag_column,
+                name_available, flag_available, flag_description_available,
+                skip_duplicates, compute_inchi, strip_salts, retain_largest_fragment,
+                parallel_threshold, max_workers, chunk_size
+            )
+
+        except Exception as e:
+            error_message = f"Error loading CSV file: {e}"
+            print(f"❌ {error_message}")
+            return {
+                'success': False,
+                'message': error_message,
+                'compounds_added': 0,
+                'duplicates_skipped': 0,
+                'errors': 1
+            }
+
+    def _execute_csv_load(self, df: pd.DataFrame, table_name: str, csv_filename: str,
+                          smiles_column: str, name_column: Optional[str], flag_column: Optional[str],
+                          name_available: bool, flag_available: bool, flag_description_available: bool,
+                          skip_duplicates: bool, compute_inchi: bool,
+                          strip_salts: bool, retain_largest_fragment: bool,
+                          parallel_threshold: int, max_workers: Optional[int],
+                          chunk_size: Optional[int]) -> Dict[str, Any]:
+        """
+        Performs the actual row parsing, insertion, and (optional) InChI key computation for
+        load_csv_file(), once the table, column mapping, and cleanup options have already been
+        resolved. Split out so it can be run either directly (foreground) or inside a separate
+        process (background) via _load_csv_file_in_background().
+
+        Returns:
+            dict: Results containing success status, counts, and messages.
+        """
+        try:
             # Determine if parallel processing should be used
             use_parallel = len(df) > parallel_threshold
             
@@ -1905,7 +1967,118 @@ class ChemSpace:
                 'duplicates_skipped': 0,
                 'errors': 1
             }
-    
+
+    def _load_csv_file_in_background(self, df: pd.DataFrame, table_name: str, csv_filename: str,
+                                     smiles_column: str, name_column: Optional[str], flag_column: Optional[str],
+                                     name_available: bool, flag_available: bool, flag_description_available: bool,
+                                     skip_duplicates: bool, compute_inchi: bool,
+                                     strip_salts: bool, retain_largest_fragment: bool,
+                                     parallel_threshold: int, max_workers: Optional[int],
+                                     chunk_size: Optional[int]) -> Dict[str, Any]:
+        """
+        Launches the CSV loading as a fully independent OS process via subprocess.Popen (the
+        same fg/bg pattern used by project_dimensionality_on_table() /
+        _project_dimensionality_in_background()) and returns immediately, so loading a large
+        CSV doesn't block the caller.
+
+        The table has already been created (or emptied, if the user chose to replace it) and
+        every interactive decision has already been resolved by the time this is called --
+        including _parse_df_from_csv_file()'s column-mapping and flag_description prompts, which
+        it re-asks unconditionally on every call. Re-reading and re-parsing the CSV from scratch
+        in the detached child (as _project_dimensionality_in_background() does for its cheap,
+        non-interactive model reload) would therefore re-trigger those prompts against a closed
+        stdin and crash with an I/O error. Instead, the already-resolved DataFrame is pickled to
+        disk here and the child just loads it back, with no re-parsing involved.
+
+        Returns:
+            dict: Minimal status dict describing the launch; the real load result (counts,
+                InChI keys computed, etc.) is only available in the database table and the log
+                file once the background process completes.
+        """
+        import subprocess
+
+        logs_dir = os.path.join(os.path.dirname(self.__chemspace_db), 'logs')
+        os.makedirs(logs_dir, exist_ok=True)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        base_name = f'csv_load_{table_name}_{timestamp}'
+        log_file_path = os.path.join(logs_dir, f'{base_name}.log')
+        script_path = os.path.join(logs_dir, f'{base_name}.py')
+        data_path = os.path.join(logs_dir, f'{base_name}_data.pkl')
+
+        df.to_pickle(data_path)
+
+        script = f"""
+import os
+import pandas as pd
+from tidyscreen import tidyscreen
+from tidyscreen.chemspace.chemspace import ChemSpace
+
+project = tidyscreen.ActivateProject({self.name!r})
+cs = ChemSpace(project)
+
+df = pd.read_pickle({data_path!r})
+
+try:
+    cs._execute_csv_load(
+        df,
+        {table_name!r},
+        {csv_filename!r},
+        {smiles_column!r},
+        {name_column!r},
+        {flag_column!r},
+        {name_available!r},
+        {flag_available!r},
+        {flag_description_available!r},
+        {skip_duplicates!r},
+        {compute_inchi!r},
+        {strip_salts!r},
+        {retain_largest_fragment!r},
+        {parallel_threshold!r},
+        {max_workers!r},
+        {chunk_size!r},
+    )
+finally:
+    os.remove({data_path!r})
+"""
+        with open(script_path, 'w') as f:
+            f.write(script)
+
+        try:
+            with open(log_file_path, 'w') as log_file:
+                process = subprocess.Popen(
+                    [sys.executable, script_path],
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    cwd=self.path,
+                    start_new_session=True
+                )
+        except Exception as e:
+            error_message = f"Error launching background CSV load: {e}"
+            print(f"❌ {error_message}")
+            return {
+                'success': False,
+                'message': error_message,
+                'compounds_added': 0,
+                'duplicates_skipped': 0,
+                'errors': 1
+            }
+
+        print(f"🚀 CSV loading launched in the background (PID {process.pid})")
+        print(f"   Loading '{csv_filename}' into table '{table_name}'...")
+        print(f"   Progress/results log: {log_file_path}")
+
+        return {
+            'success': True,
+            'message': f"CSV loading launched in the background (PID {process.pid}). See log: {log_file_path}",
+            'compounds_added': 0,
+            'duplicates_skipped': 0,
+            'errors': 0,
+            'table_name': table_name,
+            'background': True,
+            'pid': process.pid,
+            'log_file': log_file_path,
+        }
+
     def load_csv_file_extended_columns(self, csv_file_path: str = None, skip_duplicates: bool = True,
                                       strip_salts: Optional[bool] = None,
                                       retain_largest_fragment: Optional[bool] = None) -> dict:
