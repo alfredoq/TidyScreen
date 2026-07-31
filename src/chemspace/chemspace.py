@@ -1121,9 +1121,11 @@ class ChemSpace:
             return False
 
     @staticmethod
-    def list_tables(chemspace_db_path: str) -> List[str]:
+    def list_tables_at_path(chemspace_db_path: str) -> List[str]:
         """
-        Get list of all tables in a chemspace database.
+        Get list of all tables in a chemspace database at an arbitrary path, without requiring
+        an instantiated ChemSpace object -- e.g. for callers like the Streamlit GUI that only
+        have a raw db path and no active project instance to hand.
 
         Args:
             chemspace_db_path (str): Path to the chemspace.db file
@@ -1145,6 +1147,54 @@ class ChemSpace:
             print(f"❌ Error retrieving table list: {e}")
             return []
 
+    def list_tables(self, chemspace_db_path: Optional[str] = None, verbose: bool = True) -> List[str]:
+        """
+        Get list of all tables in a chemspace database, printing a formatted listing (with
+        row counts) by default. Automatically uses the active project's own chemspace
+        database unless an explicit path is given.
+
+        Args:
+            chemspace_db_path (Optional[str]): Path to a chemspace.db file to inspect instead
+                of the active project's database. If None, uses this instance's database.
+            verbose (bool): Whether to print a formatted listing of the tables found.
+                get_all_tables() passes False, since it's used pervasively throughout this
+                class as internal plumbing to build/filter candidate table lists -- printing
+                there would spam a listing as an unwanted side effect of unrelated operations.
+
+        Returns:
+            List[str]: List of table names
+        """
+        resolved_path = chemspace_db_path or self.__chemspace_db
+        tables = self.list_tables_at_path(resolved_path)
+
+        if verbose:
+            title = "TABLES IN CHEMSPACE DATABASE"
+            if chemspace_db_path is None:
+                title += f" - Project: {self.name}"
+            print("\n" + "=" * 70)
+            print(title)
+            print("=" * 70)
+            if not tables:
+                print("📝 No tables found")
+            else:
+                try:
+                    conn = sqlite3.connect(resolved_path)
+                    cursor = conn.cursor()
+                    for i, t in enumerate(tables, 1):
+                        try:
+                            cursor.execute(f"SELECT COUNT(*) FROM {t}")
+                            count = cursor.fetchone()[0]
+                            print(f"{i:3d}. {t:<40} ({count:,} rows)")
+                        except Exception:
+                            print(f"{i:3d}. {t}")
+                    conn.close()
+                except Exception:
+                    for i, t in enumerate(tables, 1):
+                        print(f"{i:3d}. {t}")
+            print("=" * 70)
+
+        return tables
+
     def get_all_tables(self) -> List[str]:
         """
         Get list of all compound tables in the database.
@@ -1152,73 +1202,88 @@ class ChemSpace:
         Returns:
             List[str]: List of table names
         """
-        return self.list_tables(self.__chemspace_db)
+        return self.list_tables(verbose=False)
     
-    def rename_table(self, old_name: str, new_name: str) -> bool:
+    def rename_table(self, old_name: Optional[str] = None, new_name: Optional[str] = None) -> Optional[str]:
         """
-        Rename a table in the database.
-        
+        Rename an existing table in the chemspace database.
+
+        Uses SQLite's native ALTER TABLE ... RENAME TO, an instant metadata-only operation
+        that preserves the table's schema exactly as-is (PRIMARY KEY/AUTOINCREMENT, UNIQUE
+        constraints, column types, and all existing indexes) -- unlike copying the data into a
+        freshly created table, which would silently drop any constraint not explicitly
+        reproduced on the new table.
+
         Args:
-            old_name (str): Current name of the table
-            new_name (str): New name for the table
-            
+            old_name (Optional[str]): Current name of the table to rename. If None, prompts an
+                interactive table selection.
+            new_name (Optional[str]): New name for the table. If None, prompts for a value.
+                Sanitized the same way as other table-creation methods.
+
         Returns:
-            bool: True if table was renamed successfully
+            Optional[str]: The new table name if the rename succeeded, or None if an error
+                occurred or the operation was cancelled
         """
         try:
-            # Check if old table exists
-            tables = self.get_all_tables()
-            if old_name not in tables:
-                print(f"⚠️  Table '{old_name}' does not exist")
-                return False
-            
-            # Sanitize new table name
+            available_tables = self.get_all_tables()
+            if not available_tables:
+                print("❌ No tables available in chemspace database")
+                return None
+
+            if old_name is None:
+                old_name = self._select_table_interactive("SELECT TABLE TO RENAME")
+                if not old_name:
+                    print("❌ No table selected for renaming")
+                    return None
+            elif old_name not in available_tables:
+                print(f"❌ Table '{old_name}' not found")
+                return None
+
+            if new_name is None:
+                try:
+                    new_name = input(f"Enter new name for table '{old_name}': ").strip()
+                except KeyboardInterrupt:
+                    print("\n❌ Rename cancelled")
+                    return None
+                if not new_name:
+                    print("❌ No new name provided")
+                    return None
+
             new_name = self._sanitize_table_name(new_name)
-            
-            # Check if new table name already exists
-            if new_name in tables:
-                print(f"⚠️  Table '{new_name}' already exists")
-                return False
-            
+
+            if new_name == old_name:
+                print(f"❌ New name is the same as the current name '{old_name}'")
+                return None
+
+            available_tables = self.get_all_tables()
+            while new_name in available_tables:
+                print(f"\n⚠️  Table '{new_name}' already exists!")
+                try:
+                    user_new_name = input("Enter a different name (or 'cancel' to abort): ").strip()
+                except KeyboardInterrupt:
+                    print("\n❌ Rename cancelled")
+                    return None
+                if user_new_name.lower() in ['cancel', 'quit', 'exit']:
+                    print("❌ Rename cancelled by user")
+                    return None
+                new_name = self._sanitize_table_name(user_new_name)
+                available_tables = self.get_all_tables()
+
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
             cursor.execute("PRAGMA journal_mode=WAL")
             cursor.execute("PRAGMA synchronous=NORMAL")
-            
-            # SQLite doesn't support RENAME TABLE directly, so we need to:
-            # 1. Create new table with same structure
-            # 2. Copy data
-            # 3. Drop old table
-            
-            # Create new table
-            cursor.execute(f"""
-            CREATE TABLE {new_name} AS 
-            SELECT * FROM {old_name}
-            """)
-            
-            # Recreate indexes for new table
-            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{new_name}_name ON {new_name}(name)")
-            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{new_name}_smiles ON {new_name}(smiles)")
-            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{new_name}_flag ON {new_name}(flag)")
-            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{new_name}_inchi_key ON {new_name}(inchi_key)")
-            
-            # Drop old table and its indexes
-            cursor.execute(f"DROP INDEX IF EXISTS idx_{old_name}_name")
-            cursor.execute(f"DROP INDEX IF EXISTS idx_{old_name}_smiles")
-            cursor.execute(f"DROP INDEX IF EXISTS idx_{old_name}_flag")
-            cursor.execute(f"DROP INDEX IF EXISTS idx_{old_name}_inchi_key")
-            cursor.execute(f"DROP TABLE {old_name}")
-            
+            cursor.execute(f"ALTER TABLE {old_name} RENAME TO {new_name}")
             conn.commit()
             conn.close()
-            
+
             print(f"✅ Table '{old_name}' renamed to '{new_name}' successfully")
-            return True
-            
+            return new_name
+
         except Exception as e:
-            print(f"❌ Error renaming table '{old_name}' to '{new_name}': {e}")
-            return False
-    
+            print(f"❌ Error renaming table '{old_name}': {e}")
+            return None
+
     @staticmethod
     def _detect_csv_delimiter_and_header(csv_file_path: str) -> Tuple[Any, Optional[int]]:
         """
@@ -4097,6 +4162,10 @@ class ChemSpace:
 
     _DIM_REDUCTION_METHODS = ('pca', 'tsne', 'umap')
     _DIM_REDUCTION_LABELS = {'pca': 'PCA', 'tsne': 't-SNE', 'umap': 'UMAP'}
+    # Fixed color for the "full table" background layer in plot_projected_chemspace_density():
+    # a warm, muted tone that stays visually distinct from both the cool lightgray reference
+    # layer and the blue-green-yellow range of the default 'viridis' density colormap.
+    _DENSITY_PLOT_TABLE_BACKGROUND_COLOR = 'darkorange'
     _MORGAN_FP_COLUMN_PATTERN = re.compile(r'^morgan_fp_r\d+_\d+$')
     # Row batch size used by project_dimensionality_on_table() when unpacking fingerprint bits
     # to float32 for reducer.transform(); bounds peak memory to ~size * n_bits * 4 bytes
@@ -5118,6 +5187,74 @@ for method in {methods_to_run!r}:
                 print("\n❌ Projection selection cancelled")
                 return None
 
+    def _get_coordinate_columns_in_table(self, table_name: str, columns) -> Dict[Tuple[str, str], List[str]]:
+        """
+        Combine a table's own fitted dimensionality-reduction coordinate columns (from
+        reduce_dimensionality(), keyed by the table's own name) with any projected coordinate
+        columns it holds (from project_dimensionality_on_table(), keyed by their reference
+        table) into a single (method, space_key) -> [x_col, y_col] map.
+
+        'space_key' identifies the 2D coordinate space the columns live in: the table itself
+        when the columns are its own fitted embedding, or the reference table it was projected
+        onto otherwise. Two tables sharing a (method, space_key) entry have directly comparable
+        x/y coordinates -- used by subset_chemical_space_based_on_dimensionality_reduction() to
+        make sure a box computed from one table is meaningful when applied to another.
+
+        Args:
+            table_name (str): Name of the table the columns belong to
+            columns: Iterable of column names to scan (e.g. df.columns)
+
+        Returns:
+            Dict[Tuple[str, str], List[str]]: (method, space_key) -> coordinate column names
+        """
+        result: Dict[Tuple[str, str], List[str]] = {}
+        for m, cols in self._detect_reduction_methods_in_columns(columns).items():
+            result[(m, table_name)] = cols
+        for key, cols in self._detect_projected_reduction_columns_in_columns(columns).items():
+            result[key] = cols
+        return result
+
+    def _select_coordinate_space_interactive(self, candidates: List[Tuple[str, str]],
+                                             context_table: str) -> Optional[Tuple[str, str]]:
+        """
+        Interactive selection among multiple shared (method, space_key) coordinate spaces,
+        for subset_chemical_space_based_on_dimensionality_reduction().
+
+        Args:
+            candidates (List[Tuple[str, str]]): (method, space_key) pairs to choose from
+            context_table (str): Name of the table the space_key is relative to (used to tell
+                apart a table's own fitted embedding from one it was projected onto)
+
+        Returns:
+            Optional[Tuple[str, str]]: Selected (method, space_key) pair, or None if cancelled
+        """
+        print(f"\n🔍 SELECT SHARED COORDINATE SPACE")
+        print("=" * 60)
+        for i, (m, space_key) in enumerate(candidates, 1):
+            origin = "own fitted embedding" if space_key == context_table else f"projected from '{space_key}'"
+            print(f"{i}. {self._DIM_REDUCTION_LABELS[m]} ({origin})")
+        print("-" * 60)
+        print("Commands: Enter option number, or 'cancel' to abort")
+
+        while True:
+            try:
+                selection = input(f"\n🔍 Select coordinate space: ").strip()
+
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    return None
+
+                try:
+                    idx = int(selection) - 1
+                    if 0 <= idx < len(candidates):
+                        return candidates[idx]
+                    print(f"❌ Invalid selection. Please enter 1-{len(candidates)}")
+                except ValueError:
+                    print(f"❌ Invalid input '{selection}'")
+
+            except KeyboardInterrupt:
+                print("\n❌ Coordinate space selection cancelled")
+                return None
+
     def _export_plot_data_and_script(self, output_path: str, datasets: Dict[str, pd.DataFrame],
                                      script_text: str) -> Tuple[List[str], str]:
         """
@@ -5198,6 +5335,78 @@ ax.set_xlabel(X_COL)
 ax.set_ylabel(Y_COL)
 ax.set_title({title!r})
 ax.grid(True, alpha=0.3)
+
+fig.savefig(OUTPUT_PATH, dpi=300, bbox_inches='tight')
+plt.show()
+'''
+
+    def _render_density_plot_script(self, csv_name: str, png_name: str, x_col: str, y_col: str,
+                                    figsize: Tuple[int, int], point_size: float, cmap: str,
+                                    title: str, all_csv_name: str, table_label: str,
+                                    ref_csv_name: Optional[str] = None,
+                                    ref_x_col: Optional[str] = None, ref_y_col: Optional[str] = None,
+                                    reference_point_size: float = 15, reference_alpha: float = 0.25,
+                                    reference_label: str = "Reference",
+                                    source_method: str = "plot_projected_chemspace_density") -> str:
+        """
+        Render a standalone Python script that reproduces a plot_projected_chemspace_density()
+        or plot_chemspace_density() plot from its exported CSV (which already includes the
+        computed 'density' column), the full-table background CSV, and, if present, the
+        reference background CSV -- with no dependency on TidyScreen or scipy.
+        """
+        ref_block = ""
+        if ref_csv_name is not None:
+            ref_block = f'''
+REF_CSV_PATH = os.path.join(SCRIPT_DIR, {ref_csv_name!r})
+REF_X_COL = {ref_x_col!r}
+REF_Y_COL = {ref_y_col!r}
+
+ref_df = pd.read_csv(REF_CSV_PATH)
+ax.scatter(ref_df[REF_X_COL], ref_df[REF_Y_COL], s={reference_point_size!r}, alpha={reference_alpha!r},
+          color='lightgray', label={reference_label!r} + f" — n={{len(ref_df)}}")
+'''
+
+        return f'''#!/usr/bin/env python3
+"""
+Regenerates '{png_name}' from '{csv_name}', '{all_csv_name}'{f" and '{ref_csv_name}'" if ref_csv_name else ""}.
+Generated by ChemSpace.{source_method}().
+"""
+import os
+import pandas as pd
+import matplotlib.pyplot as plt
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CSV_PATH = os.path.join(SCRIPT_DIR, {csv_name!r})
+ALL_CSV_PATH = os.path.join(SCRIPT_DIR, {all_csv_name!r})
+OUTPUT_PATH = os.path.join(SCRIPT_DIR, {png_name!r})
+
+X_COL = {x_col!r}
+Y_COL = {y_col!r}
+POINT_SIZE = {point_size!r}
+CMAP = {cmap!r}
+
+df = pd.read_csv(CSV_PATH)
+all_df = pd.read_csv(ALL_CSV_PATH)
+
+# Widen the figure to make room for the colorbar so the plotted data area itself keeps the
+# original figsize shape instead of being squeezed narrower.
+fig, ax = plt.subplots(figsize=({figsize[0]!r} * 1.2, {figsize[1]!r}))
+{ref_block}
+# Every compound in the table, shown as background context even for points excluded from the
+# density estimate (df) by max_points subsampling. Fixed warm color kept distinct from both
+# the lightgray reference layer and the density colormap.
+ax.scatter(all_df[X_COL], all_df[Y_COL], s=POINT_SIZE, alpha=0.35,
+          color={self._DENSITY_PLOT_TABLE_BACKGROUND_COLOR!r},
+          label={table_label!r} + f" — n={{len(all_df)}}")
+
+scatter = ax.scatter(df[X_COL], df[Y_COL], s=POINT_SIZE, c=df['density'], cmap=CMAP)
+fig.colorbar(scatter, ax=ax, label='Point density')
+
+ax.set_xlabel(X_COL)
+ax.set_ylabel(Y_COL)
+ax.set_title({title!r})
+ax.grid(True, alpha=0.3)
+ax.legend(loc='best', fontsize=8)
 
 fig.savefig(OUTPUT_PATH, dpi=300, bbox_inches='tight')
 plt.show()
@@ -5379,6 +5588,500 @@ plt.show()
 
         except Exception as e:
             print(f"❌ Error plotting reduced coordinates for table '{table_name}': {e}")
+            return None
+
+    def plot_chemspace_density(self, table_name: Optional[str] = None,
+                                method: Optional[str] = None,
+                                bandwidth: Optional[float] = None,
+                                max_points: int = 10000,
+                                output_path: Optional[str] = None,
+                                figsize: Tuple[int, int] = (8, 8),
+                                point_size: float = 20,
+                                cmap: str = 'viridis',
+                                show: bool = False) -> Optional[str]:
+        """
+        Visualize a table's own dimensionality-reduction coordinates (from
+        reduce_dimensionality()) as a 2D scatter plot where each point is colored by its local
+        point density, estimated via a Gaussian KDE fit on the plotted x,y values. Denser
+        regions of the chemical space stand out via the color scale, while every individual
+        compound remains visible as its own point (unlike a binned heatmap). Every valid
+        (x, y) row of table_name is also plotted underneath as background context (fixed warm
+        color, so no compound disappears from the plot even if excluded from the density
+        estimate by max_points subsampling).
+
+        Behaves like plot_projected_chemspace_density(), but without a reference background
+        layer: these coordinates are table_name's own fitted embedding, not a projection onto
+        another table's chemical space, so there is no separate reference chemical space to
+        plot underneath. Saved as a PNG.
+
+        Args:
+            table_name (Optional[str]): Name of the table to plot, restricted to tables with
+                reduced-coordinate columns ('<method>_1'/'_2' columns, as created by
+                reduce_dimensionality()). If None, prompts an interactive table selection.
+            method (Optional[str]): One of 'pca', 'tsne', 'umap'. If None and a single method's
+                coordinates are present in the table, that one is used automatically;
+                otherwise prompts an interactive selection.
+            bandwidth (Optional[float]): KDE bandwidth passed as gaussian_kde's bw_method. If
+                None, scipy's default (Scott's rule) is used.
+            max_points (int): Cap on the number of points used for the density estimate and
+                plot. A Gaussian KDE evaluated on n points costs O(n^2), so tables larger than
+                this are randomly subsampled (with a printed warning) to stay responsive.
+            output_path (Optional[str]): Path to save the PNG. If None, defaults to
+                '<project>/chemspace/misc/dim_reduction/<table>_density_<method>.png'
+            figsize (Tuple[int, int]): Size in inches of the actual plotted (x, y) data area,
+                matching plot_reduced_coordinates()'s figsize semantics. Since this plot always
+                carries a density colorbar, the figure is internally widened to make room for
+                it so the data area itself keeps this shape instead of being squeezed narrower.
+            point_size (float): Marker size for the density-colored scatter points
+            cmap (str): Colormap used for the density color scale
+            show (bool): Whether to also display the plot interactively (plt.show())
+
+        Returns:
+            Optional[str]: Path to the saved PNG, or None if an error occurred
+        """
+        try:
+            try:
+                import matplotlib.pyplot as plt
+            except ImportError:
+                print("❌ matplotlib not installed. Please install it to plot chemspace density:")
+                print("   pip install matplotlib")
+                return None
+
+            try:
+                from scipy.stats import gaussian_kde
+            except ImportError:
+                print("❌ scipy not installed. Please install it to estimate point density:")
+                print("   pip install scipy")
+                return None
+
+            # Resolve table interactively if not provided, restricted to tables that already
+            # have reduced-coordinate columns from reduce_dimensionality()
+            if table_name is None:
+                tables_with_coords = [
+                    t for t in self.get_all_tables()
+                    if self._detect_reduction_methods_in_columns(self._get_table_columns(t))
+                ]
+                if not tables_with_coords:
+                    print("❌ No tables with reduced-coordinate columns found.")
+                    print("   Run reduce_dimensionality() on a table first.")
+                    return None
+
+                table_name = self._select_table_interactive(
+                    "SELECT TABLE FOR CHEMSPACE DENSITY PLOT", tables_override=tables_with_coords
+                )
+                if not table_name:
+                    print("❌ No table selected for plotting")
+                    return None
+
+            print(f"📊 Retrieving table '{table_name}' for plotting...")
+            df = self._get_table_as_dataframe(table_name)
+
+            if df.empty:
+                print(f"⚠️  No data retrieved from table '{table_name}'")
+                return None
+
+            # Resolve which method's coordinates to plot
+            available_methods = self._detect_reduction_methods_in_columns(df.columns)
+
+            if not available_methods:
+                print(f"❌ No reduced-coordinate columns found in table '{table_name}'.")
+                print("   Run reduce_dimensionality() on this table first.")
+                return None
+
+            if method is None:
+                if len(available_methods) == 1:
+                    method = next(iter(available_methods))
+                else:
+                    method = self._select_dimensionality_reduction_method_interactive(
+                        tuple(available_methods.keys())
+                    )
+                    if method is None:
+                        print("❌ No dimensionality reduction method selected")
+                        return None
+            elif method not in available_methods:
+                print(f"❌ No reduced coordinates for method '{method}' found in table '{table_name}'.")
+                print(f"   Available: {list(available_methods.keys())}")
+                return None
+
+            x_col, y_col = available_methods[method][:2]
+
+            # Every valid row in the table -- kept as-is (not subsampled) so it can be plotted
+            # as background context even if the density estimate below ends up computed on a
+            # smaller subsample of it
+            full_plot_df = df.dropna(subset=[x_col, y_col]).copy()
+
+            if full_plot_df.empty:
+                print(f"❌ No rows with valid '{method}' coordinates in table '{table_name}'")
+                return None
+
+            density_df = full_plot_df
+            if len(density_df) > max_points:
+                print(f"⚠️  {len(density_df):,} points exceeds max_points={max_points:,}; using a "
+                      f"random subsample of {max_points:,} for the density estimate (Gaussian "
+                      f"KDE cost grows quadratically with point count). Pass a higher "
+                      f"max_points to use more, at the cost of runtime. All {len(density_df):,} "
+                      f"points are still shown as background context.")
+                density_df = density_df.sample(n=max_points, random_state=42)
+
+            label = self._DIM_REDUCTION_LABELS[method]
+            print(f"🎨 Estimating point density for {len(density_df):,} compounds "
+                  f"({label}) in '{table_name}'...")
+
+            xy = np.vstack([density_df[x_col].to_numpy(), density_df[y_col].to_numpy()])
+            density = gaussian_kde(xy, bw_method=bandwidth)(xy)
+
+            # Draw points in ascending density order so the densest (most crowded) points are
+            # plotted last and stay visible on top of sparser ones
+            order = np.argsort(density)
+            plot_x = density_df[x_col].to_numpy()[order]
+            plot_y = density_df[y_col].to_numpy()[order]
+            plot_density = density[order]
+
+            # This plot always carries a density colorbar, unlike plot_reduced_coordinates()
+            # where it's conditional -- widen the figure to make room for it so the plotted
+            # data area itself keeps the requested figsize shape instead of being squeezed
+            # narrower (which otherwise reads as the whole point cloud being compressed on
+            # the x axis).
+            fig, ax = plt.subplots(figsize=(figsize[0] * 1.2, figsize[1]))
+
+            # Show every compound in the table as background context -- even those excluded
+            # from the density estimate above by max_points subsampling. Fixed warm color
+            # keeps this layer distinct from the density colormap. No separate reference layer
+            # here, since these coordinates are the table's own fitted embedding.
+            ax.scatter(full_plot_df[x_col], full_plot_df[y_col], s=point_size, alpha=0.35,
+                      color=self._DENSITY_PLOT_TABLE_BACKGROUND_COLOR,
+                      label=f"'{table_name}' (all) — n={len(full_plot_df):,}")
+
+            scatter = ax.scatter(plot_x, plot_y, s=point_size, c=plot_density, cmap=cmap)
+            fig.colorbar(scatter, ax=ax, label='Point density')
+
+            ax.set_xlabel(x_col)
+            ax.set_ylabel(y_col)
+            plot_title = f"{label} — {table_name} (point density)"
+            ax.set_title(plot_title)
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc='best', fontsize=8)
+
+            if output_path is None:
+                output_dir = os.path.join(self.path, 'chemspace', 'misc', 'dim_reduction')
+                os.makedirs(output_dir, exist_ok=True)
+                output_path = os.path.join(output_dir, f"{table_name}_density_{method}.png")
+            else:
+                os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+
+            if os.path.exists(output_path):
+                print(f"⚠️  '{output_path}' already exists -- overwriting.")
+
+            fig.savefig(output_path, dpi=300, bbox_inches='tight')
+
+            if show:
+                plt.show()
+
+            plt.close(fig)
+
+            # Alongside the PNG, export the plotted data (including the computed density
+            # column) and the full table background as CSV(s), plus a standalone script that
+            # regenerates the plot from them
+            export_data = {x_col: plot_x, y_col: plot_y, 'density': plot_density}
+            if 'id' in density_df.columns:
+                export_data = {'id': density_df['id'].to_numpy()[order], **export_data}
+            export_df = pd.DataFrame(export_data)
+
+            base_name = os.path.splitext(os.path.basename(output_path))[0]
+            all_csv_columns = (['id'] if 'id' in full_plot_df.columns else []) + [x_col, y_col]
+            datasets = {'': export_df, '_all': full_plot_df[all_csv_columns]}
+            all_csv_name = f"{base_name}_all.csv"
+
+            csv_paths, script_path = self._export_plot_data_and_script(
+                output_path, datasets,
+                self._render_density_plot_script(
+                    csv_name=f"{base_name}.csv",
+                    png_name=os.path.basename(output_path),
+                    x_col=x_col, y_col=y_col, figsize=figsize, point_size=point_size,
+                    cmap=cmap, title=plot_title,
+                    all_csv_name=all_csv_name, table_label=f"'{table_name}' (all)",
+                    source_method="plot_chemspace_density"
+                )
+            )
+
+            print(f"✅ Plot saved to: {output_path}")
+            print(f"   📄 Data saved to: {', '.join(csv_paths)}")
+            print(f"   📝 Script saved to: {script_path}")
+            return output_path
+
+        except Exception as e:
+            print(f"❌ Error plotting chemspace density for table '{table_name}': {e}")
+            return None
+
+    def plot_projected_chemspace_density(self, table_name: Optional[str] = None,
+                                         method: Optional[str] = None,
+                                         reference_table: Optional[str] = None,
+                                         bandwidth: Optional[float] = None,
+                                         max_points: int = 10000,
+                                         output_path: Optional[str] = None,
+                                         figsize: Tuple[int, int] = (8, 8),
+                                         point_size: float = 20,
+                                         reference_point_size: float = 15,
+                                         reference_alpha: float = 0.25,
+                                         cmap: str = 'viridis',
+                                         show: bool = False) -> Optional[str]:
+        """
+        Visualize a table's projected dimensionality-reduction coordinates (from
+        project_dimensionality_on_table()) as a 2D scatter plot where each point is colored by
+        its local point density, estimated via a Gaussian KDE fit on the plotted x,y values.
+        Denser regions of the projected chemical space stand out via the color scale, while
+        every individual compound remains visible as its own point (unlike a binned heatmap).
+        Two background layers are plotted underneath the density-colored points: every valid
+        (x, y) row of table_name itself (gray, so no compound disappears from the plot even if
+        excluded from the density estimate by max_points subsampling), and the full reference
+        chemical space these coordinates were projected onto (its own fitted embedding from
+        reduce_dimensionality(), light gray) -- the same reference-background convention used
+        by plot_projected_chemical_space(). Saved as a PNG.
+
+        Args:
+            table_name (Optional[str]): Name of the table to plot, restricted to tables with
+                projected-coordinate columns ('<method>_from_<reference_table>_1'/'_2' columns,
+                as created by project_dimensionality_on_table()). If None, prompts an
+                interactive table selection.
+            method (Optional[str]): Restrict to a projected embedding fit with this method
+                ('pca', 'tsne', 'umap'). Combined with reference_table to disambiguate when
+                the table holds more than one projected embedding.
+            reference_table (Optional[str]): Restrict to a projected embedding that was fit
+                on this particular reference table.
+            bandwidth (Optional[float]): KDE bandwidth passed as gaussian_kde's bw_method. If
+                None, scipy's default (Scott's rule) is used.
+            max_points (int): Cap on the number of points used for the density estimate and
+                plot. A Gaussian KDE evaluated on n points costs O(n^2), so tables larger than
+                this are randomly subsampled (with a printed warning) to stay responsive.
+            output_path (Optional[str]): Path to save the PNG. If None, defaults to
+                '<project>/chemspace/misc/dim_reduction/<table>_density_<method>_from_<reference_table>.png'
+            figsize (Tuple[int, int]): Size in inches of the actual plotted (x, y) data area,
+                matching plot_projected_chemical_space()'s figsize semantics. Since this plot
+                always carries a density colorbar (unlike plot_projected_chemical_space(),
+                where it's conditional), the figure is internally widened to make room for it
+                so the data area itself keeps this shape instead of being squeezed narrower.
+            point_size (float): Marker size for the density-colored scatter points
+            reference_point_size (float): Marker size for the background reference points
+            reference_alpha (float): Marker transparency for the background reference points
+            cmap (str): Colormap used for the density color scale
+            show (bool): Whether to also display the plot interactively (plt.show())
+
+        Returns:
+            Optional[str]: Path to the saved PNG, or None if an error occurred
+        """
+        try:
+            try:
+                import matplotlib.pyplot as plt
+            except ImportError:
+                print("❌ matplotlib not installed. Please install it to plot chemspace density:")
+                print("   pip install matplotlib")
+                return None
+
+            try:
+                from scipy.stats import gaussian_kde
+            except ImportError:
+                print("❌ scipy not installed. Please install it to estimate point density:")
+                print("   pip install scipy")
+                return None
+
+            # Resolve table interactively if not provided, restricted to tables that already
+            # have projected-coordinate columns from project_dimensionality_on_table()
+            if table_name is None:
+                tables_with_projections = [
+                    t for t in self.get_all_tables()
+                    if self._detect_projected_reduction_columns_in_columns(self._get_table_columns(t))
+                ]
+                if not tables_with_projections:
+                    print("❌ No tables with projected-coordinate columns found.")
+                    print("   Run project_dimensionality_on_table() on a table first.")
+                    return None
+
+                table_name = self._select_table_interactive(
+                    "SELECT TABLE FOR PROJECTED CHEMSPACE DENSITY PLOT", tables_override=tables_with_projections
+                )
+                if not table_name:
+                    print("❌ No table selected for plotting")
+                    return None
+
+            print(f"📊 Retrieving table '{table_name}' for plotting...")
+            df = self._get_table_as_dataframe(table_name)
+
+            if df.empty:
+                print(f"⚠️  No data retrieved from table '{table_name}'")
+                return None
+
+            # Resolve which projected (method, reference_table) combination to plot
+            projections = self._detect_projected_reduction_columns_in_columns(df.columns)
+
+            if not projections:
+                print(f"❌ No projected-coordinate columns found in table '{table_name}'.")
+                print("   Run project_dimensionality_on_table() on this table first.")
+                return None
+
+            candidate_keys = list(projections.keys())
+
+            if method is not None:
+                candidate_keys = [k for k in candidate_keys if k[0] == method]
+                if not candidate_keys:
+                    print(f"❌ No projected '{method}' coordinates found in table '{table_name}'.")
+                    return None
+
+            if reference_table is not None:
+                candidate_keys = [k for k in candidate_keys if k[1] == reference_table]
+                if not candidate_keys:
+                    print(f"❌ No projected coordinates from reference table '{reference_table}' "
+                          f"found in table '{table_name}'.")
+                    return None
+
+            if len(candidate_keys) == 1:
+                selected_method, selected_reference_table = candidate_keys[0]
+            else:
+                selected_key = self._select_projection_interactive(candidate_keys)
+                if selected_key is None:
+                    print("❌ No projected embedding selected")
+                    return None
+                selected_method, selected_reference_table = selected_key
+
+            x_col, y_col = projections[(selected_method, selected_reference_table)][:2]
+
+            # Every valid row in the table -- kept as-is (not subsampled) so it can be plotted
+            # as background context even if the density estimate below ends up computed on a
+            # smaller subsample of it
+            full_plot_df = df.dropna(subset=[x_col, y_col]).copy()
+
+            if full_plot_df.empty:
+                print(f"❌ No rows with valid projected coordinates in table '{table_name}'")
+                return None
+
+            # Load the reference table's own embedding coordinates for the same method, to
+            # plot the full chemical space these points were projected onto in the background
+            ref_df = None
+            ref_x_col = ref_y_col = None
+            if selected_reference_table not in self.get_all_tables():
+                print(f"⚠️  Reference table '{selected_reference_table}' no longer exists; "
+                      f"plotting projected points only.")
+            else:
+                ref_full_df = self._get_table_as_dataframe(selected_reference_table)
+                ref_methods = self._detect_reduction_methods_in_columns(ref_full_df.columns)
+                if selected_method not in ref_methods:
+                    print(f"⚠️  Reference table '{selected_reference_table}' has no '{selected_method}' "
+                          f"coordinates; plotting projected points only.")
+                else:
+                    ref_x_col, ref_y_col = ref_methods[selected_method][:2]
+                    ref_df = ref_full_df.dropna(subset=[ref_x_col, ref_y_col]).copy()
+
+            density_df = full_plot_df
+            if len(density_df) > max_points:
+                print(f"⚠️  {len(density_df):,} points exceeds max_points={max_points:,}; using a "
+                      f"random subsample of {max_points:,} for the density estimate (Gaussian "
+                      f"KDE cost grows quadratically with point count). Pass a higher "
+                      f"max_points to use more, at the cost of runtime. All {len(density_df):,} "
+                      f"points are still shown as background context.")
+                density_df = density_df.sample(n=max_points, random_state=42)
+
+            label = self._DIM_REDUCTION_LABELS[selected_method]
+            print(f"🎨 Estimating point density for {len(density_df):,} compounds "
+                  f"({label} from '{selected_reference_table}') in '{table_name}'...")
+
+            xy = np.vstack([density_df[x_col].to_numpy(), density_df[y_col].to_numpy()])
+            density = gaussian_kde(xy, bw_method=bandwidth)(xy)
+
+            # Draw points in ascending density order so the densest (most crowded) points are
+            # plotted last and stay visible on top of sparser ones
+            order = np.argsort(density)
+            plot_x = density_df[x_col].to_numpy()[order]
+            plot_y = density_df[y_col].to_numpy()[order]
+            plot_density = density[order]
+
+            # This plot always carries a density colorbar, unlike plot_projected_chemical_space()
+            # where it's conditional -- widen the figure to make room for it so the plotted data
+            # area itself keeps the requested figsize shape instead of being squeezed narrower
+            # (which otherwise reads as the whole point cloud being compressed on the x axis).
+            fig, ax = plt.subplots(figsize=(figsize[0] * 1.2, figsize[1]))
+
+            if ref_df is not None and not ref_df.empty:
+                ax.scatter(ref_df[ref_x_col], ref_df[ref_y_col], s=reference_point_size,
+                          alpha=reference_alpha, color='lightgray',
+                          label=f"Reference ({selected_reference_table}) — n={len(ref_df):,}")
+
+            # Show every compound in the table as background context -- even those excluded
+            # from the density estimate above by max_points subsampling -- so no point ever
+            # disappears from the plot, only its density coloring. A fixed warm color keeps
+            # this layer distinct from both the lightgray reference and the density colormap.
+            ax.scatter(full_plot_df[x_col], full_plot_df[y_col], s=point_size, alpha=0.35,
+                      color=self._DENSITY_PLOT_TABLE_BACKGROUND_COLOR,
+                      label=f"'{table_name}' (all) — n={len(full_plot_df):,}")
+
+            scatter = ax.scatter(plot_x, plot_y, s=point_size, c=plot_density, cmap=cmap)
+            fig.colorbar(scatter, ax=ax, label='Point density')
+
+            ax.set_xlabel(x_col)
+            ax.set_ylabel(y_col)
+            plot_title = f"{label} — {table_name} projected onto {selected_reference_table} (point density)"
+            ax.set_title(plot_title)
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc='best', fontsize=8)
+
+            if output_path is None:
+                output_dir = os.path.join(self.path, 'chemspace', 'misc', 'dim_reduction')
+                os.makedirs(output_dir, exist_ok=True)
+                output_path = os.path.join(
+                    output_dir,
+                    f"{table_name}_density_{selected_method}_from_{selected_reference_table}.png"
+                )
+            else:
+                os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+
+            if os.path.exists(output_path):
+                print(f"⚠️  '{output_path}' already exists -- overwriting.")
+
+            fig.savefig(output_path, dpi=300, bbox_inches='tight')
+
+            if show:
+                plt.show()
+
+            plt.close(fig)
+
+            # Alongside the PNG, export the plotted data (including the computed density
+            # column), the full table background, and the reference background (if any) as
+            # CSV(s), plus a standalone script that regenerates the plot from them
+            export_data = {x_col: plot_x, y_col: plot_y, 'density': plot_density}
+            if 'id' in density_df.columns:
+                export_data = {'id': density_df['id'].to_numpy()[order], **export_data}
+            export_df = pd.DataFrame(export_data)
+
+            base_name = os.path.splitext(os.path.basename(output_path))[0]
+            all_csv_columns = (['id'] if 'id' in full_plot_df.columns else []) + [x_col, y_col]
+            datasets = {'': export_df, '_all': full_plot_df[all_csv_columns]}
+            all_csv_name = f"{base_name}_all.csv"
+
+            ref_csv_name = None
+            if ref_df is not None and not ref_df.empty:
+                ref_csv_columns = (['id'] if 'id' in ref_df.columns else []) + [ref_x_col, ref_y_col]
+                datasets['_reference'] = ref_df[ref_csv_columns]
+                ref_csv_name = f"{base_name}_reference.csv"
+
+            csv_paths, script_path = self._export_plot_data_and_script(
+                output_path, datasets,
+                self._render_density_plot_script(
+                    csv_name=f"{base_name}.csv",
+                    png_name=os.path.basename(output_path),
+                    x_col=x_col, y_col=y_col, figsize=figsize, point_size=point_size,
+                    cmap=cmap, title=plot_title,
+                    all_csv_name=all_csv_name, table_label=f"'{table_name}' (all)",
+                    ref_csv_name=ref_csv_name, ref_x_col=ref_x_col, ref_y_col=ref_y_col,
+                    reference_point_size=reference_point_size, reference_alpha=reference_alpha,
+                    reference_label=f"Reference ({selected_reference_table})"
+                )
+            )
+
+            print(f"✅ Plot saved to: {output_path}")
+            print(f"   📄 Data saved to: {', '.join(csv_paths)}")
+            print(f"   📝 Script saved to: {script_path}")
+            return output_path
+
+        except Exception as e:
+            print(f"❌ Error plotting projected chemspace density for table '{table_name}': {e}")
             return None
 
     def plot_projected_chemical_space(self, table_names: Optional[Union[str, List[str]]] = None,
@@ -5695,6 +6398,1155 @@ plt.show()
 
         except Exception as e:
             print(f"❌ Error plotting projected chemical space for table(s) '{table_names}': {e}")
+            return None
+
+    def subset_chemical_space_based_on_dimensionality_reduction(
+            self,
+            center_table: Optional[str] = None,
+            target_table: Optional[str] = None,
+            method: Optional[str] = None,
+            box_size_x: Optional[float] = None,
+            box_size_y: Optional[float] = None,
+            centroid_method: Optional[str] = None,
+            show_box_plot: bool = True,
+            output_table_name: Optional[str] = None) -> Optional[str]:
+        """
+        Define a rectangular box in dimensionality-reduction (x, y) space -- centered on the
+        centroid of a table's coordinates, sized by the user -- and subset a (possibly
+        different) table's compounds down to those whose coordinates fall inside it.
+
+        Both tables must share a coordinate space produced by reduce_dimensionality() and/or
+        project_dimensionality_on_table(): either the very same fitted embedding (center_table
+        == target_table, using its own '<method>_1'/'_2' columns) or a fitted/projected pair
+        (one table's own embedding, the other's '<method>_from_<that_table>_1'/'_2' projected
+        columns). This guarantees the box is computed and applied in the same 2D space -- see
+        _get_coordinate_columns_in_table().
+
+        Args:
+            center_table (Optional[str]): Table used to compute the box center (centroid of its
+                x,y coordinates in the chosen coordinate space). If None, prompts an interactive
+                selection restricted to tables with dimensionality-reduction coordinate columns.
+            target_table (Optional[str]): Table to subset. May be the same as center_table (the
+                box is then applied to the table it was centered on). If None, prompts an
+                interactive selection restricted to tables sharing a coordinate space with
+                center_table.
+            method (Optional[str]): Restrict to a shared coordinate space fit with this method
+                ('pca', 'tsne', 'umap'), to disambiguate when more than one is shared.
+            box_size_x (Optional[float]): Full width of the box along the x axis (centroid ±
+                box_size_x / 2). If None, prompts for a value. After the resulting compound
+                count is reported, the user is asked whether to redefine the box; answering
+                yes re-prompts for box_size_x/box_size_y (regardless of what was originally
+                passed in) and repeats the preview until accepted.
+            box_size_y (Optional[float]): Full height of the box along the y axis (centroid ±
+                box_size_y / 2). If None, prompts for a value defaulting to box_size_x
+                (a square box).
+            centroid_method (Optional[str]): How to compute the box center from center_table's
+                x,y coordinates -- 'mean' (arithmetic average), 'median' (robust to a few
+                outlier compounds skewing the box off-center), or 'bounding_box' (midpoint of
+                each axis's min/max, i.e. the geometric center of the points' extent --
+                independent of how densely points are distributed within it). If None, prompts
+                an interactive selection.
+            show_box_plot (bool): Once the box dimensions are resolved, plot center_table's own
+                coordinates with the box overlaid (and display it via plt.show()) as a visual
+                check before subsetting. If center_table's coordinates are themselves a
+                projection (space_key != center_table), the full reference chemical space is
+                also plotted in the background for context. Also saved as a PNG. Requires
+                matplotlib; a missing installation only skips the preview, it does not abort
+                the subsetting.
+            output_table_name (Optional[str]): Name for the new table holding the subset. If
+                None, prompts for a name with a timestamp-based default.
+
+        Returns:
+            Optional[str]: Name of the created output table, or None if an error occurred or
+                the operation was cancelled
+        """
+        try:
+            if centroid_method is not None and centroid_method not in ('mean', 'median', 'bounding_box'):
+                print(f"❌ Invalid centroid_method '{centroid_method}'. "
+                      f"Must be 'mean', 'median', or 'bounding_box'")
+                return None
+
+            tables_with_coords = [
+                t for t in self.get_all_tables()
+                if self._get_coordinate_columns_in_table(t, self._get_table_columns(t))
+            ]
+
+            if not tables_with_coords:
+                print("❌ No tables with dimensionality-reduction coordinate columns found.")
+                print("   Run reduce_dimensionality() and/or project_dimensionality_on_table() first.")
+                return None
+
+            # Resolve center table
+            if center_table is None:
+                center_table = self._select_table_interactive(
+                    "SELECT CENTER TABLE (BOX CENTROID SOURCE)", tables_override=tables_with_coords
+                )
+                if not center_table:
+                    print("❌ No center table selected")
+                    return None
+            elif center_table not in tables_with_coords:
+                print(f"❌ Table '{center_table}' not found or has no dimensionality-reduction coordinates.")
+                return None
+
+            print(f"📊 Retrieving table '{center_table}' for box centroid computation...")
+            center_df = self._get_table_as_dataframe(center_table)
+            if center_df.empty:
+                print(f"⚠️  No data retrieved from table '{center_table}'")
+                return None
+
+            center_coords = self._get_coordinate_columns_in_table(center_table, center_df.columns)
+            if not center_coords:
+                print(f"❌ No dimensionality-reduction coordinate columns found in table '{center_table}'")
+                return None
+
+            # Resolve target table, restricted to those sharing a coordinate space with center_table
+            if target_table is None:
+                candidate_targets = [
+                    t for t in tables_with_coords
+                    if set(self._get_coordinate_columns_in_table(t, self._get_table_columns(t)))
+                    & set(center_coords)
+                ]
+                if not candidate_targets:
+                    print(f"❌ No table shares a dimensionality-reduction coordinate space with '{center_table}'.")
+                    return None
+                target_table = self._select_table_interactive(
+                    "SELECT TARGET TABLE TO SUBSET", tables_override=candidate_targets
+                )
+                if not target_table:
+                    print("❌ No target table selected")
+                    return None
+
+            if target_table == center_table:
+                target_df = center_df
+                target_coords = center_coords
+            else:
+                if target_table not in tables_with_coords:
+                    print(f"❌ Table '{target_table}' not found or has no dimensionality-reduction coordinates.")
+                    return None
+                print(f"📊 Retrieving table '{target_table}' for subsetting...")
+                target_df = self._get_table_as_dataframe(target_table)
+                if target_df.empty:
+                    print(f"⚠️  No data retrieved from table '{target_table}'")
+                    return None
+                target_coords = self._get_coordinate_columns_in_table(target_table, target_df.columns)
+
+            # Resolve the shared coordinate space to use
+            shared_keys = sorted(set(center_coords) & set(target_coords))
+            if not shared_keys:
+                print(f"❌ Tables '{center_table}' and '{target_table}' do not share a "
+                      f"dimensionality-reduction coordinate space.")
+                return None
+
+            if method is not None:
+                shared_keys = [k for k in shared_keys if k[0] == method]
+                if not shared_keys:
+                    print(f"❌ No shared '{method}' coordinate space found between "
+                          f"'{center_table}' and '{target_table}'.")
+                    return None
+
+            if len(shared_keys) == 1:
+                selected_key = shared_keys[0]
+            else:
+                selected_key = self._select_coordinate_space_interactive(shared_keys, center_table)
+                if selected_key is None:
+                    print("❌ No coordinate space selected")
+                    return None
+
+            selected_method, space_key = selected_key
+            center_x_col, center_y_col = center_coords[selected_key][:2]
+            target_x_col, target_y_col = target_coords[selected_key][:2]
+
+            # Compute box center from the center table's coordinates
+            center_xy_df = center_df.dropna(subset=[center_x_col, center_y_col])
+            if center_xy_df.empty:
+                print(f"❌ No rows with valid '{center_x_col}'/'{center_y_col}' coordinates in '{center_table}'")
+                return None
+
+            if centroid_method is None:
+                print(f"\n🔍 SELECT CENTROID METRIC")
+                print("=" * 60)
+                print("1. mean         (arithmetic average of x,y)")
+                print("2. median       (robust to outlier compounds)")
+                print("3. bounding_box (geometric center of the points' x/y extent, "
+                      "regardless of point density)")
+                print("-" * 60)
+                while True:
+                    try:
+                        selection = input("🔍 Select centroid metric [1/2/3] (default: 1 - mean): ").strip().lower()
+                        if selection in ('', '1', 'mean'):
+                            centroid_method = 'mean'
+                            break
+                        elif selection in ('2', 'median'):
+                            centroid_method = 'median'
+                            break
+                        elif selection in ('3', 'bounding_box'):
+                            centroid_method = 'bounding_box'
+                            break
+                        else:
+                            print(f"❌ Invalid selection '{selection}'. Enter 1, 2, 3, "
+                                  f"'mean', 'median' or 'bounding_box'")
+                    except KeyboardInterrupt:
+                        print("\n❌ Cancelled")
+                        return None
+
+            if centroid_method == 'median':
+                centroid_x = center_xy_df[center_x_col].median()
+                centroid_y = center_xy_df[center_y_col].median()
+            elif centroid_method == 'bounding_box':
+                centroid_x = (center_xy_df[center_x_col].min() + center_xy_df[center_x_col].max()) / 2
+                centroid_y = (center_xy_df[center_y_col].min() + center_xy_df[center_y_col].max()) / 2
+            else:
+                centroid_x = center_xy_df[center_x_col].mean()
+                centroid_y = center_xy_df[center_y_col].mean()
+
+            label = self._DIM_REDUCTION_LABELS[selected_method]
+            print(f"📍 Box centroid ({label}, {centroid_method}, from '{center_table}', "
+                  f"n={len(center_xy_df):,}): ({centroid_x:.4f}, {centroid_y:.4f})")
+
+            # Resolve box size (width along x, height along y), letting the user preview the
+            # resulting compound count and redefine the box as many times as needed before
+            # committing to a subset
+            while True:
+                if box_size_x is None:
+                    while True:
+                        try:
+                            raw = input("Enter box width (full size along x): ").strip()
+                            box_size_x = float(raw)
+                            if box_size_x <= 0:
+                                print("❌ Box width must be positive")
+                                continue
+                            break
+                        except ValueError:
+                            print(f"❌ Invalid number '{raw}'")
+                        except KeyboardInterrupt:
+                            print("\n❌ Cancelled")
+                            return None
+                elif box_size_x <= 0:
+                    print(f"❌ box_size_x must be positive, got {box_size_x}")
+                    return None
+
+                if box_size_y is None:
+                    try:
+                        raw = input(f"Enter box height (full size along y) [default: {box_size_x} -- square]: ").strip()
+                        box_size_y = float(raw) if raw else box_size_x
+                    except KeyboardInterrupt:
+                        print("\n❌ Cancelled")
+                        return None
+                if box_size_y <= 0:
+                    print(f"❌ box_size_y must be positive, got {box_size_y}")
+                    return None
+
+                x_min, x_max = centroid_x - box_size_x / 2, centroid_x + box_size_x / 2
+                y_min, y_max = centroid_y - box_size_y / 2, centroid_y + box_size_y / 2
+
+                print(f"📦 Box: x ∈ [{x_min:.4f}, {x_max:.4f}] (width={box_size_x}), "
+                      f"y ∈ [{y_min:.4f}, {y_max:.4f}] (height={box_size_y})")
+
+                if show_box_plot:
+                    try:
+                        import matplotlib.pyplot as plt
+                        import matplotlib.patches as patches
+                    except ImportError:
+                        print("⚠️  matplotlib not installed -- skipping box preview plot.")
+                    else:
+                        fig, ax = plt.subplots(figsize=(8, 8))
+
+                        # When center_table's coordinates are themselves a projection onto another
+                        # table (space_key != center_table), show that reference table's own fitted
+                        # embedding in the background for context -- same convention as
+                        # plot_projected_chemical_space(): reference in light gray behind the points
+                        # the box is actually being centered on.
+                        center_point_color = 'lightgray'
+                        if space_key != center_table:
+                            if space_key not in self.get_all_tables():
+                                print(f"⚠️  Reference table '{space_key}' no longer exists; "
+                                      f"plotting '{center_table}' only.")
+                            else:
+                                ref_full_df = self._get_table_as_dataframe(space_key)
+                                ref_methods = self._detect_reduction_methods_in_columns(ref_full_df.columns)
+                                if selected_method not in ref_methods:
+                                    print(f"⚠️  Reference table '{space_key}' has no '{selected_method}' "
+                                          f"coordinates; plotting '{center_table}' only.")
+                                else:
+                                    ref_x_col, ref_y_col = ref_methods[selected_method][:2]
+                                    ref_plot_df = ref_full_df.dropna(subset=[ref_x_col, ref_y_col])
+                                    if not ref_plot_df.empty:
+                                        ax.scatter(ref_plot_df[ref_x_col], ref_plot_df[ref_y_col],
+                                                  s=15, alpha=0.25, color='lightgray',
+                                                  label=f"Reference ('{space_key}') — n={len(ref_plot_df):,}")
+                                        center_point_color = 'crimson'
+
+                        ax.scatter(center_xy_df[center_x_col], center_xy_df[center_y_col],
+                                  s=20, alpha=0.6, color=center_point_color,
+                                  label=f"'{center_table}' — n={len(center_xy_df):,}")
+                        ax.scatter([centroid_x], [centroid_y], s=80, color='black', marker='x',
+                                  label=f"Centroid ({centroid_x:.3f}, {centroid_y:.3f})")
+                        ax.add_patch(patches.Rectangle(
+                            (x_min, y_min), box_size_x, box_size_y,
+                            linewidth=2, edgecolor='crimson', facecolor='none',
+                            label=f"Box ({box_size_x} × {box_size_y})"
+                        ))
+                        ax.set_xlabel(center_x_col)
+                        ax.set_ylabel(center_y_col)
+                        ax.set_title(f"{label} — box preview on '{center_table}'")
+                        ax.grid(True, alpha=0.3)
+                        ax.legend(loc='best', fontsize=8)
+
+                        output_dir = os.path.join(self.path, 'chemspace', 'misc', 'dim_reduction')
+                        os.makedirs(output_dir, exist_ok=True)
+                        box_plot_path = os.path.join(
+                            output_dir,
+                            f"{center_table}_box_preview_{selected_method}_"
+                            f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+                        )
+                        fig.savefig(box_plot_path, dpi=300, bbox_inches='tight')
+                        print(f"🖼️  Box preview saved to: {box_plot_path}")
+
+                        plt.show()
+                        plt.close(fig)
+
+                # Report how many of the center table's own points fall within the box, for
+                # context on how the box relates to the space it was centered on
+                if target_table != center_table:
+                    center_mask = (
+                        (center_xy_df[center_x_col] >= x_min) & (center_xy_df[center_x_col] <= x_max) &
+                        (center_xy_df[center_y_col] >= y_min) & (center_xy_df[center_y_col] <= y_max)
+                    )
+                    center_in_box = center_xy_df[center_mask]
+                    center_retention = (len(center_in_box) / len(center_xy_df) * 100) if len(center_xy_df) else 0.0
+                    print(f"✅ {len(center_in_box):,} / {len(center_xy_df):,} compounds from '{center_table}' "
+                          f"(center table) fall within the box ({center_retention:.2f}%)")
+
+                # Subset the target table down to rows whose coordinates fall within the box
+                target_xy_df = target_df.dropna(subset=[target_x_col, target_y_col])
+                mask = (
+                    (target_xy_df[target_x_col] >= x_min) & (target_xy_df[target_x_col] <= x_max) &
+                    (target_xy_df[target_y_col] >= y_min) & (target_xy_df[target_y_col] <= y_max)
+                )
+                subset_df = target_xy_df[mask]
+
+                retention = (len(subset_df) / len(target_df) * 100) if len(target_df) else 0.0
+                print(f"✅ {len(subset_df):,} / {len(target_df):,} compounds from '{target_table}' fall "
+                      f"within the box ({retention:.2f}%)")
+
+                try:
+                    redefine = input("🔁 Redefine the box? [y/N]: ").strip().lower()
+                except KeyboardInterrupt:
+                    print("\n❌ Cancelled")
+                    return None
+
+                if redefine in ('y', 'yes'):
+                    box_size_x = None
+                    box_size_y = None
+                    continue
+                break
+
+            if subset_df.empty:
+                print("❌ No compounds fall within the defined box")
+                return None
+
+            # Resolve output table name
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            default_table_name = f"{target_table}_boxsubset_{timestamp}"
+            if output_table_name is None:
+                user_table_name = input(f"Enter table name for subset (default: {default_table_name}): ").strip()
+                output_table_name = user_table_name if user_table_name else default_table_name
+            output_table_name = self._sanitize_table_name(output_table_name)
+
+            available_tables = self.get_all_tables()
+            while output_table_name in available_tables:
+                print(f"\n⚠️  Table '{output_table_name}' already exists!")
+                user_table_name = input("Enter a different table name (or 'cancel' to abort): ").strip()
+                if user_table_name.lower() in ['cancel', 'quit', 'exit']:
+                    print("❌ Subsetting cancelled by user")
+                    return None
+                output_table_name = self._sanitize_table_name(user_table_name)
+                available_tables = self.get_all_tables()
+
+            # Save subset to database, replicating the target table's schema
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+
+            cursor.execute(f"PRAGMA table_info({target_table})")
+            columns_info = cursor.fetchall()
+
+            column_defs = []
+            for col_info in columns_info:
+                col_name, col_type, col_notnull, col_default, col_pk = col_info[1:6]
+                col_def = f"{col_name} {col_type}"
+                if col_notnull:
+                    col_def += " NOT NULL"
+                if col_default is not None and str(col_default).strip() != "":
+                    default_str = str(col_default).strip()
+                    if default_str.upper() == "NULL":
+                        col_def += " DEFAULT NULL"
+                    elif default_str.replace(".", "", 1).lstrip("-").isdigit():
+                        col_def += f" DEFAULT {default_str}"
+                    else:
+                        if not (default_str.startswith("'") or default_str.startswith('"')):
+                            default_str = f"'{default_str}'"
+                        col_def += f" DEFAULT {default_str}"
+                if col_pk:
+                    col_def += " PRIMARY KEY AUTOINCREMENT"
+                column_defs.append(col_def)
+
+            unique_constraint = ""
+            cursor.execute(f"SELECT sql FROM sqlite_master WHERE type='table' AND name='{target_table}'")
+            original_sql = cursor.fetchone()
+            if original_sql and 'UNIQUE(smiles, name)' in original_sql[0]:
+                unique_constraint = ", UNIQUE(smiles, name)"
+
+            create_table_sql = f"CREATE TABLE {output_table_name} ({', '.join(column_defs)}{unique_constraint})"
+            cursor.execute(create_table_sql)
+
+            # Insert in a single executemany() batch (see subset_table() for rationale)
+            insert_columns = [col[1] for col in columns_info if col[1] != 'id']
+            placeholders = ', '.join(['?'] * len(insert_columns))
+            insert_sql = f"INSERT OR IGNORE INTO {output_table_name} ({', '.join(insert_columns)}) VALUES ({placeholders})"
+
+            rows = [tuple(row[col] for col in insert_columns) for _, row in subset_df.iterrows()]
+            changes_before = conn.total_changes
+            cursor.executemany(insert_sql, rows)
+            inserted_count = conn.total_changes - changes_before
+
+            if 'smiles' in insert_columns:
+                cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{output_table_name}_smiles ON {output_table_name}(smiles)")
+            if 'name' in insert_columns:
+                cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{output_table_name}_name ON {output_table_name}(name)")
+
+            conn.commit()
+            conn.close()
+
+            print(f"✅ Successfully created subset table '{output_table_name}'")
+            print(f"   📊 Rows inserted: {inserted_count:,}")
+            print(f"   📦 Box ({label}, centroid from '{center_table}'): "
+                  f"x ∈ [{x_min:.4f}, {x_max:.4f}], y ∈ [{y_min:.4f}, {y_max:.4f}]")
+
+            return output_table_name
+
+        except Exception as e:
+            print(f"❌ Error subsetting chemical space based on dimensionality reduction: {e}")
+            return None
+
+    def _greedy_distance_select(self, coords: np.ndarray, n_to_select: int, sampling_mode: str,
+                                initial_dist: Optional[np.ndarray] = None,
+                                random_state: int = 42) -> List[int]:
+        """
+        Greedily select n_to_select positional indices from coords via an incremental
+        farthest-point ('max_distance') or nearest-point ('min_distance') traversal: at each
+        step, the unselected point whose distance to its nearest already-selected point is
+        largest (max_distance) or smallest (min_distance) is added, and the running per-point
+        "distance to nearest selected point" array is updated in O(n) rather than recomputing
+        all pairwise distances every iteration. Total cost is O(n_to_select * len(coords)).
+
+        Used by sample_projected_chemical_space() (seeded by one random point drawn from
+        coords itself) and sample_projected_chemical_space_including_table() (seeded by the
+        distance to an external fixed point set that is not itself selectable from coords).
+
+        Args:
+            coords (np.ndarray): (n, 2) array of candidate point coordinates
+            n_to_select (int): number of points to select (clamped to len(coords))
+            sampling_mode (str): 'max_distance' or 'min_distance'
+            initial_dist (Optional[np.ndarray]): starting per-point distance to the nearest
+                already-selected point, from an external fixed seed set not itself present in
+                coords. If None, the traversal instead seeds itself with one random point
+                drawn from coords, which becomes the first selected index.
+            random_state (int): seed for the random first pick when initial_dist is None
+
+        Returns:
+            List[int]: positional indices into coords, in selection order
+        """
+        n = len(coords)
+        n_to_select = min(n_to_select, n)
+        if n_to_select <= 0:
+            return []
+
+        selected_mask = np.zeros(n, dtype=bool)
+        selected_order: List[int] = []
+
+        if initial_dist is None:
+            rng = np.random.RandomState(random_state)
+            first_idx = int(rng.randint(n))
+            selected_mask[first_idx] = True
+            selected_order.append(first_idx)
+            dist_to_selected = np.linalg.norm(coords - coords[first_idx], axis=1)
+            remaining = n_to_select - 1
+        else:
+            dist_to_selected = initial_dist.copy()
+            remaining = n_to_select
+
+        for _ in range(remaining):
+            candidate_dist = np.where(selected_mask, np.nan, dist_to_selected)
+            if sampling_mode == 'max_distance':
+                next_idx = int(np.nanargmax(candidate_dist))
+            else:
+                next_idx = int(np.nanargmin(candidate_dist))
+
+            selected_mask[next_idx] = True
+            selected_order.append(next_idx)
+
+            new_dist = np.linalg.norm(coords - coords[next_idx], axis=1)
+            dist_to_selected = np.minimum(dist_to_selected, new_dist)
+
+        return selected_order
+
+    def sample_projected_chemical_space(self, table_name: Optional[str] = None,
+                                        method: Optional[str] = None,
+                                        reference_table: Optional[str] = None,
+                                        n_compounds: Optional[int] = None,
+                                        sampling_mode: Optional[str] = None,
+                                        max_points: int = 20000,
+                                        random_state: int = 42,
+                                        output_table_name: Optional[str] = None) -> Optional[str]:
+        """
+        Subset a fixed number of compounds from a table's projected dimensionality-reduction
+        coordinates (from project_dimensionality_on_table()), greedily selected over the 2D
+        (x, y) coordinates via an incremental farthest-point/nearest-point traversal:
+
+        - 'max_distance': at each step, add the unselected point whose distance to its nearest
+          already-selected point is largest. This is the classic MaxMin / farthest-point
+          sampling algorithm and yields a diverse subset spread out across the chemical space.
+        - 'min_distance': the mirrored traversal -- at each step, add the unselected point
+          whose distance to its nearest already-selected point is smallest. This yields a
+          compact subset that grows as a tight chain/cluster from the starting point.
+
+        Both modes start from the same randomly chosen seed point (seeded by random_state) and
+        run in O(n_compounds * n_points) time by incrementally maintaining, for every
+        unselected point, its distance to the nearest already-selected point.
+
+        Args:
+            table_name (Optional[str]): Name of the table to sample from, restricted to tables
+                with projected-coordinate columns ('<method>_from_<reference_table>_1'/'_2'
+                columns, as created by project_dimensionality_on_table()). If None, prompts an
+                interactive table selection.
+            method (Optional[str]): Restrict to a projected embedding fit with this method
+                ('pca', 'tsne', 'umap'). Combined with reference_table to disambiguate when
+                the table holds more than one projected embedding.
+            reference_table (Optional[str]): Restrict to a projected embedding that was fit
+                on this particular reference table.
+            n_compounds (Optional[int]): Number of compounds to select. If None, prompts for a
+                value. Clamped to the number of available valid rows if larger.
+            sampling_mode (Optional[str]): 'max_distance' or 'min_distance' (see above). If
+                None, prompts an interactive selection.
+            max_points (int): Cap on the number of candidate points considered. Each selection
+                step costs O(n_points), so tables larger than this are randomly subsampled
+                first (with a printed warning) to stay responsive.
+            random_state (int): Seed for the initial random seed point and any subsampling.
+            output_table_name (Optional[str]): Name for the new table holding the sampled
+                subset. If None, prompts for a name with a timestamp-based default.
+
+        Returns:
+            Optional[str]: Name of the created output table, or None if an error occurred or
+                the operation was cancelled
+        """
+        try:
+            # Resolve table interactively if not provided, restricted to tables that already
+            # have projected-coordinate columns from project_dimensionality_on_table()
+            if table_name is None:
+                tables_with_projections = [
+                    t for t in self.get_all_tables()
+                    if self._detect_projected_reduction_columns_in_columns(self._get_table_columns(t))
+                ]
+                if not tables_with_projections:
+                    print("❌ No tables with projected-coordinate columns found.")
+                    print("   Run project_dimensionality_on_table() on a table first.")
+                    return None
+
+                table_name = self._select_table_interactive(
+                    "SELECT TABLE FOR PROJECTED CHEMICAL SPACE SAMPLING", tables_override=tables_with_projections
+                )
+                if not table_name:
+                    print("❌ No table selected for sampling")
+                    return None
+
+            print(f"📊 Retrieving table '{table_name}' for sampling...")
+            df = self._get_table_as_dataframe(table_name)
+
+            if df.empty:
+                print(f"⚠️  No data retrieved from table '{table_name}'")
+                return None
+
+            # Resolve which projected (method, reference_table) combination to sample from
+            projections = self._detect_projected_reduction_columns_in_columns(df.columns)
+
+            if not projections:
+                print(f"❌ No projected-coordinate columns found in table '{table_name}'.")
+                print("   Run project_dimensionality_on_table() on this table first.")
+                return None
+
+            candidate_keys = list(projections.keys())
+
+            if method is not None:
+                candidate_keys = [k for k in candidate_keys if k[0] == method]
+                if not candidate_keys:
+                    print(f"❌ No projected '{method}' coordinates found in table '{table_name}'.")
+                    return None
+
+            if reference_table is not None:
+                candidate_keys = [k for k in candidate_keys if k[1] == reference_table]
+                if not candidate_keys:
+                    print(f"❌ No projected coordinates from reference table '{reference_table}' "
+                          f"found in table '{table_name}'.")
+                    return None
+
+            if len(candidate_keys) == 1:
+                selected_method, selected_reference_table = candidate_keys[0]
+            else:
+                selected_key = self._select_projection_interactive(candidate_keys)
+                if selected_key is None:
+                    print("❌ No projected embedding selected")
+                    return None
+                selected_method, selected_reference_table = selected_key
+
+            x_col, y_col = projections[(selected_method, selected_reference_table)][:2]
+
+            plot_df = df.dropna(subset=[x_col, y_col]).copy()
+
+            if plot_df.empty:
+                print(f"❌ No rows with valid projected coordinates in table '{table_name}'")
+                return None
+
+            if len(plot_df) > max_points:
+                print(f"⚠️  {len(plot_df):,} points exceeds max_points={max_points:,}; using a "
+                      f"random subsample of {max_points:,} candidate points (each selection "
+                      f"step costs O(n_points)). Pass a higher max_points to consider more, "
+                      f"at the cost of runtime.")
+                plot_df = plot_df.sample(n=max_points, random_state=random_state)
+
+            # Resolve number of compounds to select
+            if n_compounds is None:
+                while True:
+                    try:
+                        raw = input(f"Enter number of compounds to subset (1-{len(plot_df):,}): ").strip()
+                        n_compounds = int(raw)
+                        if n_compounds <= 0:
+                            print("❌ Number of compounds must be positive")
+                            continue
+                        break
+                    except ValueError:
+                        print(f"❌ Invalid integer '{raw}'")
+                    except KeyboardInterrupt:
+                        print("\n❌ Cancelled")
+                        return None
+            elif n_compounds <= 0:
+                print(f"❌ n_compounds must be positive, got {n_compounds}")
+                return None
+
+            if n_compounds > len(plot_df):
+                print(f"⚠️  Requested {n_compounds:,} compounds but only {len(plot_df):,} are "
+                      f"available; using all {len(plot_df):,}.")
+                n_compounds = len(plot_df)
+
+            # Resolve sampling mode
+            if sampling_mode is None:
+                print(f"\n🔍 SELECT SAMPLING MODE")
+                print("=" * 60)
+                print("1. max_distance (diverse subset, spread out across the chemical space)")
+                print("2. min_distance (compact subset, tightly clustered)")
+                print("-" * 60)
+                while True:
+                    try:
+                        selection = input("🔍 Select sampling mode [1/2]: ").strip().lower()
+                        if selection in ('1', 'max_distance', 'max'):
+                            sampling_mode = 'max_distance'
+                            break
+                        elif selection in ('2', 'min_distance', 'min'):
+                            sampling_mode = 'min_distance'
+                            break
+                        else:
+                            print(f"❌ Invalid selection '{selection}'. Enter 1, 2, "
+                                  f"'max_distance' or 'min_distance'")
+                    except KeyboardInterrupt:
+                        print("\n❌ Cancelled")
+                        return None
+            elif sampling_mode not in ('max_distance', 'min_distance'):
+                print(f"❌ Invalid sampling_mode '{sampling_mode}'. Must be 'max_distance' or 'min_distance'")
+                return None
+
+            label = self._DIM_REDUCTION_LABELS[selected_method]
+            print(f"🎯 Sampling {n_compounds:,} compounds from {len(plot_df):,} candidates "
+                  f"({label} from '{selected_reference_table}') in '{table_name}' "
+                  f"using '{sampling_mode}'...")
+
+            coords = plot_df[[x_col, y_col]].to_numpy()
+            selected_order = self._greedy_distance_select(
+                coords, n_compounds, sampling_mode, random_state=random_state
+            )
+            sampled_df = plot_df.iloc[selected_order]
+
+            print(f"✅ Selected {len(sampled_df):,} compounds from '{table_name}' "
+                  f"using '{sampling_mode}' sampling")
+
+            # Resolve output table name
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            default_table_name = f"{table_name}_sampled_{sampling_mode}_{timestamp}"
+            if output_table_name is None:
+                user_table_name = input(f"Enter table name for sample (default: {default_table_name}): ").strip()
+                output_table_name = user_table_name if user_table_name else default_table_name
+            output_table_name = self._sanitize_table_name(output_table_name)
+
+            available_tables = self.get_all_tables()
+            while output_table_name in available_tables:
+                print(f"\n⚠️  Table '{output_table_name}' already exists!")
+                user_table_name = input("Enter a different table name (or 'cancel' to abort): ").strip()
+                if user_table_name.lower() in ['cancel', 'quit', 'exit']:
+                    print("❌ Sampling cancelled by user")
+                    return None
+                output_table_name = self._sanitize_table_name(user_table_name)
+                available_tables = self.get_all_tables()
+
+            # Save sampled subset to database, replicating the source table's schema
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+
+            cursor.execute(f"PRAGMA table_info({table_name})")
+            columns_info = cursor.fetchall()
+
+            column_defs = []
+            for col_info in columns_info:
+                col_name, col_type, col_notnull, col_default, col_pk = col_info[1:6]
+                col_def = f"{col_name} {col_type}"
+                if col_notnull:
+                    col_def += " NOT NULL"
+                if col_default is not None and str(col_default).strip() != "":
+                    default_str = str(col_default).strip()
+                    if default_str.upper() == "NULL":
+                        col_def += " DEFAULT NULL"
+                    elif default_str.replace(".", "", 1).lstrip("-").isdigit():
+                        col_def += f" DEFAULT {default_str}"
+                    else:
+                        if not (default_str.startswith("'") or default_str.startswith('"')):
+                            default_str = f"'{default_str}'"
+                        col_def += f" DEFAULT {default_str}"
+                if col_pk:
+                    col_def += " PRIMARY KEY AUTOINCREMENT"
+                column_defs.append(col_def)
+
+            unique_constraint = ""
+            cursor.execute(f"SELECT sql FROM sqlite_master WHERE type='table' AND name='{table_name}'")
+            original_sql = cursor.fetchone()
+            if original_sql and 'UNIQUE(smiles, name)' in original_sql[0]:
+                unique_constraint = ", UNIQUE(smiles, name)"
+
+            create_table_sql = f"CREATE TABLE {output_table_name} ({', '.join(column_defs)}{unique_constraint})"
+            cursor.execute(create_table_sql)
+
+            insert_columns = [col[1] for col in columns_info if col[1] != 'id']
+            placeholders = ', '.join(['?'] * len(insert_columns))
+            insert_sql = f"INSERT OR IGNORE INTO {output_table_name} ({', '.join(insert_columns)}) VALUES ({placeholders})"
+
+            rows = [tuple(row[col] for col in insert_columns) for _, row in sampled_df.iterrows()]
+            changes_before = conn.total_changes
+            cursor.executemany(insert_sql, rows)
+            inserted_count = conn.total_changes - changes_before
+
+            if 'smiles' in insert_columns:
+                cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{output_table_name}_smiles ON {output_table_name}(smiles)")
+            if 'name' in insert_columns:
+                cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{output_table_name}_name ON {output_table_name}(name)")
+
+            conn.commit()
+            conn.close()
+
+            print(f"✅ Successfully created sampled table '{output_table_name}'")
+            print(f"   📊 Rows inserted: {inserted_count:,}")
+            print(f"   🎯 Sampling mode: {sampling_mode} ({label} from '{selected_reference_table}')")
+
+            return output_table_name
+
+        except Exception as e:
+            print(f"❌ Error sampling projected chemical space for table '{table_name}': {e}")
+            return None
+
+    def sample_projected_chemical_space_including_table(
+            self,
+            include_table: Optional[str] = None,
+            table_name: Optional[str] = None,
+            method: Optional[str] = None,
+            reference_table: Optional[str] = None,
+            n_compounds: Optional[int] = None,
+            sampling_mode: Optional[str] = None,
+            max_points: int = 20000,
+            random_state: int = 42,
+            output_table_name: Optional[str] = None) -> Optional[str]:
+        """
+        Same behavior as sample_projected_chemical_space(), except the final subset is forced
+        to contain every compound of a user-selected 'include_table', with the remaining
+        compounds sampled from another table to reach the requested total.
+
+        The include_table's compounds are treated as an already-selected seed set: the
+        farthest-point ('max_distance') or nearest-point ('min_distance') traversal is seeded
+        by the distance from every candidate to its nearest point in include_table (instead of
+        a single random point, as in sample_projected_chemical_space()), and grows by
+        n_compounds - len(include_table) additional picks -- i.e. just enough new compounds to
+        reach the requested total. Candidates already present in include_table (matched by
+        smiles + name) are excluded from the candidate pool so they aren't picked twice.
+
+        Args:
+            include_table (Optional[str]): Table whose compounds must all appear in the final
+                subset, restricted to tables with dimensionality-reduction coordinate columns
+                -- either a table's own fitted embedding ('<method>_1'/'_2', from
+                reduce_dimensionality()) or coordinates projected onto another table
+                ('<method>_from_<reference_table>_1'/'_2', from
+                project_dimensionality_on_table()). If None, prompts an interactive table
+                selection. Queried first, before table_name.
+            table_name (Optional[str]): Table to sample the remaining compounds from, restricted
+                to tables sharing a coordinate space with include_table (same rule as above --
+                either side may hold the fitted embedding while the other holds coordinates
+                projected onto it, or both may hold coordinates projected onto the same third
+                table). If None, prompts an interactive table selection. May be the same table
+                as include_table.
+            method (Optional[str]): Restrict to a shared embedding fit with this method
+                ('pca', 'tsne', 'umap'), to disambiguate when more than one is shared.
+            reference_table (Optional[str]): Restrict to a shared coordinate space anchored on
+                this particular reference table (its own fitted embedding, or the table other
+                tables were projected onto).
+            n_compounds (Optional[int]): TOTAL number of compounds in the final subset,
+                including include_table's own compounds. If None, prompts for a value. Clamped
+                to the number of available rows (include_table + remaining candidates) if
+                larger; if include_table alone already meets or exceeds it, no compounds are
+                sampled and only include_table's compounds are used.
+            sampling_mode (Optional[str]): 'max_distance' (new compounds spread out relative to
+                include_table) or 'min_distance' (new compounds clustered close to
+                include_table). If None, prompts an interactive selection.
+            max_points (int): Cap on the number of candidate points considered from table_name
+                (after excluding include_table's own compounds). Each selection step costs
+                O(n_points), so more candidates than this are randomly subsampled first (with
+                a printed warning) to stay responsive. include_table itself is never
+                subsampled -- all of it is always included.
+            random_state (int): Seed for any candidate subsampling (there is no random seed
+                point here, since the traversal is seeded by include_table instead).
+            output_table_name (Optional[str]): Name for the new table holding the final subset.
+                If None, prompts for a name with a timestamp-based default. Only columns
+                common to both include_table and table_name are carried over.
+
+        Returns:
+            Optional[str]: Name of the created output table, or None if an error occurred or
+                the operation was cancelled
+        """
+        try:
+            tables_with_coords = [
+                t for t in self.get_all_tables()
+                if self._get_coordinate_columns_in_table(t, self._get_table_columns(t))
+            ]
+
+            if not tables_with_coords:
+                print("❌ No tables with dimensionality-reduction coordinate columns found.")
+                print("   Run reduce_dimensionality() and/or project_dimensionality_on_table() first.")
+                return None
+
+            # Resolve include_table first, as requested
+            if include_table is None:
+                include_table = self._select_table_interactive(
+                    "SELECT TABLE TO INCLUDE IN THE FINAL SUBSET", tables_override=tables_with_coords
+                )
+                if not include_table:
+                    print("❌ No include table selected")
+                    return None
+            elif include_table not in tables_with_coords:
+                print(f"❌ Table '{include_table}' not found or has no dimensionality-reduction coordinates.")
+                return None
+
+            print(f"📊 Retrieving table '{include_table}' (compounds to include)...")
+            include_df = self._get_table_as_dataframe(include_table)
+            if include_df.empty:
+                print(f"⚠️  No data retrieved from table '{include_table}'")
+                return None
+
+            include_coords = self._get_coordinate_columns_in_table(include_table, include_df.columns)
+            if not include_coords:
+                print(f"❌ No dimensionality-reduction coordinate columns found in table '{include_table}'")
+                return None
+
+            # Resolve source table to sample the remaining compounds from, restricted to those
+            # sharing a coordinate space with include_table (own fitted embedding on one side
+            # and coordinates projected onto it on the other both count, per
+            # _get_coordinate_columns_in_table())
+            if table_name is None:
+                candidate_tables = [
+                    t for t in tables_with_coords
+                    if set(self._get_coordinate_columns_in_table(t, self._get_table_columns(t)))
+                    & set(include_coords)
+                ]
+                if not candidate_tables:
+                    print(f"❌ No table shares a coordinate space with '{include_table}'.")
+                    return None
+                table_name = self._select_table_interactive(
+                    "SELECT TABLE TO SAMPLE ADDITIONAL COMPOUNDS FROM", tables_override=candidate_tables
+                )
+                if not table_name:
+                    print("❌ No table selected for sampling")
+                    return None
+
+            if table_name == include_table:
+                df = include_df
+            else:
+                if table_name not in tables_with_coords:
+                    print(f"❌ Table '{table_name}' not found or has no dimensionality-reduction coordinates.")
+                    return None
+                print(f"📊 Retrieving table '{table_name}' for sampling...")
+                df = self._get_table_as_dataframe(table_name)
+                if df.empty:
+                    print(f"⚠️  No data retrieved from table '{table_name}'")
+                    return None
+
+            projections = self._get_coordinate_columns_in_table(table_name, df.columns)
+            if not projections:
+                print(f"❌ No dimensionality-reduction coordinate columns found in table '{table_name}'")
+                return None
+
+            # Resolve the shared coordinate space to use
+            shared_keys = sorted(set(projections) & set(include_coords))
+            if not shared_keys:
+                print(f"❌ Tables '{include_table}' and '{table_name}' do not share a "
+                      f"coordinate space.")
+                return None
+
+            if method is not None:
+                shared_keys = [k for k in shared_keys if k[0] == method]
+                if not shared_keys:
+                    print(f"❌ No shared '{method}' coordinates found between "
+                          f"'{include_table}' and '{table_name}'.")
+                    return None
+
+            if reference_table is not None:
+                shared_keys = [k for k in shared_keys if k[1] == reference_table]
+                if not shared_keys:
+                    print(f"❌ No shared coordinates from reference table "
+                          f"'{reference_table}' found between '{include_table}' and '{table_name}'.")
+                    return None
+
+            if len(shared_keys) == 1:
+                selected_key = shared_keys[0]
+            else:
+                selected_key = self._select_projection_interactive(shared_keys)
+                if selected_key is None:
+                    print("❌ No coordinate space selected")
+                    return None
+            selected_method, selected_reference_table = selected_key
+
+            include_x_col, include_y_col = include_coords[selected_key][:2]
+            x_col, y_col = projections[selected_key][:2]
+
+            include_xy_df = include_df.dropna(subset=[include_x_col, include_y_col]).copy()
+            if include_xy_df.empty:
+                print(f"❌ No rows with valid projected coordinates in table '{include_table}'")
+                return None
+
+            plot_df = df.dropna(subset=[x_col, y_col]).copy()
+            if plot_df.empty:
+                print(f"❌ No rows with valid projected coordinates in table '{table_name}'")
+                return None
+
+            # Exclude candidates already present in include_table (matched by smiles + name)
+            # so they aren't picked twice
+            if {'smiles', 'name'} <= set(plot_df.columns) and {'smiles', 'name'} <= set(include_xy_df.columns):
+                include_keys = pd.MultiIndex.from_arrays([include_xy_df['smiles'], include_xy_df['name']])
+                candidate_keys = pd.MultiIndex.from_arrays([plot_df['smiles'], plot_df['name']])
+                plot_df = plot_df[~candidate_keys.isin(include_keys)]
+
+            if len(plot_df) > max_points:
+                print(f"⚠️  {len(plot_df):,} candidate points exceeds max_points={max_points:,}; "
+                      f"using a random subsample of {max_points:,} candidates (each selection "
+                      f"step costs O(n_points)). Pass a higher max_points to consider more, at "
+                      f"the cost of runtime.")
+                plot_df = plot_df.sample(n=max_points, random_state=random_state)
+
+            # Resolve total number of compounds to select, including include_table's own
+            max_total = len(include_xy_df) + len(plot_df)
+            if n_compounds is None:
+                while True:
+                    try:
+                        raw = input(
+                            f"Enter TOTAL number of compounds to subset, including the "
+                            f"{len(include_xy_df):,} from '{include_table}' "
+                            f"(up to {max_total:,}): "
+                        ).strip()
+                        n_compounds = int(raw)
+                        if n_compounds <= 0:
+                            print("❌ Number of compounds must be positive")
+                            continue
+                        break
+                    except ValueError:
+                        print(f"❌ Invalid integer '{raw}'")
+                    except KeyboardInterrupt:
+                        print("\n❌ Cancelled")
+                        return None
+            elif n_compounds <= 0:
+                print(f"❌ n_compounds must be positive, got {n_compounds}")
+                return None
+
+            if n_compounds > max_total:
+                print(f"⚠️  Requested {n_compounds:,} compounds but only {max_total:,} are "
+                      f"available ({len(include_xy_df):,} from '{include_table}' + "
+                      f"{len(plot_df):,} candidates); using all {max_total:,}.")
+                n_compounds = max_total
+
+            n_needed = n_compounds - len(include_xy_df)
+            if n_needed <= 0:
+                print(f"⚠️  '{include_table}' alone already has {len(include_xy_df):,} compounds, "
+                      f">= the requested {n_compounds:,}; no additional compounds will be sampled.")
+                n_needed = 0
+
+            # Resolve sampling mode
+            if n_needed > 0 and sampling_mode is None:
+                print(f"\n🔍 SELECT SAMPLING MODE")
+                print("=" * 60)
+                print("1. max_distance (new compounds spread out relative to the include table)")
+                print("2. min_distance (new compounds clustered close to the include table)")
+                print("-" * 60)
+                while True:
+                    try:
+                        selection = input("🔍 Select sampling mode [1/2]: ").strip().lower()
+                        if selection in ('1', 'max_distance', 'max'):
+                            sampling_mode = 'max_distance'
+                            break
+                        elif selection in ('2', 'min_distance', 'min'):
+                            sampling_mode = 'min_distance'
+                            break
+                        else:
+                            print(f"❌ Invalid selection '{selection}'. Enter 1, 2, "
+                                  f"'max_distance' or 'min_distance'")
+                    except KeyboardInterrupt:
+                        print("\n❌ Cancelled")
+                        return None
+            elif sampling_mode is not None and sampling_mode not in ('max_distance', 'min_distance'):
+                print(f"❌ Invalid sampling_mode '{sampling_mode}'. Must be 'max_distance' or 'min_distance'")
+                return None
+
+            label = self._DIM_REDUCTION_LABELS[selected_method]
+            mode_suffix = f" using '{sampling_mode}'" if n_needed > 0 else ""
+            print(f"🎯 Including {len(include_xy_df):,} compounds from '{include_table}', "
+                  f"sampling {n_needed:,} more from {len(plot_df):,} candidates in "
+                  f"'{table_name}' ({label} from '{selected_reference_table}'){mode_suffix}...")
+
+            if n_needed > 0:
+                coords = plot_df[[x_col, y_col]].to_numpy()
+                include_coords = include_xy_df[[include_x_col, include_y_col]].to_numpy()
+
+                # Seed the traversal with the distance from every candidate to its nearest
+                # point in include_table's coordinate set, computed in chunks to bound memory
+                initial_dist = np.full(len(coords), np.inf)
+                chunk_size = 500
+                for start in range(0, len(include_coords), chunk_size):
+                    chunk = include_coords[start:start + chunk_size]
+                    d = np.linalg.norm(coords[:, None, :] - chunk[None, :, :], axis=2).min(axis=1)
+                    initial_dist = np.minimum(initial_dist, d)
+
+                selected_order = self._greedy_distance_select(
+                    coords, n_needed, sampling_mode, initial_dist=initial_dist, random_state=random_state
+                )
+                sampled_df = plot_df.iloc[selected_order]
+            else:
+                sampled_df = plot_df.iloc[0:0]
+
+            final_df = pd.concat([include_xy_df, sampled_df], ignore_index=True)
+
+            print(f"✅ Final subset: {len(final_df):,} compounds "
+                  f"({len(include_xy_df):,} included + {len(sampled_df):,} sampled)")
+
+            # Resolve output table name
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            default_table_name = f"{table_name}_including_{include_table}_{timestamp}"
+            if output_table_name is None:
+                user_table_name = input(f"Enter table name for subset (default: {default_table_name}): ").strip()
+                output_table_name = user_table_name if user_table_name else default_table_name
+            output_table_name = self._sanitize_table_name(output_table_name)
+
+            available_tables = self.get_all_tables()
+            while output_table_name in available_tables:
+                print(f"\n⚠️  Table '{output_table_name}' already exists!")
+                user_table_name = input("Enter a different table name (or 'cancel' to abort): ").strip()
+                if user_table_name.lower() in ['cancel', 'quit', 'exit']:
+                    print("❌ Sampling cancelled by user")
+                    return None
+                output_table_name = self._sanitize_table_name(user_table_name)
+                available_tables = self.get_all_tables()
+
+            # Build the output schema from table_name's columns, restricted to those also
+            # present in include_table -- the two source tables aren't guaranteed to share an
+            # identical schema, so only common columns are carried over
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+
+            cursor.execute(f"PRAGMA table_info({table_name})")
+            source_columns_info = cursor.fetchall()
+            include_table_columns = set(self._get_table_columns(include_table))
+
+            column_defs = []
+            insert_columns = []
+            for col_info in source_columns_info:
+                col_name, col_type, col_notnull, col_default, col_pk = col_info[1:6]
+                if col_name == 'id' or col_name not in include_table_columns:
+                    continue
+
+                col_def = f"{col_name} {col_type}"
+                if col_notnull:
+                    col_def += " NOT NULL"
+                if col_default is not None and str(col_default).strip() != "":
+                    default_str = str(col_default).strip()
+                    if default_str.upper() == "NULL":
+                        col_def += " DEFAULT NULL"
+                    elif default_str.replace(".", "", 1).lstrip("-").isdigit():
+                        col_def += f" DEFAULT {default_str}"
+                    else:
+                        if not (default_str.startswith("'") or default_str.startswith('"')):
+                            default_str = f"'{default_str}'"
+                        col_def += f" DEFAULT {default_str}"
+                column_defs.append(col_def)
+                insert_columns.append(col_name)
+
+            if not insert_columns:
+                print(f"❌ Tables '{include_table}' and '{table_name}' share no common columns "
+                      f"to build the output table.")
+                conn.close()
+                return None
+
+            unique_constraint = ""
+            if {'smiles', 'name'} <= set(insert_columns):
+                cursor.execute(f"SELECT sql FROM sqlite_master WHERE type='table' AND name='{table_name}'")
+                original_sql = cursor.fetchone()
+                if original_sql and 'UNIQUE(smiles, name)' in original_sql[0]:
+                    unique_constraint = ", UNIQUE(smiles, name)"
+
+            create_table_sql = (
+                f"CREATE TABLE {output_table_name} "
+                f"(id INTEGER PRIMARY KEY AUTOINCREMENT, {', '.join(column_defs)}{unique_constraint})"
+            )
+            cursor.execute(create_table_sql)
+
+            placeholders = ', '.join(['?'] * len(insert_columns))
+            insert_sql = f"INSERT OR IGNORE INTO {output_table_name} ({', '.join(insert_columns)}) VALUES ({placeholders})"
+
+            rows = [tuple(row[col] for col in insert_columns) for _, row in final_df.iterrows()]
+            changes_before = conn.total_changes
+            cursor.executemany(insert_sql, rows)
+            inserted_count = conn.total_changes - changes_before
+
+            if 'smiles' in insert_columns:
+                cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{output_table_name}_smiles ON {output_table_name}(smiles)")
+            if 'name' in insert_columns:
+                cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{output_table_name}_name ON {output_table_name}(name)")
+
+            conn.commit()
+            conn.close()
+
+            print(f"✅ Successfully created sampled table '{output_table_name}'")
+            print(f"   📊 Rows inserted: {inserted_count:,}")
+            print(f"   🎯 {len(include_xy_df):,} included from '{include_table}' + "
+                  f"{len(sampled_df):,} sampled from '{table_name}' "
+                  f"({label} from '{selected_reference_table}')")
+
+            return output_table_name
+
+        except Exception as e:
+            print(f"❌ Error sampling projected chemical space including table '{include_table}': {e}")
             return None
 
     def _select_target_tables_interactive(self, tables_with_projections: List[str]) -> Optional[List[str]]:
@@ -18469,6 +20321,182 @@ plt.show()
             sanitized = sanitized[:50]
         
         return sanitized.lower()
+
+    def remove_stereochemistry(self, table_name: Optional[str] = None,
+                               output_table_name: Optional[str] = None) -> Optional[str]:
+        """
+        Create a new table with stereochemistry stripped from a table's 'smiles' column.
+
+        Each SMILES is parsed with RDKit and re-serialized as a canonical non-isomeric SMILES
+        (Chem.MolToSmiles(mol, isomericSmiles=False)) rather than naively deleting '@'/'/'/'\\'
+        characters, which could produce an invalid or non-canonical SMILES string.
+
+        Only the compound-identity columns are carried over from the source table (e.g.
+        'smiles', 'name', 'flag', 'flag_description', and any other plain columns present) --
+        computed descriptor columns are dropped, since they were computed on the original
+        (possibly stereo) structures and no longer apply once stereo is stripped: Morgan
+        fingerprint columns, dimensionality-reduction coordinate columns (both a table's own
+        fitted embedding and coordinates projected onto another table), and 'inchi_key'. A
+        fresh 'inchi_key' is then computed for the destereo'd SMILES via compute_inchi_keys().
+
+        Args:
+            table_name (Optional[str]): Name of the table to process. If None, prompts an
+                interactive table selection.
+            output_table_name (Optional[str]): Name for the new table. If None, prompts for a
+                name defaulting to '<table_name>_no_stereo'.
+
+        Returns:
+            Optional[str]: Name of the created output table, or None if an error occurred or
+                the operation was cancelled
+        """
+        try:
+            try:
+                from rdkit import Chem
+            except ImportError:
+                print("❌ RDKit not installed. Please install RDKit to remove stereochemistry:")
+                print("   conda install -c conda-forge rdkit")
+                print("   or")
+                print("   pip install rdkit")
+                return None
+
+            available_tables = self.get_all_tables()
+            if not available_tables:
+                print("❌ No tables available in chemspace database")
+                return None
+
+            if table_name is None:
+                table_name = self._select_table_interactive("SELECT TABLE TO REMOVE STEREOCHEMISTRY FROM")
+                if not table_name:
+                    print("❌ No table selected")
+                    return None
+            elif table_name not in available_tables:
+                print(f"❌ Table '{table_name}' not found")
+                return None
+
+            print(f"📊 Retrieving table '{table_name}'...")
+            df = self._get_table_as_dataframe(table_name)
+            if df.empty:
+                print(f"⚠️  No data retrieved from table '{table_name}'")
+                return None
+
+            if 'smiles' not in df.columns:
+                print(f"❌ No 'smiles' column found in table '{table_name}'")
+                return None
+
+            # Identify computed/derived columns to drop -- they were computed on the original
+            # (possibly stereo) structures and no longer apply once stereo is stripped
+            drop_columns = {'id', 'inchi_key'}
+            drop_columns.update(c for c in df.columns if self._MORGAN_FP_COLUMN_PATTERN.match(c))
+            for cols in self._detect_reduction_methods_in_columns(df.columns).values():
+                drop_columns.update(cols)
+            for cols in self._detect_projected_reduction_columns_in_columns(df.columns).values():
+                drop_columns.update(cols)
+
+            keep_columns = [c for c in df.columns if c not in drop_columns]
+
+            print(f"🔬 Removing stereochemistry from {len(df):,} SMILES...")
+            new_smiles = []
+            failed = 0
+            try:
+                from tqdm import tqdm
+                iterator = tqdm(df['smiles'], desc="Removing stereochemistry")
+            except ImportError:
+                iterator = df['smiles']
+
+            for smiles in iterator:
+                try:
+                    mol = Chem.MolFromSmiles(str(smiles)) if pd.notna(smiles) else None
+                    if mol is None:
+                        new_smiles.append(None)
+                        failed += 1
+                        continue
+                    new_smiles.append(Chem.MolToSmiles(mol, isomericSmiles=False))
+                except Exception:
+                    new_smiles.append(None)
+                    failed += 1
+
+            result_df = df[keep_columns].copy()
+            result_df['smiles'] = new_smiles
+            result_df = result_df.dropna(subset=['smiles'])
+
+            print(f"✅ Removed stereochemistry: {len(result_df):,} succeeded, {failed:,} failed")
+
+            if result_df.empty:
+                print("❌ No compounds left after removing stereochemistry")
+                return None
+
+            # Resolve output table name
+            default_table_name = f"{table_name}_no_stereo"
+            if output_table_name is None:
+                user_table_name = input(f"Enter table name for output (default: {default_table_name}): ").strip()
+                output_table_name = user_table_name if user_table_name else default_table_name
+            output_table_name = self._sanitize_table_name(output_table_name)
+
+            available_tables = self.get_all_tables()
+            while output_table_name in available_tables:
+                print(f"\n⚠️  Table '{output_table_name}' already exists!")
+                user_table_name = input("Enter a different table name (or 'cancel' to abort): ").strip()
+                if user_table_name.lower() in ['cancel', 'quit', 'exit']:
+                    print("❌ Operation cancelled by user")
+                    return None
+                output_table_name = self._sanitize_table_name(user_table_name)
+                available_tables = self.get_all_tables()
+
+            # Create the output table, replicating the kept columns' source types
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+
+            cursor.execute(f"PRAGMA table_info({table_name})")
+            source_columns_info = {col[1]: col for col in cursor.fetchall()}
+
+            column_defs = ["id INTEGER PRIMARY KEY AUTOINCREMENT"]
+            insert_columns = []
+            for col_name in keep_columns:
+                col_info = source_columns_info.get(col_name)
+                col_type = col_info[2] if col_info else "TEXT"
+                column_defs.append(f"{col_name} {col_type}")
+                insert_columns.append(col_name)
+
+            unique_constraint = ""
+            if {'smiles', 'name'} <= set(insert_columns):
+                cursor.execute(f"SELECT sql FROM sqlite_master WHERE type='table' AND name='{table_name}'")
+                original_sql = cursor.fetchone()
+                if original_sql and 'UNIQUE(smiles, name)' in original_sql[0]:
+                    unique_constraint = ", UNIQUE(smiles, name)"
+
+            create_table_sql = f"CREATE TABLE {output_table_name} ({', '.join(column_defs)}{unique_constraint})"
+            cursor.execute(create_table_sql)
+
+            placeholders = ', '.join(['?'] * len(insert_columns))
+            insert_sql = f"INSERT OR IGNORE INTO {output_table_name} ({', '.join(insert_columns)}) VALUES ({placeholders})"
+
+            rows = [tuple(row[col] for col in insert_columns) for _, row in result_df.iterrows()]
+            changes_before = conn.total_changes
+            cursor.executemany(insert_sql, rows)
+            inserted_count = conn.total_changes - changes_before
+
+            if 'smiles' in insert_columns:
+                cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{output_table_name}_smiles ON {output_table_name}(smiles)")
+            if 'name' in insert_columns:
+                cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{output_table_name}_name ON {output_table_name}(name)")
+
+            conn.commit()
+            conn.close()
+
+            print(f"✅ Successfully created table '{output_table_name}' with {inserted_count:,} rows")
+
+            # Recompute InChI keys for the destereo'd SMILES, since any original values no
+            # longer correspond to the modified structures
+            print(f"🔬 Recomputing InChI keys for '{output_table_name}'...")
+            self.compute_inchi_keys(output_table_name)
+
+            return output_table_name
+
+        except Exception as e:
+            print(f"❌ Error removing stereochemistry from table '{table_name}': {e}")
+            return None
 
     def enumerate_stereoisomers(self, table_name: Optional[str] = None,
                             max_stereoisomers: int = 20,

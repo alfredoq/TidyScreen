@@ -1190,7 +1190,7 @@ elif page == "ChemSpace Actions":
 
     with st.expander("🔬 Filter Using Workflow"):
         chemspace_db_path = os.path.join(st.session_state["active_project_path"], "chemspace", "processed_data", "chemspace.db")
-        fuw_tables = [t for t in ChemSpace.list_tables(chemspace_db_path) if t != "filtering_workflows"]
+        fuw_tables = [t for t in ChemSpace.list_tables_at_path(chemspace_db_path) if t != "filtering_workflows"]
         fuw_workflows = [w["workflow_name"] for w in ChemSpace.get_filtering_workflows(chemspace_db_path)]
 
         if not fuw_tables:
@@ -1507,7 +1507,7 @@ elif page == "ChemSpace Actions":
 
     with st.expander("🔬 Filter Using Physicochemical Workflow"):
         chemspace_db_path = os.path.join(st.session_state["active_project_path"], "chemspace", "processed_data", "chemspace.db")
-        fupw_tables = [t for t in ChemSpace.list_tables(chemspace_db_path)
+        fupw_tables = [t for t in ChemSpace.list_tables_at_path(chemspace_db_path)
                        if t not in ("filtering_workflows", "physicochemical_filtering_workflows")]
         fupw_workflows = [w["workflow_name"] for w in ChemSpace.get_physicochemical_filtering_workflows(chemspace_db_path)]
 
