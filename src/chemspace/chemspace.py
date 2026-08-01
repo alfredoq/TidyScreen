@@ -21802,18 +21802,28 @@ plt.show()
                             generate_conformers: bool = True,
                             nbr_confs: int = 10,
                             conf_percentile: float = 0.25,
-                            mmff: str ='MMFF94') -> Optional[List[Dict[str, Any]]]:
+                            mmff: str ='MMFF94',
+                            run_in_background: Optional[bool] = None) -> Optional[List[Dict[str, Any]]]:
         """
         Generate RDKit molecule objects from SMILES in a selected table.
         Uses existing helper methods for table selection and follows established patterns.
-        
+
         Args:
             max_molecules (Optional[int]): Maximum number of molecules to process. If None, prompts user.
             generate_conformers (bool): Whether to generate 3D conformers for molecules
             conformer_count (int): Number of conformers to generate per molecule
-            
+            run_in_background (Optional[bool]): If True, once the table and molecule count have
+                been resolved, hand the actual conformer generation/storage off to a separate
+                background process and return immediately (progress and results are written to a
+                log file instead of stdout). If False, run in the foreground as usual. If None,
+                prompts an interactive fg/bg selection. Useful for large tables where generation
+                (especially with conformers) can take a long time.
+
         Returns:
-            Optional[List[Dict]]: List of molecule dictionaries with RDKit objects and metadata
+            Optional[List[Dict]]: List of molecule dictionaries with RDKit objects and metadata.
+                If run_in_background is True, this is always None -- the generated molecules are
+                only persisted (as sdf_blob data) in the source table once the background process
+                completes; see the returned/logged message for the log file path.
         """
         try:
             print(f"🧬 GENERATE MOLECULE OBJECTS FROM TABLE")
@@ -21863,13 +21873,59 @@ plt.show()
             
             processing_count = len(compounds_df)
             print(f"🧬 Generating molecule objects for {processing_count:,} compounds...")
-            
+
+            # Resolve the sdf_blob column y/n prompt here (in the foreground), before the
+            # fg/bg decision below -- _execute_mol_generation() no longer does this itself
+            # since it can also run detached in a background process, where input() would
+            # block forever waiting on a prompt nobody can answer.
+            self._check_sdf_blob_column(selected_table)
+
+            # Every interactive decision (table selection, molecule count, sdf_blob column)
+            # has now been resolved, so this is the last point where it's still cheap to ask
+            # whether the actual (potentially long-running) conformer generation/storage work
+            # should be handed off to a background process instead of blocking the caller.
+            # Mirrors the fg/bg pattern used by load_csv_file() / _load_csv_file_in_background().
+            if run_in_background is None:
+                run_mode = input(
+                    "\n⚙️  Do you want to run molecule generation in the foreground "
+                    "or background? (fg/bg) [default: fg]: "
+                ).strip().lower() or 'fg'
+                run_in_background = run_mode in ['bg', 'background']
+
+            if run_in_background:
+                return self._generate_mols_in_table_in_background(
+                    compounds_df, selected_table, generate_conformers, nbr_confs,
+                    conf_percentile, mmff
+                )
+
+            return self._execute_mol_generation(
+                compounds_df, selected_table, generate_conformers, nbr_confs,
+                conf_percentile, mmff
+            )
+
+        except Exception as e:
+            print(f"❌ Error in generate_mols_in_table: {e}")
+            return None
+
+    def _execute_mol_generation(self, compounds_df: pd.DataFrame, selected_table: str,
+                                generate_conformers: bool, nbr_confs: int,
+                                conf_percentile: float, mmff: str) -> Optional[List[Dict[str, Any]]]:
+        """
+        Performs the actual conformer generation/storage for generate_mols_in_table(), once the
+        table and molecule count have already been resolved. Split out so it can be run either
+        directly (foreground) or inside a separate process (background) via
+        _generate_mols_in_table_in_background().
+
+        Returns:
+            Optional[List[Dict]]: List of molecule dictionaries with RDKit objects and metadata.
+        """
+        try:
             # Show processing configuration
             print(f"\n⚙️  Processing Configuration:")
             print(f"   🧪 Generate conformers: {'Yes' if generate_conformers else 'No'}")
             if generate_conformers:
                 print(f"   🔄 Conformers per molecule: {nbr_confs}")
-            
+
             # Check RDKit availability (reuse existing pattern)
             try:
                 from rdkit import Chem
@@ -21880,7 +21936,7 @@ plt.show()
                 print("❌ RDKit not installed. Please install RDKit:")
                 print("   conda install -c conda-forge rdkit")
                 return None
-            
+
             # Process molecules with progress tracking
             print(f"\n🔬 Processing molecules...")
             generated_molecules = []
@@ -21903,9 +21959,7 @@ plt.show()
             else:
                 progress_bar = compounds_df.iterrows()
                 processed_count = 0
-            
-            self._check_sdf_blob_column(selected_table)
-            
+
             for _, compound in progress_bar:
                 processing_stats['processed'] += 1
                 
@@ -21989,10 +22043,86 @@ plt.show()
                 print(f"   📈 Success rate: {success_rate:.1f}%")
             
             return generated_molecules if generated_molecules else None
-            
+
         except Exception as e:
-            print(f"❌ Error in generate_mols_in_table: {e}")
+            print(f"❌ Error in _execute_mol_generation: {e}")
             return None
+
+    def _generate_mols_in_table_in_background(self, compounds_df: pd.DataFrame, selected_table: str,
+                                               generate_conformers: bool, nbr_confs: int,
+                                               conf_percentile: float, mmff: str) -> None:
+        """
+        Launches molecule generation as a fully independent OS process via subprocess.Popen (the
+        same fg/bg pattern used by load_csv_file()/_load_csv_file_in_background() and
+        project_dimensionality_on_table()/_project_dimensionality_in_background()), so generating
+        conformers for a large table doesn't block the caller.
+
+        The table and molecule count have already been resolved by the time this is called, so
+        the already-sliced compounds_df is pickled to disk and the child just loads it back --
+        no re-querying or re-prompting involved. Generated molecules are persisted as sdf_blob
+        data in the source table by _store_mol(); the in-memory RDKit objects themselves cannot
+        cross the Popen boundary.
+
+        Returns:
+            None: the generated molecule dictionaries are only available to a foreground call;
+                backgrounded runs persist results to the database and the log file only.
+        """
+        import subprocess
+
+        logs_dir = os.path.join(os.path.dirname(self.__chemspace_db), 'logs')
+        os.makedirs(logs_dir, exist_ok=True)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        base_name = f'mol_generation_{selected_table}_{timestamp}'
+        log_file_path = os.path.join(logs_dir, f'{base_name}.log')
+        script_path = os.path.join(logs_dir, f'{base_name}.py')
+        data_path = os.path.join(logs_dir, f'{base_name}_data.pkl')
+
+        compounds_df.to_pickle(data_path)
+
+        script = f"""
+import os
+import pandas as pd
+from tidyscreen import tidyscreen
+from tidyscreen.chemspace.chemspace import ChemSpace
+
+project = tidyscreen.ActivateProject({self.name!r})
+cs = ChemSpace(project)
+
+compounds_df = pd.read_pickle({data_path!r})
+
+try:
+    cs._execute_mol_generation(
+        compounds_df,
+        {selected_table!r},
+        {generate_conformers!r},
+        {nbr_confs!r},
+        {conf_percentile!r},
+        {mmff!r},
+    )
+finally:
+    os.remove({data_path!r})
+"""
+        with open(script_path, 'w') as f:
+            f.write(script)
+
+        try:
+            with open(log_file_path, 'w') as log_file:
+                process = subprocess.Popen(
+                    [sys.executable, script_path],
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    cwd=self.path,
+                    start_new_session=True
+                )
+        except Exception as e:
+            print(f"❌ Error launching background molecule generation: {e}")
+            return None
+
+        print(f"🚀 Molecule generation launched in the background (PID {process.pid})")
+        print(f"   Generating molecules for {len(compounds_df):,} compounds from table '{selected_table}'...")
+        print(f"   Progress/results log: {log_file_path}")
+
+        return None
 
     def _prompt_for_processing_count(self, total_available: int, item_type: str = "items") -> Optional[int]:
         """
