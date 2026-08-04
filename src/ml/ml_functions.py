@@ -17,6 +17,146 @@ from tidyscreen import tidyscreen
 ActivateProject = tidyscreen.ActivateProject
 
 
+def _predict_pose_worker(task: dict) -> dict:
+    """
+    Module-level worker (required for ProcessPoolExecutor pickling) that restores
+    a single docked pose, builds its AMBER complex, optionally minimizes it, and
+    computes its ProLIF fingerprint.
+
+    Runs in its own process, so it re-derives a MolDock instance via
+    MolDock.from_path() rather than receiving a live instance. Ligand-specific
+    tleap files (prepin/frcmod) must already be prepared (see
+    MachineLearning._classify_poses_parallel) and are passed in read-only, since
+    concurrent workers preparing the same ligand would race on its files.
+
+    Each pose gets its own scratch subdirectory (temp_restored_poses/pose_<id>/)
+    because MolDock's private helpers write fixed-name tleap/sander input files
+    (complex.in, min.in, minimize.in, ...) into the directory they're given —
+    fine when one pose is processed at a time, but colliding if two poses shared
+    a directory concurrently.
+    """
+    import os
+    import sys
+    import shutil
+    from moldock.moldock import MolDock
+
+    pose_id = task['pose_id']
+    ligname = task['ligname']
+    verbose = task['verbose']
+
+    devnull_fd = saved_out_fd = saved_err_fd = None
+    if not verbose:
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        saved_out_fd = os.dup(1)
+        saved_err_fd = os.dup(2)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.dup2(devnull_fd, 1)
+        os.dup2(devnull_fd, 2)
+
+    pose_dir = None
+    try:
+        moldock = MolDock.from_path(task['project_name'], task['project_path'])
+
+        shared_dir, restored_pdb = moldock._restore_single_docked_pose(
+            task['results_db'], ligname, task['run_number']
+        )
+        pose_dir = os.path.join(shared_dir, f"pose_{pose_id}")
+        work_dir = os.path.join(pose_dir, "work")
+        os.makedirs(work_dir, exist_ok=True)
+
+        prmtop_file, inpcrd_file, output_pdb_file = moldock._prepare_complex_prmtop_inpcrd(
+            task['prepin_file'], task['frcmod_file'], task['assay_info'],
+            work_dir, restored_pdb, pose_id, ligname=ligname
+        )
+
+        if task['minimize']:
+            _, output_pdb_file = moldock._minimize_complex(
+                prmtop_file, inpcrd_file, work_dir, ligname, pose_id, output_pdb_file
+            )
+
+        fps_df = moldock._compute_prolif_fingerprints3(
+            task['prolif_params_dict'], output_pdb_file, task['receptor_file'],
+            prmtop_file, inpcrd_file, ligname, pose_id
+        )
+        fps_df.columns = fps_df.columns.droplevel(0)
+        if task['renumbering_dict']:
+            fps_df = fps_df.rename(columns=task['renumbering_dict'], level=0)
+        fps_df.columns = [f"{a}_{b}" for a, b in fps_df.columns]
+
+        fp_row = fps_df.iloc[0].to_dict()
+        return {
+            'ok': True,
+            'pose_id': pose_id,
+            'lig_name': ligname,
+            'docking_score': task['docking_score'],
+            **{k: bool(v) for k, v in fp_row.items()},
+        }
+    except Exception as e:
+        return {'ok': False, 'pose_id': pose_id, 'lig_name': ligname, 'error': str(e)}
+    finally:
+        if not verbose:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os.dup2(saved_out_fd, 1)
+            os.dup2(saved_err_fd, 2)
+            os.close(saved_out_fd)
+            os.close(saved_err_fd)
+            os.close(devnull_fd)
+        if pose_dir and os.path.isdir(pose_dir):
+            shutil.rmtree(pose_dir, ignore_errors=True)
+
+
+def _run_background_rf_predictions(job_file: str) -> None:
+    """
+    Entry point for the detached background process launched by
+    MachineLearning._launch_background_rf_predictions(). Runs as a separate
+    `python -c` process with no connection to the interactive session that
+    launched it, so everything needed is reloaded from the job spec file
+    (plain, JSON-serializable data) rather than received as live objects.
+    """
+    import json
+    import pickle
+
+    with open(job_file) as f:
+        job = json.load(f)
+
+    project = ActivateProject(job['project_name'])
+    ml = MachineLearning(project)
+
+    from moldock.moldock import MolDock
+    moldock = MolDock.from_path(job['project_name'], job['project_path'])
+
+    conn = sqlite3.connect(job['rf_db_path'])
+    row = conn.execute(
+        "SELECT model_pkl FROM rf_trained_models WHERE model_id = ?", (job['model_id'],)
+    ).fetchone()
+    conn.close()
+    if not row or not row[0]:
+        print(f"[ERROR] Model blob missing for model_id {job['model_id']}")
+        return
+    model = pickle.loads(row[0])
+
+    conn = sqlite3.connect(job['results_db'])
+    poses_df = pd.read_sql_query(
+        "SELECT Pose_ID, LigName, docking_score, run_number FROM Results", conn
+    )
+    conn.close()
+
+    print(f"🧬 Background classification started for {len(poses_df)} poses "
+          f"(job: {os.path.basename(job_file)})")
+
+    fp_records, n_ok, n_failed = ml._classify_poses_parallel(
+        moldock, poses_df, job['results_db'], job['assay_info'],
+        job['prolif_params_dict'], job['receptor_file'], job['renumbering_dict'],
+        job['minimize'], job['max_workers'], job['verbose']
+    )
+
+    print(f"\n🎉 Background classification complete: {n_ok} succeeded, {n_failed} failed.")
+
+    ml._align_and_store_rf_predictions(model, fp_records, job['results_db'], job['predictions_table'])
+
+
 class MachineLearning:
     """
     MachineLearning class for managing machine learning workflows within a project.
@@ -942,6 +1082,289 @@ class MachineLearning:
     # RF predictions on docking assays
     # -------------------------------------------------------------------------
 
+    @staticmethod
+    def _chunk_poses_by_ligand(poses_df: pd.DataFrame, chunk_size: int) -> list:
+        """
+        Group poses_df rows into chunks of roughly chunk_size poses, never
+        splitting a single ligand's poses across two chunks (so each ligand's
+        tleap prep only ever needs to run once, in whichever chunk it falls in).
+        A ligand with more poses than chunk_size simply produces an oversized
+        chunk on its own.
+        """
+        chunks = []
+        current_groups = []
+        current_count = 0
+        for _, group in poses_df.groupby('LigName', sort=False):
+            current_groups.append(group)
+            current_count += len(group)
+            if current_count >= chunk_size:
+                chunks.append(pd.concat(current_groups))
+                current_groups = []
+                current_count = 0
+        if current_groups:
+            chunks.append(pd.concat(current_groups))
+        return chunks
+
+    def _classify_poses_parallel(self, moldock, poses_df, results_db, assay_info,
+                                  prolif_params_dict, receptor_file, renumbering_dict,
+                                  minimize, max_workers, verbose, chunk_size=None) -> tuple:
+        """
+        Classify docked poses in parallel using a single process pool kept alive
+        across chunks.
+
+        Large assays (hundreds of thousands to millions of poses) are processed
+        in chunks (default ~4x max_workers poses per chunk, never splitting a
+        ligand's poses across chunks) instead of preparing every ligand and
+        restoring every pose up front. Preparing everything up front would leave
+        every unique ligand's tleap files (~5 files each) plus every pose's
+        restored/withH PDBs sitting in the flat temp_restored_poses/ directory
+        for the whole run — millions of entries in one directory for a 1M-pose
+        assay, which degrades filesystem performance badly. Instead, each chunk
+        prepares only its own ligands, submits its own pose tasks to the shared
+        pool, and wipes temp_restored_poses/ before the next chunk starts, so
+        the directory only ever holds one chunk's worth of files.
+
+        Ligand-specific tleap files (prepin/frcmod) are prepared once per unique
+        ligand within a chunk, sequentially, so concurrent workers never race to
+        write the same ligand's files. Each pose then runs its own restore/
+        build-complex/minimize/fingerprint pipeline in an isolated scratch
+        directory (see _predict_pose_worker) so fixed-name tleap/sander input
+        files never collide between workers.
+
+        Returns (fp_records, n_ok, n_failed).
+        """
+        import shutil
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+
+        shared_output_dir = os.path.join(os.path.dirname(results_db), 'temp_restored_poses')
+
+        if chunk_size is None:
+            chunk_size = max(max_workers * 4, 1)
+
+        chunks = self._chunk_poses_by_ligand(poses_df, chunk_size)
+
+        fp_records = []
+        n_ok = 0
+        n_failed = 0
+        n_chunks = len(chunks)
+        chunks_done = 0
+
+        pbar = tqdm(total=len(poses_df), desc="Classifying docked poses (parallel)", disable=verbose)
+        pbar.set_postfix(classified=n_ok, failed=n_failed, chunks=f"{chunks_done}/{n_chunks}")
+        try:
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                for chunk_idx, chunk_df in enumerate(chunks, 1):
+                    os.makedirs(shared_output_dir, exist_ok=True)
+
+                    unique_lignames = chunk_df['LigName'].unique().tolist()
+                    ligand_files = {}
+                    failed_ligands = []
+
+                    if verbose:
+                        print(f"\n🧪 Chunk {chunk_idx}/{len(chunks)}: preparing tleap files "
+                              f"for {len(unique_lignames)} ligand(s), {len(chunk_df)} pose(s)...")
+
+                    for ligname in unique_lignames:
+                        suppress = contextlib.nullcontext() if verbose else self._suppress_output()
+                        try:
+                            with suppress:
+                                result = moldock._prepare_ligand_tleap_files(
+                                    ligname, assay_info, shared_output_dir
+                                )
+                        except SystemExit:
+                            # _prepare_ligand_tleap_files calls sys.exit(1) if the ligand's
+                            # SDF cannot be converted to PDB (e.g. missing from ChemSpace) —
+                            # treat that as a per-ligand failure instead of killing the run.
+                            result = None
+
+                        if not result or result[0] is None or result[1] is None:
+                            failed_ligands.append(ligname)
+                            continue
+                        ligand_files[ligname] = result
+
+                    if failed_ligands:
+                        print(f"\n⚠️  Failed to prepare tleap files for {len(failed_ligands)} "
+                              f"ligand(s) in chunk {chunk_idx}/{len(chunks)} "
+                              f"(antechamber/parmchk2/SDF error — rerun with verbose=True to "
+                              f"see details): {', '.join(failed_ligands)}")
+                        print("   Poses for these ligands will be skipped.")
+
+                    tasks = []
+                    for _, row in chunk_df.iterrows():
+                        ligname = row['LigName']
+                        if ligname not in ligand_files:
+                            n_failed += 1
+                            pbar.update(1)
+                            pbar.set_postfix(classified=n_ok, failed=n_failed,
+                                              chunks=f"{chunks_done}/{n_chunks}")
+                            continue
+                        prepin_file, frcmod_file = ligand_files[ligname]
+                        tasks.append({
+                            'project_path': self.path,
+                            'project_name': self.name,
+                            'results_db': results_db,
+                            'ligname': ligname,
+                            'run_number': row['run_number'],
+                            'pose_id': row['Pose_ID'],
+                            'docking_score': row['docking_score'],
+                            'assay_info': assay_info,
+                            'prolif_params_dict': prolif_params_dict,
+                            'receptor_file': receptor_file,
+                            'renumbering_dict': renumbering_dict,
+                            'minimize': minimize,
+                            'prepin_file': prepin_file,
+                            'frcmod_file': frcmod_file,
+                            'verbose': verbose,
+                        })
+
+                    futures = [executor.submit(_predict_pose_worker, task) for task in tasks]
+                    for future in as_completed(futures):
+                        result = future.result()
+                        if result.get('ok'):
+                            n_ok += 1
+                            fp_records.append({k: v for k, v in result.items() if k != 'ok'})
+                        else:
+                            n_failed += 1
+                            if verbose:
+                                print(f"    ❌ Error processing Pose_ID {result['pose_id']} "
+                                      f"({result['lig_name']}): {result.get('error')} — skipping")
+                        pbar.update(1)
+                        pbar.set_postfix(classified=n_ok, failed=n_failed,
+                                          chunks=f"{chunks_done}/{n_chunks}")
+
+                    # Wipe this chunk's ligand-prep + restored-pose scratch files before
+                    # the next chunk starts, so temp_restored_poses/ never accumulates
+                    # entries for the whole (potentially million-pose) run.
+                    shutil.rmtree(shared_output_dir, ignore_errors=True)
+
+                    chunks_done += 1
+                    pbar.set_postfix(classified=n_ok, failed=n_failed,
+                                      chunks=f"{chunks_done}/{n_chunks}")
+        finally:
+            pbar.close()
+            shutil.rmtree(shared_output_dir, ignore_errors=True)
+            if verbose:
+                print("\n✅ Temporary files cleaned up.")
+
+        return fp_records, n_ok, n_failed
+
+    def _align_and_store_rf_predictions(self, model, fp_records: list,
+                                         results_db: str, predictions_table: str) -> None:
+        """
+        Align computed pose fingerprints to a trained RF model's feature space,
+        predict, and store the results in the assay's results DB.
+
+        Shared by the foreground (sequential/parallel) and background
+        classification paths of make_rf_predictions_on_docking_assay() so both
+        write predictions identically.
+        """
+        if not fp_records:
+            print("\n❌ No fingerprints were successfully computed. Aborting prediction.")
+            return
+
+        pred_df = pd.DataFrame(fp_records)
+        meta_cols = ['pose_id', 'lig_name', 'docking_score']
+        X = pred_df.drop(columns=meta_cols)
+
+        expected_cols = list(model.feature_names_in_)
+        X = X.reindex(columns=expected_cols, fill_value=0).fillna(0).astype(int)
+
+        labels = model.predict(X)
+        probs = model.predict_proba(X)[:, 1]
+
+        print(f"\n📊 Predictions complete: {int((labels == 1).sum())} positives / "
+              f"{int((labels == 0).sum())} negatives out of {len(labels)} poses")
+
+        try:
+            conn = sqlite3.connect(results_db)
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {predictions_table} (
+                    Pose_ID          INTEGER PRIMARY KEY,
+                    rf_label         INTEGER NOT NULL,
+                    rf_prob_positive REAL NOT NULL
+                )
+            """)
+            conn.executemany(
+                f"""INSERT OR REPLACE INTO {predictions_table}
+                   (Pose_ID, rf_label, rf_prob_positive)
+                   VALUES (?, ?, ?)""",
+                [
+                    (
+                        int(pred_df.iloc[i]['pose_id']),
+                        int(labels[i]),
+                        float(probs[i]),
+                    )
+                    for i in range(len(pred_df))
+                ]
+            )
+            conn.commit()
+            conn.close()
+            print(f"\n✅ Predictions written to '{predictions_table}' table in:\n   {results_db}")
+        except Exception as e:
+            print(f"\n❌ Error writing predictions to database: {e}")
+
+    def _launch_background_rf_predictions(self, assay_info, model_meta, results_db,
+                                           predictions_table, prolif_params_dict,
+                                           receptor_file, renumbering_dict, minimize,
+                                           max_workers, verbose) -> None:
+        """
+        Serialize everything needed to classify an assay's poses and store
+        predictions, then launch it as a detached background process — a
+        separate `python -c` process started with start_new_session=True so it
+        survives this interactive session/terminal closing — and return
+        immediately. See the module-level _run_background_rf_predictions() for
+        the corresponding entry point.
+
+        A plain subprocess is used (rather than multiprocessing.Process)
+        because non-daemonic multiprocessing children are implicitly joined at
+        interpreter exit, which would block the caller's script from actually
+        returning until the classification finished — defeating the purpose.
+        """
+        import json
+        import subprocess
+        from datetime import datetime
+
+        jobs_dir = os.path.join(self.path, 'ml', 'results')
+        os.makedirs(jobs_dir, exist_ok=True)
+        stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        job_stem = f"rf_prediction_job_{assay_info['assay_id']}_{model_meta['model_id']}_{stamp}"
+        job_file = os.path.join(jobs_dir, f"{job_stem}.json")
+        log_file = os.path.join(jobs_dir, f"{job_stem}.log")
+        rf_db_path = os.path.join(self.__ml_models_path, 'rf_trained_models.db')
+
+        job_spec = {
+            'project_name': self.name,
+            'project_path': self.path,
+            'results_db': results_db,
+            'predictions_table': predictions_table,
+            'assay_info': assay_info,
+            'prolif_params_dict': prolif_params_dict,
+            'receptor_file': receptor_file,
+            'renumbering_dict': renumbering_dict,
+            'minimize': minimize,
+            'model_id': model_meta['model_id'],
+            'rf_db_path': rf_db_path,
+            'max_workers': max_workers,
+            'verbose': verbose,
+        }
+        with open(job_file, 'w') as f:
+            json.dump(job_spec, f)
+
+        cmd = [
+            sys.executable, '-c',
+            "from tidyscreen.ml.ml_functions import _run_background_rf_predictions; "
+            f"_run_background_rf_predictions({job_file!r})"
+        ]
+        with open(log_file, 'w') as log_fh:
+            proc = subprocess.Popen(
+                cmd, stdout=log_fh, stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL, start_new_session=True, cwd=self.path
+            )
+
+        print(f"\n🚀 Classification launched in the background (PID {proc.pid}).")
+        print(f"   Log file: {log_file}")
+        print(f"   Predictions will be written to table '{predictions_table}' in:\n   {results_db}")
+
     def make_rf_predictions_on_docking_assay(self, verbose: bool = False):
         """
         Apply a trained RF model to all poses in a selected docking assay.
@@ -1104,155 +1527,173 @@ class MachineLearning:
         template_name = selected_assay['receptor_info'].get('template_name')
         renumbering_dict = self._load_renumbering_dict(template_name) if template_name else {}
 
-        # ── 6. Compute ProLIF fingerprints for each pose ──────────────────────
-        import shutil
-        from datetime import datetime
+        # ── 6. For large assays, offer parallel classification ────────────────
         from moldock.moldock import MolDock
 
         moldock = MolDock(self.project)
-        processed_ligands = {}   # {ligname: (prepin_file, frcmod_file)}
-        fp_records = []           # [{pose_id, lig_name, docking_score, **fp_dict}, ...]
-        output_dir = None
-        n_ok = 0
-        n_failed = 0
 
-        # When quiet, tqdm writes through a duplicated stdout fd so the progress
-        # counter keeps displaying even while fd 1/2 are redirected to devnull
-        # below (needed to silence subprocess-inherited tleap/sander/ambpdb output).
-        original_stdout = os.fdopen(os.dup(1), 'w') if not verbose else sys.stdout
+        n_poses = len(poses_df)
+        use_parallel = False
+        max_workers = None
 
-        try:
-            pbar = tqdm(
-                poses_df.iterrows(), total=len(poses_df),
-                desc="Classifying docked poses", file=original_stdout,
-                dynamic_ncols=True, disable=verbose,
-            )
-            for _, row in pbar:
-                pose_id       = row['Pose_ID']
-                run_number    = row['run_number']
-                ligname       = row['LigName']
-                docking_score = row['docking_score']
-
-                if verbose:
-                    print(f"\n  🔬 Processing Pose_ID: {pose_id}  LigName: {ligname}")
-
-                suppress = contextlib.nullcontext() if verbose else self._suppress_output()
-                try:
-                    with suppress:
-                        output_dir, output_file = moldock._restore_single_docked_pose(
-                            results_db, ligname, run_number
-                        )
-
-                        if ligname not in processed_ligands:
-                            prepin_file, frcmod_file = moldock._prepare_ligand_tleap_files(
-                                ligname, selected_assay, output_dir
-                            )
-                            processed_ligands[ligname] = (prepin_file, frcmod_file)
-                        else:
-                            prepin_file, frcmod_file = processed_ligands[ligname]
-
-                        prmtop_file, inpcrd_file, output_pdb_file = moldock._prepare_complex_prmtop_inpcrd(
-                            prepin_file, frcmod_file, selected_assay, output_dir,
-                            output_file, pose_id, ligname=ligname
-                        )
-
-                        if minimize:
-                            try:
-                                if verbose:
-                                    print("    MINIMIZING COMPLEX...")
-                                _, output_pdb_file = moldock._minimize_complex(
-                                    prmtop_file, inpcrd_file, output_dir, ligname, pose_id, output_pdb_file
-                                )
-                            except Exception as e:
-                                if verbose:
-                                    print(f"    ⚠️  Minimization failed: {e}. Using original structure.")
-
-                        fps_df = moldock._compute_prolif_fingerprints3(
-                            prolif_params_dict, output_pdb_file, receptor_file,
-                            prmtop_file, inpcrd_file, ligname, pose_id
-                        )
-
-                        fps_df.columns = fps_df.columns.droplevel(0)
-                        if renumbering_dict:
-                            fps_df = fps_df.rename(columns=renumbering_dict, level=0)
-                        fps_df.columns = [f"{a}_{b}" for a, b in fps_df.columns]
-
-                        fp_row = fps_df.iloc[0].to_dict()
-                        fp_records.append({
-                            'pose_id':       pose_id,
-                            'lig_name':      ligname,
-                            'docking_score': docking_score,
-                            **{k: bool(v) for k, v in fp_row.items()},
-                        })
-
-                    n_ok += 1
-                    if verbose:
-                        print(f"    ✅ Fingerprint computed for Pose_ID {pose_id}")
-
-                except Exception as e:
-                    n_failed += 1
-                    if verbose:
-                        print(f"    ❌ Error processing Pose_ID {pose_id} ({ligname}): {e} — skipping")
-                    continue
-                finally:
-                    if not verbose:
-                        pbar.set_postfix(classified=n_ok, failed=n_failed)
-
-        finally:
-            pbar.close()
-            if not verbose:
-                original_stdout.close()
-            if output_dir:
-                shutil.rmtree(output_dir, ignore_errors=True)
-                if verbose:
-                    print("\n✅ Temporary files cleaned up.")
-
-        if not fp_records:
-            print("\n❌ No fingerprints were successfully computed. Aborting prediction.")
-            return
-
-        # ── 8. Align features to the model's training space and predict ───────
-        pred_df = pd.DataFrame(fp_records)
-        meta_cols = ['pose_id', 'lig_name', 'docking_score']
-        X = pred_df.drop(columns=meta_cols)
-
-        expected_cols = list(model.feature_names_in_)
-        X = X.reindex(columns=expected_cols, fill_value=0).fillna(0).astype(int)
-
-        labels = model.predict(X)
-        probs  = model.predict_proba(X)[:, 1]
-
-        print(f"\n📊 Predictions complete: {int((labels == 1).sum())} positives / "
-              f"{int((labels == 0).sum())} negatives out of {len(labels)} poses")
-
-        # ── 9. Store predictions in the assay results DB ──────────────────────
-        try:
-            conn = sqlite3.connect(results_db)
-            conn.execute(f"""
-                CREATE TABLE IF NOT EXISTS {predictions_table} (
-                    Pose_ID          INTEGER PRIMARY KEY,
-                    rf_label         INTEGER NOT NULL,
-                    rf_prob_positive REAL NOT NULL
+        if n_poses > 100:
+            gpu_note = ""
+            if minimize and moldock._check_gpu_available():
+                gpu_note = (
+                    " Note: minimization uses the GPU, so parallel workers will "
+                    "contend for it — consider a small worker count."
                 )
-            """)
-            conn.executemany(
-                f"""INSERT OR REPLACE INTO {predictions_table}
-                   (Pose_ID, rf_label, rf_prob_positive)
-                   VALUES (?, ?, ?)""",
-                [
-                    (
-                        int(pred_df.iloc[i]['pose_id']),
-                        int(labels[i]),
-                        float(probs[i]),
+            while True:
+                ans = input(
+                    f"\nThis assay has {n_poses} poses.{gpu_note}\n"
+                    f"Use parallel processing to classify poses faster? (y/n): "
+                ).strip().lower()
+                if ans in ('y', 'n'):
+                    use_parallel = ans == 'y'
+                    break
+                print("❌ Please enter 'y' or 'n'")
+
+            if use_parallel:
+                cpu_total = os.cpu_count() or 4
+                default_workers = min(cpu_total, n_poses)
+                while True:
+                    raw = input(f"Number of parallel workers [default {default_workers}]: ").strip()
+                    if not raw:
+                        max_workers = default_workers
+                        break
+                    try:
+                        max_workers = max(1, int(raw))
+                        break
+                    except ValueError:
+                        print("❌ Enter a valid integer")
+
+                while True:
+                    ans = input(
+                        "\nRun this classification in the background? Control returns "
+                        "immediately; predictions are written to the DB once the "
+                        "background job finishes. (y/n): "
+                    ).strip().lower()
+                    if ans in ('y', 'n'):
+                        run_in_background = ans == 'y'
+                        break
+                    print("❌ Please enter 'y' or 'n'")
+
+                if run_in_background:
+                    self._launch_background_rf_predictions(
+                        selected_assay, model_meta, results_db, predictions_table,
+                        prolif_params_dict, receptor_file, renumbering_dict,
+                        minimize, max_workers, verbose
                     )
-                    for i in range(len(pred_df))
-                ]
+                    return
+
+        # ── 7. Compute ProLIF fingerprints for each pose ───────────────────────
+        if use_parallel:
+            fp_records, n_ok, n_failed = self._classify_poses_parallel(
+                moldock, poses_df, results_db, selected_assay, prolif_params_dict,
+                receptor_file, renumbering_dict, minimize, max_workers, verbose
             )
-            conn.commit()
-            conn.close()
-            print(f"\n✅ Predictions written to '{predictions_table}' table in:\n   {results_db}")
-        except Exception as e:
-            print(f"\n❌ Error writing predictions to database: {e}")
+        else:
+            import shutil
+
+            processed_ligands = {}   # {ligname: (prepin_file, frcmod_file)}
+            fp_records = []           # [{pose_id, lig_name, docking_score, **fp_dict}, ...]
+            output_dir = None
+            n_ok = 0
+            n_failed = 0
+
+            # When quiet, tqdm writes through a duplicated stdout fd so the progress
+            # counter keeps displaying even while fd 1/2 are redirected to devnull
+            # below (needed to silence subprocess-inherited tleap/sander/ambpdb output).
+            original_stdout = os.fdopen(os.dup(1), 'w') if not verbose else sys.stdout
+
+            try:
+                pbar = tqdm(
+                    poses_df.iterrows(), total=len(poses_df),
+                    desc="Classifying docked poses", file=original_stdout,
+                    dynamic_ncols=True, disable=verbose,
+                )
+                for _, row in pbar:
+                    pose_id       = row['Pose_ID']
+                    run_number    = row['run_number']
+                    ligname       = row['LigName']
+                    docking_score = row['docking_score']
+
+                    if verbose:
+                        print(f"\n  🔬 Processing Pose_ID: {pose_id}  LigName: {ligname}")
+
+                    suppress = contextlib.nullcontext() if verbose else self._suppress_output()
+                    try:
+                        with suppress:
+                            output_dir, output_file = moldock._restore_single_docked_pose(
+                                results_db, ligname, run_number
+                            )
+
+                            if ligname not in processed_ligands:
+                                prepin_file, frcmod_file = moldock._prepare_ligand_tleap_files(
+                                    ligname, selected_assay, output_dir
+                                )
+                                processed_ligands[ligname] = (prepin_file, frcmod_file)
+                            else:
+                                prepin_file, frcmod_file = processed_ligands[ligname]
+
+                            prmtop_file, inpcrd_file, output_pdb_file = moldock._prepare_complex_prmtop_inpcrd(
+                                prepin_file, frcmod_file, selected_assay, output_dir,
+                                output_file, pose_id, ligname=ligname
+                            )
+
+                            if minimize:
+                                try:
+                                    if verbose:
+                                        print("    MINIMIZING COMPLEX...")
+                                    _, output_pdb_file = moldock._minimize_complex(
+                                        prmtop_file, inpcrd_file, output_dir, ligname, pose_id, output_pdb_file
+                                    )
+                                except Exception as e:
+                                    if verbose:
+                                        print(f"    ⚠️  Minimization failed: {e}. Using original structure.")
+
+                            fps_df = moldock._compute_prolif_fingerprints3(
+                                prolif_params_dict, output_pdb_file, receptor_file,
+                                prmtop_file, inpcrd_file, ligname, pose_id
+                            )
+
+                            fps_df.columns = fps_df.columns.droplevel(0)
+                            if renumbering_dict:
+                                fps_df = fps_df.rename(columns=renumbering_dict, level=0)
+                            fps_df.columns = [f"{a}_{b}" for a, b in fps_df.columns]
+
+                            fp_row = fps_df.iloc[0].to_dict()
+                            fp_records.append({
+                                'pose_id':       pose_id,
+                                'lig_name':      ligname,
+                                'docking_score': docking_score,
+                                **{k: bool(v) for k, v in fp_row.items()},
+                            })
+
+                        n_ok += 1
+                        if verbose:
+                            print(f"    ✅ Fingerprint computed for Pose_ID {pose_id}")
+
+                    except Exception as e:
+                        n_failed += 1
+                        if verbose:
+                            print(f"    ❌ Error processing Pose_ID {pose_id} ({ligname}): {e} — skipping")
+                        continue
+                    finally:
+                        if not verbose:
+                            pbar.set_postfix(classified=n_ok, failed=n_failed)
+
+            finally:
+                pbar.close()
+                if not verbose:
+                    original_stdout.close()
+                if output_dir:
+                    shutil.rmtree(output_dir, ignore_errors=True)
+                    if verbose:
+                        print("\n✅ Temporary files cleaned up.")
+
+        # ── 8. Align features to the model's training space, predict, and store ─
+        self._align_and_store_rf_predictions(model, fp_records, results_db, predictions_table)
 
     def _resolve_prolif_conditions_for_model(self, model_meta: dict) -> tuple:
         """
