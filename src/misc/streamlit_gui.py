@@ -4844,13 +4844,14 @@ elif page == "Docking analysis":
 
                 else:
                     ## ── Fallback: manual positive/negative binder flags ───────────
-                    _cpv_df_pos = st_funcs.get_binders_registry(_cpv_project_path, "positive")
-                    _cpv_df_neg = st_funcs.get_binders_registry(_cpv_project_path, "negative")
-
-                    if _cpv_df_pos is not None and not _cpv_df_pos.empty:
-                        _cpv_df_pos = _cpv_df_pos[_cpv_df_pos["assay_name"] == _cpv_assay].reset_index(drop=True)
-                    if _cpv_df_neg is not None and not _cpv_df_neg.empty:
-                        _cpv_df_neg = _cpv_df_neg[_cpv_df_neg["assay_name"] == _cpv_assay].reset_index(drop=True)
+                    ## Enriched with docking_score / mmgbsa_total_energy / mmgbsa_gas_energy
+                    ## (when computed for this assay) looked up from the Results table.
+                    _cpv_df_pos = st_funcs.get_binders_registry_with_scores(
+                        _cpv_project_path, "positive", _cpv_assay, results_db_path
+                    )
+                    _cpv_df_neg = st_funcs.get_binders_registry_with_scores(
+                        _cpv_project_path, "negative", _cpv_assay, results_db_path
+                    )
 
                     _cpv_has_pos = _cpv_df_pos is not None and not _cpv_df_pos.empty
                     _cpv_has_neg = _cpv_df_neg is not None and not _cpv_df_neg.empty
@@ -4885,12 +4886,22 @@ elif page == "Docking analysis":
                                         _cpv_pos_view.setStyle({"model": 1}, {"sphere": {"colorscheme": "elementColors", "scale": 0.3, "opacity": 0.6}, "stick": {"colorscheme": "elementColors", "opacity": 0.6}})
                                     _cpv_pos_view.zoomTo()
                                     st.components.v1.html(_cpv_pos_view.write_html(), height=430)
+                                    _cpv_pos_score_bits = []
+                                    if "docking_score" in _cpv_pos_row.index and pd.notna(_cpv_pos_row["docking_score"]):
+                                        _cpv_pos_score_bits.append(f"Score: {_cpv_pos_row['docking_score']:.2f}")
+                                    if "mmgbsa_total_energy" in _cpv_pos_row.index and pd.notna(_cpv_pos_row["mmgbsa_total_energy"]):
+                                        _cpv_pos_score_bits.append(f"MMGBSA total: {_cpv_pos_row['mmgbsa_total_energy']:.2f}")
+                                    if "mmgbsa_gas_energy" in _cpv_pos_row.index and pd.notna(_cpv_pos_row["mmgbsa_gas_energy"]):
+                                        _cpv_pos_score_bits.append(f"MMGBSA gas: {_cpv_pos_row['mmgbsa_gas_energy']:.2f}")
+                                    _cpv_pos_score_str = ("  |  " + "  |  ".join(_cpv_pos_score_bits)) if _cpv_pos_score_bits else ""
                                     st.caption(
                                         f"{_cpv_pos_row['pose_file']}  |  {_cpv_pos_row['directory']}  |  "
-                                        f"flagged: {_cpv_pos_row['flagged_at'][:10]}"
+                                        f"flagged: {_cpv_pos_row['flagged_at'][:10]}{_cpv_pos_score_str}"
                                     )
                                 else:
                                     st.warning(f"PDB file not found: {_cpv_pos_path}")
+                                st.divider()
+                                st.dataframe(_cpv_df_pos, use_container_width=True)
                                 if st.button("Remove from positive binders", key="cpv_btn_remove_pos"):
                                     _cpv_rem = st_funcs.remove_binder(
                                         project_path=_cpv_project_path,
@@ -4930,12 +4941,22 @@ elif page == "Docking analysis":
                                         _cpv_neg_view.setStyle({"model": 1}, {"sphere": {"colorscheme": "elementColors", "scale": 0.3, "opacity": 0.6}, "stick": {"colorscheme": "elementColors", "opacity": 0.6}})
                                     _cpv_neg_view.zoomTo()
                                     st.components.v1.html(_cpv_neg_view.write_html(), height=430)
+                                    _cpv_neg_score_bits = []
+                                    if "docking_score" in _cpv_neg_row.index and pd.notna(_cpv_neg_row["docking_score"]):
+                                        _cpv_neg_score_bits.append(f"Score: {_cpv_neg_row['docking_score']:.2f}")
+                                    if "mmgbsa_total_energy" in _cpv_neg_row.index and pd.notna(_cpv_neg_row["mmgbsa_total_energy"]):
+                                        _cpv_neg_score_bits.append(f"MMGBSA total: {_cpv_neg_row['mmgbsa_total_energy']:.2f}")
+                                    if "mmgbsa_gas_energy" in _cpv_neg_row.index and pd.notna(_cpv_neg_row["mmgbsa_gas_energy"]):
+                                        _cpv_neg_score_bits.append(f"MMGBSA gas: {_cpv_neg_row['mmgbsa_gas_energy']:.2f}")
+                                    _cpv_neg_score_str = ("  |  " + "  |  ".join(_cpv_neg_score_bits)) if _cpv_neg_score_bits else ""
                                     st.caption(
                                         f"{_cpv_neg_row['pose_file']}  |  {_cpv_neg_row['directory']}  |  "
-                                        f"flagged: {_cpv_neg_row['flagged_at'][:10]}"
+                                        f"flagged: {_cpv_neg_row['flagged_at'][:10]}{_cpv_neg_score_str}"
                                     )
                                 else:
                                     st.warning(f"PDB file not found: {_cpv_neg_path}")
+                                st.divider()
+                                st.dataframe(_cpv_df_neg, use_container_width=True)
                                 if st.button("Remove from negative binders", key="cpv_btn_remove_neg"):
                                     _cpv_rem = st_funcs.remove_binder(
                                         project_path=_cpv_project_path,

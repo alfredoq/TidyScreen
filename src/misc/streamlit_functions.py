@@ -690,6 +690,8 @@ def get_rf_classified_poses(results_db_path, model_suffix):
     Returns {"positive": DataFrame, "negative": DataFrame}.
     Positive poses are sorted by rf_prob_positive DESC; negative ASC.
     Columns: Pose_ID, LigName, run_number, docking_score, rf_prob_positive.
+    Also includes 'mmgbsa_total_energy' and 'mmgbsa_gas_energy' when present,
+    mirroring get_docking_results().
     """
     table = f"rf_predictions_{model_suffix}"
     empty = {"positive": pd.DataFrame(), "negative": pd.DataFrame()}
@@ -697,9 +699,14 @@ def get_rf_classified_poses(results_db_path, model_suffix):
         return empty
     try:
         conn = sqlite3.connect(results_db_path)
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(Results)")
+        existing = {row[1] for row in cursor.fetchall()}
+        optional_columns = [c for c in ('mmgbsa_total_energy', 'mmgbsa_gas_energy') if c in existing]
+        r_columns = ", ".join(f"R.{c}" for c in ['Pose_ID', 'LigName', 'run_number', 'docking_score'] + optional_columns)
         df_pos = pd.read_sql_query(
             f"""
-            SELECT R.Pose_ID, R.LigName, R.run_number, R.docking_score, P.rf_prob_positive
+            SELECT {r_columns}, P.rf_prob_positive
             FROM Results AS R
             JOIN "{table}" AS P ON R.Pose_ID = P.Pose_ID
             WHERE P.rf_label = 1
@@ -709,7 +716,7 @@ def get_rf_classified_poses(results_db_path, model_suffix):
         )
         df_neg = pd.read_sql_query(
             f"""
-            SELECT R.Pose_ID, R.LigName, R.run_number, R.docking_score, P.rf_prob_positive
+            SELECT {r_columns}, P.rf_prob_positive
             FROM Results AS R
             JOIN "{table}" AS P ON R.Pose_ID = P.Pose_ID
             WHERE P.rf_label = 0
@@ -1534,6 +1541,63 @@ def get_binders_registry(project_path: str, binder_type: str) -> "pd.DataFrame":
         return df
     except Exception:
         return None
+
+
+def get_binders_registry_with_scores(project_path: str, binder_type: str, assay_name: str, results_db_path: str) -> "pd.DataFrame":
+    """
+    Like get_binders_registry(), but filtered to *assay_name* and enriched with
+    docking_score (and mmgbsa_total_energy/mmgbsa_gas_energy when present) looked
+    up from the assay's Results table.
+
+    Binder registry rows only store pose_file/directory, not Pose_ID, so each
+    pose_file ('{LigName}_{run_number}.pdb', the naming convention used by
+    extract_docked_poses()/find_pose_pdb()) is parsed back into LigName/run_number
+    and merged against Results on those columns. Rows whose pose_file can't be
+    parsed, or that have no matching Results row, keep NaN for the score columns.
+
+    Returns None if the registry itself is missing; an empty/unmodified DataFrame
+    if there are no rows for this assay or the Results table can't be read.
+    """
+    df = get_binders_registry(project_path, binder_type)
+    if df is None:
+        return None
+    if df.empty:
+        return df
+
+    df = df[df["assay_name"] == assay_name].reset_index(drop=True)
+    if df.empty or not results_db_path or not os.path.exists(results_db_path):
+        return df
+
+    try:
+        conn = sqlite3.connect(results_db_path)
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(Results)")
+        existing = {row[1] for row in cursor.fetchall()}
+        score_columns = ['docking_score'] + [c for c in ('mmgbsa_total_energy', 'mmgbsa_gas_energy') if c in existing]
+        results_df = pd.read_sql_query(
+            f"SELECT LigName, run_number, {', '.join(score_columns)} FROM Results", conn
+        )
+        conn.close()
+    except Exception:
+        return df
+
+    def _parse_pose_file(pose_file):
+        stem = pose_file[:-4] if pose_file.lower().endswith(".pdb") else pose_file
+        parts = stem.rsplit("_", 1)
+        if len(parts) != 2:
+            return None, None
+        ligname, run_number_str = parts
+        try:
+            return ligname, int(run_number_str)
+        except ValueError:
+            return None, None
+
+    parsed = df["pose_file"].apply(_parse_pose_file)
+    df["LigName"] = [p[0] for p in parsed]
+    df["run_number"] = [p[1] for p in parsed]
+
+    df = df.merge(results_df, on=["LigName", "run_number"], how="left")
+    return df
 
 
 def remove_binder(project_path: str, binder_type: str, assay_name: str, pose_file: str, directory: str) -> str:
