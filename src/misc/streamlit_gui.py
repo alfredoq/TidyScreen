@@ -4651,21 +4651,15 @@ elif page == "Docking analysis":
                                 st.divider()
                                 st.dataframe(_cpv_df_pos, use_container_width=True)
                                 _cpv_pos_lig_names = _cpv_df_pos["LigName"].unique().tolist()
-                                _cpv_pos_compounds, _cpv_pos_err = st_funcs.get_compounds_for_lig_names(
-                                    _cpv_project_path, _cpv_assay, _cpv_pos_lig_names
-                                )
                                 _cpv_btn_pos, _cpv_sub_pos = st.columns(2)
                                 with _cpv_btn_pos:
-                                    if _cpv_pos_compounds is not None:
-                                        st.download_button(
-                                            "📥 Export compounds as CSV",
-                                            data=_cpv_pos_compounds.to_csv(index=False),
-                                            file_name=f"{_cpv_assay}_positive_compounds.csv",
-                                            mime="text/csv",
-                                            key="cpv_export_pos",
-                                        )
-                                    else:
-                                        st.warning(f"Export unavailable: {_cpv_pos_err}")
+                                    st.download_button(
+                                        "📥 Export compounds as CSV",
+                                        data=_cpv_df_pos.to_csv(index=False),
+                                        file_name=f"{_cpv_assay}_positive_compounds.csv",
+                                        mime="text/csv",
+                                        key="cpv_export_pos",
+                                    )
                                 with _cpv_sub_pos:
                                     if st.button("🗂️ Subset binders", key="cpv_subset_btn_pos"):
                                         st.session_state["cpv_show_subset_pos"] = not st.session_state.get("cpv_show_subset_pos", False)
@@ -4741,21 +4735,15 @@ elif page == "Docking analysis":
                                 st.divider()
                                 st.dataframe(_cpv_df_neg, use_container_width=True)
                                 _cpv_neg_lig_names = _cpv_df_neg["LigName"].unique().tolist()
-                                _cpv_neg_compounds, _cpv_neg_err = st_funcs.get_compounds_for_lig_names(
-                                    _cpv_project_path, _cpv_assay, _cpv_neg_lig_names
-                                )
                                 _cpv_btn_neg, _cpv_sub_neg = st.columns(2)
                                 with _cpv_btn_neg:
-                                    if _cpv_neg_compounds is not None:
-                                        st.download_button(
-                                            "📥 Export compounds as CSV",
-                                            data=_cpv_neg_compounds.to_csv(index=False),
-                                            file_name=f"{_cpv_assay}_negative_compounds.csv",
-                                            mime="text/csv",
-                                            key="cpv_export_neg",
-                                        )
-                                    else:
-                                        st.warning(f"Export unavailable: {_cpv_neg_err}")
+                                    st.download_button(
+                                        "📥 Export compounds as CSV",
+                                        data=_cpv_df_neg.to_csv(index=False),
+                                        file_name=f"{_cpv_assay}_negative_compounds.csv",
+                                        mime="text/csv",
+                                        key="cpv_export_neg",
+                                    )
                                 with _cpv_sub_neg:
                                     if st.button("🗂️ Subset binders", key="cpv_subset_btn_neg"):
                                         st.session_state["cpv_show_subset_neg"] = not st.session_state.get("cpv_show_subset_neg", False)
