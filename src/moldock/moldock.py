@@ -11441,6 +11441,7 @@ class MolDock:
         # pandas (engine='python', regex delimiter) to raise ParserError or
         # silently mis-assign coordinates when chain IDs are present.
         records = []
+        chain_ids = []
         with open(tleap_processed_file, 'r') as _fh:
             for _line in _fh:
                 if _line.startswith(('ATOM', 'HETATM')):
@@ -11451,6 +11452,11 @@ class MolDock:
                         atom_number = 0
                     atom_name = _line[12:16].strip()
                     residue_name = _line[17:20].strip()
+                    # Column 22 (index 21) holds the chain ID in the PDB fixed-column
+                    # format. Default to 'A' when the source file carries no chain
+                    # info so downstream consumers always see a valid chain id.
+                    chain_id = _line[21].strip() if len(_line) > 21 else ''
+                    chain_ids.append(chain_id or 'A')
                     try:
                         residue_number = int(_line[22:26])
                     except ValueError:
@@ -11483,6 +11489,8 @@ class MolDock:
                         _rnum = int(_parts[3]) if len(_parts) > 3 else 0
                     except ValueError:
                         _rnum = 0
+                    _chain_id = _line[21].strip() if len(_line) > 21 else ''
+                    chain_ids.append(_chain_id or 'A')
                     records.append(['TER', _sn, _rn, str(_rnum), _rnum,
                                     float('nan'), float('nan'), float('nan'),
                                     float('nan'), float('nan')])
@@ -11495,7 +11503,7 @@ class MolDock:
 
         ## Add missing columns according to moldf format
         df.insert(3, 'alt_loc', '')
-        df.insert(5, 'chain_id', '')
+        df.insert(5, 'chain_id', chain_ids)
         df.insert(7, 'insertion', '')
         df.insert(13, 'segment_id', '')
         df.insert(14, 'element_symbol', '')
@@ -11777,9 +11785,9 @@ class MolDock:
     def _renumber_minimized_pdb_file(self, minimized_pdb_file, renumbering_dict):
 
         """
-        Will read the minimized_pdb_file which a pdb file, and the residue name and residue number fields will be evaluated, construction a key that will be searched in renumbering_dict. The value returned will be used to reassing residue number
+        Will read the minimized_pdb_file which a pdb file, and the residue name and residue number fields will be evaluated, construction a key that will be searched in renumbering_dict. The value returned will be used to reassing residue number and chain id
         """
-        
+
         try:
             import shutil
             import re as _re
@@ -11811,15 +11819,27 @@ class MolDock:
                             # or "{res_name}{res_num}"             e.g. "ARG8" (no chain)
                             # Extract the residue number: trailing integer before _{chain_id}
                             crystal_value = renumbering_dict[key]
-                            _base = crystal_value.rsplit('_', 1)[0]  # strip chain suffix
+                            if '_' in crystal_value:
+                                _base, _chain = crystal_value.rsplit('_', 1)
+                            else:
+                                _base, _chain = crystal_value, ''
                             _m = _re.search(r'(\d+)$', _base)
                             if not _m:
                                 outfile.write(line)
                                 continue
                             new_res_num = int(_m.group(1))
 
-                            # PDB format: columns 23-26 are residue number (right-justified, 4 chars)
-                            new_line = line[:22] + f"{new_res_num:4d}" + line[26:]
+                            # tleap's savepdb drops the chain id (column 22), leaving it
+                            # blank. Restore it from the pre-tleap crystallographic file
+                            # via the same residue mapping used for renumbering, so the
+                            # original chain (e.g. 'R') survives instead of falling back
+                            # to the default 'A' applied downstream in
+                            # _add_element_column_to_pdb_file for genuinely chain-less input.
+                            chain_char = (_chain[:1] if _chain else line[21:22]) or ' '
+
+                            # PDB format: column 22 is chain id, columns 23-26 are residue
+                            # number (right-justified, 4 chars)
+                            new_line = line[:21] + chain_char + f"{new_res_num:4d}" + line[26:]
                             outfile.write(new_line)
                         else:
                             # Key not found — keep original line
