@@ -779,6 +779,73 @@ def get_rf_ligand_summary(results_db_path, model_suffix):
     return summary
 
 
+def get_rf_compound_summary(results_db_path, model_suffix, project_path=None, assay_name=None):
+    """
+    Aggregate the per-ligand RF summary further by chemical compound,
+    grouping stereoisomers together.
+
+    LigName values are InChIKeys; the first hyphen-delimited block encodes
+    the molecular skeleton (connectivity) while the second block encodes
+    stereochemistry/isotopes. Two LigNames sharing the first block are the
+    same compound in different stereoisomeric forms. This groups the
+    per-ligand summary (see get_rf_ligand_summary) by that shared prefix
+    and reports averages across the grouped stereoisomers.
+
+    If *project_path* and *assay_name* are given, a 'compound_name' column
+    is also included, derived from each LigName's chemspace 'name' (see
+    get_ligand_name_map) with the '_stereo_<n>' stereoisomer-enumeration
+    suffix stripped (e.g. 'aspirin_stereo_2' -> 'aspirin'). All stereoisomers
+    grouped under the same compound_key are expected to share this base
+    name; the first non-null value found in the group is used.
+
+    Returns a DataFrame with columns:
+        compound_key, [compound_name,] n_representatives, avg_n_poses,
+        avg_n_positive, avg_n_negative, avg_frac_positive,
+        avg_consensus_label, avg_best_docking_score, avg_max_rf_prob_positive
+    where n_representatives is the number of distinct stereoisomer LigNames
+    grouped under compound_key, and the avg_* columns are the mean of the
+    corresponding per-ligand summary column across those LigNames.
+    sorted by avg_frac_positive DESC, then n_representatives DESC.
+    Returns an empty DataFrame if no per-ligand summary is available.
+    """
+    lig_summary = get_rf_ligand_summary(results_db_path, model_suffix)
+    if lig_summary.empty:
+        return lig_summary
+
+    df = lig_summary.copy()
+    df["compound_key"] = df["LigName"].str.split("-").str[0]
+
+    if project_path and assay_name:
+        name_map = get_ligand_name_map(
+            project_path, assay_name, df["LigName"].dropna().unique().tolist()
+        )
+        df["compound_name"] = df["LigName"].map(name_map).str.replace(
+            r"_stereo_\d+$", "", regex=True
+        )
+
+    avg_cols = ["n_poses", "n_positive", "n_negative", "frac_positive",
+                "consensus_label", "best_docking_score", "max_rf_prob_positive"]
+
+    agg_kwargs = {"n_representatives": ("LigName", "nunique")}
+    if "compound_name" in df.columns:
+        agg_kwargs["compound_name"] = ("compound_name", "first")
+    agg_kwargs.update({f"avg_{col}": (col, "mean") for col in avg_cols})
+
+    compound_summary = df.groupby("compound_key").agg(**agg_kwargs).reset_index()
+
+    ordered_cols = ["compound_key"]
+    if "compound_name" in compound_summary.columns:
+        ordered_cols.append("compound_name")
+    ordered_cols.append("n_representatives")
+    ordered_cols += [f"avg_{col}" for col in avg_cols]
+
+    compound_summary = compound_summary[ordered_cols].sort_values(
+        ["avg_frac_positive", "n_representatives"], ascending=False
+    ).reset_index(drop=True)
+
+    return compound_summary
+
+
 def find_pose_pdb(results_db_path, ligname, run_number):
     """
     Search extracted pose directories adjacent to results_db_path for

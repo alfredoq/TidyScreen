@@ -4560,6 +4560,31 @@ elif page == "Docking analysis":
                             _cpv_df_neg["LigName"].str.contains(_cpv_ligname_filter, case=False, na=False)
                         ].reset_index(drop=True)
 
+                    _cpv_pred_filter_cols = list(_cpv_df_pos.columns) if not _cpv_df_pos.empty else list(_cpv_df_neg.columns)
+                    if _cpv_pred_filter_cols:
+                        st.caption("Filter Positive/Negative Predictions by column (case-insensitive substring match):")
+                        _cpv_pred_col_filter_boxes = st.columns(len(_cpv_pred_filter_cols))
+                        _cpv_pred_col_filter_values = {}
+                        for _cpv_pred_fbox, _cpv_pred_fcol in zip(_cpv_pred_col_filter_boxes, _cpv_pred_filter_cols):
+                            with _cpv_pred_fbox:
+                                _cpv_pred_col_filter_values[_cpv_pred_fcol] = st.text_input(
+                                    _cpv_pred_fcol, key=f"cpv_pred_colfilter_{_cpv_pred_fcol}"
+                                )
+                        for _cpv_pred_fcol, _cpv_pred_fval in _cpv_pred_col_filter_values.items():
+                            if _cpv_pred_fval:
+                                if _cpv_pred_fcol in _cpv_df_pos.columns:
+                                    _cpv_df_pos = _cpv_df_pos[
+                                        _cpv_df_pos[_cpv_pred_fcol].astype(str).str.contains(
+                                            _cpv_pred_fval, case=False, na=False
+                                        )
+                                    ].reset_index(drop=True)
+                                if _cpv_pred_fcol in _cpv_df_neg.columns:
+                                    _cpv_df_neg = _cpv_df_neg[
+                                        _cpv_df_neg[_cpv_pred_fcol].astype(str).str.contains(
+                                            _cpv_pred_fval, case=False, na=False
+                                        )
+                                    ].reset_index(drop=True)
+
                     _cpv_has_pos = not _cpv_df_pos.empty
                     _cpv_has_neg = not _cpv_df_neg.empty
 
@@ -4774,16 +4799,59 @@ elif page == "Docking analysis":
                                 _cpv_lig_filtered = _cpv_lig_filtered[
                                     _cpv_lig_filtered["LigName"].str.contains(_cpv_ligname_filter, case=False, na=False)
                                 ].reset_index(drop=True)
+
+                            _cpv_lig_col_filter_boxes = st.columns(len(_cpv_lig_filtered.columns))
+                            _cpv_lig_col_filter_values = {}
+                            for _cpv_lig_fbox, _cpv_lig_fcol in zip(_cpv_lig_col_filter_boxes, _cpv_lig_filtered.columns):
+                                with _cpv_lig_fbox:
+                                    _cpv_lig_col_filter_values[_cpv_lig_fcol] = st.text_input(
+                                        _cpv_lig_fcol, key=f"cpv_lig_colfilter_{_cpv_lig_fcol}"
+                                    )
+                            for _cpv_lig_fcol, _cpv_lig_fval in _cpv_lig_col_filter_values.items():
+                                if _cpv_lig_fval:
+                                    _cpv_lig_filtered = _cpv_lig_filtered[
+                                        _cpv_lig_filtered[_cpv_lig_fcol].astype(str).str.contains(
+                                            _cpv_lig_fval, case=False, na=False
+                                        )
+                                    ].reset_index(drop=True)
+
                             st.dataframe(_cpv_lig_filtered, use_container_width=True)
-                            st.bar_chart(
-                                _cpv_lig_filtered.set_index("LigName")["frac_positive"].head(30)
-                            )
                             st.download_button(
                                 "📥 Export per-ligand summary as CSV",
                                 data=_cpv_lig_filtered.to_csv(index=False),
                                 file_name=f"{_cpv_assay}_{_cpv_model}_ligand_summary.csv",
                                 mime="text/csv",
                                 key="cpv_export_ligand_summary",
+                            )
+
+                        st.divider()
+                        st.markdown("### 🧪 Per-Compound Predicted Label Summary")
+                        st.caption(
+                            "Groups stereoisomers of the same compound together (LigNames "
+                            "sharing the first InChIKey block, before the first dash) and "
+                            "reports averaged per-ligand statistics across the group."
+                        )
+                        _cpv_cmpd_summary = st_funcs.get_rf_compound_summary(
+                            results_db_path, _cpv_model, _cpv_project_path, _cpv_assay
+                        )
+                        if _cpv_cmpd_summary.empty:
+                            st.info("No per-compound summary available.")
+                        else:
+                            _cpv_cmpd_filtered = _cpv_cmpd_summary
+                            if _cpv_ligname_filter:
+                                _cpv_cmpd_filtered = _cpv_cmpd_filtered[
+                                    _cpv_cmpd_filtered["compound_key"].str.contains(_cpv_ligname_filter, case=False, na=False)
+                                ].reset_index(drop=True)
+                            st.dataframe(_cpv_cmpd_filtered, use_container_width=True)
+                            st.bar_chart(
+                                _cpv_cmpd_filtered.set_index("compound_key")["avg_frac_positive"].head(30)
+                            )
+                            st.download_button(
+                                "📥 Export per-compound summary as CSV",
+                                data=_cpv_cmpd_filtered.to_csv(index=False),
+                                file_name=f"{_cpv_assay}_{_cpv_model}_compound_summary.csv",
+                                mime="text/csv",
+                                key="cpv_export_compound_summary",
                             )
 
                 else:
