@@ -11893,9 +11893,14 @@ class MolDock:
         else:
             print("   ✅ Charge methods are consistent between receptor and ligands.")
     
-    def compute_fingerprints(self, minimize=True, clean_files=True, write_prolif=False, write_mmgbsa=False, selection_threshold=25):
+    def compute_fingerprints(self, minimize=True, clean_files=True, write_prolif=False, write_mmgbsa=False, selection_threshold=25, max_workers=None):
         """
-        Will compute the ProLIF fingerprints for all docked ligands in a given assay. 
+        Will compute the ProLIF fingerprints for all docked ligands in a given assay.
+
+        max_workers: number of parallel worker processes to use for the "MMGBSA only"
+        mode (choice 2 below). Defaults to min(cpu_count(), 8) when None. Only applies
+        to the MMGBSA-only path; ProLIF-only and combined ProLIF+MMGBSA modes always
+        run sequentially.
         """
 
         import os
@@ -12060,7 +12065,34 @@ class MolDock:
             prolif_params_dict, condition_selection = self._get_prolif_params()
             self._check_table_in_db(results_db, f'processed_prolif_fps_json_condition_{condition_selection}')
 
+        # Retrieve renumbering_dict once for the whole assay (template_name is constant
+        # across all poses in this run, so there is no need to re-query it per pose).
         renumbering_dict = {}
+        template_name = assay_info.get('receptor_info', None).get('template_name', None)
+        if template_name:
+            try:
+                conn = sqlite3.connect(pdbs_db_path)
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT renumbering_dict FROM pdb_templates WHERE pdb_template_name = ?",
+                    (template_name,)
+                )
+                result = cursor.fetchone()
+                conn.close()
+                if result and result[0]:
+                    renumbering_dict = json.loads(result[0])
+            except Exception as e:
+                print(f"Error retrieving renumbering_dict for template '{template_name}': {e}")
+
+        # MMGBSA-only mode gets a dedicated parallel execution path; ProLIF-only and
+        # combined ProLIF+MMGBSA modes keep the sequential loop below unchanged.
+        if mmbgsa and not prolif:
+            self._compute_mmgbsa_parallel(
+                df, results_db, assay_info, computation_mode, minimize,
+                is_stub_receptor, fps_tleap_config, renumbering_dict,
+                max_workers, clean_files, write_mmgbsa
+            )
+            return
 
         for idx, row in df.iterrows():
             pose_id = row['Pose_ID']
@@ -12117,23 +12149,6 @@ class MolDock:
             else:
                 rst_cpptraj_file = inpcrd_file # No minimization, use the original inpcrd file for further processing
 
-            # Retrieve renumbering_dict and rename df columns
-            template_name = assay_info.get('receptor_info', None).get('template_name', None)
-            if template_name:
-                try:
-                    conn = sqlite3.connect(pdbs_db_path)
-                    cursor = conn.cursor()
-                    cursor.execute(
-                        "SELECT renumbering_dict FROM pdb_templates WHERE pdb_template_name = ?",
-                        (template_name,)
-                    )
-                    result = cursor.fetchone()
-                    conn.close()
-                    if result and result[0]:
-                        renumbering_dict = json.loads(result[0])
-                except Exception as e:
-                    print(f"Error retrieving renumbering_dict for template '{template_name}': {e}")
-            
             # Generate a full size dataframe based on all crystal residues and requested interactions
             if prolif:
                 full_size_df = self._create_full_size_interactions_df(prolif_params_dict, renumbering_dict)
@@ -12210,12 +12225,182 @@ class MolDock:
         if write_mmgbsa:
             self._write_mmgbsa_fps(results_db, assay_info)
 
-        if clean_files:    
+        if clean_files:
             # Finally delte output_dir containing all temporary files
             import shutil
             shutil.rmtree(output_dir, ignore_errors=True)
             print("✅ Temporary files cleaned up.")
-            
+
+    def _compute_mmgbsa_parallel(self, df, results_db, assay_info, computation_mode,
+                                  minimize, is_stub_receptor, fps_tleap_config,
+                                  renumbering_dict, max_workers, clean_files, write_mmgbsa):
+        """
+        Parallel MMGBSA-only execution path for compute_fingerprints(). Each docked
+        pose's full pipeline (restore -> build complex -> minimize -> MMGBSA) runs in
+        its own worker process, isolated in its own subdirectory under
+        temp_restored_poses/, so concurrent poses never collide on the fixed-name
+        scratch files written by tleap/sander/MMPBSA.py (complex.in, min.in/out/rst,
+        cpptraj.in, MMPBSA.py's own _MMPBSA_* files). GPU minimization is serialized
+        across workers via a shared lock so only one worker uses pmemd.cuda at a time.
+        All SQLite writes to results_db happen back in this (parent) process as
+        results are collected, so workers never touch the database.
+        """
+        import contextlib
+        import shutil
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        from multiprocessing import Manager, cpu_count
+
+        n_poses = len(df)
+        print(f"📊 {n_poses} docked pose(s) will be processed for MMGBSA computation.")
+
+        if n_poses == 0:
+            print("Nothing to do.")
+            return
+
+        if max_workers is None:
+            available_cores = cpu_count()
+            default_workers = min(available_cores, 8, n_poses)
+            while True:
+                raw = input(
+                    f"How many CPU cores should be used for parallel MMGBSA computation? "
+                    f"[{default_workers}] (1-{available_cores} available): "
+                ).strip()
+                if raw == "":
+                    max_workers = default_workers
+                    break
+                try:
+                    max_workers = int(raw)
+                except ValueError:
+                    print("Please enter a valid integer.")
+                    continue
+                if max_workers < 1:
+                    print("Please enter a positive integer.")
+                    continue
+                if max_workers > available_cores:
+                    print(f"⚠️  Only {available_cores} core(s) available; using {available_cores}.")
+                    max_workers = available_cores
+                break
+
+        # No point spinning up more workers than there are poses to process.
+        max_workers = min(max_workers, n_poses)
+
+        assay_dir = os.path.dirname(os.path.abspath(results_db))
+        temp_poses_root = os.path.join(assay_dir, "temp_restored_poses")
+        os.makedirs(temp_poses_root, exist_ok=True)
+
+        # Precompute ligand parameter files once per unique ligand, sequentially,
+        # before fanning out. antechamber/parmchk2 don't set cwd=, so they litter
+        # fixed-name files into the caller's CWD; keeping this pre-pass sequential
+        # avoids a race there and lets every worker use already-materialized files.
+        # Every helper called below prints its own status/error lines; those are
+        # silenced here (with failures still surfaced through ligand_errors) so the
+        # only visible output is the progress bar itself.
+        unique_lignames = df['LigName'].unique().tolist()
+        ligand_iterator = tqdm(unique_lignames, desc="Preparing ligands", unit="ligand") if TQDM_AVAILABLE else unique_lignames
+        ligand_files = {}
+        ligand_errors = []
+        with open(os.devnull, 'w') as _devnull:
+            for ligname in ligand_iterator:
+                try:
+                    with contextlib.redirect_stdout(_devnull), contextlib.redirect_stderr(_devnull):
+                        if is_stub_receptor:
+                            ligand_params_file, frcmod_file = self._prepare_ligand_mol2_files(ligname, assay_info, temp_poses_root)
+                        else:
+                            ligand_params_file, frcmod_file = self._prepare_ligand_tleap_files(ligname, assay_info, temp_poses_root)
+                except SystemExit:
+                    # _prepare_ligand_tleap_files() calls sys.exit(1) on unrecoverable
+                    # SDF->PDB conversion failures; catch it here so one bad ligand
+                    # doesn't kill the whole parallel run silently (output is
+                    # suppressed above) — its poses are simply marked failed below.
+                    ligand_params_file, frcmod_file = None, None
+                if not ligand_params_file or not frcmod_file:
+                    ligand_errors.append(ligname)
+                ligand_files[ligname] = (ligand_params_file, frcmod_file)
+        if ligand_errors:
+            print(f"⚠️  Failed to prepare ligand parameter files for: {', '.join(ligand_errors)} (their poses will fail).")
+
+        tasks = []
+        for _, row in df.iterrows():
+            pose_id = row['Pose_ID']
+            ligname = row['LigName']
+            ligand_params_file, frcmod_file = ligand_files[ligname]
+            tasks.append({
+                'project_name': self.name,
+                'project_path': self.path,
+                'results_db': results_db,
+                'assay_info': assay_info,
+                'pose_id': pose_id,
+                'run_number': row['run_number'],
+                'ligname': ligname,
+                'ligand_params_file': ligand_params_file,
+                'frcmod_file': frcmod_file,
+                'is_stub_receptor': is_stub_receptor,
+                'fps_tleap_config': fps_tleap_config,
+                'minimize': minimize,
+                'renumbering_dict': renumbering_dict,
+                'work_subdir': f"{ligname}_{pose_id}",
+                'clean_files': clean_files,
+            })
+
+        gpu_lock = Manager().Lock()
+        succeeded = 0
+        failed = 0
+        failed_poses = []
+
+        progress_bar = tqdm(total=len(tasks), desc="Computing MMGBSA", unit="pose") if TQDM_AVAILABLE else None
+
+        with ProcessPoolExecutor(max_workers=max_workers, initializer=_init_mmgbsa_worker, initargs=(gpu_lock,)) as executor:
+            future_to_task = {executor.submit(_compute_mmgbsa_pose_worker, task): task for task in tasks}
+
+            for future in as_completed(future_to_task):
+                task = future_to_task[future]
+                try:
+                    result = future.result()
+                except Exception as e:
+                    result = {
+                        "success": False, "pose_id": task['pose_id'], "ligname": task['ligname'],
+                        "mmgbsa_df": None, "total_energy": -1, "gas_energy": -1, "error": str(e),
+                    }
+
+                pose_id = result['pose_id']
+                ligname = result['ligname']
+
+                if result['success']:
+                    self._store_processed_mmgbsa_df_in_db(result['mmgbsa_df'], pose_id, results_db, computation_mode)
+                    succeeded += 1
+                else:
+                    failed += 1
+                    failed_poses.append((pose_id, ligname))
+
+                self._update_results_mmgbsa_energies(results_db, pose_id, result['total_energy'], result['gas_energy'])
+
+                if progress_bar:
+                    progress_bar.set_postfix(ok=succeeded, failed=failed)
+                    progress_bar.update(1)
+                else:
+                    print(f"\rComputing MMGBSA: {succeeded + failed}/{len(tasks)} poses (ok={succeeded}, failed={failed})", end="", flush=True)
+
+        if progress_bar:
+            progress_bar.close()
+        else:
+            print()
+
+        print(f"✅ MMGBSA computation complete: {succeeded} succeeded, {failed} failed.")
+        if failed_poses:
+            shown = ", ".join(f"{lig}#{pid}" for pid, lig in failed_poses[:20])
+            more = f" (+{len(failed_poses) - 20} more)" if len(failed_poses) > 20 else ""
+            print(f"   Failed poses: {shown}{more}")
+
+        if write_mmgbsa:
+            self._write_mmgbsa_fps(results_db, assay_info)
+
+        if clean_files:
+            # Per-pose subdirectories are already removed by each worker as it
+            # finishes; this clears the shared per-ligand parameter files and the
+            # now-empty top-level directory.
+            shutil.rmtree(temp_poses_root, ignore_errors=True)
+            print("✅ Temporary files cleaned up.")
+
     def _remap_project_path(self, stored_path: str) -> str:
         """
         Remap a stored absolute path to the current project location.
@@ -12259,22 +12444,30 @@ class MolDock:
 
         return None
 
-    def _restore_single_docked_pose(self, results_db, ligname, run_number):
+    def _restore_single_docked_pose(self, results_db, ligname, run_number, work_subdir=None):
         """
         Generate a .pdb file for a single docked pose identified by (ligname, run_number).
         Uses the same logic as extract_docked_poses: the per-ligand run_number matches the
         suffix that was used when PDB files were written during pose extraction.
+
+        work_subdir: optional name of a subdirectory under temp_restored_poses/ to isolate
+        this pose's files from every other pose (used by the parallel MMGBSA path so
+        concurrent poses never share fixed-name scratch files). None (default) keeps the
+        original shared temp_restored_poses/ directory.
         """
 
         # Retrieve input_model and pose_coords_json using (ligname, run_number) so that
         # the correct per-ligand pose is always retrieved.
         input_model, pose_coords_json = self._retrieve_pose_info(results_db, ligname, run_number)
-        
+
         pdb_dict = self._process_input_model_for_moldf(input_model, pose_coords_json)
 
         # Get the directory of the results_db (should be .../assay_x.db)
         assay_dir = os.path.dirname(os.path.abspath(results_db))
-        output_dir = os.path.join(assay_dir, "temp_restored_poses")
+        if work_subdir:
+            output_dir = os.path.join(assay_dir, "temp_restored_poses", work_subdir)
+        else:
+            output_dir = os.path.join(assay_dir, "temp_restored_poses")
         if not os.path.exists(output_dir):
             os.makedirs(output_dir, exist_ok=True)
 
@@ -12708,10 +12901,15 @@ class MolDock:
 
         return prmtop_file, inpcrd_file, output_pdb_file
 
-    def _minimize_complex(self, prmtop_file, inpcrd_file, output_dir, ligname, pose_id, output_pdb_file):
+    def _minimize_complex(self, prmtop_file, inpcrd_file, output_dir, ligname, pose_id, output_pdb_file, gpu_lock=None):
 
         """
         Will minimize the receptor under processing using sander
+
+        gpu_lock: optional context-manager-like lock (e.g. a multiprocessing.Lock).
+        When provided and a GPU is available, only the pmemd.cuda call is serialized
+        through this lock so concurrent parallel workers never contend for the GPU.
+        None (default) preserves the original unlocked behavior.
         """
         
         import subprocess
@@ -12750,8 +12948,12 @@ class MolDock:
                     """))
 
             pmemd_command = f"pmemd.cuda -O -i {min_in_file} -o {min_out_file} -p {prmtop_file} -c {inpcrd_file} -r {min_rst_file}"
-            subprocess.run(pmemd_command, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            
+            if gpu_lock is not None:
+                with gpu_lock:
+                    subprocess.run(pmemd_command, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                subprocess.run(pmemd_command, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
         else:
             # Run minimization with CPU only
             print("No GPU detected. Using sander for minimization...")
@@ -16117,3 +16319,124 @@ Example — cyclodextrin receptor:
         except Exception as e:
             print(f"  Error parsing .map file '{map_path}': {e}")
             return None
+
+
+# --- Module-level worker functions for MolDock._compute_mmgbsa_parallel() ---
+#
+# These must live at module level (rather than as MolDock methods) so they are
+# picklable for concurrent.futures.ProcessPoolExecutor, per the project's
+# convention for parallel worker functions.
+
+_gpu_lock = None
+
+
+def _init_mmgbsa_worker(lock):
+    """
+    ProcessPoolExecutor initializer: stashes the shared GPU lock in each worker
+    process and silences stdout/stderr for the worker's whole lifetime. The helper
+    methods invoked by _compute_mmgbsa_pose_worker() (tleap/sander/MMPBSA.py wrapper
+    calls) print their own status/error lines; with many workers running
+    concurrently these interleave into unreadable output, so each worker is muted
+    and progress is reported solely through the parent process's progress bar.
+    """
+    global _gpu_lock
+    _gpu_lock = lock
+    import sys
+    devnull = open(os.devnull, 'w')
+    sys.stdout = devnull
+    sys.stderr = devnull
+
+
+def _compute_mmgbsa_pose_worker(task):
+    """
+    Runs the full per-pose MMGBSA pipeline (restore pose -> build complex -> minimize
+    -> MMGBSA) inside a worker process for a single docked pose. Every filesystem path
+    used here is scoped to this pose's own subdirectory (task['work_subdir']) so
+    concurrent workers never collide on the fixed-name scratch files written by
+    tleap/sander/MMPBSA.py. GPU minimization (if used) is serialized via the shared
+    lock stashed by _init_mmgbsa_worker().
+
+    Returns a dict: {"success", "pose_id", "ligname", "mmgbsa_df", "total_energy",
+    "gas_energy", "error"}. On any exception the same fallback semantics as the
+    original sequential loop are used (total_energy = gas_energy = -1).
+    """
+    pose_id = task['pose_id']
+    ligname = task['ligname']
+    pose_output_dir = None
+
+    try:
+        moldock = MolDock.from_path(task['project_name'], task['project_path'])
+
+        output_dir, output_file = moldock._restore_single_docked_pose(
+            task['results_db'], ligname, task['run_number'], work_subdir=task['work_subdir']
+        )
+        pose_output_dir = output_dir
+
+        ligand_params_file, frcmod_file = task['ligand_params_file'], task['frcmod_file']
+
+        if task['is_stub_receptor']:
+            _receptor_pdb = os.path.join(
+                os.path.dirname(moldock._remap_project_path(
+                    task['assay_info'].get('receptor_info', {}).get('pdbqt_file', '')
+                )),
+                'receptor_checked.pdb'
+            )
+            prmtop_file, inpcrd_file, output_pdb_file = moldock._prepare_complex_prmtop_inpcrd_from_template_fps(
+                output_file, output_dir, task['fps_tleap_config'], ligand_params_file, frcmod_file, _receptor_pdb
+            )
+        else:
+            prmtop_file, inpcrd_file, output_pdb_file = moldock._prepare_complex_prmtop_inpcrd(
+                ligand_params_file, frcmod_file, task['assay_info'], output_dir, output_file, pose_id, ligname=ligname
+            )
+
+        if task['minimize']:
+            try:
+                rst_cpptraj_file, output_pdb_file = moldock._minimize_complex(
+                    prmtop_file, inpcrd_file, output_dir, ligname, pose_id, output_pdb_file, gpu_lock=_gpu_lock
+                )
+            except Exception:
+                rst_cpptraj_file = inpcrd_file
+        else:
+            rst_cpptraj_file = inpcrd_file
+
+        renumbering_dict = task['renumbering_dict']
+
+        complex_prmtop, receptor_prmtop, ligand_prmtop = moldock._prepare_mmgbsa_files(
+            ligname, pose_id, prmtop_file, output_dir
+        )
+        moldock._compute_mmgbsa_fingerprint(
+            ligname, pose_id, complex_prmtop, receptor_prmtop, ligand_prmtop, rst_cpptraj_file, output_dir
+        )
+        mmgbsa_df = moldock._parse_mmgbsa_decomposition_output(ligname, pose_id, output_dir)
+
+        if not mmgbsa_df.empty:
+            mmgbsa_df['residue'] = mmgbsa_df['residue'].apply(lambda x: renumbering_dict.get(x, x))
+            total_energy = round(mmgbsa_df['total'].sum(), 3)
+            gas_energy = round(mmgbsa_df['gas'].sum(), 3)
+        else:
+            total_energy, gas_energy = -1, -1
+
+        return {
+            "success": True,
+            "pose_id": pose_id,
+            "ligname": ligname,
+            "mmgbsa_df": mmgbsa_df,
+            "total_energy": total_energy,
+            "gas_energy": gas_energy,
+            "error": None,
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "pose_id": pose_id,
+            "ligname": ligname,
+            "mmgbsa_df": None,
+            "total_energy": -1,
+            "gas_energy": -1,
+            "error": str(e),
+        }
+
+    finally:
+        if task.get('clean_files') and pose_output_dir:
+            shutil.rmtree(pose_output_dir, ignore_errors=True)
