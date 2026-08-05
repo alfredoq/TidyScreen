@@ -12307,17 +12307,24 @@ class MolDock:
                             ligand_params_file, frcmod_file = self._prepare_ligand_mol2_files(ligname, assay_info, temp_poses_root)
                         else:
                             ligand_params_file, frcmod_file = self._prepare_ligand_tleap_files(ligname, assay_info, temp_poses_root)
-                except SystemExit:
+                except (SystemExit, Exception):
                     # _prepare_ligand_tleap_files() calls sys.exit(1) on unrecoverable
-                    # SDF->PDB conversion failures; catch it here so one bad ligand
-                    # doesn't kill the whole parallel run silently (output is
-                    # suppressed above) — its poses are simply marked failed below.
+                    # SDF->PDB conversion failures, and RDKit/antechamber/espaloma can
+                    # also raise on malformed ligands (e.g. valence errors); catch both
+                    # here so one bad ligand doesn't kill the whole parallel run
+                    # silently (output is suppressed above) — its poses are simply
+                    # marked failed below.
                     ligand_params_file, frcmod_file = None, None
                 if not ligand_params_file or not frcmod_file:
                     ligand_errors.append(ligname)
                 ligand_files[ligname] = (ligand_params_file, frcmod_file)
+
+        n_ligand_ok = len(unique_lignames) - len(ligand_errors)
+        print(f"✅ Ligand parameter files prepared: {n_ligand_ok}/{len(unique_lignames)} succeeded.")
         if ligand_errors:
-            print(f"⚠️  Failed to prepare ligand parameter files for: {', '.join(ligand_errors)} (their poses will fail).")
+            shown = ", ".join(ligand_errors[:20])
+            more = f" (+{len(ligand_errors) - 20} more)" if len(ligand_errors) > 20 else ""
+            print(f"⚠️  Failed to prepare ligand parameter files for: {shown}{more} (their poses will fail).")
 
         tasks = []
         for _, row in df.iterrows():
@@ -12493,25 +12500,29 @@ class MolDock:
       
         ## Compute ligand espaloma charges
         espaloma_output_file = self._compute_ligand_espaloma_charges(pdb_file)
-        
+
+        if espaloma_output_file is None:
+            print(f"[ERROR] Could not compute espaloma charges for ligand {ligname}")
+            return None, None
+
         # Run antechamber
-        
+
         antechamber_command = f"antechamber -i {pdb_file} -fi pdb -o {prepin_file} -fo prepc -c rc -cf {espaloma_output_file} "
-        
+
         try:
             subprocess.run(antechamber_command, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        
+
         except Exception as e:
             print(f"[ERROR] Failed to run antechamber: {e}")
-            return None
+            return None, None
 
         parmchk2_command = f"parmchk2 -i {prepin_file} -f prepc -o {frcmod_file}"
         try:
             subprocess.run(parmchk2_command, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        
+
         except Exception as e:
             print(f"[ERROR] Failed to run parmchk2: {e}")
-            return None
+            return None, None
 
         return prepin_file, frcmod_file
 
@@ -12532,6 +12543,10 @@ class MolDock:
         frcmod_file = os.path.join(output_dir, f"{ligname}.frcmod")
 
         espaloma_output_file = self._compute_ligand_espaloma_charges(pdb_file)
+
+        if espaloma_output_file is None:
+            print(f"[ERROR] Could not compute espaloma charges for ligand {ligname}")
+            return None, None
 
         antechamber_command = f"antechamber -i {pdb_file} -fi pdb -o {mol2_file} -fo mol2 -c rc -cf {espaloma_output_file}"
         try:
@@ -12564,11 +12579,17 @@ class MolDock:
             str: Path to the generated PDB file, or None if conversion failed.
         """
         import os
-        from rdkit import Chem
+        from rdkit import Chem, RDLogger
         from rdkit.Chem import AllChem
         import sqlite3
         from moldf import read_pdb
         from moldf import write_pdb
+
+        # RDKit's C++ logger (e.g. "Explicit valence for atom # N ... is greater
+        # than permitted") writes straight to the process's stderr file descriptor,
+        # bypassing Python-level sys.stderr redirection used by callers to keep the
+        # parallel MMGBSA pre-pass quiet. Disable it explicitly instead.
+        RDLogger.DisableLog('rdApp.*')
 
         # Construct input SDF and output PDB file paths
         sdf_file = os.path.join(output_dir, f"{ligname}.sdf")
@@ -12680,10 +12701,14 @@ class MolDock:
         
     def _compute_ligand_espaloma_charges(self, pdb_file):
         
-        from rdkit import Chem
+        from rdkit import Chem, RDLogger
         from espaloma_charge import charge
         import numpy as np
-        
+
+        # See _convert_ligand_sdf_into_pdb() for why this is needed: RDKit's C++
+        # logger bypasses Python-level stderr redirection.
+        RDLogger.DisableLog('rdApp.*')
+
         # Read the ligand PDB file into an RDKit molecule
         mol = Chem.MolFromPDBFile(pdb_file, removeHs=False)
         if mol is None:
