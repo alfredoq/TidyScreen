@@ -1,5 +1,6 @@
 import ast
 from asyncio import subprocess
+import json
 import os
 import site
 import sqlite3
@@ -75,6 +76,70 @@ class MolDock:
         data_dir = os.path.dirname(self.__chemspace_db)
         os.makedirs(data_dir, exist_ok=True)
 
+    @classmethod
+    def from_path(cls, project_name, project_path):
+        """
+        Construct a MolDock instance directly from project_name and project_path,
+        without requiring an ActivateProject lookup against the global projects DB.
+        Intended for use in contexts (e.g. the Streamlit GUI) where the project is
+        already known but ActivateProject cannot resolve the registry correctly.
+        """
+        instance = cls.__new__(cls)
+        instance.project = None
+        instance.name = project_name
+        instance.path = project_path
+        instance.description = None
+        instance.id = None
+        instance.created_date = None
+        instance._MolDock__chemspace_db = os.path.join(project_path, 'chemspace/processed_data', 'chemspace.db')
+        instance._MolDock__receptor_path = os.path.join(project_path, 'docking/receptors')
+        instance._MolDock__docking_registers_db = os.path.join(project_path, 'docking/docking_registers', 'registers.db')
+        instance._MolDock__docking_params_db = os.path.join(project_path, 'docking/params', 'params.db')
+        data_dir = os.path.dirname(instance._MolDock__chemspace_db)
+        os.makedirs(data_dir, exist_ok=True)
+        return instance
+
+    @staticmethod
+    def _prompt(message):
+        """
+        Clipboard-safe replacement for input() for prompts that contain emoji.
+
+        Problems with plain input(emoji_prompt):
+        1. Bracketed-paste mode: terminals wrap pasted text with ESC[200~/ESC[201~
+           which appear as literal characters when readline does not strip them.
+        2. Emoji in the prompt string: readline counts each emoji as 1 column but
+           they render as 2, so its cursor model drifts — backspace and arrow keys
+           land in the wrong position.
+        3. Writing terminal escape sequences (e.g. \\x1b[?2004l) to stdout before
+           input() can interfere with readline's own terminal initialisation and
+           prevent it from recognising arrow-key sequences, causing ^[[D etc. to
+           be inserted as literal text.
+
+        Fix:
+        - Print the emoji-containing message on its own line so the cursor is at
+          column 0 before readline starts, giving it an accurate starting position.
+        - Use readline.parse_and_bind() to suppress the bracketed-paste sentinels
+          inside readline itself rather than fighting the terminal directly.
+          This keeps readline's terminal setup intact and arrow keys work normally.
+        - Strip any residual escape sequences from the result as a safety net.
+        """
+        import re as _re
+        print(message)
+        try:
+            import readline as _rl
+            # readline ≥ 8.1 exposes this variable directly; fall back to
+            # binding the two sentinel sequences to a no-op on older versions.
+            try:
+                _rl.parse_and_bind('set enable-bracketed-paste off')
+            except Exception:
+                _rl.parse_and_bind(r'"\e[200~": ""')
+                _rl.parse_and_bind(r'"\e[201~": ""')
+        except ImportError:
+            pass  # no readline — residual-strip below is the only defence
+        raw = input('> ')
+        raw = _re.sub(r'\x1b\[\d+~', '', raw)
+        return raw.strip()
+
     def create_docking_method(self):
         """
         Will prompt the user for the following method parameters:
@@ -132,7 +197,7 @@ class MolDock:
             # Get user selection
             while True:
                 try:
-                    selection = input(f"\n🧬 Select docking engine (1-3) or 'cancel': ").strip()
+                    selection = self._prompt(f"\n🧬 Select docking engine (1-3) or 'cancel': ")
                     
                     if selection.lower() in ['cancel', 'quit', 'exit']:
                         print("❌ Docking method creation cancelled")
@@ -153,7 +218,7 @@ class MolDock:
             # Get method name
             while True:
                 try:
-                    method_name = input(f"\n📝 Enter method name (or 'cancel'): ").strip()
+                    method_name = self._prompt(f"\n📝 Enter method name (or 'cancel'): ")
                     
                     if method_name.lower() in ['cancel', 'quit', 'exit']:
                         print("❌ Docking method creation cancelled")
@@ -175,7 +240,7 @@ class MolDock:
                     return None
             
             # Get optional description
-            description = input(f"\n📄 Enter method description (optional): ").strip()
+            description = self._prompt(f"\n📄 Enter method description (optional): ")
             if not description:
                 description = f"Docking method using {selected_engine['name']}"
             
@@ -442,6 +507,227 @@ class MolDock:
             print(f"❌ Error listing docking methods: {e}")
             return None
 
+    def export_docking_method(self):
+        """
+        Export a docking method as a JSON file suitable for recreating it with create_docking_method.
+        Uses list_docking_methods() to display available methods and prompts the user to select one.
+        """
+        import sqlite3
+        import json
+
+        print(f"\n📤 EXPORT DOCKING METHOD")
+        print("=" * 50)
+
+        # Show available methods and let user browse details
+        methods_list = self.list_docking_methods()
+
+        if not methods_list:
+            return None
+
+        # Select method to export
+        while True:
+            try:
+                selection = input(
+                    f"\nEnter the number of the method to export (1-{len(methods_list)}) or 'cancel': "
+                ).strip()
+
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    print("❌ Export cancelled.")
+                    return None
+
+                idx = int(selection)
+                if 1 <= idx <= len(methods_list):
+                    selected = methods_list[idx - 1]
+                    break
+                else:
+                    print(f"❌ Invalid selection. Choose between 1 and {len(methods_list)}.")
+            except ValueError:
+                print("❌ Please enter a valid number or 'cancel'.")
+
+        # Build the export payload — all fields required to recreate the method
+        export_data = {
+            "method_name": selected['method_name'],
+            "docking_engine": selected['docking_engine'],
+            "description": selected['description'],
+            "parameters": selected['parameters'],
+            "ligand_prep_params": selected['ligand_prep_params'],
+        }
+
+        # Suggest a default output path next to the methods database
+        docking_registers_dir = os.path.dirname(self.__docking_registers_db)
+        default_output = os.path.join(docking_registers_dir, f"{selected['method_name']}.json")
+
+        output_path = self._prompt(f"\n📁 Enter output file path\n   (default: {default_output}): ")
+        if not output_path:
+            output_path = default_output
+
+        if not output_path.endswith('.json'):
+            output_path += '.json'
+
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+            with open(output_path, 'w', encoding='utf-8') as f:
+                json.dump(export_data, f, indent=2, ensure_ascii=False)
+
+            print(f"\n✅ Method '{selected['method_name']}' exported successfully.")
+            print(f"📍 File: {output_path}")
+            return output_path
+
+        except Exception as e:
+            print(f"❌ Error writing export file: {e}")
+            return None
+
+    def import_docking_method(self):
+        """
+        Import a docking method from a JSON file previously exported with export_docking_method.
+        """
+        import sqlite3
+        import json
+
+        print(f"\n📥 IMPORT DOCKING METHOD")
+        print("=" * 50)
+
+        # Ask for the JSON file path
+        while True:
+            json_path = self._prompt("📁 Enter path to the JSON file (or 'cancel'): ")
+
+            if json_path.lower() in ['cancel', 'quit', 'exit']:
+                print("❌ Import cancelled.")
+                return None
+
+            if not json_path:
+                print("❌ Path cannot be empty.")
+                continue
+
+            if not os.path.exists(json_path):
+                print(f"❌ File not found: {json_path}")
+                continue
+
+            break
+
+        # Read and validate the JSON
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except json.JSONDecodeError as e:
+            print(f"❌ Invalid JSON file: {e}")
+            return None
+        except Exception as e:
+            print(f"❌ Error reading file: {e}")
+            return None
+
+        required_keys = {'method_name', 'docking_engine', 'description', 'parameters', 'ligand_prep_params'}
+        missing = required_keys - set(data.keys())
+        if missing:
+            print(f"❌ JSON is missing required fields: {', '.join(sorted(missing))}")
+            return None
+
+        method_name     = data['method_name']
+        docking_engine  = data['docking_engine']
+        description     = data['description']
+        parameters      = data['parameters']
+        ligand_prep_params = data['ligand_prep_params']
+
+        # Show a preview before writing
+        print(f"\n📋 METHOD TO IMPORT:")
+        print(f"   {'─' * 46}")
+        print(f"   🏷️  Name:   {method_name}")
+        print(f"   🧬 Engine: {docking_engine}")
+        print(f"   📝 Desc:   {description or 'None'}")
+        print(f"   {'─' * 46}")
+
+        confirm = input("\nProceed with import? (y/n): ").strip().lower()
+        if confirm not in ['y', 'yes']:
+            print("❌ Import cancelled.")
+            return None
+
+        # Ensure docking directories exist
+        docking_registers_dir = os.path.dirname(self.__docking_registers_db)
+        os.makedirs(docking_registers_dir, exist_ok=True)
+        methods_db_path = os.path.join(docking_registers_dir, 'docking_methods.db')
+
+        try:
+            conn = sqlite3.connect(methods_db_path)
+            cursor = conn.cursor()
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS docking_methods (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    method_name TEXT UNIQUE NOT NULL,
+                    docking_engine TEXT NOT NULL,
+                    description TEXT,
+                    parameters TEXT,
+                    ligand_prep_params TEXT,
+                    created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
+            cursor.execute("SELECT COUNT(*) FROM docking_methods WHERE method_name = ?", (method_name,))
+            exists = cursor.fetchone()[0] > 0
+
+            if exists:
+                print(f"⚠️  Method name '{method_name}' already exists.")
+                while True:
+                    overwrite = input("Overwrite existing method? (y/n): ").strip().lower()
+                    if overwrite in ['y', 'yes']:
+                        cursor.execute('''
+                            UPDATE docking_methods
+                            SET docking_engine = ?, description = ?, parameters = ?,
+                                ligand_prep_params = ?, created_date = CURRENT_TIMESTAMP
+                            WHERE method_name = ?
+                        ''', (
+                            docking_engine,
+                            description,
+                            self._serialize_parameters(parameters),
+                            self._serialize_parameters(ligand_prep_params),
+                            method_name,
+                        ))
+                        print(f"✅ Updated existing docking method '{method_name}'.")
+                        break
+                    elif overwrite in ['n', 'no']:
+                        print("❌ Import cancelled — name already exists.")
+                        conn.close()
+                        return None
+                    else:
+                        print("❌ Please answer 'y' or 'n'.")
+            else:
+                cursor.execute('''
+                    INSERT INTO docking_methods
+                        (method_name, docking_engine, description, parameters, ligand_prep_params)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (
+                    method_name,
+                    docking_engine,
+                    description,
+                    self._serialize_parameters(parameters),
+                    self._serialize_parameters(ligand_prep_params),
+                ))
+                print(f"✅ Imported docking method '{method_name}'.")
+
+            method_id = cursor.execute(
+                "SELECT id FROM docking_methods WHERE method_name = ?", (method_name,)
+            ).fetchone()[0]
+
+            conn.commit()
+            conn.close()
+
+            print(f"📋 Method ID: {method_id}")
+            print(f"🗂️  Database:  {methods_db_path}")
+
+            return {
+                'method_id': method_id,
+                'method_name': method_name,
+                'docking_engine': docking_engine,
+                'description': description,
+                'parameters': parameters,
+                'ligand_prep_params': ligand_prep_params,
+                'database_path': methods_db_path,
+            }
+
+        except Exception as e:
+            print(f"❌ Error importing docking method: {e}")
+            return None
+
     def delete_docking_method(self):
         """
         Delete a docking method registry from the database as created using the create_docking_method method
@@ -486,7 +772,7 @@ class MolDock:
                 except ValueError:
                     print("❌ Please enter a valid number or 'q' to cancel.")
 
-            confirm = input(f"⚠️  Are you sure you want to delete docking method ID {method_id}? (yes/no): ").strip().lower()
+            confirm = self._prompt(f"⚠️  Are you sure you want to delete docking method ID {method_id}? (yes/no): ").lower()
             if confirm != 'yes':
                 print("❌ Deletion cancelled by user.")
                 conn.close()
@@ -630,6 +916,185 @@ class MolDock:
         except Exception as e:
             print(f"❌ Error listing docking assays: {e}")
             return None
+
+    def delete_docking_assays(self):
+        """
+        Interactively delete one or more docking assays, removing their registry entries
+        from docking_assays.db and their associated folders on disk.
+        """
+        import sqlite3
+        import shutil
+
+        assays_db_path = os.path.join(os.path.dirname(self.__docking_registers_db), 'docking_assays.db')
+
+        if not os.path.exists(assays_db_path):
+            print("❌ No docking assays database found.")
+            print(f"   Expected location: {assays_db_path}")
+            return None
+
+        try:
+            conn = sqlite3.connect(assays_db_path)
+            cursor = conn.cursor()
+
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='docking_assays'")
+            if not cursor.fetchone():
+                print("❌ Docking assays table not found in database.")
+                conn.close()
+                return None
+
+            cursor.execute(
+                """
+                SELECT assay_id, assay_name, table_name, docking_method_name,
+                       docking_engine, status, docking_status, compound_count,
+                       created_date, assay_folder_path
+                FROM docking_assays
+                WHERE project_name = ?
+                ORDER BY assay_id ASC
+                """,
+                (self.name,)
+            )
+            rows = cursor.fetchall()
+        except sqlite3.Error as e:
+            print(f"❌ Database error: {e}")
+            return None
+
+        if not rows:
+            print(f"📋 No docking assays found for project '{self.name}'.")
+            conn.close()
+            return None
+
+        print(f"\n🗑️  DELETE DOCKING ASSAY(S) — PROJECT: {self.name}")
+        print("=" * 120)
+        print(f"{'#':<4} {'ID':<5} {'Assay Name':<20} {'Table':<18} {'Method':<18} {'Engine':<14} {'Compounds':<10} {'Created':<20}")
+        print("=" * 120)
+        for i, (assay_id, assay_name, table_name, method_name, engine,
+                status, docking_status, compound_count, created_date, assay_folder_path) in enumerate(rows, 1):
+            effective_status = status or docking_status or 'unknown'
+            print(
+                f"{i:<4} {assay_id:<5} {assay_name[:19]:<20} {table_name[:17]:<18} "
+                f"{method_name[:17]:<18} {engine[:13]:<14} {compound_count or 0:<10} {created_date or '':<20}"
+            )
+            if assay_folder_path:
+                folder_exists = os.path.exists(assay_folder_path)
+                print(f"      📁 {assay_folder_path} ({'exists' if folder_exists else 'missing'})")
+        print("=" * 120)
+
+        # Multi-selection prompt
+        print("\nEnter assay number(s) to delete — supports: individual ('1,3'), ranges ('2-5'), or mixed ('1,3-5,7'); 'all' to delete all; 'cancel' to abort.")
+        try:
+            raw = input("Selection: ").strip()
+        except KeyboardInterrupt:
+            print("\n❌ Deletion cancelled.")
+            conn.close()
+            return None
+
+        if raw.lower() in ('cancel', 'quit', 'q', ''):
+            print("❌ Deletion cancelled.")
+            conn.close()
+            return None
+
+        if raw.lower() == 'all':
+            selected_indices = list(range(len(rows)))
+        else:
+            selected_indices = []
+            for token in raw.split(','):
+                token = token.strip()
+                if '-' in token:
+                    parts = token.split('-', 1)
+                    try:
+                        start = int(parts[0].strip()) - 1
+                        end = int(parts[1].strip()) - 1
+                        if start > end:
+                            start, end = end, start
+                        if start < 0 or end >= len(rows):
+                            print(f"⚠️  Range '{token}' partially or fully out of bounds (valid: 1-{len(rows)}), skipping.")
+                            continue
+                        selected_indices.extend(range(start, end + 1))
+                    except ValueError:
+                        print(f"⚠️  Skipping invalid range token: '{token}'")
+                else:
+                    try:
+                        idx = int(token) - 1
+                        if 0 <= idx < len(rows):
+                            selected_indices.append(idx)
+                        else:
+                            print(f"⚠️  Skipping out-of-range number: {token}")
+                    except ValueError:
+                        print(f"⚠️  Skipping invalid token: '{token}'")
+            selected_indices = list(dict.fromkeys(selected_indices))  # deduplicate, preserve order
+
+        if not selected_indices:
+            print("❌ No valid assays selected. Deletion cancelled.")
+            conn.close()
+            return None
+
+        selected_rows = [rows[i] for i in selected_indices]
+
+        # Confirmation summary
+        print(f"\n⚠️  THE FOLLOWING {len(selected_rows)} ASSAY(S) WILL BE PERMANENTLY DELETED:")
+        print("=" * 80)
+        for assay_id, assay_name, table_name, method_name, engine, status, docking_status, compound_count, created_date, assay_folder_path in selected_rows:
+            print(f"   • [{assay_id}] {assay_name}  (table: {table_name}, engine: {engine})")
+            if assay_folder_path:
+                folder_exists = os.path.exists(assay_folder_path)
+                print(f"     📁 Folder: {assay_folder_path} ({'will be removed' if folder_exists else 'already missing'})")
+        print("=" * 80)
+
+        try:
+            confirm = input("Confirm deletion? (yes/no, default: no): ").strip().lower()
+        except KeyboardInterrupt:
+            print("\n❌ Deletion cancelled.")
+            conn.close()
+            return None
+
+        if confirm != 'yes':
+            print("❌ Deletion cancelled.")
+            conn.close()
+            return None
+
+        # Perform deletion
+        deleted_registries = 0
+        deleted_folders = 0
+        missing_folders = 0
+
+        try:
+            for assay_id, assay_name, _, _, _, _, _, _, _, assay_folder_path in selected_rows:
+                cursor.execute("DELETE FROM docking_assays WHERE assay_id = ?", (assay_id,))
+                deleted_registries += cursor.rowcount
+
+                if assay_folder_path:
+                    if os.path.exists(assay_folder_path):
+                        try:
+                            shutil.rmtree(assay_folder_path)
+                            deleted_folders += 1
+                            print(f"   ✓ Removed folder: {assay_folder_path}")
+                        except Exception as e:
+                            print(f"   ⚠️  Could not remove folder {assay_folder_path}: {e}")
+                    else:
+                        missing_folders += 1
+                        print(f"   ⚠️  Folder already missing: {assay_folder_path}")
+
+            conn.commit()
+        except sqlite3.Error as e:
+            conn.rollback()
+            print(f"❌ Database error during deletion: {e}")
+            conn.close()
+            return None
+        finally:
+            conn.close()
+
+        print(f"\n✅ Deletion complete.")
+        print(f"   Registry entries deleted : {deleted_registries}")
+        print(f"   Assay folders removed    : {deleted_folders}")
+        if missing_folders:
+            print(f"   Folders already missing  : {missing_folders}")
+
+        return {
+            'status': 'deleted',
+            'deleted_registries': deleted_registries,
+            'deleted_folders': deleted_folders,
+            'missing_folders': missing_folders,
+        }
 
     def _get_engine_specific_parameters(self, engine_name: str) -> Optional[Dict[str, Any]]:
         """
@@ -1069,7 +1534,7 @@ class MolDock:
         """Get integer parameter from user with validation."""
         while True:
             try:
-                value_str = input(f"📊 {param_name} ({min_val}-{max_val}, default: {default}): ").strip()
+                value_str = self._prompt(f"📊 {param_name} ({min_val}-{max_val}, default: {default}): ")
                 
                 if not value_str:
                     return default
@@ -1092,7 +1557,7 @@ class MolDock:
         """Get float parameter from user with validation."""
         while True:
             try:
-                value_str = input(f"📊 {param_name} ({min_val}-{max_val}, default: {default}): ").strip()
+                value_str = self._prompt(f"📊 {param_name} ({min_val}-{max_val}, default: {default}): ")
                 
                 if not value_str:
                     return default
@@ -1283,7 +1748,7 @@ class MolDock:
                         
                         while True:
                             try:
-                                choice = input(f"\n🧬 Choose option (1/2): ").strip()
+                                choice = self._prompt(f"\n🧬 Choose option (1/2): ")
                                 
                                 if choice == '1':
                                     print(f"\n📋 Showing all {total_analyzed} tables (including not ready)...")
@@ -1336,7 +1801,16 @@ class MolDock:
             if not receptor_info:
                 print("❌ No receptor selected. Docking cancelled.")
                 return None
-            
+
+            ## Fail fast if the receptor PDBQT is missing: docking with the 'ad4' scoring
+            ## function never reads this file (it only uses the AutoGrid4 maps), so a
+            ## missing/stale path would otherwise only surface after the full docking run,
+            ## when Ringtail's results processing needs it for save_receptor/add_interactions.
+            if selected_method['docking_engine'] == 'Vina' and not self._resolve_receptor_pdbqt_file(receptor_info):
+                print("❌ Receptor PDBQT file could not be located on disk (neither in 'processed/' nor alongside the grid maps).")
+                print("   Docking cancelled before running, since results processing would fail on this receptor later.")
+                return None
+
             print(f"✅ Selected receptor: '{receptor_info['template_name']}'")
 
             if selected_table:
@@ -1350,7 +1824,7 @@ class MolDock:
                 note_text = notes
                 if note_text is None:
                     try:
-                        note_text = input(f"\n📝 Enter notes for this docking assay (press Enter to leave blank): ")
+                        note_text = self._prompt(f"\n📝 Enter notes for this docking assay (press Enter to leave blank): ")
                     except KeyboardInterrupt:
                         print("\n❌ Docking preparation cancelled")
                         return None
@@ -1444,7 +1918,7 @@ class MolDock:
         
         while True:
             try:
-                choice = input(f"\n🧬 Choose execution mode (1/2, or 'cancel'): ").strip().lower()
+                choice = self._prompt(f"\n🧬 Choose execution mode (1/2, or 'cancel'): ").lower()
                 
                 if choice in ['1', 'foreground', 'fg']:
                     print(f"✅ Selected: FOREGROUND execution")
@@ -1539,6 +2013,7 @@ class MolDock:
         """
         import subprocess
         import sys
+        import textwrap
         from datetime import datetime
         
         try:
@@ -1553,48 +2028,48 @@ class MolDock:
             os.makedirs(os.path.dirname(log_file), exist_ok=True)
             
             # Build Python command to run docking
-            python_script = f"""
-import sys
-import os
-import time
-sys.path.insert(0, '{self.path}')
+            python_script = textwrap.dedent(f"""
+                import sys
+                import os
+                import time
+                sys.path.insert(0, '{self.path}')
 
-from tidyscreen import tidyscreen
-from tidyscreen.moldock.moldock import MolDock
+                from tidyscreen import tidyscreen
+                from tidyscreen.moldock.moldock import MolDock
 
-start_time = time.time()
+                start_time = time.time()
 
-try:
-    # Recreate the project and MolDock objects
-    project = tidyscreen.ActivateProject('{self.name}')
-    moldock = MolDock(project)
-    
-    # Retrieve method info from assay registry
-    assay_id = {assay_registry['assay_id']}
-    
-    # Prepare parameters
-    selected_table = '{selected_table}'
-    selected_method = {selected_method}
-    assay_registry = {assay_registry}
-    clean_ligand_files = {clean_ligand_files}
-    receptor_info = {receptor_info}
-    
-    # Run docking
-    moldock._run_docking_foreground(selected_table, selected_method, assay_registry, clean_ligand_files, receptor_info)
-    
-    elapsed = time.time() - start_time
-    print(f'✅ Background docking process completed successfully')
-    print(f'⏱️  Elapsed time: {{elapsed:.2f}} seconds')
-    sys.exit(0)
-    
-except Exception as e:
-    elapsed = time.time() - start_time
-    print(f'❌ Error in background docking process: {{e}}')
-    print(f'⏱️  Elapsed time (with error): {{elapsed:.2f}} seconds')
-    import traceback
-    traceback.print_exc()
-    sys.exit(1)
-    """
+                try:
+                    # Recreate the project and MolDock objects
+                    project = tidyscreen.ActivateProject('{self.name}')
+                    moldock = MolDock(project)
+
+                    # Retrieve method info from assay registry
+                    assay_id = {assay_registry['assay_id']}
+
+                    # Prepare parameters
+                    selected_table = '{selected_table}'
+                    selected_method = {selected_method}
+                    assay_registry = {assay_registry}
+                    clean_ligand_files = {clean_ligand_files}
+                    receptor_info = {receptor_info}
+
+                    # Run docking
+                    moldock._run_docking_foreground(selected_table, selected_method, assay_registry, clean_ligand_files, receptor_info)
+
+                    elapsed = time.time() - start_time
+                    print(f'✅ Background docking process completed successfully')
+                    print(f'⏱️  Elapsed time: {{elapsed:.2f}} seconds')
+                    sys.exit(0)
+
+                except Exception as e:
+                    elapsed = time.time() - start_time
+                    print(f'❌ Error in background docking process: {{e}}')
+                    print(f'⏱️  Elapsed time (with error): {{elapsed:.2f}} seconds')
+                    import traceback
+                    traceback.print_exc()
+                    sys.exit(1)
+                """)
             
             # Write script to temporary file
             script_file = os.path.join(
@@ -1869,37 +2344,39 @@ except Exception as e:
             assay_name (str): Name of the assay
         """
         try:
+            import textwrap
             from datetime import datetime
             
-            readme_content = f"""# Docking Assay: {assay_name}
+            readme_content = textwrap.dedent(f"""
+                # Docking Assay: {assay_name}
 
-    Created: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-    Project: {self.name}
+                Created: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+                Project: {self.name}
 
-    ## Folder Structure
+                ## Folder Structure
 
-    - **ligands/**: Prepared ligand files (PDBQT, SDF formats)
-    - **receptors/**: Receptor structure files (PDB, PDBQT formats)  
-    - **grid_files/**: Grid and map files for docking
-    - **results/**: Docking output files and poses
-    - **logs/**: Log files and error reports
-    - **analysis/**: Analysis results, plots, and summaries
-    - **configurations/**: Docking configuration files (DPF, config files)
+                - **ligands/**: Prepared ligand files (PDBQT, SDF formats)
+                - **receptors/**: Receptor structure files (PDB, PDBQT formats)
+                - **grid_files/**: Grid and map files for docking
+                - **results/**: Docking output files and poses
+                - **logs/**: Log files and error reports
+                - **analysis/**: Analysis results, plots, and summaries
+                - **configurations/**: Docking configuration files (DPF, config files)
 
-    ## Usage Notes
+                ## Usage Notes
 
-    This folder structure is designed to organize all files related to this docking assay.
-    Place input files in the appropriate directories and docking results will be saved
-    to the results/ directory.
+                This folder structure is designed to organize all files related to this docking assay.
+                Place input files in the appropriate directories and docking results will be saved
+                to the results/ directory.
 
-    ## File Naming Convention
+                ## File Naming Convention
 
-    - Use consistent naming with assay ID prefix
-    - Keep original compound identifiers where possible
-    - Use standard file extensions (.pdbqt, .sdf, .pdb, .dlg, etc.)
+                - Use consistent naming with assay ID prefix
+                - Keep original compound identifiers where possible
+                - Use standard file extensions (.pdbqt, .sdf, .pdb, .dlg, etc.)
 
-    Generated by TidyScreen MolDock module.
-    """
+                Generated by TidyScreen MolDock module.
+                """)
             
             readme_path = os.path.join(assay_folder_path, 'README.md')
             with open(readme_path, 'w') as f:
@@ -2228,7 +2705,7 @@ except Exception as e:
             # Method selection loop
             while True:
                 try:
-                    selection = input(f"\n🎯 Select docking method: ").strip()
+                    selection = self._prompt(f"\n🎯 Select docking method: ")
                     
                     if selection.lower() in ['cancel', 'quit', 'exit']:
                         return None
@@ -2407,7 +2884,7 @@ except Exception as e:
             # Get user choice
             while True:
                 try:
-                    choice = input("🎯 Select next step (1/2): ").strip()
+                    choice = self._prompt("🎯 Select next step (1/2): ")
                     
                     if choice == '1':
                         print("🧪 Will load molecules for immediate docking preparation")
@@ -2468,7 +2945,7 @@ except Exception as e:
             # Get user choice
             while True:
                 try:
-                    choice = input("🧬 Select preparation option (1/2/3): ").strip()
+                    choice = self._prompt("🧬 Select preparation option (1/2/3): ")
                     
                     if choice == '1':
                         print("✅ Will return table name for later processing")
@@ -3000,7 +3477,7 @@ except Exception as e:
             # Rest of the selection logic remains the same...
             while True:
                 try:
-                    selection = input(f"\n🧬 Select table for docking preparation: ").strip()
+                    selection = self._prompt(f"\n🧬 Select table for docking preparation: ")
                     
                     if selection.lower() in ['cancel', 'quit', 'exit']:
                         return None
@@ -3130,6 +3607,225 @@ except Exception as e:
         except Exception as e:
             print(f"❌ Error showing table details: {e}")
     
+    def _check_pdb_format_integrity(self, pdb_file: str) -> Dict[str, Any]:
+        """
+        Check that ATOM/HETATM records conform to the fixed-column PDB v3.3 format.
+
+        Validated fields per record:
+          - Minimum line length to contain XYZ coordinates (≥ 54 chars)
+          - Residue sequence number (cols 23-26) parseable as integer
+          - X, Y, Z coordinates (cols 31-54) parseable as floats
+          - Occupancy (cols 55-60) and B-factor (cols 61-66) parseable as floats (warnings only)
+
+        Returns a dict with keys:
+          passed   (bool)   — False if any error-level issue found
+          errors   (list)   — list of {line, record, field, message} dicts
+          warnings (list)   — list of {line, record, field, message} dicts
+          stats    (dict)   — atom_records, hetatm_records, malformed_records counts
+        """
+        result: Dict[str, Any] = {
+            'passed': True,
+            'errors': [],
+            'warnings': [],
+            'stats': {'atom_records': 0, 'hetatm_records': 0, 'malformed_records': 0, 'has_end_record': False},
+        }
+
+        def _err(line_no, record, field, msg):
+            result['errors'].append({'line': line_no, 'record': record, 'field': field, 'message': msg})
+            result['stats']['malformed_records'] += 1
+            result['passed'] = False
+
+        def _warn(line_no, record, field, msg):
+            result['warnings'].append({'line': line_no, 'record': record, 'field': field, 'message': msg})
+
+        try:
+            with open(pdb_file, 'r', errors='replace') as f:
+                lines = f.readlines()
+        except OSError as e:
+            result['passed'] = False
+            result['errors'].append({'line': 0, 'record': '', 'field': '', 'message': f"Cannot read file: {e}"})
+            return result
+
+        for line_no, line in enumerate(lines, 1):
+            line = line.rstrip('\n')
+            record = line[:6].strip()
+
+            if record == 'END':
+                result['stats']['has_end_record'] = True
+                continue
+
+            if record not in ('ATOM', 'HETATM'):
+                continue
+
+            if record == 'ATOM':
+                result['stats']['atom_records'] += 1
+            else:
+                result['stats']['hetatm_records'] += 1
+
+            # Minimum length to contain Z coordinate (col 47-54, 0-based 46-54)
+            if len(line) < 54:
+                _err(line_no, record, 'XYZ', f"Line too short ({len(line)} chars); coordinates missing")
+                continue
+
+            # Residue sequence number (cols 23-26, 0-based 22-26)
+            resseq_raw = line[22:26]
+            try:
+                int(resseq_raw)
+            except ValueError:
+                _err(line_no, record, 'resSeq', f"Residue sequence number not an integer: {resseq_raw!r}")
+
+            # X coordinate (cols 31-38, 0-based 30-38)
+            x_raw = line[30:38]
+            try:
+                float(x_raw)
+            except ValueError:
+                _err(line_no, record, 'X', f"X coordinate not a float: {x_raw!r}")
+
+            # Y coordinate (cols 39-46, 0-based 38-46)
+            y_raw = line[38:46]
+            try:
+                float(y_raw)
+            except ValueError:
+                _err(line_no, record, 'Y', f"Y coordinate not a float: {y_raw!r}")
+
+            # Z coordinate (cols 47-54, 0-based 46-54)
+            z_raw = line[46:54]
+            try:
+                float(z_raw)
+            except ValueError:
+                _err(line_no, record, 'Z', f"Z coordinate not a float: {z_raw!r}")
+
+            # Occupancy (cols 55-60, 0-based 54-60) — warning only
+            if len(line) >= 60:
+                occ_raw = line[54:60]
+                try:
+                    float(occ_raw)
+                except ValueError:
+                    _warn(line_no, record, 'occupancy', f"Occupancy not a float: {occ_raw!r}")
+
+            # B-factor (cols 61-66, 0-based 60-66) — warning only
+            if len(line) >= 66:
+                bfac_raw = line[60:66]
+                try:
+                    float(bfac_raw)
+                except ValueError:
+                    _warn(line_no, record, 'tempFactor', f"B-factor not a float: {bfac_raw!r}")
+
+        total_coord = result['stats']['atom_records'] + result['stats']['hetatm_records']
+        if total_coord == 0:
+            result['passed'] = False
+            result['errors'].append({'line': 0, 'record': '', 'field': '', 'message': "No ATOM or HETATM records found"})
+
+        if not result['stats']['has_end_record']:
+            _warn(0, '', '', "Missing END record")
+
+        return result
+
+    def _validate_pdb_model_input(self, pdb_file: str) -> bool:
+        """
+        Run all input validation checks on a PDB file before registering it as a model.
+        Returns True if the file passes (or the user chooses to proceed despite warnings).
+        Returns False if errors are found and the user decides not to continue.
+        """
+        print(f"\n🔍 Validating PDB file...")
+
+        # --- Check 1: standard PDB format integrity ---
+        integrity = self._check_pdb_format_integrity(pdb_file)
+
+        stats = integrity['stats']
+        print(f"   ATOM records  : {stats['atom_records']}")
+        print(f"   HETATM records: {stats['hetatm_records']}")
+
+        if integrity['warnings']:
+            print(f"   ⚠️  Warnings ({len(integrity['warnings'])}):")
+            for w in integrity['warnings']:
+                loc = f"line {w['line']}" if w['line'] else "file"
+                print(f"       [{loc}] {w['field']}: {w['message']}" if w['field'] else f"       [{loc}] {w['message']}")
+
+        if not integrity['passed']:
+            print(f"   ❌ Format integrity check FAILED ({len(integrity['errors'])} error(s)):")
+            for e in integrity['errors']:
+                loc = f"line {e['line']}" if e['line'] else "file"
+                print(f"       [{loc}] {e['field']}: {e['message']}" if e['field'] else f"       [{loc}] {e['message']}")
+            try:
+                proceed = input(f"\n   Proceed anyway? (yes/no, default: no): ").strip().lower()
+            except KeyboardInterrupt:
+                return False
+            if proceed != 'yes':
+                print(f"❌ Import cancelled due to format errors")
+                return False
+            print(f"   ⚠️  Proceeding despite format errors")
+        else:
+            print(f"   ✓ Format integrity check passed")
+
+        # --- Check 2: water residues (HOH/WAT) labeled as ATOM instead of HETATM ---
+        water_atom_count = 0
+        water_residues = {'HOH', 'WAT'}
+        try:
+            with open(pdb_file, 'r', errors='replace') as f:
+                for line in f:
+                    if line[:6].strip() == 'ATOM' and len(line) >= 20:
+                        if line[17:20].strip() in water_residues:
+                            water_atom_count += 1
+        except OSError:
+            pass
+
+        if water_atom_count > 0:
+            print(f"   ⚠️  Water record type check: {water_atom_count} HOH/WAT record(s) labeled as ATOM — will be auto-corrected to HETATM")
+        else:
+            print(f"   ✓ Water record type check passed")
+
+        return True
+
+    def _fix_water_record_types(self, pdb_content: bytes) -> tuple:
+        """
+        Relabel water residues (HOH, WAT) incorrectly recorded as ATOM to HETATM.
+        Both record names are exactly 6 characters, so all column offsets are preserved.
+        Returns (corrected_bytes, n_fixed).
+        """
+        water_residues = {'HOH', 'WAT'}
+        result = []
+        n_fixed = 0
+        for raw_line in pdb_content.splitlines(keepends=True):
+            line = raw_line.decode('utf-8', errors='replace')
+            if line[:6].strip() == 'ATOM' and len(line) >= 20:
+                if line[17:20].strip() in water_residues:
+                    line = 'HETATM' + line[6:]
+                    raw_line = line.encode('utf-8')
+                    n_fixed += 1
+            result.append(raw_line)
+        return b''.join(result), n_fixed
+
+    def _strip_histidine_hydrogens(self, pdb_content: bytes) -> tuple:
+        """
+        Remove all hydrogen atoms belonging to histidine residues (HIS/HID/HIE/HIP)
+        from PDB content.  tleap re-adds the correct Hs based on the residue name.
+
+        Returns (cleaned_bytes, n_removed).
+        """
+        his_residues = {'HIS', 'HID', 'HIE', 'HIP'}
+        filtered, removed = [], 0
+        for raw_line in pdb_content.splitlines(keepends=True):
+            line = raw_line.decode('utf-8', errors='replace')
+            record = line[:6].strip()
+            if record in ('ATOM', 'HETATM'):
+                res_name = line[17:20].strip()
+                if res_name in his_residues:
+                    atom_name = line[12:16].strip()
+                    element = line[76:78].strip() if len(line) > 76 else ''
+                    is_hydrogen = (
+                        element == 'H'
+                        or (not element and (
+                            atom_name.startswith('H')
+                            or (len(atom_name) >= 2 and atom_name[0].isdigit() and atom_name[1] == 'H')
+                        ))
+                    )
+                    if is_hydrogen:
+                        removed += 1
+                        continue
+            filtered.append(raw_line)
+        return b''.join(filtered), removed
+
     def create_pdb_model(self) -> Optional[Dict[str, Any]]:
         """
         The user is prompted to select a PDB file, which will be stored as a blob object in a table named pdb_files in the pdbs.db located in the 
@@ -3153,7 +3849,7 @@ except Exception as e:
             # Get PDB file path
             while True:
                 try:
-                    pdb_file_temp = input(f"\n📁 Enter path to PDB model file: ").strip()
+                    pdb_file_temp = self._prompt(f"\n📁 Enter path to PDB model file: ")
                     pdb_file = os.path.abspath(os.path.expanduser(pdb_file_temp))
                     
                     
@@ -3189,7 +3885,7 @@ except Exception as e:
             default_name = os.path.splitext(os.path.basename(pdb_file))[0]
             while True:
                 try:
-                    pdb_model_name = input(f"\n🏷️  Enter name for this PDB model (default: {default_name}): ").strip()
+                    pdb_model_name = self._prompt(f"\n🏷️  Enter name for this PDB model (default: {default_name}): ")
                     
                     if not pdb_model_name:
                         pdb_model_name = default_name
@@ -3222,20 +3918,32 @@ except Exception as e:
             
             # Get optional description
             try:
-                description = input(f"\n📝 Enter description (optional, press Enter to skip): ").strip()
+                description = self._prompt(f"\n📝 Enter description (optional, press Enter to skip): ")
             except KeyboardInterrupt:
                 print(f"\n   ⚠️  Description entry cancelled. Using empty description.")
                 description = ""
             
+            # Validate PDB file before storing
+            if not self._validate_pdb_model_input(pdb_file):
+                return None
+
             # Read PDB file content
             print(f"\n📖 Reading PDB file...")
             try:
                 with open(pdb_file, 'rb') as f:
                     pdb_blob = f.read()
-                
+
+                pdb_blob, his_h_removed = self._strip_histidine_hydrogens(pdb_blob)
+                if his_h_removed:
+                    print(f"   ✓ Removed {his_h_removed} hydrogen atom(s) from histidine residues")
+
+                pdb_blob, waters_fixed = self._fix_water_record_types(pdb_blob)
+                if waters_fixed:
+                    print(f"   ✓ Corrected {waters_fixed} water record(s) from ATOM to HETATM")
+
                 file_size = len(pdb_blob)
                 print(f"   ✓ File read successfully ({file_size:,} bytes)")
-                
+
             except Exception as e:
                 print(f"❌ Error reading PDB file: {e}")
                 return None
@@ -3324,180 +4032,428 @@ except Exception as e:
             traceback.print_exc()
             return None
     
+    def create_pdb_models_in_batch(self) -> Optional[Dict[str, Any]]:
+        """
+        The user is prompted to select a PDB file, which will be stored as a blob object in a table named pdb_files in the pdbs.db located in the 
+        project_path/docking/receptors directory
+        
+        Returns:
+            Optional[Dict[str, Any]]: Information about the saved PDB file or None if failed
+        """
+        import sqlite3
+        import json
+        from datetime import datetime
+        
+        
+        # Query the user the directory from which to retrieve the .pdb batch files
+        directory = input("Enter the full path to the directory containing the .pdb files: ")
+        files_pattern = input("Enter the pattern to match pdb files to process: ")
+        
+        # Create a list of files in 'directory' containining the file_pattern
+        
+        pdb_files = []
+        
+        for filename in os.listdir(directory):
+            if files_pattern in filename and filename.endswith('.pdb'):
+                print(f"Processing {filename}")
+                pdb_files.append(os.path.join(directory, filename))
+
+        print(pdb_files)
+
+        ## Loop through the list of files and process them one by one, with the same logic as in create_pdb_model, but without asking for the file path and name, since they are already defined in the list. The description will be set to "Model loaded in batch mode." and the notes will include the original file path. The rest of the logic will be the same, including checking for existing names in the database and adding an increasing index if needed.
+        for pdb_file in pdb_files:
+            try:
+                # Prompt for PDB file path
+                print(f"\n💾 SAVE PDB MODEL TO DATABASE")
+                print("=" * 80)
+                print(f"   This will store a PDB file as a blob in the database")
+                print(f"   Location: {self.path}/docking/receptors/pdbs.db")
+                print("=" * 80)
+                        
+                print(f"Processing {pdb_file}")
+            
+                if not pdb_file:
+                    print(f"❌ No file path provided")
+                    return None
+            
+                # Check if it's a PDB file
+                if not pdb_file.lower().endswith('.pdb'):
+                    print(f"⚠️  Warning: File doesn't have .pdb extension")
+                    proceed = input(f"   Proceed anyway? (y/n, default: n): ").strip().lower()
+                    if proceed != 'y':
+                        continue
+                    else:
+                        break
+            
+                # Get PDB name/identifier
+                pdb_model_name = pdb_file.split('/')[-1].split('.')[0]
+                
+                # Check if name already exists
+                pdbs_db_path = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
+                
+                # This will creck the pdb_model_name existence, and in case it exists, will add an incresing subindex to the name. Will loop until the resulting name is not found
+                
+                if os.path.exists(pdbs_db_path):
+                    conn = sqlite3.connect(pdbs_db_path)
+                    cursor = conn.cursor()
+            
+                counter = 0
+                while True:
+                    # Check if table exists
+                    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pdb_models'")
+                    if cursor.fetchone():
+                        if counter == 0:
+                            cursor.execute("SELECT COUNT(*) FROM pdb_models WHERE pdb_model_name = ?", (pdb_model_name,))
+                        else:
+                            print(new_pdb_model_name)
+                            cursor.execute("SELECT COUNT(*) FROM pdb_models WHERE pdb_model_name = ?", (new_pdb_model_name,))
+                        
+                        if cursor.fetchone()[0] > 0:
+                            print(f"⚠️  PDB name '{pdb_model_name}' already exists in database - adding +1 index")
+                            counter += 1
+                            new_pdb_model_name = f"{pdb_model_name}_{counter}"
+                            continue
+                        else:
+                            # Assign the corresponding variable before exiting the loop in case a model previously existed
+                            if counter > 0:
+                                pdb_model_name = new_pdb_model_name
+                                break
+                            break
+                            
+                conn.close()
+        
+                print(f"PDB Model Name: {pdb_model_name}")
+        
+                description = "Model loaded in batch mode."
+                
+                # Read PDB file content
+                print(f"\n📖 Reading PDB file...")
+                try:
+                    with open(pdb_file, 'rb') as f:
+                        pdb_blob = f.read()
+                    
+                    file_size = len(pdb_blob)
+                    print(f"   ✓ File read successfully ({file_size:,} bytes)")
+                    
+                except Exception as e:
+                    print(f"❌ Error reading PDB file: {e}")
+                    return None
+        
+                # Get basic file information
+                file_info = {
+                    'original_path': pdb_file,
+                    'filename': os.path.basename(pdb_file),
+                    'file_size': file_size,
+                    'modified_date': datetime.fromtimestamp(os.path.getmtime(pdb_file)).isoformat()
+                }
+        
+                # Create database and table if not existing
+                os.makedirs(os.path.dirname(pdbs_db_path), exist_ok=True)
+        
+                conn = sqlite3.connect(pdbs_db_path)
+                cursor = conn.cursor()
+        
+                # Create pdb_files table if it doesn't exist
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS pdb_models (
+                        file_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        pdb_model_name TEXT UNIQUE NOT NULL,
+                        project_name TEXT,
+                        pdb_blob BLOB NOT NULL,
+                        original_path TEXT,
+                        filename TEXT,
+                        file_size INTEGER,
+                        description TEXT,
+                        file_info TEXT,
+                        created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        last_modified TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        notes TEXT
+                    )
+                ''')
+        
+                # Insert or replace PDB file
+                print(f"\n💾 Saving to database...")
+                
+                cursor.execute('''
+                    INSERT OR REPLACE INTO pdb_models (
+                        pdb_model_name, project_name, pdb_blob, original_path, filename,
+                        file_size, description, file_info, notes
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    pdb_model_name,
+                    self.name,
+                    pdb_blob,
+                    pdb_file,
+                    os.path.basename(pdb_file),
+                    file_size,
+                    description,
+                    json.dumps(file_info, indent=2),
+                    f"PDB file saved from: {pdb_file}"
+                ))
+        
+                file_id = cursor.lastrowid or cursor.execute(
+                    "SELECT file_id FROM pdb_models WHERE pdb_model_name = ?", 
+                    (pdb_model_name,)
+                ).fetchone()[0]
+                
+                conn.commit()
+                conn.close()
+        
+                # Display summary
+                print(f"\n{'=' * 80}")
+                print(f"✅ PDB MODEL SAVED SUCCESSFULLY")
+                print(f"{'=' * 80}")
+                print(f"   📋 File ID: {file_id}")
+                print(f"   🏷️  PDB model Name: {pdb_model_name}")
+                print(f"   📁 Original Path: {pdb_file}")
+                print(f"   📊 File Size: {file_size:,} bytes")
+                print(f"   📝 Description: {description or 'None'}")
+                print(f"   💾 Database: {pdbs_db_path}")
+                print(f"   📅 Saved: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                print(f"{'=' * 80}")
+                
+                print(f"\n💡 Use list_pdb_models() to view all saved PDB models")
+            
+            
+            except sqlite3.Error as e:
+                print(e)
+    
     def delete_pdb_model(self):
         """
-        Will list the available pdb models in the database and prompt the user to select one to delete.
+        List available pdb models and prompt the user to select one or more to delete.
+        Accepts comma-separated model numbers, e.g. '1' or '1,3,5'.
         """
         import sqlite3
         from datetime import datetime
 
         try:
-            # Path to pdbs database
             pdbs_db_path = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
-            
-            # Check if database exists
+            receptors_db_path = os.path.join(self.path, 'docking', 'receptors', 'receptors.db')
+            docking_assays_db_path = os.path.join(self.path, 'docking', 'docking_registers', 'docking_assays.db')
+            md_registers_db_path = os.path.join(self.path, 'dynamics', 'md_registers', 'md_registers.db')
+
             if not os.path.exists(pdbs_db_path):
                 print(f"❌ No PDB database found")
                 print(f"   Expected location: {pdbs_db_path}")
                 return None
-            
-            # List available PDB models
+
             print(f"\n🗑️  DELETE PDB MODEL FROM DATABASE")
             print("=" * 80)
-            
-            models_list = self.list_pdb_models()
-            
+
+            models_list = self.list_pdb_models(interactive=False)
+
             if not models_list:
                 print(f"❌ No PDB models available to delete")
                 return None
-            
-            # Prompt user to select a model
+
+            # Prompt for one or more model numbers (comma-separated)
             while True:
                 try:
-                    selection_input = input(f"\nEnter the model number to delete (or 'q' to quit): ").strip()
-                    
+                    selection_input = input(
+                        f"\nEnter model number(s) to delete, e.g. 1 or 1,3,5 or 2-4 (or 'q' to quit): "
+                    ).strip()
+
                     if selection_input.lower() == 'q':
                         print(f"❌ Operation cancelled by user")
                         return None
-                    
+
                     try:
-                        model_number = int(selection_input)
-                        if model_number < 1 or model_number > len(models_list):
-                            print(f"❌ Invalid model number. Choose between 1 and {len(models_list)}")
-                            continue
-                        
-                        selected_model = models_list[model_number - 1]
+                        seen_nums = []
+                        for part in selection_input.split(','):
+                            part = part.strip()
+                            if '-' in part:
+                                start, end = part.split('-', 1)
+                                start, end = int(start.strip()), int(end.strip())
+                                if start > end:
+                                    raise ValueError(f"Range {start}-{end} is invalid (start > end)")
+                                for n in range(start, end + 1):
+                                    if n < 1 or n > len(models_list):
+                                        raise ValueError(f"{n} is out of range (1-{len(models_list)})")
+                                    if n not in seen_nums:
+                                        seen_nums.append(n)
+                            else:
+                                n = int(part)
+                                if n < 1 or n > len(models_list):
+                                    raise ValueError(f"{n} is out of range (1-{len(models_list)})")
+                                if n not in seen_nums:
+                                    seen_nums.append(n)
+                        selected_models = [models_list[n - 1] for n in seen_nums]
                         break
-                        
-                    except ValueError:
-                        print(f"❌ Please enter a valid number or 'q' to quit")
+                    except ValueError as e:
+                        print(f"❌ Invalid input: {e}")
                         continue
-                        
+
                 except KeyboardInterrupt:
                     print(f"\n\n❌ Operation cancelled by user")
                     return None
-            
 
-            # Check for related entries in pdb_templates and receptor_models before confirming deletion
-            try:
-                conn = sqlite3.connect(pdbs_db_path)
-                cursor = conn.cursor()
-                # Check if there are related entries in pdb_templates and get their template names
-                cursor.execute("SELECT pdb_template_name FROM pdb_templates WHERE pdb_model_name = ?",(selected_model['pdb_model_name'],))
-                template_names = [row[0] for row in cursor.fetchall()]
-                template_count = len(template_names)
-                conn.close()
-            except sqlite3.Error as e:
-                print(f"⚠️  Warning: Could not check related templates in pdb_templates: {e}")
-                template_names = []
-                template_count = 0
-            
-            # Check for related entries in receptor_models
-            try:
-                receptors_db_path = os.path.join(self.path, 'docking', 'receptors', 'receptors.db')
-                receptor_model_names = []
-                receptor_model_count = 0
-                if os.path.exists(receptors_db_path):
-                    conn = sqlite3.connect(receptors_db_path)
+            # Gather dependencies for every selected model before asking for confirmation
+            model_data = []
+            for model in selected_models:
+                data = {'model': model}
+
+                # Templates
+                try:
+                    conn = sqlite3.connect(pdbs_db_path)
                     cursor = conn.cursor()
-                    # Check if there are related entries in receptor_models and get their names
-                    cursor.execute("SELECT receptor_model_name FROM receptor_models WHERE pdb_model_name = ?", 
-                                 (selected_model['pdb_model_name'],))
-                    receptor_model_names = [row[0] for row in cursor.fetchall() if row[0]]
-                    receptor_model_count = len(receptor_model_names)
-                    conn.close()
-            except sqlite3.Error as e:
-                print(f"⚠️  Warning: Could not check related receptor models: {e}")
-                receptor_model_names = []
-                receptor_model_count = 0
-            
-            # Check for related docking assays
-            docking_assays_count = 0
-            docking_assay_names = []
-            try:
-                docking_assays_db_path = os.path.join(self.path, 'docking', 'docking_registers', 'docking_assays.db')
-                
-                if os.path.exists(docking_assays_db_path):
-                    conn_assays = sqlite3.connect(docking_assays_db_path)
-                    cursor_assays = conn_assays.cursor()
-                    
-                    # Check if there are related entries in docking_assays and get their names
-                    cursor_assays.execute(
-                        "SELECT assay_name FROM docking_assays WHERE receptor_info LIKE ?",
-                        (f'%"model_name": "{selected_model["pdb_model_name"]}"%',)
+                    cursor.execute(
+                        "SELECT pdb_template_name, template_folder_path FROM pdb_templates WHERE pdb_model_name = ?",
+                        (model['pdb_model_name'],)
                     )
-                    docking_assay_names = [row[0] for row in cursor_assays.fetchall() if row[0]]
-                    docking_assays_count = len(docking_assay_names)
-                    
-                    conn_assays.close()
-                    
-            except sqlite3.Error as e:
-                print(f"❌ Database error while checking docking assays: {e}")
-                return None
-            
-            # Confirm deletion
-            print(f"\n⚠️  CONFIRM DELETION")
+                    rows = cursor.fetchall()
+                    data['template_names'] = [r[0] for r in rows]
+                    data['template_folders'] = [r[1] for r in rows if r[1]]
+                    conn.close()
+                except sqlite3.Error as e:
+                    print(f"⚠️  Warning: Could not check templates for {model['pdb_model_name']}: {e}")
+                    data['template_names'] = []
+                    data['template_folders'] = []
+
+                # Receptor models
+                try:
+                    data['receptor_model_names'] = []
+                    if os.path.exists(receptors_db_path):
+                        conn = sqlite3.connect(receptors_db_path)
+                        cursor = conn.cursor()
+                        cursor.execute(
+                            "SELECT receptor_model_name FROM receptor_models WHERE pdb_model_name = ?",
+                            (model['pdb_model_name'],)
+                        )
+                        data['receptor_model_names'] = [r[0] for r in cursor.fetchall() if r[0]]
+                        conn.close()
+                except sqlite3.Error as e:
+                    print(f"⚠️  Warning: Could not check receptor models for {model['pdb_model_name']}: {e}")
+                    data['receptor_model_names'] = []
+
+                # Docking assays
+                try:
+                    data['docking_assay_ids'] = []
+                    data['docking_assay_names'] = []
+                    data['docking_assays_to_delete'] = []  # (assay_id, folder_path)
+                    if os.path.exists(docking_assays_db_path):
+                        conn = sqlite3.connect(docking_assays_db_path)
+                        cursor = conn.cursor()
+                        cursor.execute(
+                            "SELECT assay_id, assay_name, assay_folder_path FROM docking_assays"
+                            " WHERE receptor_info LIKE ?",
+                            (f'%"pdb_model_name": "{model["pdb_model_name"]}"%',)
+                        )
+                        rows = cursor.fetchall()
+                        data['docking_assay_ids'] = [r[0] for r in rows if r[0] is not None]
+                        data['docking_assay_names'] = [r[1] for r in rows if r[1]]
+                        data['docking_assays_to_delete'] = [(r[0], r[2]) for r in rows]
+                        conn.close()
+                except sqlite3.Error as e:
+                    print(f"⚠️  Warning: Could not check docking assays for {model['pdb_model_name']}: {e}")
+                    data['docking_assay_ids'] = []
+                    data['docking_assay_names'] = []
+                    data['docking_assays_to_delete'] = []
+
+                # MD assays (linked via docking assay ids or template names)
+                try:
+                    data['md_assay_names'] = []
+                    data['md_entries'] = []  # (assay_id, folder_path)
+                    if os.path.exists(md_registers_db_path):
+                        conn = sqlite3.connect(md_registers_db_path)
+                        cursor = conn.cursor()
+                        seen_md = set()
+                        for dock_id in data['docking_assay_ids']:
+                            cursor.execute(
+                                "SELECT assay_id, assay_folder_path, md_assay FROM md_assays"
+                                " WHERE docking_assay_id = ?",
+                                (f'assay_{dock_id}',)
+                            )
+                            for row in cursor.fetchall():
+                                if row[0] not in seen_md:
+                                    data['md_entries'].append((row[0], row[1]))
+                                    if row[2]:
+                                        data['md_assay_names'].append(row[2])
+                                    seen_md.add(row[0])
+                        for tmpl in data['template_names']:
+                            cursor.execute(
+                                "SELECT assay_id, assay_folder_path, md_assay FROM md_assays"
+                                " WHERE receptor_template_name = ?",
+                                (tmpl,)
+                            )
+                            for row in cursor.fetchall():
+                                if row[0] not in seen_md:
+                                    data['md_entries'].append((row[0], row[1]))
+                                    if row[2]:
+                                        data['md_assay_names'].append(row[2])
+                                    seen_md.add(row[0])
+                        conn.close()
+                except sqlite3.Error as e:
+                    print(f"⚠️  Warning: Could not check MD assays for {model['pdb_model_name']}: {e}")
+                    data['md_assay_names'] = []
+                    data['md_entries'] = []
+
+                model_data.append(data)
+
+            # Confirmation: list all models and their cascaded dependencies
+            print(f"\n⚠️  CONFIRM DELETION OF {len(selected_models)} MODEL(S)")
             print("=" * 80)
-            print(f"   PDB Name: {selected_model['pdb_model_name']}")
-            print(f"   Filename: {selected_model['filename']}")
-            print(f"   File Size: {selected_model['file_size']:,} bytes" if selected_model['file_size'] else "   File Size: Unknown")
-            print(f"   Created: {selected_model['created_date']}")
-            print(f"   Description: {selected_model['description'] or 'None'}")
-            if template_count > 0:
-                print(f"   ⚠️  Related templates to be deleted: {template_count}")
-                for template_name in template_names:
-                    print(f"       - {template_name}")
-            if receptor_model_count > 0:
-                print(f"   ⚠️  Related receptor models to be deleted: {receptor_model_count}")
-                for receptor_name in receptor_model_names:
-                    print(f"       - {receptor_name}")
-            if docking_assays_count > 0:
-                print(f"   ⚠️  Related docking assays to be deleted: {docking_assays_count}")
-                for assay_name in docking_assay_names:
-                    print(f"       - {assay_name}")
+            for data in model_data:
+                model = data['model']
+                print(f"\n  📦 {model['pdb_model_name']}")
+                print(f"     Filename : {model['filename']}")
+                if model['file_size']:
+                    print(f"     File Size: {model['file_size']:,} bytes")
+                print(f"     Created  : {model['created_date']}")
+                if data['template_names']:
+                    print(f"     ⚠️  Related templates to be deleted: {len(data['template_names'])}")
+                    for n in data['template_names']:
+                        print(f"         - {n}")
+                if data['receptor_model_names']:
+                    print(f"     ⚠️  Related receptor models to be deleted: {len(data['receptor_model_names'])}")
+                    for n in data['receptor_model_names']:
+                        print(f"         - {n}")
+                if data['docking_assay_names']:
+                    print(f"     ⚠️  Related docking assays to be deleted: {len(data['docking_assay_names'])}")
+                    for n in data['docking_assay_names']:
+                        print(f"         - {n}")
+                if data['md_assay_names']:
+                    print(f"     ⚠️  Related MD assays to be deleted: {len(data['md_assay_names'])}")
+                    for n in data['md_assay_names']:
+                        print(f"         - {n}")
             print("=" * 80)
-            
-            confirm = input(f"\n⚠️  Are you sure you want to delete this PDB model? (yes/no, default: no): ").strip().lower()
-            
+
+            confirm = input(
+                f"\n⚠️  Are you sure you want to delete {len(selected_models)} PDB model(s)? (yes/no, default: no): "
+            ).strip().lower()
+
             if confirm != 'yes':
                 print(f"❌ Deletion cancelled by user")
                 return None
-            
-            # Delete from database
-            try:
-                conn = sqlite3.connect(pdbs_db_path)
-                cursor = conn.cursor()
-                
-                # Retrieve template_folder_path values before deleting from pdb_templates
-                template_folders = []
-                if template_count > 0:
-                    cursor.execute("SELECT template_folder_path FROM pdb_templates WHERE pdb_model_name = ?", 
-                                 (selected_model['pdb_model_name'],))
-                    template_folders = [row[0] for row in cursor.fetchall() if row[0]]
-                
-                # Delete the record from pdb_models
-                cursor.execute("DELETE FROM pdb_models WHERE file_id = ?", (selected_model['file_id'],))
-                
-                if cursor.rowcount == 0:
-                    print(f"❌ Failed to delete PDB model from database")
-                    conn.close()
-                    return None
-                
-                # Delete related entries from pdb_templates
-                if template_count > 0:
-                    cursor.execute("DELETE FROM pdb_templates WHERE pdb_model_name = ?", 
-                                 (selected_model['pdb_model_name'],))
-                    templates_deleted = cursor.rowcount
-                else:
+
+            # Delete each model in sequence
+            results = []
+            for data in model_data:
+                model = data['model']
+                try:
+                    conn = sqlite3.connect(pdbs_db_path)
+                    cursor = conn.cursor()
+
+                    cursor.execute("DELETE FROM pdb_models WHERE file_id = ?", (model['file_id'],))
+                    if cursor.rowcount == 0:
+                        print(f"❌ Failed to delete '{model['pdb_model_name']}' from database")
+                        conn.close()
+                        results.append({'status': 'failed', 'pdb_model_name': model['pdb_model_name']})
+                        continue
+
                     templates_deleted = 0
-                
-                conn.commit()
-                conn.close()
-                
-                # Recursively delete template folders
-                folders_deleted = 0
-                if template_folders:
-                    for folder_path in template_folders:
+                    if data['template_names']:
+                        cursor.execute(
+                            "DELETE FROM pdb_templates WHERE pdb_model_name = ?",
+                            (model['pdb_model_name'],)
+                        )
+                        templates_deleted = cursor.rowcount
+
+                    conn.commit()
+                    conn.close()
+
+                    # Delete template folders on disk
+                    folders_deleted = 0
+                    for folder_path in data['template_folders']:
                         if os.path.exists(folder_path):
                             try:
                                 shutil.rmtree(folder_path)
@@ -3507,48 +4463,33 @@ except Exception as e:
                                 print(f"   ⚠️  Warning: Could not delete folder {folder_path}: {e}")
                         else:
                             print(f"   ⚠️  Folder not found (already deleted?): {folder_path}")
-                
-                # Delete related entries from receptor_models
-                receptor_models_deleted = 0
-                if receptor_model_count > 0:
-                    try:
-                        conn_receptor = sqlite3.connect(receptors_db_path)
-                        cursor_receptor = conn_receptor.cursor()
-                        
-                        cursor_receptor.execute("DELETE FROM receptor_models WHERE pdb_model_name = ?", 
-                                              (selected_model['pdb_model_name'],))
-                        receptor_models_deleted = cursor_receptor.rowcount
-                        
-                        conn_receptor.commit()
-                        conn_receptor.close()
-                        
-                    except sqlite3.Error as e:
-                        print(f"⚠️  Warning: Error deleting receptor models: {e}")
-                
-                ## Delete all assay folder associated to the pdb_model
-                docking_assays_deleted = 0
-                assay_folders_deleted = 0
-                docking_assays_db_path = os.path.join(self.path, 'docking', 'docking_registers', 'docking_assays.db')
-                
-                if os.path.exists(docking_assays_db_path):
-                    try:
-                        conn_assays = sqlite3.connect(docking_assays_db_path)
-                        cursor_assays = conn_assays.cursor()
-                        
-                        # Retrieve assay_id and assay_folder_path for assays containing the model_name
-                        cursor_assays.execute(
-                            "SELECT assay_id, assay_folder_path FROM docking_assays WHERE receptor_info LIKE ?",
-                            (f'%"model_name": "{selected_model["pdb_model_name"]}"%',)
-                        )
-                        assays_to_delete = cursor_assays.fetchall()
-                        
-                        if assays_to_delete:
-                            # Delete the docking assays
-                            for assay_id, assay_folder_path in assays_to_delete:
-                                cursor_assays.execute("DELETE FROM docking_assays WHERE assay_id = ?", (assay_id,))
+
+                    # Delete receptor models
+                    receptor_models_deleted = 0
+                    if data['receptor_model_names'] and os.path.exists(receptors_db_path):
+                        try:
+                            conn = sqlite3.connect(receptors_db_path)
+                            cursor = conn.cursor()
+                            cursor.execute(
+                                "DELETE FROM receptor_models WHERE pdb_model_name = ?",
+                                (model['pdb_model_name'],)
+                            )
+                            receptor_models_deleted = cursor.rowcount
+                            conn.commit()
+                            conn.close()
+                        except sqlite3.Error as e:
+                            print(f"⚠️  Warning: Error deleting receptor models: {e}")
+
+                    # Delete docking assays and their folders
+                    docking_assays_deleted = 0
+                    assay_folders_deleted = 0
+                    if data['docking_assays_to_delete'] and os.path.exists(docking_assays_db_path):
+                        try:
+                            conn = sqlite3.connect(docking_assays_db_path)
+                            cursor = conn.cursor()
+                            for assay_id, assay_folder_path in data['docking_assays_to_delete']:
+                                cursor.execute("DELETE FROM docking_assays WHERE assay_id = ?", (assay_id,))
                                 docking_assays_deleted += 1
-                                
-                                # Delete assay folders if they exist
                                 if assay_folder_path and os.path.exists(assay_folder_path):
                                     try:
                                         shutil.rmtree(assay_folder_path)
@@ -3558,44 +4499,71 @@ except Exception as e:
                                         print(f"   ⚠️  Warning: Could not delete assay folder {assay_folder_path}: {e}")
                                 elif assay_folder_path:
                                     print(f"   ⚠️  Assay folder not found (already deleted?): {assay_folder_path}")
-                        
-                        conn_assays.commit()
-                        conn_assays.close()
-                        
-                    except sqlite3.Error as e:
-                        print(f"⚠️  Warning: Error deleting docking assays: {e}")
+                            conn.commit()
+                            conn.close()
+                        except sqlite3.Error as e:
+                            print(f"⚠️  Warning: Error deleting docking assays: {e}")
 
-                
-                print(f"\n✓ PDB model '{selected_model['pdb_model_name']}' successfully deleted from database")
-                print(f"   File ID: {selected_model['file_id']}")
-                print(f"   Database: {pdbs_db_path}")
-                if templates_deleted > 0:
-                    print(f"   Related templates deleted: {templates_deleted}")
-                if receptor_models_deleted > 0:
-                    print(f"   Related receptor models deleted: {receptor_models_deleted}")
-                if folders_deleted > 0:
-                    print(f"   Template folders deleted: {folders_deleted}")
-                if docking_assays_deleted > 0:
-                    print(f"   Related docking assays deleted: {docking_assays_deleted}")
-                if assay_folders_deleted > 0:
-                    print(f"   Assay folders deleted: {assay_folders_deleted}")
-                
-                return {
-                    'status': 'deleted',
-                    'pdb_model_name': selected_model['pdb_model_name'],
-                    'file_id': selected_model['file_id'],
-                    'templates_deleted': templates_deleted,
-                    'receptor_models_deleted': receptor_models_deleted,
-                    'folders_deleted': folders_deleted,
-                    'docking_assays_deleted': docking_assays_deleted,
-                    'assay_folders_deleted': assay_folders_deleted,
-                    'deleted_date': datetime.now().isoformat()
-                }
-                
-            except sqlite3.Error as e:
-                print(f"❌ Database error while deleting PDB model: {e}")
-                return None
-                
+                    # Delete MD assays and their folders
+                    md_assays_deleted = 0
+                    md_assay_folders_deleted = 0
+                    if data['md_entries'] and os.path.exists(md_registers_db_path):
+                        try:
+                            conn = sqlite3.connect(md_registers_db_path)
+                            cursor = conn.cursor()
+                            for md_id, md_folder in data['md_entries']:
+                                cursor.execute("DELETE FROM md_assays WHERE assay_id = ?", (md_id,))
+                                md_assays_deleted += 1
+                                if md_folder and os.path.exists(md_folder):
+                                    try:
+                                        shutil.rmtree(md_folder)
+                                        md_assay_folders_deleted += 1
+                                        print(f"   ✓ Deleted MD assay folder: {md_folder}")
+                                    except Exception as e:
+                                        print(f"   ⚠️  Warning: Could not delete MD assay folder {md_folder}: {e}")
+                                elif md_folder:
+                                    print(f"   ⚠️  MD assay folder not found (already deleted?): {md_folder}")
+                            conn.commit()
+                            conn.close()
+                        except sqlite3.Error as e:
+                            print(f"⚠️  Warning: Error deleting MD assays: {e}")
+
+                    print(f"\n✓ PDB model '{model['pdb_model_name']}' successfully deleted")
+                    if templates_deleted > 0:
+                        print(f"   Related templates deleted    : {templates_deleted}")
+                    if receptor_models_deleted > 0:
+                        print(f"   Receptor models deleted      : {receptor_models_deleted}")
+                    if folders_deleted > 0:
+                        print(f"   Template folders deleted     : {folders_deleted}")
+                    if docking_assays_deleted > 0:
+                        print(f"   Docking assays deleted       : {docking_assays_deleted}")
+                    if assay_folders_deleted > 0:
+                        print(f"   Assay folders deleted        : {assay_folders_deleted}")
+                    if md_assays_deleted > 0:
+                        print(f"   MD assays deleted            : {md_assays_deleted}")
+                    if md_assay_folders_deleted > 0:
+                        print(f"   MD assay folders deleted     : {md_assay_folders_deleted}")
+
+                    results.append({
+                        'status': 'deleted',
+                        'pdb_model_name': model['pdb_model_name'],
+                        'file_id': model['file_id'],
+                        'templates_deleted': templates_deleted,
+                        'receptor_models_deleted': receptor_models_deleted,
+                        'folders_deleted': folders_deleted,
+                        'docking_assays_deleted': docking_assays_deleted,
+                        'assay_folders_deleted': assay_folders_deleted,
+                        'md_assays_deleted': md_assays_deleted,
+                        'md_assay_folders_deleted': md_assay_folders_deleted,
+                        'deleted_date': datetime.now().isoformat()
+                    })
+
+                except sqlite3.Error as e:
+                    print(f"❌ Database error while deleting '{model['pdb_model_name']}': {e}")
+                    results.append({'status': 'failed', 'pdb_model_name': model['pdb_model_name']})
+
+            return results[0] if len(results) == 1 else results
+
         except Exception as e:
             print(f"❌ Error deleting PDB model: {e}")
             return None
@@ -3649,7 +4617,7 @@ except Exception as e:
             
             # Display selected model info
             print(f"\n{'=' * 80}")
-            print(f"✓ Selected Model: {selected_model['pdb_name']}")
+            print(f"✓ Selected Model: {selected_model['pdb_model_name']}")
             print(f"  Original name: {selected_model['filename']}")
             print(f"  File size: {selected_model['file_size']:,} bytes" if selected_model['file_size'] else "  File size: Unknown")
             print(f"{'=' * 80}")
@@ -3662,7 +4630,7 @@ except Exception as e:
             cursor = conn.cursor()
             
             cursor.execute('''
-                SELECT pdb_blob FROM pdb_files WHERE file_id = ?
+                SELECT pdb_blob FROM pdb_models WHERE file_id = ?
             ''', (selected_model['file_id'],))
             
             result = cursor.fetchone()
@@ -3707,7 +4675,7 @@ except Exception as e:
             print(f"✅ PDB FILE RETRIEVED AND WRITTEN SUCCESSFULLY")
             print(f"{'=' * 80}")
             print(f"   📋 Model ID: {selected_model['file_id']}")
-            print(f"   🏷️  Model Name: {selected_model['pdb_name']}")
+            print(f"   🏷️  Model Name: {selected_model['pdb_model_name']}")
             print(f"   📁 Output Filename: {output_filename}")
             print(f"   📍 Output Path: {output_path}")
             print(f"   📊 File Size: {written_size:,} bytes")
@@ -3718,7 +4686,7 @@ except Exception as e:
             
             return {
                 'file_id': selected_model['file_id'],
-                'model_name': selected_model['pdb_name'],
+                'model_name': selected_model['pdb_model_name'],
                 'filename': output_filename,
                 'output_path': output_path,
                 'file_size': written_size,
@@ -3733,8 +4701,169 @@ except Exception as e:
             import traceback
             traceback.print_exc()
             return None
-    
-    def list_pdb_models(self) -> Optional[List[Dict[str, Any]]]:
+
+    def write_pdb_template(self):
+        """
+        List available PDB templates and prompt the user to select one. The
+        checked (fully-processed) PDB file is copied to the project's
+        docking/receptors directory using the template name as filename.
+
+        Returns:
+            Optional[Dict[str, Any]]: Information about the written file or None if failed
+        """
+        import sqlite3
+        import shutil as _shutil
+        from datetime import datetime
+
+        try:
+            pdbs_db_path = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
+
+            if not os.path.exists(pdbs_db_path):
+                print(f"❌ No PDB database found")
+                print(f"   Expected location: {pdbs_db_path}")
+                return None
+
+            print(f"\n📁 RETRIEVE PDB TEMPLATE FROM DATABASE")
+            print("=" * 80)
+
+            conn = sqlite3.connect(pdbs_db_path)
+            cursor = conn.cursor()
+
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pdb_templates'")
+            if not cursor.fetchone():
+                print(f"❌ No PDB templates table found in database")
+                conn.close()
+                return None
+
+            cursor.execute('''
+                SELECT pdb_id, pdb_template_name, pdb_model_name, chains,
+                       atom_count, checked_pdb_path, template_folder_path,
+                       created_date, notes
+                FROM pdb_templates
+                ORDER BY created_date ASC
+            ''')
+            rows = cursor.fetchall()
+            conn.close()
+
+            if not rows:
+                print(f"❌ No PDB templates available")
+                print(f"   Create one first using create_pdb_template()")
+                return None
+
+            # Display numbered list
+            print(f"   Found {len(rows)} PDB template(s) in database")
+            print(f"   Database: {pdbs_db_path}")
+            print("=" * 80)
+            templates_list = []
+            for idx, (pdb_id, tmpl_name, model_name, chains, atom_count,
+                      checked_path, folder_path, created_date, notes) in enumerate(rows, 1):
+                tmpl = {
+                    'pdb_id': pdb_id,
+                    'pdb_template_name': tmpl_name,
+                    'pdb_model_name': model_name,
+                    'chains': chains,
+                    'atom_count': atom_count,
+                    'checked_pdb_path': checked_path,
+                    'template_folder_path': folder_path,
+                    'created_date': created_date,
+                    'notes': notes,
+                }
+                templates_list.append(tmpl)
+                print(f"\n{idx}. 🧬 {tmpl_name}")
+                print(f"   {'─' * 76}")
+                print(f"   📋 ID      : {pdb_id}")
+                print(f"   📦 Model   : {model_name}")
+                print(f"   🔗 Chains  : {chains or 'N/A'}")
+                print(f"   ⚛️  Atoms   : {atom_count or 'N/A'}")
+                print(f"   📅 Created : {created_date}")
+                print(f"   {'─' * 76}")
+            print("=" * 80)
+
+            # Selection prompt
+            while True:
+                try:
+                    selection_input = input(
+                        f"\nEnter the template number to retrieve (or 'q' to quit): "
+                    ).strip()
+
+                    if selection_input.lower() == 'q':
+                        print(f"❌ Operation cancelled by user")
+                        return None
+
+                    try:
+                        tmpl_number = int(selection_input)
+                        if tmpl_number < 1 or tmpl_number > len(templates_list):
+                            print(f"❌ Invalid number. Choose between 1 and {len(templates_list)}")
+                            continue
+                        selected = templates_list[tmpl_number - 1]
+                        break
+                    except ValueError:
+                        print(f"❌ Invalid input. Please enter a number or 'q' to quit")
+                        continue
+
+                except KeyboardInterrupt:
+                    print(f"\n\n❌ Operation cancelled by user")
+                    return None
+
+            # Verify source file exists
+            source_path = selected['checked_pdb_path']
+            if not source_path or not os.path.exists(source_path):
+                print(f"❌ Checked PDB file not found on disk: {source_path}")
+                return None
+
+            print(f"\n{'=' * 80}")
+            print(f"✓ Selected Template: {selected['pdb_template_name']}")
+            print(f"  Source file      : {source_path}")
+            print(f"{'=' * 80}")
+
+            # Determine output path
+            receptors_dir = os.path.join(self.path, 'docking', 'receptors')
+            output_filename = f"{selected['pdb_template_name']}.pdb"
+            output_path = os.path.join(receptors_dir, output_filename)
+
+            if os.path.exists(output_path):
+                print(f"⚠️  File already exists: {output_path}")
+                overwrite = input(f"   Overwrite? (y/n, default: n): ").strip().lower()
+                if overwrite != 'y':
+                    print(f"❌ Operation cancelled by user")
+                    return None
+
+            print(f"\n💾 Writing PDB template to disk...")
+            os.makedirs(receptors_dir, exist_ok=True)
+            _shutil.copy2(source_path, output_path)
+            written_size = os.path.getsize(output_path)
+            print(f"   ✓ File written successfully ({written_size:,} bytes)")
+
+            print(f"\n{'=' * 80}")
+            print(f"✅ PDB TEMPLATE RETRIEVED AND WRITTEN SUCCESSFULLY")
+            print(f"{'=' * 80}")
+            print(f"   📋 Template ID  : {selected['pdb_id']}")
+            print(f"   🏷️  Template Name: {selected['pdb_template_name']}")
+            print(f"   📁 Output file  : {output_filename}")
+            print(f"   📍 Output path  : {output_path}")
+            print(f"   📊 File size    : {written_size:,} bytes")
+            print(f"   📅 Retrieved    : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"{'=' * 80}")
+
+            return {
+                'pdb_id': selected['pdb_id'],
+                'template_name': selected['pdb_template_name'],
+                'filename': output_filename,
+                'output_path': output_path,
+                'file_size': written_size,
+                'retrieved_date': datetime.now().isoformat()
+            }
+
+        except sqlite3.Error as e:
+            print(f"❌ Database error: {e}")
+            return None
+        except Exception as e:
+            print(f"❌ Error retrieving PDB template: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def list_pdb_models(self, print_models: bool = True, interactive: bool = True) -> Optional[List[Dict[str, Any]]]:
         """
         List the PDB models saved in the pdbs.db located in the 
         project_path/docking/receptors directory.
@@ -3786,12 +4915,13 @@ except Exception as e:
                 print(f"\n💡 Save a PDB model using save_pdb_model()")
                 return None
             
-            # Display models
-            print(f"\n📦 SAVED PDB MODELS")
-            print("=" * 100)
-            print(f"   Found {len(pdb_models)} PDB model(s) in database")
-            print(f"   Database: {pdbs_db_path}")
-            print("=" * 100)
+            if print_models:
+                # Display models
+                print(f"\n📦 SAVED PDB MODELS")
+                print("=" * 100)
+                print(f"   Found {len(pdb_models)} PDB model(s) in database")
+                print(f"   Database: {pdbs_db_path}")
+                print("=" * 100)
             
             models_list = []
             
@@ -3813,82 +4943,90 @@ except Exception as e:
                 }
                 models_list.append(model_info)
                 
-                # Display basic model details
-                print(f"\n{idx}. 📦 {pdb_model_name}")
-                print(f"   {'─' * 96}")
-                print(f"   📋 ID: {file_id}")
-                print(f"   🏷️  PDB Model Name: {pdb_model_name}")
-                print(f"   📝 Description: {description or 'None'}")
+                if print_models:
                 
-                # Display modification date if different from created date
-                if last_modified and last_modified != created_date:
-                    print(f"   🔄 Modified: {last_modified}")
+                    # Display basic model details
+                    print(f"\n{idx}. 📦 {pdb_model_name}")
+                    print(f"   {'─' * 96}")
+                    print(f"   📋 ID: {file_id}")
+                    print(f"   🏷️  PDB Model Name: {pdb_model_name}")
+                    print(f"   📝 Description: {description or 'None'}")
                 
-                print(f"   {'─' * 96}")
-            
-            print("=" * 100)
-            print(f"💡 Type 'details <number>' to view full information about a model")
-            
-            # Interactive details viewing
-            while True:
-                try:
-                    user_input = input(f"\nEnter command (or press Enter to exit): ").strip()
+                if print_models:
+                
+                    # Display modification date if different from created date
+                    if last_modified and last_modified != created_date:
+                        print(f"   🔄 Modified: {last_modified}")
                     
-                    if not user_input:
-                        break
-                    
-                    # Check if user wants details
-                    if user_input.lower().startswith('details'):
-                        parts = user_input.split()
-                        if len(parts) < 2:
-                            print(f"❌ Please specify a model number. Example: details 1")
-                            continue
+                    print(f"   {'─' * 96}")
+            
+            if print_models:
+                print("=" * 100)
+                print(f"💡 Type 'details <number>' to view full information about a model")
+            
+            
+            if print_models and interactive:
+
+                # Interactive details viewing
+                while True:
+                    try:
+                        user_input = input(f"\nEnter command (or press Enter to exit): ").strip()
                         
-                        try:
-                            model_number = int(parts[1])
-                            if model_number < 1 or model_number > len(models_list):
-                                print(f"❌ Invalid model number. Choose between 1 and {len(models_list)}")
+                        if not user_input:
+                            break
+                        
+                        # Check if user wants details
+                        if user_input.lower().startswith('details'):
+                            parts = user_input.split()
+                            if len(parts) < 2:
+                                print(f"❌ Please specify a model number. Example: details 1")
                                 continue
                             
-                            # Display detailed information for selected model
-                            selected_model = models_list[model_number - 1]
-                            print(f"\n{'═' * 100}")
-                            print(f"🔍 DETAILED INFORMATION FOR: {selected_model['pdb_model_name']}")
-                            print(f"{'═' * 100}")
-                            print(f"   📋 File ID: {selected_model['file_id']}")
-                            print(f"   🏷️  PDB Model Name: {selected_model['pdb_model_name']}")
-                            print(f"   📁 Filename: {selected_model['filename']}")
-                            print(f"   📍 Original Path: {selected_model['original_path']}")
-                            print(f"   📦 Project: {selected_model['project_name']}")
-                            
-                            if selected_model['file_size']:
-                                print(f"\n   📊 SIZE INFORMATION:")
-                                print(f"      • File Size: {selected_model['file_size']:,} bytes")
-                            
-                            if selected_model['description']:
-                                print(f"\n   📝 DESCRIPTION:")
-                                print(f"      {selected_model['description']}")
-                            
-                            print(f"\n   📅 TIMESTAMPS:")
-                            print(f"      • Created: {selected_model['created_date']}")
-                            if selected_model['last_modified'] and selected_model['last_modified'] != selected_model['created_date']:
-                                print(f"      • Last Modified: {selected_model['last_modified']}")
-                            
-                            if selected_model['notes']:
-                                print(f"\n   📋 NOTES:")
-                                print(f"      {selected_model['notes']}")
-                            
-                            print(f"{'═' * 100}")
-                            
-                        except ValueError:
-                            print(f"❌ Invalid number format. Please use: details <number>")
-                            continue
-                    else:
-                        print(f"❌ Unknown command. Use 'details <number>' to view full information")
-                
-                except KeyboardInterrupt:
-                    print(f"\n\n👋 Exiting PDB models list")
-                    break
+                            try:
+                                model_number = int(parts[1])
+                                if model_number < 1 or model_number > len(models_list):
+                                    print(f"❌ Invalid model number. Choose between 1 and {len(models_list)}")
+                                    continue
+                                
+                                # Display detailed information for selected model
+                                selected_model = models_list[model_number - 1]
+                                print(f"\n{'═' * 100}")
+                                print(f"🔍 DETAILED INFORMATION FOR: {selected_model['pdb_model_name']}")
+                                print(f"{'═' * 100}")
+                                print(f"   📋 File ID: {selected_model['file_id']}")
+                                print(f"   🏷️  PDB Model Name: {selected_model['pdb_model_name']}")
+                                print(f"   📁 Filename: {selected_model['filename']}")
+                                print(f"   📍 Original Path: {selected_model['original_path']}")
+                                print(f"   📦 Project: {selected_model['project_name']}")
+                                
+                                if selected_model['file_size']:
+                                    print(f"\n   📊 SIZE INFORMATION:")
+                                    print(f"      • File Size: {selected_model['file_size']:,} bytes")
+                                
+                                if selected_model['description']:
+                                    print(f"\n   📝 DESCRIPTION:")
+                                    print(f"      {selected_model['description']}")
+                                
+                                print(f"\n   📅 TIMESTAMPS:")
+                                print(f"      • Created: {selected_model['created_date']}")
+                                if selected_model['last_modified'] and selected_model['last_modified'] != selected_model['created_date']:
+                                    print(f"      • Last Modified: {selected_model['last_modified']}")
+                                
+                                if selected_model['notes']:
+                                    print(f"\n   📋 NOTES:")
+                                    print(f"      {selected_model['notes']}")
+                                
+                                print(f"{'═' * 100}")
+                                
+                            except ValueError:
+                                print(f"❌ Invalid number format. Please use: details <number>")
+                                continue
+                        else:
+                            print(f"❌ Unknown command. Use 'details <number>' to view full information")
+                    
+                    except KeyboardInterrupt:
+                        print(f"\n\n👋 Exiting PDB models list")
+                        break
             
             return models_list
             
@@ -3961,7 +5099,7 @@ except Exception as e:
                 while True:
                     try:
                         default_name = f"{selected_model['pdb_model_name']}_template"
-                        pdb_template_name = input(f"\n🏷️  Enter PDB template name (default: {default_name}): ").strip()
+                        pdb_template_name = self._prompt(f"\n🏷️  Enter PDB template name (default: {default_name}): ")
                         
                         if not pdb_template_name:
                             pdb_template_name = default_name
@@ -4083,6 +5221,202 @@ except Exception as e:
                 if os.path.exists(temp_pdb_path):
                     os.unlink(temp_pdb_path)
                 
+        except Exception as e:
+            print(f"❌ Error creating PDB template: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+        
+    def create_pdb_template_in_batch(self, pdb_template_name: Optional[str] = None, verbose=True) -> Optional[Dict[str, Any]]:
+        """
+        Create a PDB file template from a PDB model stored in the database using save_pdb_model.
+        The user is prompted to select a PDB model from the database, after which the PDB file 
+        is analyzed and a registered for the receptor is created in the pdb_templates table.
+        
+        Args:
+            pdb_name (Optional[str]): Name for the receptor template. If None, user will be prompted.
+            verbose (bool): Whether to display detailed output during processing.
+            
+        Returns:
+            Optional[Dict[str, Any]]: PDB template registry information or None if failed
+        """
+        import sqlite3
+        import tempfile
+        from datetime import datetime
+        
+        try:
+            
+            print(f"🧬 CREATING PDB TEMPLATE FROM DATABASE IN BATCH MODE")
+            print("=" * 80)
+            
+            # Create a list of PDB models number to process as batch as integers separated by commas (e.g. 1,3,5) or by ranges (e.g. 1-5) or a combination of both (e.g. 1,3,5-7)
+            pdb_model_numbers = []
+            while True:
+                try:
+                    model_input = input(f"\nEnter PDB model numbers for batch processing (e.g. 1,3,5 or 1-5 or 1,3-5): ").strip()
+                    if not model_input:
+                        print("❌ Invalid input. Please enter a valid list of PDB model numbers.")
+                        continue
+                    # Parse the input into individual numbers or ranges
+                    for part in model_input.split(','):
+                        part = part.strip()
+                        if '-' in part:
+                            start, end = map(int, part.split('-'))
+                            pdb_model_numbers.extend(range(start, end + 1))
+                        else:
+                            pdb_model_numbers.append(int(part))
+                    break
+                except ValueError:
+                    print("❌ Invalid input. Please enter valid integers or ranges.")
+                    continue
+            
+             # Step 1: List and select PDB model from database
+            print(f"\n📂 Retrieving PDB models from database...")
+            models_list = self.list_pdb_models(print_models=False)
+            
+            # Loop through the selected model numbers and process each one
+            
+            processing_index = 0 # This is set to 1 to keep track of the processing order in batch mode
+            
+            for selection_input in pdb_model_numbers:
+                
+                processing_index += 1 # Increase the counter for each model processed in batch mode
+                
+                # Prompt user to select a model
+                while True:
+                        
+                    try:
+                        model_number = int(selection_input)
+                        if model_number < 1 or model_number > len(models_list):
+                            print(f"❌ Invalid model number. Choose between 1 and {len(models_list)}")
+                            continue
+                        
+                        selected_model = models_list[model_number - 1]
+                        break
+                        
+                    except ValueError:
+                        print(f"❌ Invalid input. Please enter a number or 'q' to quit")
+                        continue
+            
+            # Step 5: Get PDB template name
+                #default_name = f"{selected_model['pdb_model_name']}_template"
+                pdb_template_name = f"{selected_model['pdb_model_name']}_template"
+                        
+                # Validate template name
+                if not pdb_template_name.replace('_', '').replace('-', '').replace(' ', '').isalnum():
+                    print("❌ Template name can only contain letters, numbers, spaces, hyphens, and underscores")
+                    continue
+
+                print(pdb_template_name)
+                        
+                        
+                        
+        # except Exception as e:
+        #     print(f"\n❌ PDB template batch processing failed: {e}")
+        #     return None
+
+                # Step 6: Check if template name already exists
+                existing_check = self._check_pdb_name_exists(pdb_template_name)
+        
+
+                print(f"Existing check: {existing_check}")
+                
+                if existing_check:
+                    print(f"❌ PDB template {pdb_template_name} creation cancelled - name already exists")
+                    continue
+
+                # Step 2: Retrieve PDB blob from database
+                print(f"\n📥 Retrieving PDB file from database...")
+                pdbs_db_path = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
+                conn = sqlite3.connect(pdbs_db_path)
+                cursor = conn.cursor()
+        
+                cursor.execute('''
+                    SELECT pdb_blob FROM pdb_models WHERE file_id = ?
+                ''', (selected_model['file_id'],))
+        
+                result = cursor.fetchone()
+                conn.close()
+        
+                if not result or not result[0]:
+                    print(f"❌ Failed to retrieve PDB blob from database")
+                    return None
+        
+                pdb_blob = result[0]
+        
+                # Step 3: Write blob to temporary file for analysis
+                print(f"📝 Processing PDB file...")
+                with tempfile.NamedTemporaryFile(mode='wb', suffix='.pdb', delete=False) as tmp_file:
+                    tmp_file.write(pdb_blob)
+                    temp_pdb_path = tmp_file.name
+        
+                # Step 4: Analyze PDB file
+                print(f"🔬 Analyzing PDB structure...")
+                pdb_analysis = self._analyze_pdb_file(temp_pdb_path)
+            
+                if not pdb_analysis:
+                    print(f"❌ Failed to analyze PDB file")
+                    os.unlink(temp_pdb_path)
+                    return None
+            
+                if verbose:
+                    self._display_pdb_analysis(pdb_analysis)
+            
+                # Step 7: Create receptors directory structure
+                receptors_base_dir = os.path.join(self.path, 'docking', 'receptors')
+                os.makedirs(receptors_base_dir, exist_ok=True)
+            
+                # Create template-specific directory
+                pdb_template_folder = self._create_receptor_template_folder(receptors_base_dir, pdb_template_name)
+            
+                if not pdb_template_folder:
+                    print("❌ Failed to create PDB template folder")
+                    os.unlink(temp_pdb_path)
+                    return None
+            
+                # Step 8: Copy and process PDB file
+                print(f"📂 Processing and saving PDB template...")
+                pdb_processing_result = self._process_pdb_file_in_batch(temp_pdb_path, pdb_template_folder, pdb_analysis, processing_index)
+                
+                # if not pdb_processing_result:
+                #     print("❌ Failed to process PDB file")
+                #     os.unlink(temp_pdb_path)
+                #     return None
+            
+                # processed_pdb_path, checked_pdb_path, renumbering_dict, his_names = pdb_processing_result
+                
+                # print("Processed pdb path:", processed_pdb_path)
+                # print("Checked pdb path:", checked_pdb_path)
+
+        #     # Step 9: Create template registry entry
+        #     pdb_registry = self._create_pdb_template_registry_entry(
+        #         pdb_template_name, selected_model['pdb_model_name'], selected_model['original_path'], processed_pdb_path, pdb_template_folder, pdb_analysis, checked_pdb_path, renumbering_dict, his_names
+        #     )
+            
+        #     if not pdb_registry:
+        #         print("❌ Failed to create PDB template registry")
+        #         os.unlink(temp_pdb_path)
+        #         return None
+            
+        #     if verbose:
+        #         # Step 10: Display success summary
+        #         self._display_pdb_creation_summary(pdb_registry)
+            
+        #     print(f"\n{'=' * 80}")
+        #     print(f"✅ PDB TEMPLATE CREATED SUCCESSFULLY FROM DATABASE MODEL")
+        #     print(f"{'=' * 80}")
+        #     print(f"   Source Model: {selected_model['pdb_model_name']}")
+        #     print(f"   Template Name: {pdb_template_name}")
+        #     print(f"   Location: {pdb_template_folder}")
+        #     print(f"{'=' * 80}\n")
+            
+        #     return pdb_registry
+            
+        # finally:
+        #     # Clean up temporary file
+        #     if os.path.exists(temp_pdb_path):
+        #         os.unlink(temp_pdb_path)
+            
         except Exception as e:
             print(f"❌ Error creating PDB template: {e}")
             import traceback
@@ -4282,7 +5616,7 @@ except Exception as e:
                 print(f"   🔗 Multi-chain structure detected: {', '.join(analysis['chains'])}")
                 while True:
                     try:
-                        choice = input(f"   🧬 Keep all chains or select specific chain(s)? (all/select): ").strip().lower()
+                        choice = self._prompt(f"   🧬 Keep all chains or select specific chain(s)? (all/select): ").lower()
                         if choice in ['all', 'a']:
                             print("   ✅ Keeping all chains")
                             selected_chains = analysis['chains']
@@ -4315,6 +5649,12 @@ except Exception as e:
             his_names = self._parse_histidine_names(original_pdb_path, selected_chains)
             his_names = self._customize_histidine_names(his_names)
 
+            ## Detect and (optionally) model disulfide bridges
+            ################################
+            disulfide_candidates = self._find_disulfide_candidates(processed_pdb_path, selected_chains)
+            disulfide_bonds = self._customize_disulfide_bonds(disulfide_candidates)
+            analysis['disulfide_bonds'] = disulfide_bonds
+
             ## Process ligands if any exist
             ################################
             selected_ligands = None
@@ -4330,7 +5670,7 @@ except Exception as e:
                             print("   2. Keep all ligands")
                             print("   3. Select specific ligands to keep")
                             print("   4. Keep only co-crystallized ligands (exclude waters)")
-                            ligand_choice = input("   💊 Select ligand handling (1-4): ").strip()
+                            ligand_choice = self._prompt("   💊 Select ligand handling (1-4): ")
                             if ligand_choice == '1':
                                 print("   🧹 Will remove all ligands from processed PDB")
                                 selected_ligands = []
@@ -4395,16 +5735,23 @@ except Exception as e:
                 else:
                     print("   🧹 Will remove all water molecules.")
 
-            # Create processed PDB file with selected chains, ligands, and waters
+            # Create processed PDB file with selected chains, ligands, and waters.
+            # _create_filtered_pdb must also run when structural gaps exist, because
+            # it is the only place that inserts TER records between discontinuous
+            # segments (e.g. protein→metal ion). Without TER records tleap tries to
+            # form a peptide bond across the gap and fails to write the output PDB.
+            _has_gaps = any(gaps for gaps in analysis.get('gaps', {}).values())
             if (selected_chains != analysis['chains'] or
                 selected_ligands != list(analysis['ligand_residues']) or
-                (water_details and selected_waters != list(water_details.keys()))):
+                (water_details and selected_waters != list(water_details.keys())) or
+                _has_gaps or
+                water_details is not None):
                 print(f"   🔄 Applying filters to processed PDB (chains, ligands, waters)...")
-                
+
                 filtered_pdb_path = self._create_filtered_pdb(
                     processed_pdb_path, selected_chains, selected_ligands, selected_waters, analysis
                 )
-                
+
                 if not filtered_pdb_path:
                     print("   ❌ Failed to create filtered PDB file")
                     return None
@@ -4414,6 +5761,9 @@ except Exception as e:
 
             # Manage HIS residue naming based on previous selection
             self._fix_histine_names(his_names, processed_pdb_path) 
+
+            # Rename confirmed disulfide-bonded CYS residues to CYX
+            self._fix_cysteine_names(disulfide_bonds, processed_pdb_path)
 
             # Create reference ligand file if ligands were kept
             if selected_ligands:
@@ -4429,10 +5779,14 @@ except Exception as e:
                                   
             # Process tleap_processed_file to add the element name column if missing
             receptor_moldf_dict, renumbering_dict = self._refine_receptor_model(tleap_processed_file, processed_pdb_path, analysis)
-            
+
+            if receptor_moldf_dict is None:
+                print(f"❌ Receptor refinement failed — aborting template creation.")
+                return None
+
             # Write (overwrite) the tleap_processed_file
             from moldf import write_pdb
-            
+
             write_pdb(receptor_moldf_dict, tleap_processed_file)
             
             
@@ -4441,6 +5795,253 @@ except Exception as e:
             return processed_pdb_path, tleap_processed_file, renumbering_dict, his_names
             
 
+        except Exception as e:
+            print(f"❌ Error processing PDB file: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+        
+    def _process_pdb_file_in_batch(self, pdb_template_folder: str, pdb_folder: str, analysis: Dict[str, Any], processing_index: int) -> Optional[Tuple[str, str, Dict, Dict]]:
+        """
+        Process and copy PDB file to receptor folder with chain, ligand, and water selection options.
+        Now also manages alternate locations (altlocs) and water molecules if present.
+        
+        Returns:
+            Optional[Tuple[str, str, Dict, Dict]]: Tuple of (processed_pdb_path, tleap_processed_file, renumbering_dict, his_names) or None on error
+        """
+        try:
+            import shutil
+
+            # Copy original PDB to original folder
+            original_dir = os.path.join(pdb_folder, 'original')
+            original_pdb_path = os.path.join(original_dir, 'receptor_original.pdb')
+            os.makedirs(original_dir, exist_ok=True)
+            shutil.copy2(pdb_template_folder, original_pdb_path)
+            print(f"   📋 Copied original PDB file to: {os.path.relpath(original_pdb_path)}")
+
+            # Create processed PDB path in processed folder
+            processed_dir = os.path.join(pdb_folder, 'processed')
+            os.makedirs(processed_dir, exist_ok=True)
+            processed_pdb_path = os.path.join(processed_dir, 'receptor.pdb')
+            shutil.copy2(original_pdb_path, processed_pdb_path)
+            print(f"   🔄 Created working copy for processing: {os.path.relpath(processed_pdb_path)}")
+
+            # --- ALTLOC MANAGEMENT ---
+            altloc_handling = None
+            altloc_map = {}
+            if analysis.get('has_altlocs', False):
+                # altlocs = analysis.get('altlocs', {})
+                # print(f"\n⚠️  Alternate locations (altlocs) detected in structure.")
+                # print(f"   • Residues with altlocs: {altlocs.get('residues_with_altlocs', 0)}")
+                # print(f"   • Unique altloc IDs: {', '.join(altlocs.get('unique_altloc_ids', [])) or 'None'}")
+                # print(f"   • Total altloc atoms: {altlocs.get('total_altlocs', 0)}")
+                # print("   ⚠️  You must select which altlocs to keep in the processed file.")
+
+                # Query user for altloc handling strategy
+                altloc_handling, altloc_map = self._query_altloc_handling_in_batch(original_pdb_path, analysis)
+                if altloc_handling == "cancel":
+                    print("   ❌ Altloc selection cancelled. Aborting processing.")
+                    return None
+
+                # Apply altloc filtering to processed file
+                self._filter_altlocs_in_pdb(processed_pdb_path, altloc_handling, altloc_map)
+                print(f"   ✅ Applied altloc filtering: {altloc_handling}")
+
+            # Process chains if multiple chains exist
+            selected_chains = None
+            if len(analysis['chains']) > 1:
+                print(f"   🔗 Multi-chain structure detected: {', '.join(analysis['chains'])}")
+                
+                # In batch mode, the selection of defaulted to 'all chains'
+                choice = 'all'
+                while True:
+                    try:
+                        #choice = self._prompt(f"   🧬 Keep all chains or select specific chain(s)? (all/select): ").lower()
+                        if choice in ['all', 'a']:
+                            print("   ✅ Keeping all chains")
+                            selected_chains = analysis['chains']
+                            break
+                        elif choice in ['select', 's']:
+                            selected_chains = self._select_chain_interactive(analysis['chains'])
+                            if selected_chains:
+                                if len(selected_chains) == 1:
+                                    print(f"   ✅ Selected chain: {selected_chains[0]}")
+                                else:
+                                    print(f"   ✅ Selected chains: {', '.join(selected_chains)}")
+                                break
+                            else:
+                                print("   ⚠️  No chain selected, keeping all chains")
+                                selected_chains = analysis['chains']
+                                break
+                        else:
+                            print("   ❌ Please enter 'all' or 'select'")
+                            continue
+                    except KeyboardInterrupt:
+                        print("\n   ⚠️  Using all chains by default")
+                        selected_chains = analysis['chains']
+                        break
+            else:
+                selected_chains = analysis['chains']
+
+
+            ## Parse Histidine names
+            ################################
+            # In batch mode, the parsing of histidine names is performed only for the first template and applied consitently afterwards.
+            his_names = self._parse_histidine_names_batch_mode(original_pdb_path, selected_chains, processing_index)
+            his_names = self._customize_histidine_names(his_names)
+
+            ## Detect and (optionally) model disulfide bridges
+            ################################
+            # In batch mode, the candidate pairs are detected for the first template and
+            # re-validated (re-measured) against each subsequent structure afterwards.
+            disulfide_candidates = self._find_disulfide_candidates_batch_mode(processed_pdb_path, selected_chains, processing_index)
+            disulfide_bonds = self._customize_disulfide_bonds(disulfide_candidates)
+            analysis['disulfide_bonds'] = disulfide_bonds
+
+            ## Process ligands if any exist
+            ################################
+            selected_ligands = None
+            
+            ## In batch mode the selection of ligands is only performed for the first template and applied consitently afterwards.
+            if processing_index == 1:
+                if analysis['has_ligands'] and analysis['ligand_residues']:
+                    print(f"\n   💊 Ligand residues detected: {', '.join(analysis['ligand_residues'])}")
+                    ligand_details = self._analyze_ligands_in_pdb(original_pdb_path, analysis['ligand_residues'], selected_chains)
+                    if ligand_details:
+                        self._display_ligand_analysis(ligand_details)
+                        while True:
+                            try:
+                                print("\n   🧪 LIGAND OPTIONS:")
+                                print("   1. Remove all ligands (clean receptor)")
+                                print("   2. Keep all ligands")
+                                print("   3. Select specific ligands to keep")
+                                print("   4. Keep only co-crystallized ligands (exclude waters)")
+                                ligand_choice = self._prompt("   💊 Select ligand handling (1-4): ")
+                                if ligand_choice == '1':
+                                    print("   🧹 Will remove all ligands from processed PDB")
+                                    selected_ligands = []
+                                    break
+                                elif ligand_choice == '2':
+                                    print("   ✅ Will keep all ligands")
+                                    selected_ligands = list(analysis['ligand_residues'])
+                                    break
+                                elif ligand_choice == '3':
+                                    selected_ligands = self._select_ligands_interactive(ligand_details)
+                                    if selected_ligands is not None:
+                                        if selected_ligands:
+                                            print(f"   ✅ Selected ligands: {', '.join(selected_ligands)}")
+                                        else:
+                                            print("   🧹 No ligands selected - will create clean receptor")
+                                        break
+                                    else:
+                                        print("   ⚠️  Ligand selection cancelled, keeping all ligands")
+                                        selected_ligands = list(analysis['ligand_residues'])
+                                        break
+                                elif ligand_choice == '4':
+                                    non_water_ligands = [lig for lig in analysis['ligand_residues'] if lig != 'HOH']
+                                    selected_ligands = non_water_ligands
+                                    if non_water_ligands:
+                                        print(f"   ✅ Will keep co-crystallized ligands: {', '.join(non_water_ligands)}")
+                                    else:
+                                        print("   🧹 No co-crystallized ligands found - will create clean receptor")
+                                    break
+                                else:
+                                    print("   ❌ Invalid choice. Please enter 1, 2, 3, or 4")
+                                    continue
+                            except KeyboardInterrupt:
+                                print("\n   ⚠️  Keeping all ligands by default")
+                                selected_ligands = list(analysis['ligand_residues'])
+                                break
+                    else:
+                        selected_ligands = list(analysis['ligand_residues'])
+                else:
+                    selected_ligands = []
+
+            ## If selected_ligands contains ligands information
+            if selected_ligands:
+            
+                # Check if ligand residues are present in tleap force field
+                analysis = self._process_selected_ligands(selected_ligands,original_pdb_path, selected_chains, analysis, processed_dir)
+
+            else:
+                analysis["cofactors"] ={"cofactors_present":0} # Indicate that no cofactors are present in the system
+
+
+            ## --- WATER MANAGEMENT ---
+            ## In batch mode all waters are removed from the receptor templates, sin they are not expected to be reproduce among different structures.
+            selected_waters = []
+            water_details = self._analyze_waters_in_pdb(original_pdb_path, selected_chains)
+            
+            if water_details:
+                print(f"\n   💧 Water molecules detected: {len(water_details)}")
+                #selected_waters = self._select_waters_interactive(water_details)
+                selected_waters = [] # This will again default to None selected water molecules
+                if selected_waters is None:
+                    print("   ⚠️  Water selection cancelled, will remove all waters.")
+                    selected_waters = []
+                elif selected_waters:
+                    print(f"   ✅ Will keep {len(selected_waters)} water(s): {', '.join(selected_waters)}")
+                else:
+                    print("   🧹 Will remove all water molecules.")
+
+            # Create processed PDB file with selected chains, ligands, and waters.
+            # _create_filtered_pdb must also run when structural gaps exist, because
+            # it is the only place that inserts TER records between discontinuous
+            # segments (e.g. protein→metal ion). Without TER records tleap tries to
+            # form a peptide bond across the gap and fails to write the output PDB.
+            _has_gaps = any(gaps for gaps in analysis.get('gaps', {}).values())
+            if (selected_chains != analysis['chains'] or
+                selected_ligands != list(analysis['ligand_residues']) or
+                (water_details and selected_waters != list(water_details.keys())) or
+                _has_gaps or
+                water_details is not None):
+                print(f"   🔄 Applying filters to processed PDB (chains, ligands, waters)...")
+
+                filtered_pdb_path = self._create_filtered_pdb(
+                    processed_pdb_path, selected_chains, selected_ligands, selected_waters, analysis
+                )
+
+                if not filtered_pdb_path:
+                    print("   ❌ Failed to create filtered PDB file")
+                    return None
+                processed_pdb_path = filtered_pdb_path
+            else:
+                print(f"   ✅ No filtering needed - processed PDB ready")
+
+            # Manage HIS residue naming based on previous selection
+            self._fix_histine_names(his_names, processed_pdb_path)
+
+            # Rename confirmed disulfide-bonded CYS residues to CYX
+            self._fix_cysteine_names(disulfide_bonds, processed_pdb_path)
+
+            # Create reference ligand file if ligands were kept
+            if selected_ligands:
+                self._extract_reference_ligands(processed_pdb_path, pdb_folder, selected_ligands)
+
+            # Create processing summary file
+            self._create_processing_summary(pdb_folder, original_pdb_path, processed_pdb_path, selected_chains, selected_ligands, analysis)
+            
+            # --- Add missing atoms using tleap ---
+            #tleap_processed_file = self._add_missing_atoms_in_pdb_tleap(processed_pdb_path, analysis)
+            # Modified to process receptors containing cobound ligands
+            tleap_processed_file = self._add_missing_atoms_in_pdb_tleap2(processed_pdb_path, analysis, processed_dir)
+                                  
+            # Process tleap_processed_file to add the element name column if missing
+            receptor_moldf_dict, renumbering_dict = self._refine_receptor_model(tleap_processed_file, processed_pdb_path, analysis)
+
+            if receptor_moldf_dict is None:
+                print(f"❌ Receptor refinement failed — aborting template creation.")
+                return None
+
+            # Write (overwrite) the tleap_processed_file
+            from moldf import write_pdb
+
+            write_pdb(receptor_moldf_dict, tleap_processed_file)
+            
+            print(f"✅ tleap processing complete. Output: {tleap_processed_file}")
+            
+            return processed_pdb_path, tleap_processed_file, renumbering_dict, his_names
+            
         except Exception as e:
             print(f"❌ Error processing PDB file: {e}")
             import traceback
@@ -4517,7 +6118,7 @@ except Exception as e:
             print("   • Comma-separated ResNums (e.g., 101,202) to select by residue number (all chains)")
             print("   • 'cancel' to abort water selection")
             while True:
-                selection = input("   💧 Select waters to keep: ").strip().lower()
+                selection = self._prompt("   💧 Select waters to keep: ").lower()
                 if selection in ['all', 'a']:
                     return [wid for wid, _ in water_list]
                 elif selection in ['none', 'n']:
@@ -4670,6 +6271,36 @@ except Exception as e:
                 altloc_map = self._manual_select_altlocs(pdb_file, analysis)
                 return "manual", altloc_map
             elif choice == '4' or choice.lower() in ['cancel', 'quit', 'exit']:
+                return "cancel", {}
+            else:
+                print("   ❌ Invalid choice. Please enter 1, 2, 3, or 4.")
+                
+    def _query_altloc_handling_in_batch(self, pdb_file: str, analysis: Dict[str, Any]) -> Tuple[str, dict]:
+        """
+        Query the user for how to handle altlocs: keep first, keep highest occupancy, or select manually.
+        Returns the chosen strategy and a mapping if manual selection.
+        """
+        altlocs = analysis.get('altlocs', {})
+        # unique_altlocs = altlocs.get('unique_altloc_ids', [])
+        # print("\n   ALTLOC HANDLING OPTIONS:")
+        # print("   1. Keep only the first altloc (A/B/C...) for each residue")
+        # print("   2. Keep altloc with highest occupancy (if available)")
+        # print("   3. Select altloc manually for each residue with altlocs")
+        # print("   4. Cancel processing")
+        
+        # For batch processing default to highest occupancy if altlocs are present, otherwise no handling needed
+        choice = 2
+        while True:
+            #choice = input("   Select altloc handling (1-4): ").strip()
+            if choice == 1:
+                return "first", {}
+            elif choice == 2:
+                return "highest_occupancy", {}
+            elif choice == 3:
+                # Manual selection per residue
+                altloc_map = self._manual_select_altlocs(pdb_file, analysis)
+                return "manual", altloc_map
+            elif choice == 4 or choice.lower() in ['cancel', 'quit', 'exit']:
                 return "cancel", {}
             else:
                 print("   ❌ Invalid choice. Please enter 1, 2, 3, or 4.")
@@ -5074,7 +6705,7 @@ except Exception as e:
                 
                 while True:
                     try:
-                        selection = input(f"\n   💊 Select ligands to keep: ").strip().lower()
+                        selection = self._prompt(f"\n   💊 Select ligands to keep: ").lower()
                         
                         if selection in ['cancel', 'quit', 'exit']:
                             return None
@@ -5343,7 +6974,7 @@ except Exception as e:
             
             while True:
                 try:
-                    selection = input(f"   🔗 Select chain(s) ({'/'.join(chains)} or comma-separated): ").strip().upper()
+                    selection = self._prompt(f"   🔗 Select chain(s) ({'/'.join(chains)} or comma-separated): ").upper()
                     
                     if selection.lower() in ['cancel', 'quit', 'exit']:
                         return None
@@ -5574,6 +7205,7 @@ except Exception as e:
         """
         import subprocess
         import tempfile
+        import textwrap
         import os
         import shutil
 
@@ -5589,12 +7221,12 @@ except Exception as e:
             output_pdb = os.path.join(receptor_dir, "receptor_checked.pdb")
 
             # Prepare tleap input script
-            tleap_script = f"""
-source leaprc.protein.ff14SB
-mol = loadpdb "{receptor_file}"
-savepdb mol "{output_pdb}"
-quit
-"""
+            tleap_script = textwrap.dedent(f"""
+                source leaprc.protein.ff14SB
+                mol = loadpdb "{receptor_file}"
+                savepdb mol "{output_pdb}"
+                quit
+                """)
             # Write tleap script to a temp file
             with tempfile.NamedTemporaryFile("w", delete=False, suffix=".in") as tf:
                 tf.write(tleap_script)
@@ -5638,43 +7270,6 @@ quit
             # Move the intermediate file (without hydrogens) to the final output path
             shutil.move(output_receptor_file_intermediate, output_pdb)
 
-#             # A second round of tleap processing will be performed on the receptor containing all heavy atoms
-
-#             # Prepare tleap input script. The original output_pdb will be overwritten.
-#             tleap_script = f"""
-# source leaprc.protein.ff14SB
-# mol = loadpdb "{output_receptor_file_intermediate}"
-# savepdb mol "{output_pdb}"
-# quit
-# """
-
-#             # Write tleap script to a temp file
-#             with tempfile.NamedTemporaryFile("w", delete=False, suffix=".in") as tf:
-#                 tf.write(tleap_script)
-#                 tleap_input_path = tf.name
-
-#             ## This second tleap run will ensure addition of hydrogens on all added heavy atoms
-#             result = subprocess.run(
-#                 ["tleap", "-f", tleap_input_path],
-#                 stdout=subprocess.PIPE,
-#                 stderr=subprocess.PIPE,
-#                 text=True
-#             )
-
-#             # Clean up temp file
-#             os.remove(tleap_input_path)
-
-#             # Check for errors
-#             if result.returncode != 0:
-#                 print("❌ tleap failed to process the receptor file.")
-#                 print(result.stderr)
-#                 return None
-
-#             # Check if output file was created
-#             if not os.path.exists(output_pdb):
-#                 print("❌ tleap did not produce the expected output file.")
-#                 return None
-
             # Reassign chain IDs and residue numbers
             self._reassign_chain_and_resnums(receptor_file, output_pdb)
 
@@ -5707,6 +7302,7 @@ quit
         
         import tempfile
         import subprocess
+        import textwrap
         
         print(f"Processing pdb: \n {receptor_file} \n with tleap")
         
@@ -5719,21 +7315,16 @@ quit
                 print("❌ tleap not found in PATH. Please install AmberTools and ensure tleap is available.")
                 return None
         
-        
-
-        
-        
-        
             # Process with tleap
             tleap_processed_file = receptor_file.replace(".pdb", "_checked.pdb")
-            tleap_script = f"""
-source leaprc.protein.ff14SB
-source leaprc.water.tip3p
-HOH = WAT
-mol = loadpdb {receptor_file}
-savepdb mol {tleap_processed_file}
-quit
-"""
+            tleap_script = textwrap.dedent(f"""
+                source leaprc.protein.ff14SB
+                source leaprc.water.tip3p
+                HOH = WAT
+                mol = loadpdb {receptor_file}
+                savepdb mol {tleap_processed_file}
+                quit
+                """)
 
             print(receptor_file)
             print(tleap_processed_file)
@@ -5786,12 +7377,13 @@ quit
             print(e)
             return None
     
+
     def _add_missing_atoms_in_pdb_tleap2(self, receptor_file, receptor_info, processed_dir):
-        
-        ## Modified to treat cobound ligands in receptor
-        
+
+
         import tempfile
         import subprocess
+        import textwrap
         
         print(f"Processing pdb: \n {receptor_file} \n with tleap")
         
@@ -5804,16 +7396,28 @@ quit
                 print("❌ tleap not found in PATH. Please install AmberTools and ensure tleap is available.")
                 return None
 
+            # Ensure water residues are labeled HETATM before tleap sees the file.
+            # ATOM-labeled HOH/WAT records cause tleap to treat waters as part of the
+            # main chain; without a TER separator this corrupts adjacent metal ion
+            # coordinates (e.g. ZN) in the savepdb output.
+            with open(receptor_file, 'rb') as _f:
+                _pdb_bytes = _f.read()
+            _pdb_bytes, _waters_fixed = self._fix_water_record_types(_pdb_bytes)
+            if _waters_fixed:
+                with open(receptor_file, 'wb') as _f:
+                    _f.write(_pdb_bytes)
+                print(f"   ✓ Corrected {_waters_fixed} water record(s) from ATOM to HETATM before tleap processing")
+
             tleap_file = f"{processed_dir}/add_missing_atoms_in_pdb.in"
             tleap_processed_file = receptor_file.replace(".pdb", "_checked.pdb")
             with open(tleap_file, "w") as f:
                 f.write(f"#Adding missing atoms\n")
                 f.write(f"source leaprc.protein.ff14SB\n")
+                f.write(f"loadamberparams frcmod.ions1lm_126_tip3p\n")
                 f.write(f"source leaprc.water.tip3p\n")
                 f.write(f"source leaprc.gaff2\n")
                 f.write(f"HOH = WAT\n")
             f.close()
-            
             
             ligands_in_template = receptor_info.get('has_ligands', []) # Will return either True or False
             if ligands_in_template:
@@ -5828,14 +7432,20 @@ quit
                 
                     # Append each cofactor information to the file
                     with open(tleap_file, 'a') as f:
-                        f.write(f"""# Load cofactor {name}
-{name} = loadmol2 {mol2_file}
-loadamberparams {frcmod_file}
+                        f.write(textwrap.dedent(f"""
+                            # Load cofactor {name}
+                            {name} = loadmol2 {mol2_file}
+                            loadamberparams {frcmod_file}
 
-""")    
+                            """))    
             
+            disulfide_bonds = receptor_info.get('disulfide_bonds', [])
+            bond_lines = self._get_tleap_bond_lines(receptor_file, disulfide_bonds, 'mol')
+
             with open(tleap_file, "a") as f:
                 f.write(f"mol = loadpdb {receptor_file}\n")
+                for bond_line in bond_lines:
+                    f.write(bond_line)
                 f.write(f"savepdb mol {tleap_processed_file}\n")
                 f.write(f"quit")
             f.close()
@@ -5852,15 +7462,6 @@ loadamberparams {frcmod_file}
             )
            
 
-            ## Rename 'WAT' residues to 'HOH' in the tleap_processed_file
-            with open(tleap_file, 'r') as file:
-                filedata = file.read()
-
-            filedata = filedata.replace(' WAT ', ' HOH ')
-
-            with open(tleap_file, 'w') as file:
-                file.write(filedata)
-        
             # Check for errors
             if result.returncode != 0:
                 print("❌ tleap failed to process the receptor file.")
@@ -5872,13 +7473,45 @@ loadamberparams {frcmod_file}
                 print("❌ tleap did not produce the expected output file.")
                 return None
 
+            # Rename 'WAT' residues to 'HOH' in the tleap output PDB.
+            # tleap renames HOH→WAT when 'HOH = WAT' is set; rename them back
+            # so downstream tools see the canonical water residue name.
+            with open(tleap_processed_file, 'r') as _f:
+                _pdb_data = _f.read()
+            _pdb_data = _pdb_data.replace(' WAT ', ' HOH ')
+            with open(tleap_processed_file, 'w') as _f:
+                _f.write(_pdb_data)
+
+            # Validate that tleap wrote real coordinates. A known silent failure
+            # mode is tleap exiting 0 but producing a PDB where every coordinate
+            # field is blank (e.g. when it encounters ATOM-labeled water records
+            # or other formatting issues). Detect this before continuing.
+            _atom_count = 0
+            _blank_count = 0
+            with open(tleap_processed_file, 'r') as _fv:
+                for _vline in _fv:
+                    if _vline.startswith(('ATOM', 'HETATM')):
+                        _atom_count += 1
+                        try:
+                            float(_vline[30:38])
+                        except ValueError:
+                            _blank_count += 1
+            if _atom_count == 0:
+                print(f"❌ tleap produced an empty PDB file (no ATOM/HETATM records).")
+                return None
+            if _blank_count == _atom_count:
+                print(f"❌ tleap produced {_atom_count} atoms but ALL coordinate fields are blank.")
+                print(f"   This is a known silent tleap failure. Check the PDB for ATOM-labeled")
+                print(f"   water records or other formatting issues in: {receptor_file}")
+                return None
+
             return tleap_processed_file
-                    
+
         except Exception as e:
             print(f"Failed processing: {receptor_file} with tleap")
             print(e)
             return None
-    
+
     def _reassign_chain_and_resnums(self, reference_pdb, target_pdb):
         """
         Create a dictionary in which the key is formed by residue name, the chain and the residue number in the reference pdb_file, and the value is formed by the residue name and residue number in the target pdb file.
@@ -6085,6 +7718,25 @@ loadamberparams {frcmod_file}
             print(f"   ⚠️  Error in residue mapping: {e}")
             return {}
     
+    def _rebase_project_path(self, stored_path: str) -> str:
+        """
+        Rebase a stored absolute path to the current project root (self.path).
+
+        Paths are stored as absolute values at creation time. If the project is
+        moved, the stored root becomes stale. This method recovers the relative
+        portion of the path starting from the 'docking' directory and rebuilds
+        it under the current self.path.
+        """
+        if not stored_path:
+            return stored_path
+        normalized = stored_path.replace('\\', '/')
+        marker = '/docking/'
+        idx = normalized.find(marker)
+        if idx != -1:
+            relative = normalized[idx + 1:]  # 'docking/...'
+            return os.path.join(self.path, relative)
+        return stored_path
+
     def create_receptor_for_docking(self, selection: int = None):
         """
         Will load the pdbs.db database from project_path/docking/receptors and prompt the user to select one of the PBD models available to create a pdbqt file for docking purposes using helper function to be created.
@@ -6156,6 +7808,11 @@ loadamberparams {frcmod_file}
 
         pdb_id, template_name, model_name, processed_pdb_path, checked_pdb_path, folder, notes = selected
 
+        # Rebase stored paths in case the project was moved
+        processed_pdb_path = self._rebase_project_path(processed_pdb_path)
+        checked_pdb_path   = self._rebase_project_path(checked_pdb_path)
+        folder             = self._rebase_project_path(folder)
+
         # Select the pdb file to convert to .pdbqt
         pdb_to_convert = checked_pdb_path
 
@@ -6200,7 +7857,170 @@ loadamberparams {frcmod_file}
         else:
             print("❌ Failed to create PDBQT file.")
             return None
-        
+
+    def create_receptor_for_docking_from_config(self, config_file: str = None, selection: int = None):
+        """
+        Duplicate of create_receptor_for_docking() that reads docking parameters from a JSON config
+        file (as written by export_receptor_config()) instead of prompting the user interactively.
+
+        The config file must contain the following keys:
+            - center          : dict with 'x', 'y', 'z' (float) – box center coordinates
+            - size            : dict with 'x', 'y', 'z' (int)   – box dimensions
+            - biases          : list of bias point dicts or null  – ANSED bias potentials
+            - dielectric      : float – dielectric constant
+            - smooth          : float – smooth constant
+            - spacing         : float – spacing
+            - receptor_charge_model : str – charge model ('gasteiger', 'espaloma')
+
+        Args:
+            config_file (str): Path to the JSON config file. If None, the user will be prompted.
+            selection   (int): 1-based index of the PDB entry to use. If None, the user is prompted.
+        """
+        import sqlite3
+        import json
+
+        # ── Load config file ──────────────────────────────────────────────────
+        if config_file is None:
+            try:
+                config_file = input("Enter path to receptor config JSON file: ").strip()
+            except KeyboardInterrupt:
+                print("\n❌ Config file entry cancelled.")
+                return None
+
+        if not os.path.exists(config_file):
+            print(f"❌ Config file not found: {config_file}")
+            return None
+
+        try:
+            with open(config_file, 'r') as f:
+                configs = json.load(f)
+        except Exception as e:
+            print(f"❌ Failed to read config file: {e}")
+            return None
+
+        required_keys = ['center', 'size', 'dielectric', 'smooth', 'spacing', 'receptor_charge_model']
+        missing = [k for k in required_keys if k not in configs]
+        if missing:
+            print(f"❌ Config file is missing required keys: {missing}")
+            return None
+
+        # Ensure 'biases' key exists (may be absent in older exports)
+        configs.setdefault('biases', None)
+
+        print("\n📄 Loaded receptor config:")
+        print(f"   Center   : {configs['center']}")
+        print(f"   Size     : {configs['size']}")
+        print(f"   Dielectric : {configs['dielectric']}")
+        print(f"   Smooth   : {configs['smooth']}")
+        print(f"   Spacing  : {configs['spacing']}")
+        print(f"   Charge model : {configs['receptor_charge_model']}")
+        print(f"   Biases   : {'yes' if configs['biases'] else 'none'}")
+
+        # ── Select PDB ────────────────────────────────────────────────────────
+        pdbs_db_path = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
+        if not os.path.exists(pdbs_db_path):
+            print(f"❌ No pdbs database found at {pdbs_db_path}")
+            return None
+
+        try:
+            conn = sqlite3.connect(pdbs_db_path)
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT pdb_id, pdb_template_name, pdb_model_name, processed_pdb_path, checked_pdb_path, template_folder_path, notes
+                FROM pdb_templates
+                ORDER BY pdb_id ASC
+            ''')
+            pdbs = cursor.fetchall()
+            conn.close()
+        except Exception as e:
+            print(f"❌ Error loading PDB files database: {e}")
+            return None
+
+        if not pdbs:
+            print("❌ No PDB files found in the database.")
+            return None
+
+        print("\n📋 Available PDB templates:")
+        print("=" * 60)
+        for i, (rid, template_name, pdb_model_name, processed_pdb, checked_pdb, folder, notes) in enumerate(pdbs, 1):
+            print(f"{i}. {template_name} - {pdb_model_name} (ID: {rid})")
+            print(f"   PDB Model: {pdb_model_name}")
+            print(f"   Processed PDB: {os.path.basename(processed_pdb)}")
+            print(f"   Checked PDB: {os.path.basename(checked_pdb)}")
+            print(f"   Folder: {os.path.relpath(folder)}")
+            print(f"   Notes: {notes}")
+        print("=" * 60)
+
+        if selection is None:
+            while True:
+                try:
+                    selection_input = input("Select the pdb file by number (or 'cancel'): ").strip()
+                    if selection_input.lower() in ['cancel', 'quit', 'exit']:
+                        print("❌ PDB file selection cancelled.")
+                        return None
+                    try:
+                        idx = int(selection_input) - 1
+                        if 0 <= idx < len(pdbs):
+                            selected = pdbs[idx]
+                            break
+                        else:
+                            print(f"❌ Invalid selection. Enter a number between 1 and {len(pdbs)}.")
+                    except ValueError:
+                        print("❌ Please enter a valid number.")
+                except KeyboardInterrupt:
+                    print("\n❌ PDB selection cancelled.")
+                    return None
+        else:
+            idx = selection - 1
+            if 0 <= idx < len(pdbs):
+                selected = pdbs[idx]
+            else:
+                print(f"❌ Invalid selection. Enter a number between 1 and {len(pdbs)}.")
+                return None
+
+        pdb_id, template_name, pdb_model_name, processed_pdb_path, checked_pdb_path, folder, notes = selected
+
+        processed_pdb_path = self._rebase_project_path(processed_pdb_path)
+        checked_pdb_path   = self._rebase_project_path(checked_pdb_path)
+        folder             = self._rebase_project_path(folder)
+
+        pdb_to_convert = checked_pdb_path
+
+        # ── Create PDBQT using the configs loaded from the file ───────────────
+        pdbqt_file = self._create_pdbqt_from_pdb_with_config(pdb_to_convert, configs)
+
+        # ── Zn check ──────────────────────────────────────────────────────────
+        has_ZN = self._check_ZN_presence(pdbqt_file, folder)
+
+        if has_ZN:
+            print("⚠️  Zn atom(s) detected in the receptor structure.")
+            while True:
+                zn_choice = input("Do you want to process with AutoDock4Zn parameters? (y/n): ").strip().lower()
+                if zn_choice in ['y', 'yes']:
+                    print("✅ AutoDock4Zn parameters will be applied.")
+                    self._apply_ad4zn_params(pdbqt_file, folder)
+                    break
+                elif zn_choice in ['n', 'no']:
+                    print("ℹ️  Skipping AutoDock4Zn processing.")
+                    has_ZN = False
+                    break
+                else:
+                    print("❌ Please answer 'y' or 'n'.")
+
+            print("✅ AutoDock4Zn parameters to be applied.")
+
+        last_receptor_model_id = self._get_last_receptor_model_id()
+        receptor_model_id = int(last_receptor_model_id) + 1
+
+        configs = self._create_receptor_grids(pdbqt_file, configs, folder, has_ZN, receptor_model_id)
+
+        if pdbqt_file:
+            self._create_receptor_register(pdb_id, template_name, pdb_model_name, pdb_to_convert, pdbqt_file, configs)
+            print(f"✅ PDBQT file created: {pdbqt_file}")
+        else:
+            print("❌ Failed to create PDBQT file.")
+            return None
+
     def _create_pdbqt_from_pdb(self, pdb_to_convert):
         
         from meeko import MoleculePreparation, ResidueChemTemplates
@@ -6225,6 +8045,41 @@ loadamberparams {frcmod_file}
         
         if os.path.exists(destination_pdbqt):
             return destination_pdbqt, configs
+        else:
+            print(f"❌ Failed to create PDBQT file at {destination_pdbqt}")
+            return False
+
+    def _create_pdbqt_from_pdb_with_config(self, pdb_to_convert: str, configs: dict):
+        """
+        Convert a PDB file to PDBQT using a pre-built configs dict (no interactive prompts).
+
+        This is the counterpart of _create_pdbqt_from_pdb() used by
+        create_receptor_for_docking_from_config() when parameters are loaded from a JSON file.
+
+        Args:
+            pdb_to_convert (str): Path to the checked PDB file.
+            configs        (dict): Config dict with at least 'receptor_charge_model'.
+
+        Returns:
+            str : Path to the created PDBQT file, or False on failure.
+        """
+        from meeko import MoleculePreparation, ResidueChemTemplates
+        from meeko import Polymer
+
+        structure = self._create_prody_selection(pdb_to_convert)
+
+        receptor_charge_model = configs.get('receptor_charge_model', 'gasteiger')
+        destination_pdbqt = pdb_to_convert.replace(".pdb", f"_{receptor_charge_model}.pdbqt")
+
+        mk_prep = MoleculePreparation(charge_model=receptor_charge_model)
+        print(f"Creating receptor .pdbqt file applying charge model: {receptor_charge_model}")
+        chem_templates = ResidueChemTemplates.create_from_defaults()
+        mypol = Polymer.from_prody(structure, chem_templates, mk_prep)
+
+        self._write_pdbqt(mypol, destination_pdbqt)
+
+        if os.path.exists(destination_pdbqt):
+            return destination_pdbqt
         else:
             print(f"❌ Failed to create PDBQT file at {destination_pdbqt}")
             return False
@@ -6881,14 +8736,14 @@ loadamberparams {frcmod_file}
         receptor_main_path = self.__receptor_path + f"/{receptor_info.get('pdb_name', None)}"
         receptor_charge_model = receptor_info.get('configs', None).get('receptor_charge_model', 'unknown')
         #receptor_pdbqt_file = receptor_main_path + f"/processed/receptor_checked.pdbqt"
-        receptor_pdbqt_file = receptor_info.get('pdbqt_file', None)
+        receptor_pdbqt_file = self._resolve_receptor_pdbqt_file(receptor_info)
         #fld_file = receptor_main_path + f"/grid_files/receptor_checked.maps.fld"
-        grids_path = receptor_info.get('configs', None).get('grids_path', None)
+        grids_path = self._remap_project_path(receptor_info.get('configs', None).get('grids_path', None))
         fld_file = grids_path + f"/receptor_checked_{receptor_charge_model}.maps.fld"
         assay_folder = assay_registry['assay_folder_path']
-    
+
         if not receptor_pdbqt_file:
-            print("❌ No receptor .pdbqt file found.")
+            print("❌ No receptor .pdbqt file found (checked 'processed/' and the grid maps folder).")
             return
         
         if not fld_file:
@@ -6935,8 +8790,9 @@ loadamberparams {frcmod_file}
                 
                 ## Generate the ligand.pdbqt file
                 ligand_pdbqt_filepath = f"{docking_results_dir}/{inchi_key}.pdbqt"
-                self._pdbqt_from_mol(mol, ligand_pdbqt_filepath, inchi_key, ligand_prep_parameters)
-                
+                if not self._pdbqt_from_mol(mol, ligand_pdbqt_filepath, inchi_key, ligand_prep_parameters):
+                    continue
+
                 ## Execute autodockgpu
                 self._execute_autodockgpu(ligand_pdbqt_filepath, fld_file, method_params)
                 
@@ -7183,19 +9039,21 @@ loadamberparams {frcmod_file}
                 return None
             
     def _pdbqt_from_mol(self, mol, ligand_pdbqt_file, inchi_key, ligand_prep_params):
-        
+
         from meeko import MoleculePreparation
         from meeko import MoleculeSetup
         from meeko import PDBQTWriterLegacy
+        from rdkit.Chem import rdchem
         import ast
-        
+
         try:
             # Compose MoleculePreparation arguments from ligand_prep_params
             merge_atoms = eval(ligand_prep_params.get('merge_these_atom_types', '')) # The eval method is required to convert a string defining the atoms into a tuple as required by MoleculePreparation
             charge = ligand_prep_params.get('charge', '')
             hydrate = ligand_prep_params.get('hydrate', '')
+            rigid_macrocycles = ligand_prep_params.get('rigid_macrocycles', True)
             add_atom_types = ligand_prep_params.get('add_atom_types', '')
-            
+
             # evaluate the type of add_atom_types to end with a list type as required by MoleculePreparation
             if add_atom_types:
                 try:
@@ -7207,9 +9065,23 @@ loadamberparams {frcmod_file}
             mk_prep = MoleculePreparation(merge_these_atom_types=merge_atoms,
                                           charge_model=charge,
                                           hydrate=hydrate,
+                                          rigid_macrocycles=rigid_macrocycles,
                                           add_atom_types=add_atom_types
                                          )
-            mol_setup_list = mk_prep.prepare(mol, rename_atoms=True)
+            try:
+                mol_setup_list = mk_prep.prepare(mol, rename_atoms=True)
+            except AssertionError as _ez_err:
+                if 'E/Z stereo' not in str(_ez_err):
+                    raise
+                # OpenFF failed to encode E/Z stereo as bond directions for at
+                # least one bond (typically a ring double bond stored in the DB
+                # with residual stereo flags). Strip ALL bond-level E/Z and
+                # BondDir — atom chirality (tetrahedral, [C@@H]) is unaffected —
+                # and retry. Charges are topology-based so they are unaffected.
+                for bond in mol.GetBonds():
+                    bond.SetStereo(rdchem.BondStereo.STEREONONE)
+                    bond.SetBondDir(rdchem.BondDir.NONE)
+                mol_setup_list = mk_prep.prepare(mol, rename_atoms=True)
             mol_setup = mol_setup_list[0]
 
             pdbqt_string = PDBQTWriterLegacy.write_string(mol_setup)
@@ -7217,8 +9089,11 @@ loadamberparams {frcmod_file}
             with open(ligand_pdbqt_file, "w") as f:
                 f.write(pdbqt_string[0])
 
+            return True
+
         except Exception as e:
             print(f"   ❌ Error creating PDBQT for molecule {inchi_key}: {e}")
+            return False
             
     def _execute_autodockgpu(self, ligand_pdbqt_filepath, fld_file, method_params):
         import subprocess
@@ -7226,8 +9101,6 @@ loadamberparams {frcmod_file}
 
         fld_file_path = os.path.dirname(fld_file)
         fld_filename = fld_file.split('/')[-1]
-
-        print(fld_file_path)
 
         # Build AutoDockGPU command
         cmd = [
@@ -7289,7 +9162,10 @@ loadamberparams {frcmod_file}
             rtc = RingtailCore(db_file = results_db_file, docking_mode=docking_mode )
             # If Vina docking engine, add computation of fingerprints
             if selected_method['docking_engine'] == 'Vina':
-                receptor_file = assay_registry.get('receptor_info').get('pdbqt_file')
+                receptor_file = self._resolve_receptor_pdbqt_file(assay_registry.get('receptor_info') or {})
+                if not receptor_file:
+                    print("❌ Receptor PDBQT file could not be located on disk (neither in 'processed/' nor alongside the grid maps).")
+                    return None
                 rtc.add_results_from_files(file_path = f"{assay_folder}/results", recursive = True, save_receptor = True, max_poses=max_poses, add_interactions = True, receptor_file = receptor_file)
             elif selected_method['docking_engine'] == 'AutoDockGPU':
                 rtc.add_results_from_files(file_path = f"{assay_folder}/results", recursive = True, save_receptor = False, max_poses=max_poses) # Interactions already computed
@@ -7479,9 +9355,37 @@ loadamberparams {frcmod_file}
                 docking_assays = cur_assays.fetchall()
                 conn_assays.close()
             except sqlite3.Error as e:
-                print(f"❌ Database error while checking docking assays: {e}")
-                conn.close()
-                return None
+                print(f"⚠️  Warning: Could not check related docking assays: {e}")
+                docking_assays = []
+
+        # Check related MD assays (via receptor template name OR via docking assay link)
+        md_assay_names = []
+        md_registers_db_path = os.path.join(self.path, 'dynamics', 'md_registers', 'md_registers.db')
+        if os.path.exists(md_registers_db_path):
+            try:
+                conn_md = sqlite3.connect(md_registers_db_path)
+                cursor_md = conn_md.cursor()
+                seen_md_names = set()
+                cursor_md.execute(
+                    "SELECT md_assay FROM md_assays WHERE receptor_template_name = ?",
+                    (selected_template['pdb_template_name'],)
+                )
+                for row in cursor_md.fetchall():
+                    if row[0] and row[0] not in seen_md_names:
+                        md_assay_names.append(row[0])
+                        seen_md_names.add(row[0])
+                for assay_id, _, _ in docking_assays:
+                    cursor_md.execute(
+                        "SELECT md_assay FROM md_assays WHERE docking_assay_id = ?",
+                        (f'assay_{assay_id}',)
+                    )
+                    for row in cursor_md.fetchall():
+                        if row[0] and row[0] not in seen_md_names:
+                            md_assay_names.append(row[0])
+                            seen_md_names.add(row[0])
+                conn_md.close()
+            except sqlite3.Error as e:
+                print(f"⚠️  Warning: Could not check related MD assays: {e}")
 
         # Confirm deletion
         print("\n⚠️  CONFIRM PDB TEMPLATE DELETION")
@@ -7497,6 +9401,10 @@ loadamberparams {frcmod_file}
             print(f"   ⚠️  Related docking assays to be deleted: {len(docking_assays)}")
             for _, assay_name, _ in docking_assays:
                 print(f"       - {assay_name}")
+        if md_assay_names:
+            print(f"   ⚠️  Related MD assays to be deleted: {len(md_assay_names)}")
+            for name in md_assay_names:
+                print(f"       - {name}")
         print("=" * 80)
 
         confirm = input("Are you sure you want to delete this PDB template? (yes/no, default: no): ").strip().lower()
@@ -7564,6 +9472,49 @@ loadamberparams {frcmod_file}
                 except sqlite3.Error as e:
                     print(f"⚠️  Warning: Error deleting docking assays: {e}")
 
+            # Delete related MD assays (via receptor template name OR via docking assay link)
+            md_assays_deleted = 0
+            md_assay_folders_deleted = 0
+            if os.path.exists(md_registers_db_path):
+                try:
+                    conn_md = sqlite3.connect(md_registers_db_path)
+                    cursor_md = conn_md.cursor()
+                    md_entries_to_delete = []
+                    seen_md_ids = set()
+                    cursor_md.execute(
+                        "SELECT assay_id, assay_folder_path FROM md_assays WHERE receptor_template_name = ?",
+                        (selected_template['pdb_template_name'],)
+                    )
+                    for row in cursor_md.fetchall():
+                        if row[0] not in seen_md_ids:
+                            md_entries_to_delete.append(row)
+                            seen_md_ids.add(row[0])
+                    for assay_id, _, _ in docking_assays:
+                        cursor_md.execute(
+                            "SELECT assay_id, assay_folder_path FROM md_assays WHERE docking_assay_id = ?",
+                            (f'assay_{assay_id}',)
+                        )
+                        for row in cursor_md.fetchall():
+                            if row[0] not in seen_md_ids:
+                                md_entries_to_delete.append(row)
+                                seen_md_ids.add(row[0])
+                    for md_id, md_folder in md_entries_to_delete:
+                        cursor_md.execute("DELETE FROM md_assays WHERE assay_id = ?", (md_id,))
+                        md_assays_deleted += 1
+                        if md_folder and os.path.exists(md_folder):
+                            try:
+                                shutil.rmtree(md_folder)
+                                md_assay_folders_deleted += 1
+                                print(f"   ✓ Deleted MD assay folder: {md_folder}")
+                            except Exception as e:
+                                print(f"   ⚠️  Warning: Could not delete MD assay folder {md_folder}: {e}")
+                        elif md_folder:
+                            print(f"   ⚠️  MD assay folder not found (already deleted?): {md_folder}")
+                    conn_md.commit()
+                    conn_md.close()
+                except sqlite3.Error as e:
+                    print(f"⚠️  Warning: Error deleting MD assays: {e}")
+
             print(f"\n✓ PDB template '{selected_template['pdb_template_name']}' deleted")
             print(f"   Database: {pdbs_db_path}")
             if template_deleted:
@@ -7576,6 +9527,10 @@ loadamberparams {frcmod_file}
                 print(f"   Related docking assays deleted: {docking_assays_deleted}")
             if assay_folders_deleted:
                 print(f"   Assay folders deleted: {assay_folders_deleted}")
+            if md_assays_deleted:
+                print(f"   Related MD assays deleted: {md_assays_deleted}")
+            if md_assay_folders_deleted:
+                print(f"   MD assay folders deleted: {md_assay_folders_deleted}")
 
             return {
                 'status': 'deleted',
@@ -7585,6 +9540,8 @@ loadamberparams {frcmod_file}
                 'receptor_models_deleted': receptor_models_deleted,
                 'docking_assays_deleted': docking_assays_deleted,
                 'assay_folders_deleted': assay_folders_deleted,
+                'md_assays_deleted': md_assays_deleted,
+                'md_assay_folders_deleted': md_assay_folders_deleted,
             }
 
         except sqlite3.Error as e:
@@ -7638,6 +9595,115 @@ loadamberparams {frcmod_file}
             print(f"Configs: {configs}")
             print(f"Notes: {notes}")
             print("-" * 40)
+
+    def export_receptor_config(self, selection: int = None, output_path: str = None):
+        """
+        Export the configuration of a receptor model to a JSON file that can be used
+        to recreate new receptor models without re-entering parameters interactively.
+
+        The exported file contains the full 'configs' dictionary (docking box center/size,
+        charge model, grid parameters, biases, etc.) together with identifying metadata
+        (receptor_model_name, template_name, pdb_model_name, pdbqt_file).
+
+        The file is written to 'output_path' when provided, otherwise it is saved to:
+            <project_path>/docking/receptors/<receptor_model_name>_receptor_config.json
+
+        Args:
+            selection (int, optional): 1-based index of the receptor model to export.
+                If not provided the user will be prompted interactively.
+            output_path (str, optional): Full path for the exported JSON file.
+                Defaults to the receptors folder using the model name as filename.
+
+        Returns:
+            str | None: Absolute path to the written config file, or None on failure.
+        """
+        import sqlite3
+        import json
+
+        receptors_db_path = os.path.join(self.path, 'docking', 'receptors', 'receptors.db')
+        if not os.path.exists(receptors_db_path):
+            print(f"❌ Database not found: {receptors_db_path}")
+            return None
+
+        try:
+            conn = sqlite3.connect(receptors_db_path)
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT id, receptor_model_name, template_name, pdb_model_name, pdb_to_convert, pdbqt_file, configs, notes
+                FROM receptor_models
+                ORDER BY id ASC
+            ''')
+            rows = cursor.fetchall()
+            conn.close()
+        except Exception as e:
+            print(f"❌ Error reading receptors.db: {e}")
+            return None
+
+        if not rows:
+            print("📋 No receptor models found in the database.")
+            return None
+
+        print("\n📋 Available Receptor Models:")
+        print("=" * 60)
+        for i, (rid, receptor_model_name, template_name, pdb_model_name, *_) in enumerate(rows, 1):
+            print(f"{i}. [ID {rid}] {receptor_model_name}  |  Template: {template_name}  |  PDB Model: {pdb_model_name}")
+        print("=" * 60)
+
+        if selection is None:
+            while True:
+                try:
+                    raw = input("Select a receptor model by number (or 'cancel'): ").strip()
+                    if raw.lower() in ('cancel', 'quit', 'exit'):
+                        print("❌ Export cancelled.")
+                        return None
+                    idx = int(raw) - 1
+                    if 0 <= idx < len(rows):
+                        break
+                    print(f"❌ Enter a number between 1 and {len(rows)}.")
+                except ValueError:
+                    print("❌ Please enter a valid number.")
+                except KeyboardInterrupt:
+                    print("\n❌ Export cancelled.")
+                    return None
+        else:
+            idx = selection - 1
+            if not (0 <= idx < len(rows)):
+                print(f"❌ Invalid selection {selection}. Must be between 1 and {len(rows)}.")
+                return None
+
+        rid, receptor_model_name, template_name, pdb_model_name, pdb_to_convert, pdbqt_file, configs_raw, notes = rows[idx]
+
+        try:
+            configs = json.loads(configs_raw) if configs_raw else {}
+        except json.JSONDecodeError as e:
+            print(f"❌ Failed to parse configs JSON for model '{receptor_model_name}': {e}")
+            return None
+
+        export_data = {
+            "receptor_model_name": receptor_model_name,
+            "template_name": template_name,
+            "pdb_model_name": pdb_model_name,
+            "pdb_to_convert": pdb_to_convert,
+            "pdbqt_file": pdbqt_file,
+            "notes": notes,
+            "configs": configs,
+        }
+
+        if output_path is None:
+            safe_name = receptor_model_name.replace(" ", "_")
+            output_path = os.path.join(
+                self.path, 'docking', 'receptors', f"{safe_name}_receptor_config.json"
+            )
+
+        try:
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            with open(output_path, 'w') as fh:
+                json.dump(export_data, fh, indent=2)
+            print(f"✅ Receptor config exported to: {output_path}")
+            return output_path
+        except Exception as e:
+            print(f"❌ Error writing config file: {e}")
+            return None
 
     def delete_receptor_model(self):
         """
@@ -7886,7 +9952,17 @@ loadamberparams {frcmod_file}
                 [False, True],
                 default=False
             )
-            
+
+            ligand_prep_parameters['rigid_macrocycles'] = self._get_parameter_choice(
+                "Keep rings rigid instead of letting Meeko break rings >= 7 atoms into flexible "
+                "macrocycles (glue 'G'/'CG' pseudo-atoms). Fused/bridged polycyclic scaffolds that "
+                "merely happen to contain a 7+ atom ring should normally stay rigid; only set to "
+                "False for genuine flexible macrocycles (e.g. macrolactones) and a macrocycle-aware "
+                "docking engine.",
+                [True, False],
+                default=True
+            )
+
             ligand_prep_parameters['add_atom_types'] = self._input_parameter_choice(
                 "Specify additional atom types to assign in JSON format, with SMARTS patterns and atom type names. (i.e.: '[{'smarts': '[#1][#6X3]:[#6X3]([#6])[#7]:[#7][#7][#6]', 'atype': 'HD'}]' for 1,2,3-triazole donor HD in 4 position. Default: None)",
                 default=None
@@ -7908,7 +9984,7 @@ loadamberparams {frcmod_file}
             return None
         pass
     
-    def extract_docked_poses(self, assay=None):
+    def extract_docked_poses(self, assay=None, selection=None, score_column=None):
         """
         Extract docked poses from a docking assay and save them as PDB files based on user-selected criteria.
         This method allows users to select a docking assay from the registry and extract poses based on three
@@ -8005,6 +10081,15 @@ loadamberparams {frcmod_file}
 
         assay_id, assay_name, docking_engine, assay_folder, status = selected_assay
 
+        # Reconstruct assay folder path from self.path to handle project relocations.
+        reconstructed_folder = os.path.join(self.path, 'docking', 'docking_assays', assay_name)
+        if os.path.exists(reconstructed_folder):
+            assay_folder = reconstructed_folder
+        elif not os.path.exists(assay_folder):
+            print(f"❌ Assay folder not found at reconstructed path: {reconstructed_folder}")
+            print(f"   Also not found at stored path: {assay_folder}")
+            return None
+
         # Locate results directory
         results_dir = os.path.join(assay_folder, "results")
         if not os.path.exists(results_dir):
@@ -8016,55 +10101,60 @@ loadamberparams {frcmod_file}
 
         ## Evaluate the docking engine in order to use the corresponding pose extraction method
         if docking_engine == "AutoDockGPU":
-            self._extract_docked_poses_autodockgpu(db_path)
-            
-        elif docking_engine == "Vina":
-            self._extract_docked_poses_autodockvina(db_path)
-    
-    def _extract_docked_poses_autodockgpu(self, db_path):
+            return self._extract_docked_poses_autodockgpu(db_path, selection=selection, score_column=score_column)
+
+        else:
+            return self._extract_docked_poses_autodockvina(db_path, selection=selection, score_column=score_column)
+
+    def _extract_docked_poses_autodockgpu(self, db_path, selection=None, score_column=None):
         ## Start the analysis
         print("Starting poses extraction for engine AutoDockGPU")
         print("")
-        print("Select an option:")
-        print("1 - Select lowest energy poses")
-        print("2 - Select most populated poses")
-        print("3 - Select most lowest energy AND populated poses (both criteria)")
-        print("4 - Select ALL poses")
-        selection = input("Enter your choice (1, 2, 3, or 4): ").strip()
 
-        ## Prompt the user which selection to make
-        while selection not in ("1", "2", "3", "4"):
-            print("Invalid selection. Only 1, 2, 3, or 4 can be selected.")
+        if selection is None:
+            print("Select an option:")
+            print("1 - Select lowest energy poses")
+            print("2 - Select most populated poses")
+            print("3 - Select most lowest energy AND populated poses (both criteria)")
+            print("4 - Select ALL poses")
             selection = input("Enter your choice (1, 2, 3, or 4): ").strip()
+
+            ## Prompt the user which selection to make
+            while selection not in ("1", "2", "3", "4"):
+                print("Invalid selection. Only 1, 2, 3, or 4 can be selected.")
+                selection = input("Enter your choice (1, 2, 3, or 4): ").strip()
+
+        if selection not in ("1", "2", "3", "4"):
+            print(f"❌ Invalid selection '{selection}' for AutoDockGPU. Choose 1, 2, 3, or 4.")
+            return None
 
         # Act according to user selection
         if selection == "1":
             print("You selected: lowest energy poses")
-            # Create output directory for most stable poses
             output_dir = os.path.join(os.path.dirname(os.path.abspath(db_path)), "most_stable_poses")
-            os.makedirs(output_dir, exist_ok=True)
-            
-            df = self._select_most_stable_poses(db_path)
-        
+            if not self._prepare_output_dir(output_dir):
+                return None
+            df = self._select_most_stable_poses(db_path, score_column=score_column)
+
         elif selection == "2":
             print("You selected: most populated poses")
-            # Create output directory for most populated poses
             output_dir = os.path.join(os.path.dirname(os.path.abspath(db_path)), "most_populated_poses")
-            os.makedirs(output_dir, exist_ok=True)
+            if not self._prepare_output_dir(output_dir):
+                return None
             df = self._select_most_populated_poses(db_path)
 
         elif selection == "3":
             print("You selected: most populated AND lowest energy poses")
-            # Create output directory for most populated and stable poses
             output_dir = os.path.join(os.path.dirname(os.path.abspath(db_path)), "most_populated_and_stable_poses")
-            os.makedirs(output_dir, exist_ok=True)
-            df = self._select_most_populated_and_stable_poses(db_path)
+            if not self._prepare_output_dir(output_dir):
+                return None
+            df = self._select_most_populated_and_stable_poses(db_path, score_column=score_column)
 
         elif selection == "4":
             print("You selected: ALL poses")
-            # Create output directory for all poses
             output_dir = os.path.join(os.path.dirname(os.path.abspath(db_path)), "all_poses")
-            os.makedirs(output_dir, exist_ok=True)
+            if not self._prepare_output_dir(output_dir):
+                return None
             df = self._select_all_poses(db_path)
 
         # Continue processing the selected poses
@@ -8073,7 +10163,7 @@ loadamberparams {frcmod_file}
             pose_id = row[1]['Pose_ID']
             run_number = row[1]['run_number']
             
-            input_model, pose_coords_json = self._retrieve_pose_info(db_path, pose_id)
+            input_model, pose_coords_json = self._retrieve_pose_info(db_path, ligname, run_number)
             pdb_dict = self._process_input_model_for_moldf(input_model, pose_coords_json)
             self._write_pdb_with_moldf(pdb_dict, ligname, run_number, output_dir)
 
@@ -8084,74 +10174,197 @@ loadamberparams {frcmod_file}
         elif selection == "3":
             print(f"Most populated and stable poses extracted and saved as PDB files to: \n \t {output_dir}")
         elif selection == "4":
-            print(f"All poses extracted and saved as PDB files to: \n \t {output_dir}")    
-    
-    def _extract_docked_poses_autodockvina(self, db_path):
-        
+            print(f"All poses extracted and saved as PDB files to: \n \t {output_dir}")
+
+        return output_dir
+
+    def _extract_docked_poses_autodockvina(self, db_path, selection=None, score_column=None):
+
         ## Start the analysis
         print("Starting poses extraction for engine Vina")
         print("")
-        print("Select an option:")
-        print("1 - Extract lowest energy pose")
-        print("2 - Extract all poses")
-        selection = input("Enter your choice (1 or 2): ").strip()
-        
-        ## Prompt the user which selection to make
-        while selection not in ("1", "2"):
-            print("Invalid selection. Only 1 or 2 can be selected.")
+
+        if selection is None:
+            print("Select an option:")
+            print("1 - Extract lowest energy pose")
+            print("2 - Extract all poses")
             selection = input("Enter your choice (1 or 2): ").strip()
-        
+
+            ## Prompt the user which selection to make
+            while selection not in ("1", "2"):
+                print("Invalid selection. Only 1 or 2 can be selected.")
+                selection = input("Enter your choice (1 or 2): ").strip()
+
+        if selection not in ("1", "2"):
+            print(f"❌ Invalid selection '{selection}' for AutoDock Vina. Choose 1 or 2.")
+            return None
+
         # Act according to user selection
         if selection == "1":
             print("You selected: lowest energy poses")
-            # Create output directory for most stable poses
             output_dir = os.path.join(os.path.dirname(os.path.abspath(db_path)), "most_stable_poses")
-            os.makedirs(output_dir, exist_ok=True)
-            
-            df = self._select_most_stable_poses(db_path)
+            if not self._prepare_output_dir(output_dir):
+                return None
+            df = self._select_most_stable_poses(db_path, score_column=score_column)
 
         elif selection == "2":
             print("You selected: all poses")
-            # Create output directory for all poses
             output_dir = os.path.join(os.path.dirname(os.path.abspath(db_path)), "all_poses")
-            os.makedirs(output_dir, exist_ok=True)
-            
+            if not self._prepare_output_dir(output_dir):
+                return None
             df = self._select_all_poses(db_path)
 
-        # Continue pprocessing the selected poses
+        # Continue processing the selected poses
         for row in df.iterrows():
             ligname = row[1]['LigName']
             pose_id = row[1]['Pose_ID']
             run_number = row[1]['run_number']
-            
-            input_model, pose_coords_json = self._retrieve_pose_info(db_path, pose_id)
+
+            input_model, pose_coords_json = self._retrieve_pose_info(db_path, ligname, run_number)
             pdb_dict = self._process_input_model_for_moldf(input_model, pose_coords_json)
             self._write_pdb_with_moldf(pdb_dict, ligname, run_number, output_dir)
 
         print(f"Docked poses extracted to {output_dir}")
+        return output_dir
 
-    def _select_most_stable_poses(self, db_path):
+    def _prepare_output_dir(self, output_dir):
         """
-        Select the most stable pose (lowest docking score) for each ligand
-        from the Ringtail database located at db_path.
-        Returns a DataFrame with LigName, Pose_ID, and docking_score.
+        Ensure output_dir is an empty, ready-to-use directory.
+
+        - If the directory does not exist it is created and True is returned.
+        - If it already exists the user is asked whether to delete it:
+            - 'y' / Enter  → directory is removed and recreated; True is returned.
+            - 'n' / Ctrl-C → operation is cancelled; False is returned (caller
+                             should abort and return None).
+        """
+        import os
+        import shutil
+
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+            return True
+
+        ## An existing-but-empty directory (e.g. left over from a previous
+        ## extraction that was interrupted before writing any PDB files) is
+        ## safe to reuse as-is — nothing would be lost by proceeding.
+        if not os.listdir(output_dir):
+            return True
+
+        print(f"\n⚠️  Output directory already exists:\n   {output_dir}")
+
+        ## input() has no source when this runs non-interactively (e.g. from the
+        ## Streamlit GUI subprocess), which raises EOFError. Default to the safe
+        ## choice (cancel, do not delete) in that case.
+        if not sys.stdin.isatty():
+            print("❌ Non-interactive session — refusing to overwrite without confirmation. Operation cancelled.")
+            return False
+
+        try:
+            answer = input("Delete it and proceed? [y/N]: ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print("\n❌ Operation cancelled.")
+            return False
+
+        if answer == 'y':
+            shutil.rmtree(output_dir)
+            os.makedirs(output_dir)
+            print("Directory cleared.")
+            return True
+
+        print("❌ Operation cancelled.")
+        return False
+
+    def _prompt_score_column(self, conn):
+        """
+        Inspect the Results table for available scoring columns and, when more than
+        one is populated, ask the user which one to use as the 'lowest energy' criterion.
+
+        Candidate columns (in priority order):
+            docking_score        — always present
+            mmgbsa_total_energy  — added after compute_fingerprints(write_mmgbsa=True)
+            mmgbsa_gas_energy    — same
+
+        A column is considered available only when it exists AND has at least one
+        non-NULL, non-(-1) value (-1 is the sentinel stored for failed MMGBSA runs).
+
+        Returns the chosen column name as a string.
+        """
+        import sqlite3
+
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(Results)")
+        existing = {row[1] for row in cursor.fetchall()}
+
+        candidates = []
+        for col in ['docking_score', 'mmgbsa_total_energy', 'mmgbsa_gas_energy']:
+            if col in existing:
+                cursor.execute(
+                    f"SELECT COUNT(*) FROM Results WHERE {col} IS NOT NULL AND {col} != -1"
+                )
+                if cursor.fetchone()[0] > 0:
+                    candidates.append(col)
+
+        if len(candidates) <= 1:
+            return candidates[0] if candidates else 'docking_score'
+
+        labels = {
+            'docking_score':       'Docking score  (AutoDock binding energy, kcal/mol)',
+            'mmgbsa_total_energy': 'MMGBSA total energy  (gas + solvation, kcal/mol)',
+            'mmgbsa_gas_energy':   'MMGBSA gas-phase energy  (kcal/mol)',
+        }
+
+        ## input() has no source when this runs non-interactively (e.g. from the
+        ## Streamlit GUI subprocess), which raises EOFError. Default to the
+        ## highest-priority candidate (docking_score, when present) in that case.
+        if not sys.stdin.isatty():
+            chosen = candidates[0]
+            print(f"\nMultiple scoring columns available; defaulting to '{chosen}' (non-interactive session).")
+            return chosen
+
+        print("\nMultiple scoring columns are available in this assay:")
+        for i, col in enumerate(candidates, 1):
+            print(f"  {i}. {labels.get(col, col)}")
+
+        while True:
+            try:
+                choice = input("Select the column to use as lowest-energy criterion: ").strip()
+                idx = int(choice) - 1
+                if 0 <= idx < len(candidates):
+                    chosen = candidates[idx]
+                    print(f"Using: {chosen}")
+                    return chosen
+                print("Invalid selection. Try again.")
+            except (ValueError, KeyboardInterrupt, EOFError):
+                print("Defaulting to docking_score.")
+                return 'docking_score'
+
+    def _select_most_stable_poses(self, db_path, score_column=None):
+        """
+        Select the most stable pose (lowest score) for each ligand from the Ringtail
+        database at db_path.  When secondary scoring columns (mmgbsa_total_energy,
+        mmgbsa_gas_energy) are populated the user is asked which column to minimise,
+        unless score_column is passed explicitly (e.g. chosen via the GUI).
+        Returns a DataFrame with LigName, Pose_ID, the chosen score column, and run_number.
         """
         import sqlite3
         import pandas as pd
-        
+
         conn = sqlite3.connect(db_path)
-        query = """
-        SELECT LigName, Pose_ID, docking_score, run_number
+        score_col = score_column or self._prompt_score_column(conn)
+
+        query = f"""
+        SELECT LigName, Pose_ID, {score_col}, run_number
         FROM Results AS R1
-        WHERE docking_score = (
-            SELECT MIN(docking_score)
+        WHERE {score_col} = (
+            SELECT MIN({score_col})
             FROM Results AS R2
             WHERE R1.LigName = R2.LigName
+              AND {score_col} IS NOT NULL AND {score_col} != -1
         )
         """
         df = pd.read_sql(query, conn)
         conn.close()
-        
+
         return df
 
     def _select_all_poses(self, db_path):
@@ -8198,49 +10411,58 @@ loadamberparams {frcmod_file}
         
         return df
 
-    def _select_most_populated_and_stable_poses(self, db_path):
+    def _select_most_populated_and_stable_poses(self, db_path, score_column=None):
         """
         Selects the most populated and stable docking poses for each ligand from a SQLite database.
         This method connects to the specified SQLite database, queries the 'Results' table,
         and retrieves the pose(s) for each ligand that have the largest cluster size (most populated)
-        and the lowest docking score (most stable). The results are returned as a pandas DataFrame.
+        and the lowest score (most stable). When secondary scoring columns are populated the user
+        is asked which column to use for the stability criterion, unless score_column is passed
+        explicitly (e.g. chosen via the GUI).
         Args:
             db_path (str): Path to the SQLite database file containing the docking results.
         Returns:
-            pandas.DataFrame: A DataFrame containing the ligand name, pose ID, cluster size, docking score, and run number for the selected poses.
+            pandas.DataFrame: A DataFrame containing the ligand name, pose ID, cluster size,
+                the chosen score column, and run number for the selected poses.
         """
 
         import sqlite3
         import pandas as pd
 
         conn = sqlite3.connect(db_path)
-        query = """
-        SELECT LigName, Pose_ID, cluster_size, docking_score, run_number
+        score_col = score_column or self._prompt_score_column(conn)
+
+        query = f"""
+        SELECT LigName, Pose_ID, cluster_size, {score_col}, run_number
         FROM Results AS R1
         WHERE cluster_size = (
             SELECT MAX(cluster_size)
             FROM Results AS R2
             WHERE R1.LigName = R2.LigName
         )
-        AND docking_score = (
-            SELECT MIN(docking_score)
+        AND {score_col} = (
+            SELECT MIN({score_col})
             FROM Results AS R3
             WHERE R1.LigName = R3.LigName
+              AND {score_col} IS NOT NULL AND {score_col} != -1
         )
         """
         df = pd.read_sql(query, conn)
-        conn.close()    
-        
+        conn.close()
+
         return df
 
-    def _retrieve_pose_info(self, db_path, pose_id):
+    def _retrieve_pose_info(self, db_path, ligname, run_number):
         """
-        Retrieves ligand pose information from the database for a given pose ID.
-        Connects to the specified SQLite database, queries the Ligands and Results tables
-        to obtain the input model and ligand coordinates associated with the provided pose ID.
+        Retrieves ligand pose information from the database for a given ligand name and
+        per-ligand run number.  Queries by (LigName, run_number) so the correct pose is
+        returned regardless of the global Pose_ID assignment order.
+
         Args:
             db_path (str): Path to the SQLite database file.
-            pose_id (int or str): Identifier of the pose to retrieve.
+            ligname (str): Ligand name (LigName column in the Ligands / Results tables).
+            run_number (int or str): Per-ligand sequential pose number stored in the
+                Results table and used as the suffix in extracted PDB filenames.
         Returns:
             tuple: A tuple containing:
                 - input_model (str): The input model data for the ligand.
@@ -8255,12 +10477,14 @@ loadamberparams {frcmod_file}
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
 
-        # Retrieve the info required to reconstruct the ligand pose
+        # Retrieve the info required to reconstruct the ligand pose.
+        # Filter by both LigName and run_number so the correct per-ligand pose is
+        # returned even when run_number values repeat across different ligands.
         cursor.execute("""
         SELECT L.input_model, R.ligand_coordinates FROM Ligands L
         JOIN Results R ON L.LigName = R.LigName
-        WHERE R.Pose_ID = ?
-        """, (pose_id,))
+        WHERE R.LigName = ? AND R.run_number = ?
+        """, (ligname, run_number))
         row = cursor.fetchone()
         
         input_model, pose_coords_json = row
@@ -8411,20 +10635,20 @@ loadamberparams {frcmod_file}
         # Select the receptor to be used for docking
         receptor_conditions = self._get_receptor_conditions(receptor_info.get('id', None))
         
-        receptor_pdbqt_file = receptor_info.get('pdbqt_file', None)
+        receptor_pdbqt_file = self._resolve_receptor_pdbqt_file(receptor_info)
         charge_model = receptor_info.get('configs', None).get('receptor_charge_model', None)
-        grids_path = receptor_info.get('grids_path', None)
+        grids_path = self._remap_project_path(receptor_info.get('configs', {}).get('grids_path', None))
         fld_file = f"{grids_path}/receptor_checked_{charge_model}.maps.fld"
         assay_folder = assay_registry['assay_folder_path']
 
         if not receptor_pdbqt_file:
-            print("❌ No receptor .pdbqt file found.")
+            print("❌ No receptor .pdbqt file found (checked 'processed/' and the grid maps folder).")
             return
-        
+
         if not fld_file:
             print("❌ No receptor .maps.fld file found.")
             return
-            
+
         # Connect to chemspace database and get compounds
         try:
             conn = sqlite3.connect(self.__chemspace_db)
@@ -8451,7 +10675,7 @@ loadamberparams {frcmod_file}
             progress_bar = tqdm(total=len(compounds), desc="Docking compounds", unit="ligand")
 
         ## If 'vina' scoring function is to be applied, compute the maps once for batch docking
-        if method_params['sf_name'] == 'vina':          
+        if method_params['sf_name'] == 'vina':
             vina_rec_object = self._prepare_vina_receptor(method_params, receptor_pdbqt_file, receptor_conditions)
         elif method_params['sf_name'] == 'ad4':
             vina_rec_object = None
@@ -8471,8 +10695,9 @@ loadamberparams {frcmod_file}
                 
                 ## Generate the ligand.pdbqt file
                 ligand_pdbqt_filepath = f"{docking_results_dir}/{inchi_key}.pdbqt"
-                self._pdbqt_from_mol(mol, ligand_pdbqt_filepath, inchi_key, ligand_prep_parameters)
-                
+                if not self._pdbqt_from_mol(mol, ligand_pdbqt_filepath, inchi_key, ligand_prep_parameters):
+                    continue
+
                 ## Execute vina using ad4 scoring function
                 self._execute_vina(ligand_pdbqt_filepath, assay_registry, method_params, receptor_pdbqt_file, receptor_conditions, vina_rec_object)
                 
@@ -8522,20 +10747,20 @@ loadamberparams {frcmod_file}
         # Select the receptor to be used for docking
         receptor_conditions = self._get_receptor_conditions(receptor_info.get('id', None))
         
-        receptor_pdbqt_file = receptor_info.get('pdbqt_file', None)
+        receptor_pdbqt_file = self._resolve_receptor_pdbqt_file(receptor_info)
         charge_model = receptor_info.get('configs', None).get('receptor_charge_model', None)
-        grids_path = receptor_info.get('grids_path', None)
+        grids_path = self._remap_project_path(receptor_info.get('configs', {}).get('grids_path', None))
         fld_file = f"{grids_path}/receptor_checked_{charge_model}.maps.fld"
         assay_folder = assay_registry['assay_folder_path']
 
         if not receptor_pdbqt_file:
-            print("❌ No receptor .pdbqt file found.")
+            print("❌ No receptor .pdbqt file found (checked 'processed/' and the grid maps folder).")
             return
-        
+
         if not fld_file:
             print("❌ No receptor .maps.fld file found.")
             return
-            
+
         # Connect to chemspace database and get compounds
         try:
             conn = sqlite3.connect(self.__chemspace_db)
@@ -8562,16 +10787,16 @@ loadamberparams {frcmod_file}
             progress_bar = tqdm(total=len(compounds), desc="Docking compounds", unit="ligand")
 
         ## If 'vina' scoring function is to be applied, compute the maps once for batch docking
-        if method_params['sf_name'] == 'vina':          
+        if method_params['sf_name'] == 'vina':
             unidock_cmd = "unidock --scoring vina "
-        
+
         elif method_params['sf_name'] == 'ad4':
             unidock_cmd = "unidock --scoring ad4 "
 
             # Append the maps prefix to the command
-            maps_path = receptor_info["configs"]["grids_path"]
-            maps_prefix = f"{maps_path}/receptor_checked_{charge_model} "
-            unidock_cmd += f"--maps {maps_prefix} " 
+            maps_path = grids_path
+            maps_prefix = f"{maps_path}/receptor_checked_{charge_model}.maps "
+            unidock_cmd += f"--maps {maps_prefix} "
 
         # Iterate and dock each compound
         for idx, (inchi_key, sdf_blob) in enumerate(compounds, 1):
@@ -8588,7 +10813,8 @@ loadamberparams {frcmod_file}
                 
                 ## Generate the ligand.pdbqt file
                 ligand_pdbqt_filepath = f"{docking_results_dir}/{inchi_key}.pdbqt"
-                self._pdbqt_from_mol(mol, ligand_pdbqt_filepath, inchi_key, ligand_prep_parameters)
+                if not self._pdbqt_from_mol(mol, ligand_pdbqt_filepath, inchi_key, ligand_prep_parameters):
+                    continue
 
                 ## Execute unidock in single compound mode
                 self._execute_unidock(ligand_pdbqt_filepath, assay_registry, method_params, receptor_pdbqt_file, receptor_conditions, unidock_cmd)
@@ -8640,20 +10866,20 @@ loadamberparams {frcmod_file}
         # Select the receptor to be used for docking
         receptor_conditions = self._get_receptor_conditions(receptor_info.get('id', None))
         
-        receptor_pdbqt_file = receptor_info.get('pdbqt_file', None)
+        receptor_pdbqt_file = self._resolve_receptor_pdbqt_file(receptor_info)
         charge_model = receptor_info.get('configs', None).get('receptor_charge_model', None)
-        grids_path = receptor_info.get('grids_path', None)
+        grids_path = self._remap_project_path(receptor_info.get('configs', {}).get('grids_path', None))
         fld_file = f"{grids_path}/receptor_checked_{charge_model}.maps.fld"
         assay_folder = assay_registry['assay_folder_path']
 
         if not receptor_pdbqt_file:
-            print("❌ No receptor .pdbqt file found.")
+            print("❌ No receptor .pdbqt file found (checked 'processed/' and the grid maps folder).")
             return
-        
+
         if not fld_file:
             print("❌ No receptor .maps.fld file found.")
             return
-            
+
         # Connect to chemspace database and get compounds
         try:
             conn = sqlite3.connect(self.__chemspace_db)
@@ -8675,16 +10901,16 @@ loadamberparams {frcmod_file}
         docking_results_dir = f"{assay_folder}/results"
 
         ## If 'vina' scoring function is to be applied, compute the maps once for batch docking
-        if method_params['sf_name'] == 'vina':          
+        if method_params['sf_name'] == 'vina':
             unidock_cmd = "unidock --scoring vina "
-        
+
         elif method_params['sf_name'] == 'ad4':
             unidock_cmd = "unidock --scoring ad4 "
 
             # Append the maps prefix to the command
-            maps_path = receptor_info["configs"]["grids_path"]
-            maps_prefix = f"{maps_path}/receptor_checked_{charge_model} "
-            unidock_cmd += f"--maps {maps_prefix} " 
+            maps_path = grids_path
+            maps_prefix = f"{maps_path}/receptor_checked_{charge_model}.maps "
+            unidock_cmd += f"--maps {maps_prefix} "
 
         # Iterate and dock each compound
         for idx, (inchi_key, sdf_blob) in enumerate(compounds, 1):
@@ -8731,7 +10957,6 @@ loadamberparams {frcmod_file}
         print(f"\n🎉 Docking completed for table: {selected_table}")
         print(f"Results saved in: {docking_results_dir}")
 
-
     def _prepare_vina_receptor(self, method_params, receptor_pdbqt_file, receptor_conditions):
         
         from vina import Vina
@@ -8747,7 +10972,55 @@ loadamberparams {frcmod_file}
         vina_rec_object.compute_vina_maps(center=box_center, box_size=box_size)        
         
         return vina_rec_object
-    
+
+    def _normalize_grid_maps(self, grids_path, canonical_stem):
+        """
+        Rename all map/xyz files in grids_path from their original AutoGrid4 prefix
+        to canonical_stem, then rewrite the .maps.fld internal file references to match.
+
+        Vina's load_maps(prefix) derives BOTH the fld filename and the individual .map
+        filenames directly from the prefix, so all files must share the same stem.
+        This method is idempotent: it is a no-op when the files are already canonical.
+        """
+        import glob as _glob
+        canonical_fld = os.path.join(grids_path, f"{canonical_stem}.maps.fld")
+        if not os.path.exists(canonical_fld):
+            print(f"⚠️  Canonical FLD not found, cannot normalize: {canonical_fld}")
+            return False
+
+        # Detect the current map stem from the electrostatics map (.e.map), which is
+        # always present in AD4 grids. Globbing avoids regex ambiguity with dots in
+        # the receptor name (e.g. HP_beta_CD_MS_0.70_model...) that would truncate
+        # the stem at the first dot.
+        e_maps = _glob.glob(os.path.join(grids_path, '*.e.map'))
+        if not e_maps:
+            print(f"⚠️  No .e.map file found in {grids_path}, cannot normalize.")
+            return False
+
+        original_stem = os.path.basename(e_maps[0])[:-len('.e.map')]
+
+        if original_stem == canonical_stem:
+            return True  # Already normalized
+
+        # Rename all .map and .xyz files from the original stem to the canonical stem
+        for fname in os.listdir(grids_path):
+            if fname.startswith(original_stem + '.') and (fname.endswith('.map') or fname.endswith('.xyz')):
+                suffix = fname[len(original_stem):]  # e.g. '.A.map', '.maps.xyz'
+                dst = os.path.join(grids_path, canonical_stem + suffix)
+                src = os.path.join(grids_path, fname)
+                if not os.path.exists(dst):
+                    os.rename(src, dst)
+
+        # Rewrite fld internal references to use the canonical stem
+        with open(canonical_fld) as _f:
+            fld_content = _f.read()
+        new_content = fld_content.replace(original_stem + '.', canonical_stem + '.')
+        with open(canonical_fld, 'w') as _f:
+            _f.write(new_content)
+
+        print(f"  Normalized grid maps: '{original_stem}.*' → '{canonical_stem}.*'")
+        return True
+
     def _execute_vina(self, ligand_pdbqt_filepath, assay_registry, method_params, receptor_pdbqt_file, receptor_conditions, vina_rec_object):
         """
         Execute molecular docking using AutoDock Vina with specified scoring function.
@@ -8812,13 +11085,19 @@ loadamberparams {frcmod_file}
             # This will apply docking using the 'ad4' scoring function
             elif method_params['sf_name'] == 'ad4':
                 vina_rec_object = Vina(sf_name = method_params['sf_name'])
-                
-                # Determine the grids files path
-                grid_maps_path = receptor_conditions.get('configs', None).get('grids_path', None)
-                receptor_charge_model = receptor_conditions.get('configs', None).get('receptor_charge_model', None)
-                grid_files_prefix = f"{grid_maps_path}/receptor_checked_{receptor_charge_model}" 
 
-                vina_rec_object.load_maps(grid_files_prefix)
+                # Determine the grids files path
+                grid_maps_path = self._remap_project_path(receptor_conditions.get('configs', None).get('grids_path', None))
+                receptor_charge_model = receptor_conditions.get('configs', None).get('receptor_charge_model', None)
+                canonical_stem = f"receptor_checked_{receptor_charge_model}"
+
+                # Ensure all map files and the fld's internal references share the
+                # canonical stem — required by Vina which derives map filenames from
+                # the prefix directly (unlike AutoDock GPU which uses CWD + fld refs).
+                self._normalize_grid_maps(grid_maps_path, canonical_stem)
+
+                maps_prefix = os.path.join(grid_maps_path, canonical_stem)
+                vina_rec_object.load_maps(maps_prefix)
                 
                 vina_rec_object.set_ligand_from_file(ligand_pdbqt_filepath)
                 
@@ -9149,9 +11428,13 @@ loadamberparams {frcmod_file}
             return False
     
     def _refine_receptor_model(self, tleap_processed_file, processed_pdb_path, analysis):
-        
+
         # Minize the receptor model as processed with tleap
-        minimized_pdb_file = self._minimize_receptor(tleap_processed_file, analysis)
+        minimized_pdb_file = self._minimize_receptor(tleap_processed_file, analysis, processed_pdb_path)
+
+        if minimized_pdb_file is None:
+            print(f"❌ Receptor minimization failed — cannot refine model.")
+            return None, None
 
         ## Create residue number matching dictionary
         renumbering_dict = self._construct_resnumbers_matching_dictionary(processed_pdb_path, minimized_pdb_file)
@@ -9173,28 +11456,78 @@ loadamberparams {frcmod_file}
         return receptor_moldf_dict, renumbering_dict
         
     def _add_element_column_to_pdb_file(self, tleap_processed_file):
-        
-        from moldf import read_pdb
-        from moldf import write_pdb
+
         import pandas as pd
-        
-        # Create a df from the tleap_receptor file
-        df = pd.read_csv(tleap_processed_file, sep=r'\s+', engine='python', header=None)
-        
-        # Change the column names
-        df.columns = ['record_name', 'atom_number', 'atom_name', 'residue_name', 'residue_number', 'x_coord', 'y_coord', 'z_coord', 'occupancy', 'b_factor']
-        # Fill NaN values in the 'atom_number' column with forward fill and then add a cumulative sum to ensure unique atom numbers
-        df['atom_number'] = df['atom_number'].ffill().add(df['atom_number'].isna().astype(int).cumsum()).astype(int)
-        # Fill NaN values with a default value (e.g., 0) and change the residue_number column to integer type
-        df['residue_number'] = df['residue_number'].ffill().fillna(0).astype(int)
-        # Fill NaN atom names with an empty string
-        df['atom_name'] = df['atom_name'].fillna('')
-        # Fil NaN residue names with the same value as above
-        df['residue_name'] = df['residue_name'].ffill().fillna('')
+
+        # Use fixed-column PDB parsing instead of whitespace splitting.
+        # pd.read_csv(sep=r'\s+') breaks on PDB files because the REMARK/TER
+        # lines have different token counts than ATOM/HETATM lines, causing
+        # pandas (engine='python', regex delimiter) to raise ParserError or
+        # silently mis-assign coordinates when chain IDs are present.
+        records = []
+        chain_ids = []
+        with open(tleap_processed_file, 'r') as _fh:
+            for _line in _fh:
+                if _line.startswith(('ATOM', 'HETATM')):
+                    record_name = _line[0:6].strip()
+                    try:
+                        atom_number = int(_line[6:11])
+                    except ValueError:
+                        atom_number = 0
+                    atom_name = _line[12:16].strip()
+                    residue_name = _line[17:20].strip()
+                    # Column 22 (index 21) holds the chain ID in the PDB fixed-column
+                    # format. Default to 'A' when the source file carries no chain
+                    # info so downstream consumers always see a valid chain id.
+                    chain_id = _line[21].strip() if len(_line) > 21 else ''
+                    chain_ids.append(chain_id or 'A')
+                    try:
+                        residue_number = int(_line[22:26])
+                    except ValueError:
+                        residue_number = 0
+                    try:
+                        x_coord = float(_line[30:38])
+                        y_coord = float(_line[38:46])
+                        z_coord = float(_line[46:54])
+                    except ValueError:
+                        x_coord = y_coord = z_coord = float('nan')
+                    try:
+                        occupancy = float(_line[54:60])
+                    except ValueError:
+                        occupancy = 1.0
+                    try:
+                        b_factor = float(_line[60:66])
+                    except ValueError:
+                        b_factor = 0.0
+                    records.append([record_name, atom_number, atom_name, residue_name,
+                                    residue_number, x_coord, y_coord, z_coord,
+                                    occupancy, b_factor])
+                elif _line.startswith('TER'):
+                    # Include TER records so write_pdb emits chain delimiters.
+                    # Field mapping matches what old pd.read_csv(sep=r'\s+')
+                    # produced: TER serial → atom_number, TER resName → atom_name.
+                    _parts = _line.split()
+                    _sn = int(_parts[1]) if len(_parts) > 1 else 0
+                    _rn = _parts[2] if len(_parts) > 2 else ''
+                    try:
+                        _rnum = int(_parts[3]) if len(_parts) > 3 else 0
+                    except ValueError:
+                        _rnum = 0
+                    _chain_id = _line[21].strip() if len(_line) > 21 else ''
+                    chain_ids.append(_chain_id or 'A')
+                    records.append(['TER', _sn, _rn, str(_rnum), _rnum,
+                                    float('nan'), float('nan'), float('nan'),
+                                    float('nan'), float('nan')])
+
+        df = pd.DataFrame(records, columns=[
+            'record_name', 'atom_number', 'atom_name', 'residue_name',
+            'residue_number', 'x_coord', 'y_coord', 'z_coord',
+            'occupancy', 'b_factor',
+        ])
 
         ## Add missing columns according to moldf format
         df.insert(3, 'alt_loc', '')
-        df.insert(5, 'chain_id', '')
+        df.insert(5, 'chain_id', chain_ids)
         df.insert(7, 'insertion', '')
         df.insert(13, 'segment_id', '')
         df.insert(14, 'element_symbol', '')
@@ -9258,7 +11591,7 @@ loadamberparams {frcmod_file}
         # Return the moldf like dataframe
         return df
     
-    def _minimize_receptor(self, tleap_processed_file, analysis):
+    def _minimize_receptor(self, tleap_processed_file, analysis, processed_pdb_path=None):
         """
         Will minimize the receptor under processing using sander
         """
@@ -9267,28 +11600,31 @@ loadamberparams {frcmod_file}
         import os
         import tempfile
         import shutil
-
-        print("Minimizing receptor")
+        import textwrap
 
         # Create minimization input file in the same directory as tleap_processed_file
         min_in_file = os.path.join(os.path.dirname(tleap_processed_file), "min.in")
 
         with open(min_in_file, 'w') as f:
-            f.write("""Initial minimisation of the receptor
- &cntrl
-  imin=1, maxcyc=50, ncyc=25,
-  cut=16, ntb=0, igb=1,
- &end
-        """)
+            f.write(textwrap.dedent("""\
+                Initial minimisation of the receptor
+                 &cntrl
+                  imin=1, maxcyc=50, ncyc=25,
+                  cut=16, ntb=0, igb=1,
+                 &end
+                """))
 
         # Create a tleap input file in the same directory as tleap_processed_file 
         tleap_in_file = os.path.join(os.path.dirname(tleap_processed_file), "minimize.in")
 
         with open(tleap_in_file, 'w') as f:
-            f.write(f"""source leaprc.protein.ff14SB
-source leaprc.water.tip3p
-source leaprc.gaff2
-HOH = WAT\n""")
+            f.write(textwrap.dedent(f"""\
+                source leaprc.protein.ff14SB
+                loadamberparams frcmod.ions1lm_126_tip3p
+                source leaprc.water.tip3p
+                source leaprc.gaff2
+                HOH = WAT
+                """))
 
         # Get the presence of co-factors in the receptor and if present, add them to the tleap input file
         
@@ -9310,29 +11646,79 @@ HOH = WAT\n""")
                     f.write(f"loadamberparams {cofactor_frcmod}\n")
         
         # Finish the writting of the tleap input file with the receptor loading and saving commands
+        #
+        # Bond indices are computed against processed_pdb_path (the file fed into the
+        # PRECEDING tleap call, _add_missing_atoms_in_pdb_tleap2), not tleap_processed_file
+        # (that call's own savepdb output). tleap renumbers residues sequentially in its
+        # savepdb output (resSeq becomes 1..N in file order, chain IDs dropped) — so a
+        # residue's ORIGINAL chain/resnum can no longer be matched reliably in
+        # tleap_processed_file. Residue order and count are preserved 1:1 across that
+        # tleap round trip, so the ordinal position computed from processed_pdb_path is
+        # still valid when tleap_processed_file is freshly loaded here.
+        disulfide_bonds = analysis.get('disulfide_bonds', [])
+        bond_lines = self._get_tleap_bond_lines(processed_pdb_path or tleap_processed_file, disulfide_bonds, 'rec')
+
         with open(tleap_in_file, 'a') as f:
             f.write(f"rec = loadpdb {tleap_processed_file}\n")
+            for bond_line in bond_lines:
+                f.write(bond_line)
             f.write(f"saveamberparm rec {os.path.join(os.path.dirname(tleap_processed_file), 'receptor.prmtop')} {os.path.join(os.path.dirname(tleap_processed_file), 'receptor.inpcrd')}\n")
             f.write("quit\n")
                 
         # Run tleap to generate prmtop and inpcrd files
         tleap_command = f"tleap -f {tleap_in_file}"
-        subprocess.run(tleap_command, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        tleap_min_result = subprocess.run(tleap_command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if tleap_min_result.returncode != 0:
+            print(f"❌ tleap (minimize.in) failed with return code {tleap_min_result.returncode}")
+            print(tleap_min_result.stderr)
+            return None
 
         # Set file to run sander to minimize the receptor
         prmtop_file = os.path.join(os.path.dirname(tleap_processed_file), "receptor.prmtop")
         inpcrd_file = os.path.join(os.path.dirname(tleap_processed_file), "receptor.inpcrd")
         min_out_file = os.path.join(os.path.dirname(tleap_processed_file), "min.out")
         min_rst_file = os.path.join(os.path.dirname(tleap_processed_file), "min.rst")
-        
+
+        if not os.path.exists(prmtop_file) or os.path.getsize(prmtop_file) == 0:
+            print(f"❌ tleap did not produce a valid prmtop file: {prmtop_file}")
+            return None
+        if not os.path.exists(inpcrd_file) or os.path.getsize(inpcrd_file) == 0:
+            print(f"❌ tleap did not produce a valid inpcrd file: {inpcrd_file}")
+            return None
+
         # Run sander to minimize the receptor
         sander_command = f"sander -O -i {min_in_file} -o {min_out_file} -p {prmtop_file} -c {inpcrd_file} -r {min_rst_file}"
-        subprocess.run(sander_command, shell=True, check=True)   
+        sander_result = subprocess.run(sander_command, shell=True)
+        if sander_result.returncode != 0:
+            print(f"❌ sander minimization failed with return code {sander_result.returncode}")
+            return None
 
-        # Convert minimized restart file back to PDB format
+        # Detect NaN energies in sander output — a sign that input coordinates
+        # were invalid (e.g. all-zero from a blank-coord inpcrd).
+        with open(min_out_file, 'r') as _mout:
+            _min_out_content = _mout.read()
+        if 'NaN' in _min_out_content:
+            print(f"❌ AMBER minimization produced NaN energies in {min_out_file}.")
+            print(f"   This indicates the input coordinates (inpcrd) are invalid,")
+            print(f"   most likely because tleap received a PDB with blank coordinates.")
+            return None
+
+        # Convert minimized restart file back to PDB format using subprocess stdout
+        # (avoid shell redirect which masks ambpdb exit codes).
         minimized_pdb_file = tleap_processed_file.replace('.pdb', '_minimized.pdb')
-        ambpdb_min_command = f"ambpdb -p {prmtop_file} -c {min_rst_file} > {minimized_pdb_file}"
-        subprocess.run(ambpdb_min_command, shell=True, check=True)
+        with open(minimized_pdb_file, 'w') as _ambpdb_out:
+            ambpdb_result = subprocess.run(
+                ['ambpdb', '-p', prmtop_file, '-c', min_rst_file],
+                stdout=_ambpdb_out,
+                stderr=subprocess.PIPE
+            )
+        if ambpdb_result.returncode != 0:
+            print(f"❌ ambpdb failed to convert minimized restart to PDB (return code {ambpdb_result.returncode})")
+            print(ambpdb_result.stderr.decode(errors='replace'))
+            return None
+        if not os.path.exists(minimized_pdb_file) or os.path.getsize(minimized_pdb_file) == 0:
+            print(f"❌ ambpdb produced an empty output file: {minimized_pdb_file}")
+            return None
 
         # Rename 'WAT' residues to 'HOH' in the minimized PDB file
         with open(minimized_pdb_file, 'r') as file:
@@ -9437,39 +11823,64 @@ HOH = WAT\n""")
     def _renumber_minimized_pdb_file(self, minimized_pdb_file, renumbering_dict):
 
         """
-        Will read the minimized_pdb_file which a pdb file, and the residue name and residue number fields will be evaluated, construction a key that will be searched in renumbering_dict. The value returned will be used to reassing residue number
+        Will read the minimized_pdb_file which a pdb file, and the residue name and residue number fields will be evaluated, construction a key that will be searched in renumbering_dict. The value returned will be used to reassing residue number and chain id
         """
-        
+
         try:
             import shutil
-            
+            import re as _re
+
             # Create temporary output file
             temp_out = minimized_pdb_file + ".renumbered"
-            
+
             with open(minimized_pdb_file, 'r') as infile, open(temp_out, 'w') as outfile:
                 for line in infile:
                     if line.startswith('ATOM') or line.startswith('HETATM'):
                         # Extract residue name and number from the minimized file
                         res_name = line[17:20].strip()
-                        res_num = int(line[22:26].strip())
-                        
-                        # Construct the key to search in renumbering_dict
-                        key = f"{res_name}_{res_num}"
-                        
+                        try:
+                            res_num = int(line[22:26].strip())
+                        except ValueError:
+                            outfile.write(line)
+                            continue
+
+                        # Construct the key to search in renumbering_dict.
+                        # Key format must match _construct_resnumbers_matching_dictionary
+                        # which builds tleap_key_list entries as f"{res_name}{res_num}"
+                        # (no underscore separator).
+                        key = f"{res_name}{res_num}"
+
                         # Look up the crystallographic numbering
                         if key in renumbering_dict:
-                            # Parse the value to get the new residue number
+                            # Value format from _construct_resnumbers_matching_dictionary:
+                            #   "{res_name}{res_num}_{chain_id}"  e.g. "ARG8_B"
+                            # or "{res_name}{res_num}"             e.g. "ARG8" (no chain)
+                            # Extract the residue number: trailing integer before _{chain_id}
                             crystal_value = renumbering_dict[key]
-                            # The value format is "ResName_ResNum"
-                            crystal_res_name, crystal_res_num = crystal_value.rsplit('_', 1)
-                            new_res_num = int(crystal_res_num)
-                            
-                            # Reconstruct the line with the new residue number
-                            # PDB format: columns 23-26 are residue number (right-justified, 4 characters)
-                            new_line = line[:22] + f"{new_res_num:4d}" + line[26:]
+                            if '_' in crystal_value:
+                                _base, _chain = crystal_value.rsplit('_', 1)
+                            else:
+                                _base, _chain = crystal_value, ''
+                            _m = _re.search(r'(\d+)$', _base)
+                            if not _m:
+                                outfile.write(line)
+                                continue
+                            new_res_num = int(_m.group(1))
+
+                            # tleap's savepdb drops the chain id (column 22), leaving it
+                            # blank. Restore it from the pre-tleap crystallographic file
+                            # via the same residue mapping used for renumbering, so the
+                            # original chain (e.g. 'R') survives instead of falling back
+                            # to the default 'A' applied downstream in
+                            # _add_element_column_to_pdb_file for genuinely chain-less input.
+                            chain_char = (_chain[:1] if _chain else line[21:22]) or ' '
+
+                            # PDB format: column 22 is chain id, columns 23-26 are residue
+                            # number (right-justified, 4 chars)
+                            new_line = line[:21] + chain_char + f"{new_res_num:4d}" + line[26:]
                             outfile.write(new_line)
                         else:
-                            # If key not found in dictionary, keep original line
+                            # Key not found — keep original line
                             outfile.write(line)
                     else:
                         # Non-ATOM/HETATM lines are written as-is
@@ -9520,9 +11931,14 @@ HOH = WAT\n""")
         else:
             print("   ✅ Charge methods are consistent between receptor and ligands.")
     
-    def compute_fingerprints(self, minimize=True, clean_files=True, write_prolif=False, write_mmgbsa=False, selection_threshold=25):
+    def compute_fingerprints(self, minimize=True, clean_files=True, write_prolif=False, write_mmgbsa=False, selection_threshold=25, max_workers=None):
         """
-        Will compute the ProLIF fingerprints for all docked ligands in a given assay. 
+        Will compute the ProLIF fingerprints for all docked ligands in a given assay.
+
+        max_workers: number of parallel worker processes to use for the "MMGBSA only"
+        mode (choice 2 below). Defaults to min(cpu_count(), 8) when None. Only applies
+        to the MMGBSA-only path; ProLIF-only and combined ProLIF+MMGBSA modes always
+        run sequentially.
         """
 
         import os
@@ -9541,7 +11957,9 @@ HOH = WAT\n""")
         assay_id = self._prompt_assay("for ProLIF fingerprint computation", assay_by_id)
         
         # Get the receptor file used for the corresponding docking studies
-        receptor_file = ('/').join(assay_by_id[assay_id].get('receptor_info', {})["pdbqt_file"].split('/')[:-1]) + "/receptor_checked.pdb"
+        _pdbqt = assay_by_id[assay_id].get('receptor_info', {}).get('pdbqt_file', '')
+        _pdbqt = self._remap_project_path(_pdbqt)
+        receptor_file = os.path.join(os.path.dirname(_pdbqt), 'receptor_checked.pdb')
         
         # Prompt user for fingerprint/computation options
         print("\nSelect fingerprint/computation options:")
@@ -9569,13 +11987,29 @@ HOH = WAT\n""")
             return None
 
         assay_info = assay_by_id[assay_id]
-        
+
         # Get the path to the results database for the selected assay
-        results_db = os.path.join(assay_info['assay_folder_path'], "results", f"assay_{assay_id}.db")
-        
+        _remapped_folder = self._remap_project_path(assay_info['assay_folder_path'])
+        results_db = os.path.join(_remapped_folder, "results", f"assay_{assay_id}.db")
+        print(f"📂 Results DB: {results_db}")
+
+        if not os.path.isfile(results_db):
+            print(f"❌ Results database not found: {results_db}")
+            print(f"   Stored assay folder : {assay_info['assay_folder_path']}")
+            print(f"   Remapped assay folder: {_remapped_folder}")
+            print("   Make sure docking has been run for this assay and the results file exists.")
+            return None
+
         try:
             conn = sqlite3.connect(results_db)
-            query = "SELECT Pose_ID, LigName, docking_score, cluster_size FROM Results"
+            # Verify the Results table exists before querying
+            tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+            if 'Results' not in tables:
+                print(f"❌ 'Results' table not found in {results_db}")
+                print(f"   Tables present: {tables}")
+                conn.close()
+                return None
+            query = "SELECT Pose_ID, LigName, docking_score, cluster_size, run_number FROM Results"
             df = pd.read_sql(query, conn)
             conn.close()
         except Exception as e:
@@ -9632,31 +12066,117 @@ HOH = WAT\n""")
             #self._check_table_in_db(results_db, "processed_prolif_fps_json") # Deprecated since the existence is checked at the moment of storing the results in the database.
         if mmbgsa:
             print("I will compute MMGBSA FPS")
-            # Check already existing fingerprints tables in the database
-            self._check_table_in_db(results_db, "processed_mmgbsa_decomposition_json")
-        
+            if not prolif:
+                # MMGBSA-only mode runs through the parallel path (_compute_mmgbsa_parallel),
+                # which is the long-running job most exposed to an unexpected shutdown.
+                # Offer to resume instead of forcing a full overwrite or a cancel.
+                mmgbsa_resume = self._check_mmgbsa_table_for_resume(results_db, "processed_mmgbsa_decomposition_json")
+                if mmgbsa_resume == 'resume':
+                    computed_pose_ids = self._get_computed_mmgbsa_pose_ids(results_db)
+                    n_before = len(df)
+                    df = df[~df['Pose_ID'].isin(computed_pose_ids)].reset_index(drop=True)
+                    print(f"   ℹ️  {n_before - len(df)} pose(s) already have MMGBSA results; {len(df)} pose(s) remain to be computed.")
+            else:
+                # Check already existing fingerprints tables in the database
+                self._check_table_in_db(results_db, "processed_mmgbsa_decomposition_json")
+
         ## Loop over dataframe to process each docked pose
         processed_ligands = []
-        
+
+        pdbs_db_path = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
+
+        # Detect whether the assay receptor is a stub (created by import_receptor_model)
+        is_stub_receptor = False
+        fps_tleap_config = None
+        _template_name = assay_info.get('receptor_info', {}).get('template_name')
+        if _template_name:
+            try:
+                conn = sqlite3.connect(pdbs_db_path)
+                _status_row = conn.execute(
+                    "SELECT status FROM pdb_templates WHERE pdb_template_name = ?",
+                    (_template_name,)
+                ).fetchone()
+                conn.close()
+                if _status_row and _status_row[0] == 'imported':
+                    is_stub_receptor = True
+            except Exception:
+                pass
+
+        if is_stub_receptor:
+            _receptor_model_name = assay_info.get('receptor_info', {}).get('receptor_model_name')
+            fps_tleap_config = self._get_or_store_receptor_tleap_template(_receptor_model_name)
+            if not fps_tleap_config:
+                print("❌ No tleap template available for this stub receptor. Cannot proceed.")
+                return None
+
         ## If ProLIF fingerprints are requested, retrieve the computation parameters
         if prolif == True:
             prolif_params_dict, condition_selection = self._get_prolif_params()
             self._check_table_in_db(results_db, f'processed_prolif_fps_json_condition_{condition_selection}')
 
+        # Retrieve renumbering_dict once for the whole assay (template_name is constant
+        # across all poses in this run, so there is no need to re-query it per pose).
+        renumbering_dict = {}
+        template_name = assay_info.get('receptor_info', None).get('template_name', None)
+        if template_name:
+            try:
+                conn = sqlite3.connect(pdbs_db_path)
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT renumbering_dict FROM pdb_templates WHERE pdb_template_name = ?",
+                    (template_name,)
+                )
+                result = cursor.fetchone()
+                conn.close()
+                if result and result[0]:
+                    renumbering_dict = json.loads(result[0])
+            except Exception as e:
+                print(f"Error retrieving renumbering_dict for template '{template_name}': {e}")
+
+        # MMGBSA-only mode gets a dedicated parallel execution path; ProLIF-only and
+        # combined ProLIF+MMGBSA modes keep the sequential loop below unchanged.
+        if mmbgsa and not prolif:
+            self._compute_mmgbsa_parallel(
+                df, results_db, assay_info, computation_mode, minimize,
+                is_stub_receptor, fps_tleap_config, renumbering_dict,
+                max_workers, clean_files, write_mmgbsa
+            )
+            return
+
         for idx, row in df.iterrows():
             pose_id = row['Pose_ID']
+            run_number = row['run_number']
             ligname = row['LigName']
             print(f"Processing Pose_ID: {pose_id}, LigName: {ligname}")
         
-            # Restore every docked pose
-            output_dir, output_file = self._restore_single_docked_pose(results_db, ligname, pose_id)
+            # Restore every docked pose using (ligname, run_number) which matches the
+            # per-ligand sequential number used when PDB filenames are constructed.
+            output_dir, output_file = self._restore_single_docked_pose(results_db, ligname, run_number)
         
-            # Create ligand .mol2 and .frcmod files
+            # Create ligand parameter files.
+            # Stub receptors use mol2 format so {{MOL2_FILE}} in the tleap template
+            # is substituted correctly; standard receptors keep prepin format.
             if ligname not in processed_ligands:
-                prepin_file, frcmod_file  = self._prepare_ligand_tleap_files(ligname, assay_info, output_dir)
-        
+                if is_stub_receptor:
+                    ligand_params_file, frcmod_file = self._prepare_ligand_mol2_files(ligname, assay_info, output_dir)
+                else:
+                    ligand_params_file, frcmod_file = self._prepare_ligand_tleap_files(ligname, assay_info, output_dir)
+
             # Create complex .prmtop and .inpcrd files
-            prmtop_file, inpcrd_file, output_pdb_file = self._prepare_complex_prmtop_inpcrd(prepin_file, frcmod_file, assay_info, output_dir, output_file, pose_id)
+            if is_stub_receptor:
+                _receptor_pdb = os.path.join(
+                    os.path.dirname(self._remap_project_path(
+                        assay_info.get('receptor_info', {}).get('pdbqt_file', '')
+                    )),
+                    'receptor_checked.pdb'
+                )
+                prmtop_file, inpcrd_file, output_pdb_file = self._prepare_complex_prmtop_inpcrd_from_template_fps(
+                    output_file, output_dir, fps_tleap_config, ligand_params_file, frcmod_file, _receptor_pdb
+                )
+            else:
+                prmtop_file, inpcrd_file, output_pdb_file = self._prepare_complex_prmtop_inpcrd(
+                    ligand_params_file, frcmod_file, assay_info, output_dir, output_file, pose_id, ligname=ligname
+                )
             
             if minimize:
                 # Minimize complex
@@ -9678,24 +12198,6 @@ HOH = WAT\n""")
             else:
                 rst_cpptraj_file = inpcrd_file # No minimization, use the original inpcrd file for further processing
 
-            # Retrieve renumbering_dict and rename df columns
-            template_name = assay_info.get('receptor_info', None).get('template_name', None)
-            pdbs_db_path = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
-            if template_name:
-                try:
-                    conn = sqlite3.connect(pdbs_db_path)
-                    cursor = conn.cursor()
-                    cursor.execute(
-                        "SELECT renumbering_dict FROM pdb_templates WHERE pdb_template_name = ?",
-                        (template_name,)
-                    )
-                    result = cursor.fetchone()
-                    conn.close()
-                    if result and result[0]:
-                        renumbering_dict = json.loads(result[0])
-                except Exception as e:
-                    print(f"Error retrieving renumbering_dict for template '{template_name}': {e}")
-            
             # Generate a full size dataframe based on all crystal residues and requested interactions
             if prolif:
                 full_size_df = self._create_full_size_interactions_df(prolif_params_dict, renumbering_dict)
@@ -9732,19 +12234,34 @@ HOH = WAT\n""")
                 
             if mmbgsa == True:
 
-                ## Compute MMGBSA binding energy
-                complex_prmtop, receptor_prmtop, ligand_prmtop = self._prepare_mmgbsa_files(ligname, pose_id, prmtop_file, output_dir)
+                try:
+                    ## Compute MMGBSA binding energy
+                    complex_prmtop, receptor_prmtop, ligand_prmtop = self._prepare_mmgbsa_files(ligname, pose_id, prmtop_file, output_dir)
 
-                self._compute_mmgbsa_fingerprint(ligname, pose_id, complex_prmtop, receptor_prmtop, ligand_prmtop, rst_cpptraj_file, output_dir)
-            
-                # Parse MMGBSA decomposition original output
-                df = self._parse_mmgbsa_decomposition_output(ligname, pose_id, output_dir)
-            
-                # Renumber the residue numbers to match the crystal numbering
-                df['residue'] = df['residue'].apply(lambda x: renumbering_dict.get(x, x))
-            
-                # Store the processed mmgbsa df in the assay database for posterior processing
-                self._store_processed_mmgbsa_df_in_db(df, pose_id, results_db, computation_mode)
+                    self._compute_mmgbsa_fingerprint(ligname, pose_id, complex_prmtop, receptor_prmtop, ligand_prmtop, rst_cpptraj_file, output_dir)
+
+                    # Parse MMGBSA decomposition original output
+                    mmgbsa_df = self._parse_mmgbsa_decomposition_output(ligname, pose_id, output_dir)
+
+                    # Renumber the residue numbers to match the crystal numbering
+                    if not mmgbsa_df.empty:
+                        mmgbsa_df['residue'] = mmgbsa_df['residue'].apply(lambda x: renumbering_dict.get(x, x))
+
+                    # Store the processed mmgbsa df in the assay database for posterior processing
+                    self._store_processed_mmgbsa_df_in_db(mmgbsa_df, pose_id, results_db, computation_mode)
+
+                    # Extract summary energies to write back to the Results table
+                    if not mmgbsa_df.empty:
+                        total_energy = round(mmgbsa_df['total'].sum(), 3)
+                        gas_energy = round(mmgbsa_df['gas'].sum(), 3)
+                    else:
+                        total_energy, gas_energy = -1, -1
+
+                except Exception as e:
+                    print(f"Error occurred while computing MMGBSA for Pose_ID: {pose_id}, LigName: {ligname}: {e}")
+                    total_energy, gas_energy = -1, -1
+
+                self._update_results_mmgbsa_energies(results_db, pose_id, total_energy, gas_energy)
                 
             # Add processed ligand to list
             processed_ligands.append(ligname)
@@ -9757,30 +12274,261 @@ HOH = WAT\n""")
         if write_mmgbsa:
             self._write_mmgbsa_fps(results_db, assay_info)
 
-        if clean_files:    
+        if clean_files:
             # Finally delte output_dir containing all temporary files
             import shutil
             shutil.rmtree(output_dir, ignore_errors=True)
             print("✅ Temporary files cleaned up.")
-            
-    def _restore_single_docked_pose(self, results_db, ligname, pose_id):
+
+    def _compute_mmgbsa_parallel(self, df, results_db, assay_info, computation_mode,
+                                  minimize, is_stub_receptor, fps_tleap_config,
+                                  renumbering_dict, max_workers, clean_files, write_mmgbsa):
         """
-        Will use a similar logic than that used in the extract_docked_poses to generate a .pdb file from a single docked pose identified by Pose_ID in the Results table of the assay database
+        Parallel MMGBSA-only execution path for compute_fingerprints(). Each docked
+        pose's full pipeline (restore -> build complex -> minimize -> MMGBSA) runs in
+        its own worker process, isolated in its own subdirectory under
+        temp_restored_poses/, so concurrent poses never collide on the fixed-name
+        scratch files written by tleap/sander/MMPBSA.py (complex.in, min.in/out/rst,
+        cpptraj.in, MMPBSA.py's own _MMPBSA_* files). GPU minimization is serialized
+        across workers via a shared lock so only one worker uses pmemd.cuda at a time.
+        All SQLite writes to results_db happen back in this (parent) process as
+        results are collected, so workers never touch the database.
+        """
+        import contextlib
+        import shutil
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        from multiprocessing import Manager, cpu_count
+
+        n_poses = len(df)
+        print(f"📊 {n_poses} docked pose(s) will be processed for MMGBSA computation.")
+
+        if n_poses == 0:
+            print("Nothing to do.")
+            return
+
+        if max_workers is None:
+            available_cores = cpu_count()
+            default_workers = min(available_cores, 8, n_poses)
+            while True:
+                raw = input(
+                    f"How many CPU cores should be used for parallel MMGBSA computation? "
+                    f"[{default_workers}] (1-{available_cores} available): "
+                ).strip()
+                if raw == "":
+                    max_workers = default_workers
+                    break
+                try:
+                    max_workers = int(raw)
+                except ValueError:
+                    print("Please enter a valid integer.")
+                    continue
+                if max_workers < 1:
+                    print("Please enter a positive integer.")
+                    continue
+                if max_workers > available_cores:
+                    print(f"⚠️  Only {available_cores} core(s) available; using {available_cores}.")
+                    max_workers = available_cores
+                break
+
+        # No point spinning up more workers than there are poses to process.
+        max_workers = min(max_workers, n_poses)
+
+        assay_dir = os.path.dirname(os.path.abspath(results_db))
+        temp_poses_root = os.path.join(assay_dir, "temp_restored_poses")
+        os.makedirs(temp_poses_root, exist_ok=True)
+
+        # Precompute ligand parameter files once per unique ligand, sequentially,
+        # before fanning out. antechamber/parmchk2 don't set cwd=, so they litter
+        # fixed-name files into the caller's CWD; keeping this pre-pass sequential
+        # avoids a race there and lets every worker use already-materialized files.
+        # Every helper called below prints its own status/error lines; those are
+        # silenced here (with failures still surfaced through ligand_errors) so the
+        # only visible output is the progress bar itself.
+        unique_lignames = df['LigName'].unique().tolist()
+        ligand_iterator = tqdm(unique_lignames, desc="Preparing ligands", unit="ligand") if TQDM_AVAILABLE else unique_lignames
+        ligand_files = {}
+        ligand_errors = []
+        with open(os.devnull, 'w') as _devnull:
+            for ligname in ligand_iterator:
+                try:
+                    with contextlib.redirect_stdout(_devnull), contextlib.redirect_stderr(_devnull):
+                        if is_stub_receptor:
+                            ligand_params_file, frcmod_file = self._prepare_ligand_mol2_files(ligname, assay_info, temp_poses_root)
+                        else:
+                            ligand_params_file, frcmod_file = self._prepare_ligand_tleap_files(ligname, assay_info, temp_poses_root)
+                except (SystemExit, Exception):
+                    # _prepare_ligand_tleap_files() calls sys.exit(1) on unrecoverable
+                    # SDF->PDB conversion failures, and RDKit/antechamber/espaloma can
+                    # also raise on malformed ligands (e.g. valence errors); catch both
+                    # here so one bad ligand doesn't kill the whole parallel run
+                    # silently (output is suppressed above) — its poses are simply
+                    # marked failed below.
+                    ligand_params_file, frcmod_file = None, None
+                if not ligand_params_file or not frcmod_file:
+                    ligand_errors.append(ligname)
+                ligand_files[ligname] = (ligand_params_file, frcmod_file)
+
+        n_ligand_ok = len(unique_lignames) - len(ligand_errors)
+        print(f"✅ Ligand parameter files prepared: {n_ligand_ok}/{len(unique_lignames)} succeeded.")
+        if ligand_errors:
+            shown = ", ".join(ligand_errors[:20])
+            more = f" (+{len(ligand_errors) - 20} more)" if len(ligand_errors) > 20 else ""
+            print(f"⚠️  Failed to prepare ligand parameter files for: {shown}{more} (their poses will fail).")
+
+        tasks = []
+        for _, row in df.iterrows():
+            pose_id = row['Pose_ID']
+            ligname = row['LigName']
+            ligand_params_file, frcmod_file = ligand_files[ligname]
+            tasks.append({
+                'project_name': self.name,
+                'project_path': self.path,
+                'results_db': results_db,
+                'assay_info': assay_info,
+                'pose_id': pose_id,
+                'run_number': row['run_number'],
+                'ligname': ligname,
+                'ligand_params_file': ligand_params_file,
+                'frcmod_file': frcmod_file,
+                'is_stub_receptor': is_stub_receptor,
+                'fps_tleap_config': fps_tleap_config,
+                'minimize': minimize,
+                'renumbering_dict': renumbering_dict,
+                'work_subdir': f"{ligname}_{pose_id}",
+                'clean_files': clean_files,
+            })
+
+        gpu_lock = Manager().Lock()
+        succeeded = 0
+        failed = 0
+        failed_poses = []
+
+        progress_bar = tqdm(total=len(tasks), desc="Computing MMGBSA", unit="pose") if TQDM_AVAILABLE else None
+
+        with ProcessPoolExecutor(max_workers=max_workers, initializer=_init_mmgbsa_worker, initargs=(gpu_lock,)) as executor:
+            future_to_task = {executor.submit(_compute_mmgbsa_pose_worker, task): task for task in tasks}
+
+            for future in as_completed(future_to_task):
+                task = future_to_task[future]
+                try:
+                    result = future.result()
+                except Exception as e:
+                    result = {
+                        "success": False, "pose_id": task['pose_id'], "ligname": task['ligname'],
+                        "mmgbsa_df": None, "total_energy": -1, "gas_energy": -1, "error": str(e),
+                    }
+
+                pose_id = result['pose_id']
+                ligname = result['ligname']
+
+                if result['success']:
+                    self._store_processed_mmgbsa_df_in_db(result['mmgbsa_df'], pose_id, results_db, computation_mode)
+                    succeeded += 1
+                else:
+                    failed += 1
+                    failed_poses.append((pose_id, ligname))
+
+                self._update_results_mmgbsa_energies(results_db, pose_id, result['total_energy'], result['gas_energy'])
+
+                if progress_bar:
+                    progress_bar.set_postfix(ok=succeeded, failed=failed)
+                    progress_bar.update(1)
+                else:
+                    print(f"\rComputing MMGBSA: {succeeded + failed}/{len(tasks)} poses (ok={succeeded}, failed={failed})", end="", flush=True)
+
+        if progress_bar:
+            progress_bar.close()
+        else:
+            print()
+
+        print(f"✅ MMGBSA computation complete: {succeeded} succeeded, {failed} failed.")
+        if failed_poses:
+            shown = ", ".join(f"{lig}#{pid}" for pid, lig in failed_poses[:20])
+            more = f" (+{len(failed_poses) - 20} more)" if len(failed_poses) > 20 else ""
+            print(f"   Failed poses: {shown}{more}")
+
+        if write_mmgbsa:
+            self._write_mmgbsa_fps(results_db, assay_info)
+
+        if clean_files:
+            # Per-pose subdirectories are already removed by each worker as it
+            # finishes; this clears the shared per-ligand parameter files and the
+            # now-empty top-level directory.
+            shutil.rmtree(temp_poses_root, ignore_errors=True)
+            print("✅ Temporary files cleaned up.")
+
+    def _remap_project_path(self, stored_path: str) -> str:
+        """
+        Remap a stored absolute path to the current project location.
+
+        When a project is imported to a new location the paths stored inside
+        SQLite blobs still reference the original directory.  This method
+        detects the first occurrence of a known top-level project subdirectory
+        inside *stored_path* and replaces everything before it with self.path,
+        leaving the relative suffix intact.
+        """
+        if not stored_path or os.path.exists(stored_path):
+            return stored_path
+        for marker in ('/docking/', '/chemspace/', '/ml/', '/dynamics/'):
+            pos = stored_path.find(marker)
+            if pos != -1:
+                relative = stored_path[pos + 1:]  # strip the leading '/'
+                return os.path.join(self.path, relative)
+        return stored_path
+
+    def _resolve_receptor_pdbqt_file(self, receptor_info: Dict[str, Any]) -> Optional[str]:
+        """
+        Resolve the on-disk receptor PDBQT path for a receptor_info dict.
+
+        receptor_info['pdbqt_file'] points at 'processed/receptor_checked_<charge>.pdbqt',
+        which is only ever read there when sf_name == 'vina'. When the AD4 scoring
+        function is used, docking runs entirely off the AutoGrid4 maps and never
+        touches that file, so a missing/stale path goes unnoticed until Ringtail's
+        results processing needs it for save_receptor/add_interactions. Fall back to
+        the copy _create_receptor_grids() places alongside the maps (grids_path) so
+        a missing 'processed' copy doesn't fail the whole assay after docking is done.
+        """
+        pdbqt_file = self._remap_project_path(receptor_info.get('pdbqt_file'))
+        if pdbqt_file and os.path.exists(pdbqt_file):
+            return pdbqt_file
+
+        grids_path = self._remap_project_path((receptor_info.get('configs') or {}).get('grids_path'))
+        if pdbqt_file and grids_path:
+            fallback = os.path.join(grids_path, os.path.basename(pdbqt_file))
+            if os.path.exists(fallback):
+                return fallback
+
+        return None
+
+    def _restore_single_docked_pose(self, results_db, ligname, run_number, work_subdir=None):
+        """
+        Generate a .pdb file for a single docked pose identified by (ligname, run_number).
+        Uses the same logic as extract_docked_poses: the per-ligand run_number matches the
+        suffix that was used when PDB files were written during pose extraction.
+
+        work_subdir: optional name of a subdirectory under temp_restored_poses/ to isolate
+        this pose's files from every other pose (used by the parallel MMGBSA path so
+        concurrent poses never share fixed-name scratch files). None (default) keeps the
+        original shared temp_restored_poses/ directory.
         """
 
-        # Retrieve input_model and pose_coords_json
-        input_model, pose_coords_json = self._retrieve_pose_info(results_db, pose_id)
-        
+        # Retrieve input_model and pose_coords_json using (ligname, run_number) so that
+        # the correct per-ligand pose is always retrieved.
+        input_model, pose_coords_json = self._retrieve_pose_info(results_db, ligname, run_number)
+
         pdb_dict = self._process_input_model_for_moldf(input_model, pose_coords_json)
 
         # Get the directory of the results_db (should be .../assay_x.db)
         assay_dir = os.path.dirname(os.path.abspath(results_db))
-        output_dir = os.path.join(assay_dir, "temp_restored_poses")
+        if work_subdir:
+            output_dir = os.path.join(assay_dir, "temp_restored_poses", work_subdir)
+        else:
+            output_dir = os.path.join(assay_dir, "temp_restored_poses")
         if not os.path.exists(output_dir):
             os.makedirs(output_dir, exist_ok=True)
 
         # # Write the PDB file
-        output_file = self._write_pdb_with_moldf(pdb_dict, ligname, pose_id, output_dir)
+        output_file = self._write_pdb_with_moldf(pdb_dict, ligname, run_number, output_dir)
 
         return output_dir, output_file
 
@@ -9801,27 +12549,71 @@ HOH = WAT\n""")
       
         ## Compute ligand espaloma charges
         espaloma_output_file = self._compute_ligand_espaloma_charges(pdb_file)
-        
+
+        if espaloma_output_file is None:
+            print(f"[ERROR] Could not compute espaloma charges for ligand {ligname}")
+            return None, None
+
         # Run antechamber
-        
+
         antechamber_command = f"antechamber -i {pdb_file} -fi pdb -o {prepin_file} -fo prepc -c rc -cf {espaloma_output_file} "
-        
+
         try:
             subprocess.run(antechamber_command, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        
+
         except Exception as e:
             print(f"[ERROR] Failed to run antechamber: {e}")
-            return None
+            return None, None
 
         parmchk2_command = f"parmchk2 -i {prepin_file} -f prepc -o {frcmod_file}"
         try:
             subprocess.run(parmchk2_command, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        
+
         except Exception as e:
             print(f"[ERROR] Failed to run parmchk2: {e}")
-            return None
+            return None, None
 
         return prepin_file, frcmod_file
+
+    def _prepare_ligand_mol2_files(self, ligname, assay_info, output_dir):
+        """
+        Prepare GAFF2 mol2 + frcmod files for the ligand using antechamber (mol2 output)
+        with espaloma charges.  Used by the template-based fingerprint workflow for stub
+        receptors so the {{MOL2_FILE}} token is consistent with perform_md_assay().
+        """
+        import subprocess
+
+        pdb_file = self._convert_ligand_sdf_into_pdb(ligname, assay_info, output_dir)
+        if pdb_file is None:
+            print(f"[ERROR] Could not convert ligand {ligname} SDF to PDB")
+            return None, None
+
+        mol2_file = os.path.join(output_dir, f"{ligname}.mol2")
+        frcmod_file = os.path.join(output_dir, f"{ligname}.frcmod")
+
+        espaloma_output_file = self._compute_ligand_espaloma_charges(pdb_file)
+
+        if espaloma_output_file is None:
+            print(f"[ERROR] Could not compute espaloma charges for ligand {ligname}")
+            return None, None
+
+        antechamber_command = f"antechamber -i {pdb_file} -fi pdb -o {mol2_file} -fo mol2 -c rc -cf {espaloma_output_file}"
+        try:
+            subprocess.run(antechamber_command, shell=True, check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            print(f"[ERROR] Failed to run antechamber: {e}")
+            return None, None
+
+        parmchk2_command = f"parmchk2 -i {mol2_file} -f mol2 -o {frcmod_file}"
+        try:
+            subprocess.run(parmchk2_command, shell=True, check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            print(f"[ERROR] Failed to run parmchk2: {e}")
+            return None, None
+
+        return mol2_file, frcmod_file
 
     def _convert_ligand_sdf_into_pdb(self, ligname, assay_info, output_dir):
         """
@@ -9836,11 +12628,17 @@ HOH = WAT\n""")
             str: Path to the generated PDB file, or None if conversion failed.
         """
         import os
-        from rdkit import Chem
+        from rdkit import Chem, RDLogger
         from rdkit.Chem import AllChem
         import sqlite3
         from moldf import read_pdb
         from moldf import write_pdb
+
+        # RDKit's C++ logger (e.g. "Explicit valence for atom # N ... is greater
+        # than permitted") writes straight to the process's stderr file descriptor,
+        # bypassing Python-level sys.stderr redirection used by callers to keep the
+        # parallel MMGBSA pre-pass quiet. Disable it explicitly instead.
+        RDLogger.DisableLog('rdApp.*')
 
         # Construct input SDF and output PDB file paths
         sdf_file = os.path.join(output_dir, f"{ligname}.sdf")
@@ -9952,10 +12750,14 @@ HOH = WAT\n""")
         
     def _compute_ligand_espaloma_charges(self, pdb_file):
         
-        from rdkit import Chem
+        from rdkit import Chem, RDLogger
         from espaloma_charge import charge
         import numpy as np
-        
+
+        # See _convert_ligand_sdf_into_pdb() for why this is needed: RDKit's C++
+        # logger bypasses Python-level stderr redirection.
+        RDLogger.DisableLog('rdApp.*')
+
         # Read the ligand PDB file into an RDKit molecule
         mol = Chem.MolFromPDBFile(pdb_file, removeHs=False)
         if mol is None:
@@ -9980,78 +12782,91 @@ HOH = WAT\n""")
 
         return espaloma_output_file
 
-    def _prepare_complex_prmtop_inpcrd(self, prepin_file, frcmod_file, assay_info, output_dir, pdb_file, pose_id):
+    def _prepare_complex_prmtop_inpcrd(self, prepin_file, frcmod_file, assay_info, output_dir, pdb_file, pose_id, ligname=None):
 
         import subprocess
+        import textwrap
 
-        
-        receptor_pdb = assay_info.get('receptor_info', None).get('pdbqt_file', None) 
+        receptor_pdb = assay_info.get('receptor_info', None).get('pdbqt_file', None)
+        receptor_pdb = self._remap_project_path(receptor_pdb)
 
         # Define the raw .pdb file of the receptor
-        receptor_pdb_path = '/'.join(receptor_pdb.split('/')[:-1]) + '/receptor_checked.pdb'
+        receptor_pdb_path = os.path.join(os.path.dirname(receptor_pdb), 'receptor_checked.pdb')
 
         # Create tleap input file to load receptor and ligand
         tleap_in_file = os.path.join(output_dir, "complex.in")
 
         # Defined output files
-        prmtop_file = os.path.join(output_dir, f'complex_{pose_id}.prmtop')
-        inpcrd_file = os.path.join(output_dir, f'complex_{pose_id}.inpcrd')
+        _prefix = f"{ligname}_" if ligname else ""
+        prmtop_file = os.path.join(output_dir, f'{_prefix}complex_{pose_id}.prmtop')
+        inpcrd_file = os.path.join(output_dir, f'{_prefix}complex_{pose_id}.inpcrd')
 
         # Write an output pdb file with Hidrogens
         output_pdb_file = pdb_file.replace('.pdb', '_withH.pdb')
 
 
         ### Determine if ligands are bound as cofactors
-        ## Get the pdb template n>ame
+        ## Get the pdb template name
         pdb_template_name = assay_info.get('receptor_info', None).get('template_name', None)
         ligands_in_template, cofactors_names, mol2_files_names, frcmod_files_names = self._check_ligands_in_template(pdb_template_name)
-        
+
+        ### Determine if the receptor has confirmed disulfide bridges to bond explicitly
+        disulfide_bonds = self._check_disulfides_in_template(pdb_template_name)
+        disulfide_bond_lines = self._get_tleap_bond_lines(receptor_pdb_path, disulfide_bonds, 'rec')
+
         # Will write the header of the tleap input file
         with open(tleap_in_file, 'w') as f:
-            f.write(f"""source leaprc.protein.ff14SB
-source leaprc.water.tip3p
-source leaprc.gaff2
-HOH = WAT
+            f.write(textwrap.dedent("""\
+                source leaprc.protein.ff14SB
+                source leaprc.water.tip3p
+                source leaprc.gaff2
+                HOH = WAT
 
-""")
-    
+                """))
+
         ## Evaluate if ligands/cofactors are required to be loaded with the receptor
         if ligands_in_template:
             # loop over cofactors_name and get the index and item
             for index, cofactor_name in enumerate(cofactors_names):
                 name = cofactor_name
-                mol2_file_lig = mol2_files_names[index]
-                frcmod_file_lig = frcmod_files_names[index]
+                mol2_file_lig = self._remap_project_path(mol2_files_names[index])
+                frcmod_file_lig = self._remap_project_path(frcmod_files_names[index])
                 
                 # Append each cofactor information to the file
                 with open(tleap_in_file, 'a') as f:
-                    f.write(f"""# Load cofactor {name}
-{name} = loadmol2 {mol2_file_lig}
-loadamberparams {frcmod_file_lig}
+                    f.write(textwrap.dedent(f"""\
+                        # Load cofactor {name}
+                        {name} = loadmol2 {mol2_file_lig}
+                        loadamberparams {frcmod_file_lig}
 
-""")
+                        """))
 
         # Will write the rest of the tleap input file
         with open(tleap_in_file, 'a') as f:
-            f.write(f"""# Load receptor
-rec = loadpdb "{receptor_pdb_path}"
+            f.write(textwrap.dedent(f"""\
+                # Load receptor
+                rec = loadpdb "{receptor_pdb_path}"
 
-# Load ligand parameters
-loadamberprep {prepin_file}
-loadamberparams {frcmod_file}
+                """))
+            for bond_line in disulfide_bond_lines:
+                f.write(bond_line)
+            f.write(textwrap.dedent(f"""\
+                # Load ligand parameters
+                loadamberprep {prepin_file}
+                loadamberparams {frcmod_file}
 
-lig = loadpdb "{pdb_file}"
+                lig = loadpdb "{pdb_file}"
 
-savepdb lig "{output_pdb_file}"
+                savepdb lig "{output_pdb_file}"
 
-# Create complex
-complex = combine {{rec lig}}
+                # Create complex
+                complex = combine {{rec lig}}
 
-# Save complex parameters and coordinates
-saveamberparm complex "{prmtop_file}" "{inpcrd_file}"
+                # Save complex parameters and coordinates
+                saveamberparm complex "{prmtop_file}" "{inpcrd_file}"
 
-quit
-""")
+                quit
+                """))
 
         # Run tleap to generate prmtop and inpcrd files
         tleap_command = f"tleap -f {tleap_in_file}"
@@ -10063,16 +12878,127 @@ quit
 
         return prmtop_file, inpcrd_file, output_pdb_file
 
-    def _minimize_complex(self, prmtop_file, inpcrd_file, output_dir, ligname, pose_id, output_pdb_file):
+    def _strip_solvation_from_template(self, template_content):
+        """
+        Comment out explicit solvation commands from a tleap template so the
+        resulting topology is a gas-phase (unsolvated) complex.  Used before
+        running tleap for fingerprint / MMGBSA computation; the original template
+        (with solvation intact) is kept for molecular dynamics via
+        _prepare_complex_prmtop_inpcrd_from_template() in MolDyn.
+
+        Stripped command prefixes (case-insensitive, leading whitespace ignored):
+          solvate   → solvateBox, solvateOct, solvateShell, …
+          addions   → addions, addions2, addIons, addIons2, …
+        """
+        solvation_prefixes = ('solvate', 'addions')
+        out = []
+        for line in template_content.splitlines():
+            keyword = line.lstrip().lower()
+            if any(keyword.startswith(p) for p in solvation_prefixes):
+                out.append(f"# [gas-phase strip] {line}")
+            else:
+                out.append(line)
+        return '\n'.join(out)
+
+    def _prepare_complex_prmtop_inpcrd_from_template_fps(self, ligand_pdb, output_dir, fps_tleap_config, mol2_file, frcmod_file, receptor_pdb):
+        """
+        Build an unsolvated complex prmtop/inpcrd for fingerprint computation
+        using a user-supplied tleap template (for stub/non-protein receptors).
+
+        Solvation commands (solvateBox, addions, …) are automatically stripped
+        before tleap runs so the topology is always gas-phase, regardless of
+        whether the stored template includes solvation for MD use.
+
+        Tokens substituted in the template:
+          {{RECEPTOR_PDB}} → receptor_pdb
+          {{LIGAND_PDB}}   → ligand_pdb
+          {{MOL2_FILE}}    → mol2_file  (antechamber mol2, GAFF2 + espaloma charges)
+          {{FRCMOD_FILE}}  → frcmod_file  (parmchk2 .frcmod)
+          {{PRMTOP_OUT}}   → complex.prmtop inside output_dir
+          {{INPCRD_OUT}}   → complex.inpcrd inside output_dir
+
+        Returns (prmtop_file, inpcrd_file, output_pdb_file).
+        output_pdb_file is a placeholder path that _compute_prolif_fingerprints3()
+        overwrites via ambpdb using the generated prmtop/inpcrd.
+        """
+        import subprocess
+
+        template_content = fps_tleap_config.get('template_content', '')
+        if not template_content:
+            raise RuntimeError("fps_tleap_config has no 'template_content'.")
+
+        # Strip solvation so this workflow always produces a gas-phase complex.
+        template_content = self._strip_solvation_from_template(template_content)
+
+        prmtop_file = os.path.join(output_dir, 'complex.prmtop')
+        inpcrd_file = os.path.join(output_dir, 'complex.inpcrd')
+        tleap_in_file = os.path.join(output_dir, 'complex_fps.in')
+        tleap_log_file = os.path.join(output_dir, 'tleap_fps.log')
+        output_pdb_file = ligand_pdb.replace('.pdb', '_withH.pdb')
+
+        for cf in fps_tleap_config.get('custom_parameter_files', []):
+            dest = os.path.join(output_dir, cf['filename'])
+            with open(dest, 'w') as fh:
+                fh.write(cf['content'])
+            print(f"   ✓ Restored custom parameter file: {cf['filename']}")
+
+        content = template_content
+        content = content.replace("'{{RECEPTOR_PDB}}'", receptor_pdb)
+        content = content.replace('{{RECEPTOR_PDB}}', receptor_pdb)
+        content = content.replace('{{LIGAND_PDB}}', ligand_pdb)
+        content = content.replace('{{MOL2_FILE}}', mol2_file)
+        content = content.replace('{{FRCMOD_FILE}}', frcmod_file)
+        content = content.replace('{{PRMTOP_OUT}}', prmtop_file)
+        content = content.replace('{{INPCRD_OUT}}', inpcrd_file)
+
+        with open(tleap_in_file, 'w') as f:
+            f.write(content)
+
+        result = subprocess.run(
+            f"tleap -f {tleap_in_file}",
+            shell=True, capture_output=True, text=True, cwd=output_dir,
+        )
+        with open(tleap_log_file, 'w') as lf:
+            lf.write(result.stdout)
+            if result.stderr:
+                lf.write("\n--- STDERR ---\n")
+                lf.write(result.stderr)
+
+        if result.returncode != 0:
+            tail = result.stdout[-3000:] if len(result.stdout) > 3000 else result.stdout
+            print(f"   tleap output (last lines):\n{tail}")
+            raise RuntimeError(
+                f"tleap exited with code {result.returncode}. Full log: {tleap_log_file}"
+            )
+
+        missing = [f for f in (prmtop_file, inpcrd_file) if not os.path.exists(f)]
+        if missing:
+            tail = result.stdout[-3000:] if len(result.stdout) > 3000 else result.stdout
+            print(f"   tleap output (last lines):\n{tail}")
+            raise RuntimeError(
+                f"tleap completed but did not produce: "
+                f"{', '.join(os.path.basename(f) for f in missing)}. "
+                f"Full log: {tleap_log_file}"
+            )
+
+        return prmtop_file, inpcrd_file, output_pdb_file
+
+    def _minimize_complex(self, prmtop_file, inpcrd_file, output_dir, ligname, pose_id, output_pdb_file, gpu_lock=None):
 
         """
         Will minimize the receptor under processing using sander
+
+        gpu_lock: optional context-manager-like lock (e.g. a multiprocessing.Lock).
+        When provided and a GPU is available, only the pmemd.cuda call is serialized
+        through this lock so concurrent parallel workers never contend for the GPU.
+        None (default) preserves the original unlocked behavior.
         """
         
         import subprocess
         import os
         import tempfile
         import shutil
+        import textwrap
 
         print("Minimizing complex")
 
@@ -10095,40 +13021,47 @@ quit
 
             # Write a GPU compatible minimization script
             with open(min_in_file, 'w') as f:
-                f.write("""Minimisation of the complex
- &cntrl
-  imin=1, maxcyc=50, ncyc=25,
-  cut=999, ntb=0, igb=1,
- &end
-        """)
+                f.write(textwrap.dedent("""\
+                    Minimisation of the complex
+                     &cntrl
+                      imin=1, maxcyc=50, ncyc=25,
+                      cut=999, ntb=0, igb=1,
+                     &end
+                    """))
 
             pmemd_command = f"pmemd.cuda -O -i {min_in_file} -o {min_out_file} -p {prmtop_file} -c {inpcrd_file} -r {min_rst_file}"
-            subprocess.run(pmemd_command, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            
+            if gpu_lock is not None:
+                with gpu_lock:
+                    subprocess.run(pmemd_command, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                subprocess.run(pmemd_command, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
         else:
             # Run minimization with CPU only
             print("No GPU detected. Using sander for minimization...")
 
             # Write a sander compatible minimization script
             with open(min_in_file, 'w') as f:
-                f.write("""Minimisation of the complex
- &cntrl
-  imin=1, maxcyc=50, ncyc=25,
-  cut=16, ntb=0, igb=1,
- &end
-        """)
+                f.write(textwrap.dedent("""\
+                    Minimisation of the complex
+                     &cntrl
+                      imin=1, maxcyc=50, ncyc=25,
+                      cut=16, ntb=0, igb=1,
+                     &end
+                    """))
             
             sander_command = f"sander -O -i {min_in_file} -o {min_out_file} -p {prmtop_file} -c {inpcrd_file} -r {min_rst_file}"
             subprocess.run(sander_command, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         ## Use Cpptraj to reprocess min_rst_file to make it compatible with MDAnalysis read
         with open(cpptraj_in_file, 'w') as f:
-            f.write(f"""parm {prmtop_file}
-trajin {min_rst_file}
-trajout {min_rst_cpptraj_file}
-go
-quit
-        """)
+            f.write(textwrap.dedent(f"""\
+                parm {prmtop_file}
+                trajin {min_rst_file}
+                trajout {min_rst_cpptraj_file}
+                go
+                quit
+                """))
 
         cpptraj_command = f"cpptraj -i {cpptraj_in_file}"
         subprocess.run(cpptraj_command, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -10160,6 +13093,20 @@ quit
         # Select the ligand and create the corresponding ProLIF object
         lig = u.select_atoms(prolif_params_dict['selection_dict']['ligand'])
         ligand_mol = plf.Molecule.from_mda(lig)
+        # Exec any custom interaction class definitions so they are registered in ProLIF
+        custom_interactions = prolif_params_dict.get('custom_interactions', {})
+        if custom_interactions:
+            from prolif.interactions.base import Interaction, Distance, SingleAngle, DoubleAngle
+            exec_namespace = {
+                'Interaction': Interaction,
+                'Distance': Distance,
+                'SingleAngle': SingleAngle,
+                'DoubleAngle': DoubleAngle,
+            }
+            for script_code in set(custom_interactions.values()):
+                exec(script_code, exec_namespace)
+            print(f"✅ Custom interactions registered: {list(custom_interactions.keys())}")
+
         # Define all available interaction for computation
         fp = plf.Fingerprint(interactions_list, parameters=interactions_parameters_dict)
         # Compute the fingerprints
@@ -10189,7 +13136,21 @@ quit
         # Load the ligand file
         ligand = Chem.MolFromPDBFile(output_pdb_file, removeHs=False)
         ligand_plf = plf.Molecule.from_rdkit(ligand)
-        
+
+        # Exec any custom interaction class definitions so they are registered in ProLIF
+        custom_interactions = prolif_params_dict.get('custom_interactions', {})
+        if custom_interactions:
+            from prolif.interactions.base import Interaction, Distance, SingleAngle, DoubleAngle
+            exec_namespace = {
+                'Interaction': Interaction,
+                'Distance': Distance,
+                'SingleAngle': SingleAngle,
+                'DoubleAngle': DoubleAngle,
+            }
+            for script_code in set(custom_interactions.values()):
+                exec(script_code, exec_namespace)
+            print(f"✅ Custom interactions registered: {list(custom_interactions.keys())}")
+
         fp = plf.Fingerprint(interactions_list, parameters=interactions_parameters_dict)
         # Compute the fingerprints
         fp.run_from_iterable([ligand_plf], receptor_plf,progress=False)
@@ -10211,7 +13172,6 @@ quit
         interactions_list = prolif_params_dict['interactions_list']
         interactions_parameters_dict = prolif_params_dict.get('interaction_parameters', {})
         
-                               
         # Use ambpdb to generate a .pdb file from the prmtop and inpcrd files to be used for ProLIF processing. Will overwrite the output_pdb_file generated after tleap processing to keep the same file for posterior ProLIF processing and avoid having to manage multiple files.
         ambpdb_command = f"ambpdb -p {prmtop_file} -c {inpcrd_file} -conect > {output_pdb_file}"
         print(ambpdb_command)
@@ -10220,11 +13180,26 @@ quit
         # # # Load the receptor file
         u = mda.Universe(f"{output_pdb_file}")
         
+
         receptor = u.select_atoms(f"{prolif_params_dict['selection_dict']['receptor']}")
         receptor_plf = plf.Molecule.from_mda(receptor)
         ligand = u.select_atoms(f"{prolif_params_dict['selection_dict']['ligand']}")
         ligand_plf = plf.Molecule.from_mda(ligand)
-        
+
+        # Exec any custom interaction class definitions so they are registered in ProLIF
+        custom_interactions = prolif_params_dict.get('custom_interactions', {})
+        if custom_interactions:
+            from prolif.interactions.base import Interaction, Distance, SingleAngle, DoubleAngle
+            exec_namespace = {
+                'Interaction': Interaction,
+                'Distance': Distance,
+                'SingleAngle': SingleAngle,
+                'DoubleAngle': DoubleAngle,
+            }
+            for script_code in set(custom_interactions.values()):
+                exec(script_code, exec_namespace)
+            print(f"✅ Custom interactions registered: {list(custom_interactions.keys())}")
+
         #fp = plf.Fingerprint(interactions_list, parameters=interactions_parameters_dict)
         fp = plf.Fingerprint(interactions=interactions_list, parameters=interactions_parameters_dict)
         # # Compute the fingerprints
@@ -10370,12 +13345,78 @@ quit
         # Store interaction conditions
         prolif_conditions['interaction_parameters'] = interaction_parameters
 
+        # Query user for custom interaction class definitions
+        print(f"\n🧩 CUSTOM INTERACTION TYPES")
+        print("=" * 70)
+        add_custom = input("Do you want to add custom interaction class definitions? (y/n, default: n): ").strip().lower()
+        if add_custom == 'y':
+            custom_interactions = self._collect_custom_interactions()
+            if custom_interactions:
+                prolif_conditions['custom_interactions'] = custom_interactions
+                prolif_conditions['interactions_list'].extend(custom_interactions.keys())
+
         print(prolif_conditions)
 
         # Create a register of the conditions dictionary
 
         self._register_prolif_conditions(prolif_conditions)
         
+    def _collect_custom_interactions(self) -> dict:
+        """
+        Collects custom ProLIF interaction class definitions from a user-supplied Python script.
+        The script is validated with compile() and all class names are extracted via AST.
+        Returns {class_name: script_source_code}.
+        """
+        import ast
+
+        custom_interactions = {}
+
+        print("\nProvide the path to a Python script containing custom interaction class definitions.")
+        print("  - The script must define classes that inherit from ProLIF's Interaction base class.")
+        print("  - Type 'DONE' to finish.\n")
+
+        while True:
+            script_path = input("Enter script path (or DONE to finish): ").strip()
+
+            if script_path.upper() == 'DONE':
+                break
+
+            if not os.path.isfile(script_path):
+                print(f"❌ File not found: {script_path}")
+                continue
+
+            with open(script_path, 'r') as f:
+                code = f.read()
+
+            # Validate the code compiles
+            try:
+                compile(code, script_path, "exec")
+            except SyntaxError as e:
+                print(f"❌ Syntax error in script: {e}")
+                continue
+
+            # Extract class names via AST
+            try:
+                parsed = ast.parse(code)
+                class_nodes = [node for node in ast.walk(parsed) if isinstance(node, ast.ClassDef)]
+                if not class_nodes:
+                    print("❌ No class definitions found in the script. Please check the file.")
+                    continue
+                class_names = [node.name for node in class_nodes]
+            except Exception as e:
+                print(f"❌ Could not parse script: {e}")
+                continue
+
+            for class_name in class_names:
+                custom_interactions[class_name] = code
+                print(f"✅ Class '{class_name}' found and registered.")
+
+            another = input("Add another script? (y/n, default: n): ").strip().lower()
+            if another != 'y':
+                break
+
+        return custom_interactions
+
     def _get_prolif_parameter_string(self, param_name: str, default: str, description: str = None) -> str:
         """
         Get string parameter for ProLIF conditions with validation.
@@ -10523,25 +13564,41 @@ quit
                 print(f"✅ Using all {len(default_interactions)} interaction types")
                 return default_interactions
             elif choice == '2':
-                print("\nEnter interaction numbers separated by commas (e.g., 1,3,7,8):")
+                print("\nEnter interaction numbers separated by commas, ranges allowed (e.g., 1,3,5-7):")
                 selection = input("Selection: ").strip()
-                
+
                 if not selection:
                     print("❌ No selection made, using defaults")
                     return default_interactions
-                
+
                 try:
-                    indices = [int(x.strip()) - 1 for x in selection.split(',')]
-                    selected = [default_interactions[i] for i in indices 
+                    indices = []
+                    for token in selection.split(','):
+                        token = token.strip()
+                        if not token:
+                            continue
+                        if '-' in token:
+                            start_str, end_str = token.split('-', 1)
+                            start, end = int(start_str.strip()), int(end_str.strip())
+                            if start > end:
+                                start, end = end, start
+                            indices.extend(range(start - 1, end))
+                        else:
+                            indices.append(int(token) - 1)
+
+                    seen = set()
+                    ordered_indices = [i for i in indices if not (i in seen or seen.add(i))]
+
+                    selected = [default_interactions[i] for i in ordered_indices
                             if 0 <= i < len(default_interactions)]
-                    
+
                     if selected:
                         print(f"✅ Selected {len(selected)} interactions: {', '.join(selected)}")
                         return selected
                     else:
                         print("❌ Invalid selection, using defaults")
                         return default_interactions
-                        
+
                 except (ValueError, IndexError):
                     print("❌ Invalid input format, using defaults")
                     return default_interactions
@@ -11021,6 +14078,302 @@ quit
         except Exception as e:
             print(f"\n❌ Unexpected error retrieving ProLIF conditions: {e}")
             return None
+
+    def list_prolif_conditions(self):
+        """
+        Lists all ProLIF conditions stored in params.db, prompts the user to select
+        one by description, and prints the full conditions dictionary in a readable
+        formatted layout.
+        """
+
+        prolif_params_db = self.__docking_params_db
+
+        try:
+            conn = sqlite3.connect(prolif_params_db)
+            cursor = conn.cursor()
+
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='ProLIF_Conditions'")
+            if not cursor.fetchone():
+                print("\n❌ No ProLIF_Conditions table found in database")
+                conn.close()
+                return
+
+            cursor.execute("SELECT id, description FROM ProLIF_Conditions ORDER BY id ASC")
+            records = cursor.fetchall()
+
+            if not records:
+                print("\n❌ No ProLIF conditions registered in database")
+                conn.close()
+                return
+
+            print(f"\n🔬 PROLIF CONDITIONS")
+            print("=" * 70)
+            for idx, (record_id, description) in enumerate(records, 1):
+                print(f"   {idx}. ID {record_id}: {description}")
+            print("=" * 70)
+
+            while True:
+                try:
+                    selection = input("\nSelect conditions to inspect (enter number or 'c' to cancel): ").strip()
+                    if selection.lower() == 'c':
+                        conn.close()
+                        return
+                    selection_idx = int(selection) - 1
+                    if 0 <= selection_idx < len(records):
+                        selected_id, selected_description = records[selection_idx]
+                        break
+                    print(f"❌ Please enter a valid number (1-{len(records)})")
+                except ValueError:
+                    print("❌ Please enter a valid number")
+
+            cursor.execute("SELECT conditions FROM ProLIF_Conditions WHERE id = ?", (selected_id,))
+            result = cursor.fetchone()
+            conn.close()
+
+            if not result:
+                print("\n❌ Failed to retrieve selected conditions")
+                return
+
+            conditions_dict = json.loads(result[0])
+
+            print(f"\n{'=' * 70}")
+            print(f"  📌 {selected_description}  (ID {selected_id})")
+            print(f"{'=' * 70}")
+            print(json.dumps(conditions_dict, indent=4))
+            print(f"{'=' * 70}\n")
+
+        except sqlite3.Error as e:
+            print(f"\n❌ Database error: {e}")
+        except json.JSONDecodeError as e:
+            print(f"\n❌ Error parsing stored conditions: {e}")
+        except Exception as e:
+            print(f"\n❌ Unexpected error: {e}")
+
+    def delete_prolif_conditions(self):
+        """
+        Lists all ProLIF conditions stored in params.db, prompts the user to select
+        one, and permanently deletes that record from the ProLIF_Conditions table.
+        """
+
+        prolif_params_db = self.__docking_params_db
+
+        try:
+            conn = sqlite3.connect(prolif_params_db)
+            cursor = conn.cursor()
+
+            cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='ProLIF_Conditions'"
+            )
+            if not cursor.fetchone():
+                print("\n❌ No ProLIF_Conditions table found in database")
+                conn.close()
+                return
+
+            cursor.execute("SELECT id, description FROM ProLIF_Conditions ORDER BY id ASC")
+            records = cursor.fetchall()
+
+            if not records:
+                print("\n❌ No ProLIF conditions registered in database")
+                conn.close()
+                return
+
+            print(f"\n🗑️  DELETE PROLIF CONDITIONS")
+            print("=" * 70)
+            for idx, (record_id, description) in enumerate(records, 1):
+                print(f"   {idx}. ID {record_id}: {description}")
+            print("=" * 70)
+
+            while True:
+                try:
+                    selection = input("\nSelect conditions to delete (enter number or 'c' to cancel): ").strip()
+                    if selection.lower() == 'c':
+                        conn.close()
+                        return
+                    selection_idx = int(selection) - 1
+                    if 0 <= selection_idx < len(records):
+                        selected_id, selected_description = records[selection_idx]
+                        break
+                    print(f"❌ Please enter a valid number (1-{len(records)})")
+                except ValueError:
+                    print("❌ Please enter a valid number")
+
+            confirm = input(
+                f"\n⚠️  Delete '{selected_description}' (ID {selected_id})? This cannot be undone. (y/n): "
+            ).strip().lower()
+            if confirm != 'y':
+                print("❌ Deletion cancelled.")
+                conn.close()
+                return
+
+            cursor.execute("DELETE FROM ProLIF_Conditions WHERE id = ?", (selected_id,))
+            conn.commit()
+            conn.close()
+
+            print(f"\n✅ ProLIF conditions '{selected_description}' (ID {selected_id}) deleted successfully.")
+
+        except sqlite3.Error as e:
+            print(f"\n❌ Database error: {e}")
+        except Exception as e:
+            print(f"\n❌ Unexpected error: {e}")
+
+    def export_prolif_conditions(self):
+        """
+        Exports a ProLIF conditions record from the database to a portable JSON file.
+        The user selects the record to export and provides an output file path.
+        The exported file can later be re-imported with import_prolif_conditions().
+        """
+
+        import sqlite3
+        import json
+
+        prolif_params_db = self.__docking_params_db
+
+        try:
+            conn = sqlite3.connect(prolif_params_db)
+            cursor = conn.cursor()
+
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='ProLIF_Conditions'")
+            if not cursor.fetchone():
+                print("\n❌ No ProLIF_Conditions table found in database")
+                conn.close()
+                return
+
+            cursor.execute("SELECT id, description FROM ProLIF_Conditions ORDER BY id ASC")
+            records = cursor.fetchall()
+
+            if not records:
+                print("\n❌ No ProLIF conditions registered in database")
+                conn.close()
+                return
+
+            print(f"\n📤 EXPORT PROLIF CONDITIONS")
+            print("=" * 70)
+            for idx, (record_id, description) in enumerate(records, 1):
+                print(f"   {idx}. ID {record_id}: {description}")
+            print("=" * 70)
+
+            while True:
+                try:
+                    selection = input("\nSelect conditions to export (enter number or 'c' to cancel): ").strip()
+                    if selection.lower() == 'c':
+                        conn.close()
+                        return
+                    selection_idx = int(selection) - 1
+                    if 0 <= selection_idx < len(records):
+                        selected_id, selected_description = records[selection_idx]
+                        break
+                    print(f"❌ Please enter a valid number (1-{len(records)})")
+                except ValueError:
+                    print("❌ Please enter a valid number")
+
+            cursor.execute("SELECT description, conditions FROM ProLIF_Conditions WHERE id = ?", (selected_id,))
+            result = cursor.fetchone()
+            conn.close()
+
+            if not result:
+                print("\n❌ Failed to retrieve selected conditions")
+                return
+
+            description, conditions_json = result
+            conditions_dict = json.loads(conditions_json)
+
+            export_payload = {
+                "description": description,
+                "conditions": conditions_dict
+            }
+
+            output_path = input("\nEnter output file path (e.g. prolif_conditions.json): ").strip()
+            if not output_path:
+                print("❌ No output path provided. Export cancelled.")
+                return
+
+            with open(output_path, 'w') as f:
+                json.dump(export_payload, f, indent=2)
+
+            print(f"\n✅ ProLIF conditions exported successfully to: {output_path}")
+            print(f"   📌 Description: {description}")
+
+        except sqlite3.Error as e:
+            print(f"\n❌ Database error: {e}")
+        except Exception as e:
+            print(f"\n❌ Unexpected error exporting ProLIF conditions: {e}")
+
+    def import_prolif_conditions(self):
+        """
+        Imports a ProLIF conditions record from a JSON file previously created by
+        export_prolif_conditions() and inserts it as a new record in the database.
+        The user may override the description before inserting.
+        """
+
+        import os
+        import sqlite3
+        import json
+
+        file_path = input("\nEnter path to the ProLIF conditions JSON file: ").strip()
+        if not file_path or not os.path.isfile(file_path):
+            print(f"❌ File not found: {file_path}")
+            return
+
+        try:
+            with open(file_path, 'r') as f:
+                export_payload = json.load(f)
+        except json.JSONDecodeError as e:
+            print(f"❌ Failed to parse JSON file: {e}")
+            return
+
+        if "description" not in export_payload or "conditions" not in export_payload:
+            print("❌ Invalid export file: missing 'description' or 'conditions' keys.")
+            return
+
+        original_description = export_payload["description"]
+        conditions_dict = export_payload["conditions"]
+
+        print(f"\n📥 IMPORT PROLIF CONDITIONS")
+        print("=" * 70)
+        print(f"   📌 Original description: {original_description}")
+
+        override = input("\nKeep original description? (y/n, default: y): ").strip().lower()
+        if override == 'n':
+            while True:
+                new_description = input("Enter new description: ").strip()
+                if new_description:
+                    original_description = new_description
+                    break
+                print("❌ Description cannot be empty. Please enter a valid description.")
+
+        prolif_params_db = self.__docking_params_db
+
+        try:
+            if not os.path.exists(prolif_params_db):
+                open(prolif_params_db, 'w').close()
+
+            conn = sqlite3.connect(prolif_params_db)
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS ProLIF_Conditions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    description TEXT,
+                    conditions TEXT
+                )
+            """)
+
+            conditions_json = json.dumps(conditions_dict, indent=2)
+            cursor.execute("""
+                INSERT INTO ProLIF_Conditions (description, conditions)
+                VALUES (?, ?)
+            """, (original_description, conditions_json))
+            conn.commit()
+            new_id = cursor.lastrowid
+            conn.close()
+
+            print(f"\n✅ ProLIF conditions imported successfully into {prolif_params_db}")
+            print(f"   📌 Description: {original_description}")
+            print(f"   🔍 New record ID: {new_id}")
+
+        except sqlite3.Error as e:
+            print(f"\n❌ Database error: {e}")
+        except Exception as e:
+            print(f"\n❌ Unexpected error importing ProLIF conditions: {e}")
 
     def _create_selection_commands(self):
         
@@ -11563,8 +14916,7 @@ quit
         except subprocess.CalledProcessError as e:  
             print(f"\n❌ Error computing MMGBSA binding energy: {e}")
 
-    def _parse_mmgbsa_decomposition_output(self, ligname, pose_id, output_dir): # This will work for the running workflow
-    #def parse_mmgbsa_decomposition_output(self, filename): # bypass to work with a file path
+    def _parse_mmgbsa_decomposition_output(self, ligname, pose_id, output_dir): 
         import pandas as pd
         import re   
         output_decomp_file = f"{output_dir}/{ligname}_{pose_id}_mmgbsa_decomp.out" # This will work for the running workflow
@@ -11672,7 +15024,36 @@ quit
             
         except Exception as e:
             print(f"\n❌ Error storing processed MMGBSA decomposition dataframe as JSON in database: {e}")
-            
+
+    def _update_results_mmgbsa_energies(self, results_db, pose_id, total_energy, gas_energy):
+        """
+        Write mmgbsa_total_energy and mmgbsa_gas_energy into the Results table for pose_id.
+        Columns are added via ALTER TABLE if they do not already exist (idempotent).
+        -1 is stored when the MMPBSA computation failed for this pose.
+        """
+        import sqlite3
+        try:
+            conn = sqlite3.connect(results_db)
+            cursor = conn.cursor()
+
+            cursor.execute("PRAGMA table_info(Results)")
+            existing_columns = {row[1] for row in cursor.fetchall()}
+
+            for col_name, col_type in [('mmgbsa_total_energy', 'REAL'), ('mmgbsa_gas_energy', 'REAL')]:
+                if col_name not in existing_columns:
+                    cursor.execute(f"ALTER TABLE Results ADD COLUMN {col_name} {col_type}")
+
+            cursor.execute(
+                "UPDATE Results SET mmgbsa_total_energy = ?, mmgbsa_gas_energy = ? WHERE Pose_ID = ?",
+                (total_energy, gas_energy, pose_id)
+            )
+
+            conn.commit()
+            conn.close()
+
+        except Exception as e:
+            print(f"\n❌ Error updating Results table with MMPBSA energies for Pose_ID {pose_id}: {e}")
+
     def _check_table_in_db(self, db, table_name):
         
         import sqlite3
@@ -11710,7 +15091,86 @@ quit
                         except KeyboardInterrupt:
                             print("\n   ❌ Operation cancelled by user.")
                             return False
-                        
+
+    def _check_mmgbsa_table_for_resume(self, results_db, table_name):
+        """
+        Like _check_table_in_db(), but for the MMGBSA-only path: offers to resume
+        an interrupted run (keep existing rows, compute only the poses still
+        missing) in addition to overwriting everything or cancelling.
+
+        Returns:
+            None      - table does not exist yet, nothing to resume/overwrite.
+            'resume'  - table left intact; caller should skip already-computed poses.
+            'overwrite' - table dropped; caller should (re)compute every pose.
+        Raises SystemExit if the user cancels.
+        """
+        import sqlite3
+
+        conn = sqlite3.connect(results_db)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table_name,)
+        )
+        table_exists = cursor.fetchone() is not None
+        conn.close()
+
+        if not table_exists:
+            return None
+
+        print(f"   ⚠️  Warning: {table_name} table already exists in the {results_db}.")
+
+        while True:
+            try:
+                response = input(
+                    "   Existing MMGBSA results found. "
+                    "(r)esume unfinished poses, (o)verwrite all, (c)ancel? [r/o/c]: "
+                ).strip().lower()
+            except KeyboardInterrupt:
+                raise SystemExit("\n   ❌ Operation cancelled by user.")
+
+            if response in ('r', 'resume'):
+                print("   ℹ️  Resuming: only poses without existing MMGBSA results will be computed.")
+                return 'resume'
+            elif response in ('o', 'overwrite'):
+                conn = sqlite3.connect(results_db)
+                cursor = conn.cursor()
+                cursor.execute(f"DROP TABLE IF EXISTS {table_name};")
+                conn.commit()
+                conn.close()
+                print(f"   ℹ️  Proceeding to overwrite existing {table_name} table.")
+                return 'overwrite'
+            elif response in ('c', 'cancel'):
+                raise SystemExit("   ❌ Operation cancelled to avoid overwriting existing data.")
+            else:
+                print("   ❌ Please answer 'r', 'o', or 'c'")
+
+    def _get_computed_mmgbsa_pose_ids(self, results_db):
+        """
+        Return the set of Pose_ID values already present in
+        processed_mmgbsa_decomposition_json, i.e. poses that have already had
+        an MMGBSA computation attempt stored (successful or not). Used to skip
+        already-processed poses when resuming an interrupted run.
+        """
+        import sqlite3
+
+        try:
+            conn = sqlite3.connect(results_db)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='processed_mmgbsa_decomposition_json'"
+            )
+            if cursor.fetchone() is None:
+                conn.close()
+                return set()
+
+            cursor.execute("SELECT pose_id FROM processed_mmgbsa_decomposition_json")
+            pose_ids = {row[0] for row in cursor.fetchall()}
+            conn.close()
+            return pose_ids
+        except Exception as e:
+            print(f"❌ Error retrieving already-computed MMGBSA pose IDs: {e}")
+            return set()
+
     def _clean_ligand_names_in_results_db(self, results_db_file):
         import sqlite3
         try:
@@ -11902,6 +15362,102 @@ quit
                         his_names[f"{res_num}_{chain_id}"] = res_name
         
         return his_names
+    
+    def _parse_histidine_names_batch_mode(self, original_pdb_path, selected_chains, procesing_index):
+        """
+        Parses a PDB file to identify and record the names of Histidine residues (HIS, HID, HIE, HIP) 
+        within specified chains.
+        Args:
+            original_pdb_path (str): Path to the original PDB file.
+            selected_chains (Iterable[str]): Collection of chain identifiers to search for Histidine residues.
+        Returns:
+            dict: A dictionary mapping residue number and chain (formatted as "{res_num}_{chain_id}") 
+                  to the Histidine residue name found in the PDB file.
+        """
+
+        # If the dictionary is not empty:
+        if procesing_index > 1:
+            print("\nExisting Histidine names found in batch mode. Skipping parsing of Histidine names from PDB file.")
+            
+            # Read the dictionary from the temp file in /tmp directory
+            import json
+            temp_file_path = "/tmp/his_names_batch_mode.json"
+            with open(temp_file_path, 'r') as temp_file:
+                his_names = json.load(temp_file)
+            return his_names
+        
+        else:
+            his_names = {}
+            with open(original_pdb_path, 'r') as pdb_file:
+                for line in pdb_file:
+                    if line.startswith("HETATM") or line.startswith("ATOM"):
+                        chain_id = line[21].strip()
+                        res_name = line[17:20].strip()
+                        res_num = line[22:26].strip()
+                        if chain_id in selected_chains and res_name in ['HIS', 'HID', 'HIE', 'HIP']:
+                            his_names[f"{res_num}_{chain_id}"] = res_name
+            
+            # Write the dictionary to a temp file for subsequent retrieval in batch mode to the /tmp directory
+            import json
+            temp_file_path = "/tmp/his_names_batch_mode.json"
+            with open(temp_file_path, 'w') as temp_file:
+                json.dump(his_names, temp_file)
+
+            return his_names
+
+    def _find_disulfide_candidates_batch_mode(self, pdb_path, selected_chains, processing_index, threshold=2.2):
+        """
+        Batch-mode variant of _find_disulfide_candidates(). The first structure
+        in a batch run detects candidate disulfide pairs and caches them (same
+        /tmp-file convention as _parse_histidine_names_batch_mode); subsequent
+        structures re-measure each cached pair's own SG-SG distance (batch
+        structures are expected to share chain/residue numbering, but not
+        necessarily identical conformations) and drop pairs that no longer
+        meet the threshold, rather than trusting the cached distance blindly.
+
+        Returns:
+            List[Dict]: candidate disulfide bridges for this specific structure
+        """
+        import json
+
+        temp_file_path = "/tmp/disulfide_candidates_batch_mode.json"
+
+        if processing_index > 1:
+            print("\nReusing cached disulfide bridge candidate pairs from the first structure in this batch.")
+            try:
+                with open(temp_file_path, 'r') as temp_file:
+                    cached_pairs = json.load(temp_file)
+            except (OSError, json.JSONDecodeError):
+                cached_pairs = []
+
+            all_candidates = self._find_disulfide_candidates(pdb_path, selected_chains, threshold)
+            all_by_key = {
+                frozenset({(c['chain1'], c['resnum1']), (c['chain2'], c['resnum2'])}): c
+                for c in all_candidates
+            }
+
+            candidates = []
+            for pair in cached_pairs:
+                key = frozenset({(pair['chain1'], pair['resnum1']), (pair['chain2'], pair['resnum2'])})
+                match = all_by_key.get(key)
+                if match:
+                    candidates.append(match)
+                else:
+                    print(
+                        f"   ⚠️  Cached disulfide pair CYS{pair['resnum1']}_{pair['chain1']}--"
+                        f"CYS{pair['resnum2']}_{pair['chain2']} is not within {threshold} Å in this "
+                        f"structure; skipping."
+                    )
+            return candidates
+
+        else:
+            candidates = self._find_disulfide_candidates(pdb_path, selected_chains, threshold)
+            try:
+                with open(temp_file_path, 'w') as temp_file:
+                    json.dump(candidates, temp_file)
+            except OSError:
+                pass
+            return candidates
 
     def _customize_histidine_names(self, his_names):
 
@@ -11971,7 +15527,224 @@ quit
                         new_res_name = his_names[res_key]
                         if new_res_name != res_name:
                             line = line[:17] + new_res_name.ljust(3) + line[20:]
-                pdb_file.write(line)    
+                pdb_file.write(line)
+
+    def _find_disulfide_candidates(self, pdb_path, selected_chains, threshold=2.2):
+        """
+        Scan pdb_path for CYS/CYX/CYM side-chain sulfur (SG) atoms within
+        selected_chains, and return every pair whose SG-SG distance is below
+        threshold (Angstrom, default matches the accepted disulfide bond
+        distance) as a candidate disulfide bridge.
+
+        Returns:
+            List[Dict]: each entry has chain1, resnum1, chain2, resnum2, distance
+        """
+        import math
+
+        cysteine_resnames = ('CYS', 'CYX', 'CYM')
+        sg_atoms = []
+
+        with open(pdb_path, 'r') as f:
+            for line in f:
+                if line.startswith('ATOM'):
+                    res_name = line[17:20].strip()
+                    atom_name = line[12:16].strip()
+                    if res_name in cysteine_resnames and atom_name == 'SG':
+                        chain_id = line[21].strip()
+                        if chain_id not in selected_chains:
+                            continue
+                        try:
+                            resnum = int(line[22:26])
+                            x = float(line[30:38])
+                            y = float(line[38:46])
+                            z = float(line[46:54])
+                        except ValueError:
+                            continue
+                        sg_atoms.append({'chain_id': chain_id, 'resnum': resnum, 'x': x, 'y': y, 'z': z})
+
+        candidates = []
+        for i in range(len(sg_atoms)):
+            for j in range(i + 1, len(sg_atoms)):
+                a, b = sg_atoms[i], sg_atoms[j]
+                if a['chain_id'] == b['chain_id'] and a['resnum'] == b['resnum']:
+                    continue
+                distance = math.sqrt(
+                    (a['x'] - b['x']) ** 2 + (a['y'] - b['y']) ** 2 + (a['z'] - b['z']) ** 2
+                )
+                if distance < threshold:
+                    candidates.append({
+                        'chain1': a['chain_id'], 'resnum1': a['resnum'],
+                        'chain2': b['chain_id'], 'resnum2': b['resnum'],
+                        'distance': round(distance, 3),
+                    })
+
+        return candidates
+
+    def _customize_disulfide_bonds(self, candidates):
+        """
+        Present detected disulfide bridge candidates to the user and let them
+        confirm, pair by pair, which ones should be explicitly modeled (the
+        cysteines renamed to CYX and their sulfur atoms bonded in tleap).
+
+        Returns:
+            List[Dict]: the confirmed subset of `candidates`
+        """
+        if not candidates:
+            print("No disulfide bridge candidates detected.")
+            return []
+
+        print(f"\n🔗 {len(candidates)} potential disulfide bridge(s) detected (SG-SG < 2.2 Å):")
+        for c in candidates:
+            print(f"   • CYS{c['resnum1']}_{c['chain1']} -- CYS{c['resnum2']}_{c['chain2']}  (SG-SG {c['distance']} Å)")
+
+        confirmed = []
+        for c in candidates:
+            while True:
+                try:
+                    response = input(
+                        f"\n   Model CYS{c['resnum1']}_{c['chain1']} -- CYS{c['resnum2']}_{c['chain2']} "
+                        f"(SG-SG {c['distance']} Å) as a disulfide bond (CYX)? (y/N): "
+                    ).strip().lower()
+                except KeyboardInterrupt:
+                    print("\n   ⚠️  Cancelled — leaving this pair unbonded.")
+                    response = 'n'
+
+                if not response:
+                    response = 'n'
+                if response in ('y', 'yes'):
+                    confirmed.append(c)
+                    break
+                elif response in ('n', 'no'):
+                    break
+                else:
+                    print("   ❌ Please answer 'y' or 'n'")
+                    continue
+
+        if confirmed:
+            print(f"\n   ✅ Will model {len(confirmed)} disulfide bridge(s) as CYX.")
+        else:
+            print("\n   ℹ️  No disulfide bridges will be explicitly modeled.")
+
+        return confirmed
+
+    def _fix_cysteine_names(self, disulfide_bonds, processed_pdb_path):
+        """
+        Rename CYS residues participating in a confirmed disulfide bond to
+        CYX in processed_pdb_path, so tleap builds them without a thiol
+        hydrogen (the actual S-S bond is added separately via an explicit
+        tleap `bond` command — see _get_tleap_bond_lines()).
+        """
+        if not disulfide_bonds:
+            return
+
+        cyx_keys = set()
+        for bond in disulfide_bonds:
+            cyx_keys.add((bond['chain1'], bond['resnum1']))
+            cyx_keys.add((bond['chain2'], bond['resnum2']))
+
+        with open(processed_pdb_path, 'r') as pdb_file:
+            pdb_lines = pdb_file.readlines()
+        with open(processed_pdb_path, 'w') as pdb_file:
+            for line in pdb_lines:
+                if line.startswith(('ATOM', 'HETATM')):
+                    chain_id = line[21].strip()
+                    res_name = line[17:20].strip()
+                    try:
+                        res_num = int(line[22:26])
+                    except ValueError:
+                        pdb_file.write(line)
+                        continue
+                    if res_name == 'CYS' and (chain_id, res_num) in cyx_keys:
+                        line = line[:17] + 'CYX'.ljust(3) + line[20:]
+                pdb_file.write(line)
+
+    def _get_tleap_bond_lines(self, pdb_path, disulfide_bonds, unit_name):
+        """
+        Compute each disulfide-bonded residue's 1-based ordinal position in
+        file order within pdb_path, and return the corresponding tleap
+        `bond` command lines for `unit_name`. tleap numbers residues
+        sequentially within a freshly loaded unit purely by loading order,
+        independent of the PDB resSeq/chain fields — so this ordinal count
+        is what a `bond <unit>.<idx>.SG ...` command must address.
+
+        IMPORTANT: pdb_path must carry the ORIGINAL chain/resnum identity
+        (chain1/resnum1/chain2/resnum2 as recorded in disulfide_bonds), not
+        a file that has already been through a prior tleap `loadpdb`+`savepdb`
+        round trip. tleap's savepdb rewrites resSeq to match its own
+        sequential unit-residue numbering (1..N in file order) and drops
+        chain IDs — so on such a file, a residue's *original* resnum no
+        longer identifies the same residue, and the resnum-only fallback
+        below would silently match the wrong atom (see
+        _construct_resnumbers_matching_dictionary for the same renumbering
+        behavior in a different context). Residue order and count are
+        preserved 1:1 across a tleap round trip, so it is safe to compute
+        indices from the PRE-tleap file and reuse them for the POST-tleap
+        file's own subsequent loadpdb, as _minimize_receptor() does.
+
+        Matching is primarily by (chain_id, resnum); when a residue isn't
+        found under its original chain (e.g. a later pipeline stage, such as
+        the ambpdb round trip, dropped chain identifiers but preserved the
+        original/crystal resSeq numbering), matching falls back to resnum
+        alone as long as that resnum is unambiguous among the queried
+        residues.
+
+        Returns:
+            List[str]: ready-to-write tleap script lines (newline-terminated)
+        """
+        if not disulfide_bonds:
+            return []
+
+        residue_keys = set()
+        for bond in disulfide_bonds:
+            residue_keys.add((bond['chain1'], bond['resnum1']))
+            residue_keys.add((bond['chain2'], bond['resnum2']))
+
+        resnum_counts = {}
+        for _chain_id, resnum in residue_keys:
+            resnum_counts[resnum] = resnum_counts.get(resnum, 0) + 1
+        ambiguous_resnums = {r for r, n in resnum_counts.items() if n > 1}
+
+        index_by_chain_resnum = {}
+        index_by_resnum = {}
+        seen_residue = None
+        ordinal = 0
+        with open(pdb_path, 'r') as f:
+            for line in f:
+                if line.startswith(('ATOM', 'HETATM')):
+                    chain_id = line[21].strip()
+                    try:
+                        resnum = int(line[22:26])
+                    except ValueError:
+                        continue
+                    res_uid = (chain_id, resnum)
+                    if res_uid != seen_residue:
+                        ordinal += 1
+                        seen_residue = res_uid
+                        index_by_chain_resnum.setdefault(res_uid, ordinal)
+                        index_by_resnum.setdefault(resnum, ordinal)
+
+        def _resolve(chain_id, resnum):
+            idx = index_by_chain_resnum.get((chain_id, resnum))
+            if idx is not None:
+                return idx
+            if resnum not in ambiguous_resnums:
+                return index_by_resnum.get(resnum)
+            return None
+
+        bond_lines = []
+        for bond in disulfide_bonds:
+            idx1 = _resolve(bond['chain1'], bond['resnum1'])
+            idx2 = _resolve(bond['chain2'], bond['resnum2'])
+            if idx1 is None or idx2 is None:
+                print(
+                    f"   ⚠️  Could not locate disulfide partner residue(s) for "
+                    f"CYX{bond['resnum1']}_{bond['chain1']}--CYX{bond['resnum2']}_{bond['chain2']} "
+                    f"in {pdb_path}; skipping explicit tleap bond for this pair."
+                )
+                continue
+            bond_lines.append(f"bond {unit_name}.{idx1}.SG {unit_name}.{idx2}.SG\n")
+
+        return bond_lines
 
     def _get_last_receptor_model_id(self):
 
@@ -12285,6 +16058,8 @@ quit
                 return
             else:
                 pdb_analysis_json = result[0]
+                if pdb_analysis_json is None:
+                    return False, [], [], []
                 import json
                 pdb_analysis = json.loads(pdb_analysis_json)
                 ligands_in_template = pdb_analysis.get('has_ligands', []) # Will return either True or False
@@ -12301,15 +16076,831 @@ quit
         except Exception as e:
             print(f"Error accessing PDB templates database: {e}. Stopping")
             sys.exit(1)
-    
-        
-        
-                                    
-                            
-                            
-                            
-                            
 
-        
-        
-        
+    def _check_disulfides_in_template(self, pdb_template_name):
+        """
+        Retrieve the confirmed disulfide_bonds list stored for pdb_template_name
+        in pdbs.db (persisted inside the pdb_analysis JSON blob, same channel
+        used for cofactors — see _check_ligands_in_template()).
+
+        Returns:
+            List[Dict]: disulfide bond entries (chain1, resnum1, chain2,
+            resnum2, distance), or [] if none are recorded / on any error.
+        """
+        import sqlite3
+        import json
+
+        try:
+            pdb_templates_db_path = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
+            conn = sqlite3.connect(pdb_templates_db_path)
+            cursor = conn.cursor()
+
+            cursor.execute("SELECT pdb_analysis FROM pdb_templates WHERE pdb_template_name = ?", (pdb_template_name,))
+            result = cursor.fetchone()
+            conn.close()
+
+            if result is None or result[0] is None:
+                return []
+
+            pdb_analysis = json.loads(result[0])
+            return pdb_analysis.get('disulfide_bonds', []) or []
+
+        except Exception as e:
+            print(f"Error retrieving disulfide bonds for template '{pdb_template_name}': {e}")
+            return []
+
+    def _show_tleap_template_guide_for_fps(self):
+        """Print guidance for writing a tleap template for stub receptors."""
+        print("\n" + "=" * 70)
+        print("TLEAP TEMPLATE GUIDE — stub receptor (fingerprints + MD)")
+        print("=" * 70)
+        print("""
+This template is used for ALL workflows involving this imported receptor:
+
+  • compute_fingerprints() — MMGBSA/ProLIF (gas-phase complex)
+  • perform_md_assay()     — molecular dynamics (solvated complex)
+
+SOLVATION COMMANDS (solvateBox, addions, …) are automatically STRIPPED
+when the template is used for fingerprints/MMGBSA, and KEPT AS-IS when
+used for molecular dynamics.  You may therefore write a single template
+that includes solvation — it will behave correctly in both contexts.
+
+Tokens substituted automatically at runtime:
+
+  {{RECEPTOR_PDB}}  → absolute path to receptor_checked.pdb
+  {{LIGAND_PDB}}    → absolute path to the docked-pose PDB
+  {{MOL2_FILE}}     → absolute path to the ligand .mol2 file (antechamber/GAFF2)
+  {{FRCMOD_FILE}}   → absolute path to the ligand .frcmod file (parmchk2)
+  {{PRMTOP_OUT}}    → output path where tleap writes complex.prmtop
+  {{INPCRD_OUT}}    → output path where tleap writes complex.inpcrd
+
+Rules:
+  • Load the receptor force field first
+  • For proteins use leaprc.protein.ff14SB (or ff19SB)
+  • For cyclodextrins use leaprc.GLYCAM_06j-1
+  • Use loadmol2 to load the ligand mol2; loadamberparams loads the frcmod
+  • Include solvateBox / addions if you want explicit-solvent MD;
+    they will be ignored automatically for fingerprint computation
+
+Example — protein receptor (solvated template, safe for both workflows):
+  source leaprc.protein.ff14SB
+  source leaprc.gaff2
+  source leaprc.water.tip3p
+  HOH = WAT
+  rec = loadpdb {{RECEPTOR_PDB}}
+  UNL = loadmol2 {{MOL2_FILE}}
+  loadamberparams {{FRCMOD_FILE}}
+  lig = loadpdb {{LIGAND_PDB}}
+  complex = combine {rec lig}
+  solvateBox complex TIP3PBOX 10.0 iso 1.0
+  addions complex Na+ 0
+  addions complex Cl- 0
+  saveamberparm complex {{PRMTOP_OUT}} {{INPCRD_OUT}}
+  quit
+
+Example — cyclodextrin receptor:
+  source leaprc.GLYCAM_06j-1
+  source leaprc.gaff2
+  source leaprc.water.tip3p
+  HOH = WAT
+  rec = loadpdb {{RECEPTOR_PDB}}
+  UNL = loadmol2 {{MOL2_FILE}}
+  loadamberparams {{FRCMOD_FILE}}
+  lig = loadpdb {{LIGAND_PDB}}
+  complex = combine {rec lig}
+  solvateBox complex TIP3PBOX 10.0 iso 1.0
+  addions complex Na+ 0
+  addions complex Cl- 0
+  saveamberparm complex {{PRMTOP_OUT}} {{INPCRD_OUT}}
+  quit
+""")
+        print("=" * 70)
+
+    def _get_or_store_receptor_tleap_template(self, receptor_model_name):
+        """
+        Return the tleap_config dict (template + custom param files) for a stub
+        receptor.  Reads receptor_models.tleap_config; if absent (receptor was
+        imported before this feature was added), prompts once and persists the
+        result so it is never requested again.
+
+        The stored template is shared between compute_fingerprints() (solvation
+        commands are stripped automatically) and perform_md_assay() (solvation
+        commands are kept).
+        """
+        import sqlite3
+        import json
+
+        receptors_db_path = os.path.join(self.path, 'docking', 'receptors', 'receptors.db')
+
+        conn = sqlite3.connect(receptors_db_path)
+        cur = conn.cursor()
+        # Ensure both the current column and the legacy column exist
+        for col in ('tleap_config', 'fps_tleap_config'):
+            try:
+                cur.execute(f"ALTER TABLE receptor_models ADD COLUMN {col} TEXT")
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass  # column already exists
+
+        # Prefer tleap_config; fall back to fps_tleap_config (migration path)
+        cur.execute(
+            "SELECT tleap_config, fps_tleap_config FROM receptor_models WHERE receptor_model_name = ?",
+            (receptor_model_name,)
+        )
+        row = cur.fetchone()
+        conn.close()
+
+        if row:
+            raw = row[0] or row[1]  # tleap_config takes priority
+            if raw:
+                try:
+                    config = json.loads(raw)
+                    if config.get('template_content'):
+                        print(f"✅ Using stored tleap template for receptor '{receptor_model_name}'.")
+                        return config
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+
+        # No stored template — prompt the user (lazy fallback for old imports)
+        self._show_tleap_template_guide_for_fps()
+
+        template_content = None
+        while True:
+            path = self._prompt("\n📂 Path to tleap template file (or 'cancel'): ")
+            if path.lower() in ('cancel', 'quit', 'exit'):
+                return None
+            path = os.path.expanduser(path)
+            if not os.path.isfile(path):
+                print(f"❌ File not found: {path}")
+                continue
+            with open(path, 'r') as fh:
+                template_content = fh.read()
+            n_lines = len(template_content.splitlines())
+            print(f"✅ Template loaded: {os.path.basename(path)} ({n_lines} lines)")
+            break
+
+        print("\nAttach any custom .lib or .frcmod files required by the template.")
+        print("They will be copied to the working folder before each tleap run.")
+        print("Enter 'done' when finished.")
+        custom_parameter_files = []
+        while True:
+            raw = input("  Path to custom file (or 'done'): ").strip()
+            if raw.lower() in ('done', 'skip', ''):
+                break
+            raw = os.path.expanduser(raw)
+            if not os.path.isfile(raw):
+                print(f"  ❌ File not found: {raw}")
+                continue
+            with open(raw, 'r') as fh:
+                content = fh.read()
+            filename = os.path.basename(raw)
+            custom_parameter_files.append({'filename': filename, 'content': content})
+            print(f"  ✓ Attached: {filename}")
+
+        config = {
+            'template_content': template_content,
+            'custom_parameter_files': custom_parameter_files,
+        }
+
+        conn = sqlite3.connect(receptors_db_path)
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE receptor_models SET tleap_config = ? WHERE receptor_model_name = ?",
+            (json.dumps(config), receptor_model_name)
+        )
+        conn.commit()
+        conn.close()
+        print(f"✅ tleap template stored for receptor '{receptor_model_name}' — will not be requested again.")
+
+        return config
+
+    def import_receptor_model(self, input_folder_path=None, receptor_model_name=None,
+                              charge_model='gasteiger', notes=None):
+        """
+        Import a precomputed receptor model (PDBQT + grid files) directly into the project.
+
+        Accepts a folder containing a prepared .pdbqt file, a .fld file, and one or more .map
+        files.  A .gpf file is used to parse the docking box parameters when present; when absent
+        (e.g. ensemble-derived maps) the parameters are read from the header of a .map file instead.
+        Stub pdb_model and
+        pdb_template records are created so that downstream analyses (e.g. ProLIF fingerprints)
+        do not fail.  ProLIF residue labels will reflect the numbering in the imported PDBQT
+        directly (no remapping is applied).
+
+        Args:
+            input_folder_path (str, optional): Full path to folder containing receptor files.
+                If None, the user is prompted interactively.
+            receptor_model_name (str, optional): Name to register for this receptor model.
+                If None, the user is prompted interactively.
+            charge_model (str): Charge model label used to name the grid-files subfolder
+                (default: 'gasteiger').
+            notes (str, optional): Notes to store in the receptor_models record.
+
+        Returns:
+            int or None: The new receptor model ID on success, None on failure.
+        """
+        import sqlite3
+        import json
+        import shutil
+
+        # --- Step 1: Resolve and validate input folder ---
+        while not input_folder_path:
+            raw = input("\nEnter the full path to the folder containing the receptor files: ").strip().strip('"').strip("'")
+            if not raw:
+                print("Operation cancelled.")
+                return None
+            candidate = os.path.abspath(os.path.expanduser(raw))
+            if os.path.isdir(candidate):
+                input_folder_path = candidate
+            else:
+                print(f"  Directory not found: {candidate}")
+
+        all_files = os.listdir(input_folder_path)
+        pdbqt_files = [f for f in all_files if f.lower().endswith('.pdbqt')]
+        gpf_files   = [f for f in all_files if f.lower().endswith('.gpf')]
+        fld_files   = [f for f in all_files if f.lower().endswith('.fld')]
+        map_files   = [f for f in all_files if f.lower().endswith('.map')]
+        pdb_files   = [f for f in all_files if f.lower().endswith('.pdb')]
+
+        errors = []
+        if len(pdbqt_files) != 1:
+            errors.append(f"expected exactly 1 .pdbqt file, found {len(pdbqt_files)}")
+        if not fld_files:
+            errors.append("no .fld file found")
+        if not map_files:
+            errors.append("no .map files found")
+        if errors:
+            print("  Validation errors in input folder:")
+            for err in errors:
+                print(f"    - {err}")
+            return None
+
+        pdbqt_src = os.path.join(input_folder_path, pdbqt_files[0])
+        gpf_src   = os.path.join(input_folder_path, gpf_files[0]) if gpf_files else None
+        if gpf_src is None:
+            print("  No .gpf file found — box parameters will be read from a .map file header.")
+
+        # --- Resolve receptor PDB file ---
+        # receptor_checked.pdb is required for both docking (ProLIF fingerprints) and
+        # MD assay preparation (perform_md_assay() tleap setup).
+        # If a single .pdb is present in the folder use it; otherwise ask the user.
+        if len(pdb_files) == 1:
+            pdb_src = os.path.join(input_folder_path, pdb_files[0])
+            print(f"  Found receptor PDB: {pdb_files[0]}")
+        elif len(pdb_files) > 1:
+            print(f"  Multiple .pdb files found in the input folder: {pdb_files}")
+            while True:
+                choice = input("  Enter the name of the PDB file to use as receptor_checked.pdb: ").strip()
+                if choice in pdb_files:
+                    pdb_src = os.path.join(input_folder_path, choice)
+                    break
+                print(f"  '{choice}' not found. Please enter one of: {pdb_files}")
+        else:
+            print("  No .pdb file found in the input folder.")
+            print("  A receptor PDB is required for docking (ProLIF fingerprints) and MD assay preparation.")
+            while True:
+                raw_pdb = input("  Enter the full path to the receptor PDB file (or 'skip' to omit): ").strip().strip('"').strip("'")
+                if raw_pdb.lower() == 'skip':
+                    pdb_src = None
+                    print("  Warning: no receptor PDB stored — docking fingerprints and perform_md_assay() will fail for this receptor.")
+                    break
+                candidate = os.path.abspath(os.path.expanduser(raw_pdb))
+                if os.path.isfile(candidate):
+                    pdb_src = candidate
+                    break
+                print(f"  File not found: {candidate}")
+
+        # --- Prompt for receptor_model_name if not provided ---
+        while not receptor_model_name:
+            raw_name = input("\nEnter a name for this receptor model: ").strip()
+            if raw_name:
+                receptor_model_name = raw_name
+            else:
+                print("  Name is required.")
+
+        # Check name uniqueness in receptors.db
+        receptors_db_path = os.path.join(self.path, 'docking', 'receptors', 'receptors.db')
+        os.makedirs(os.path.dirname(receptors_db_path), exist_ok=True)
+        conn_r = sqlite3.connect(receptors_db_path)
+        cur_r = conn_r.cursor()
+        cur_r.execute("""
+            CREATE TABLE IF NOT EXISTS receptor_models (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pdb_id INTEGER,
+                receptor_model_name TEXT,
+                template_name TEXT,
+                pdb_model_name TEXT,
+                pdb_to_convert TEXT,
+                pdbqt_file TEXT,
+                configs TEXT,
+                notes TEXT
+            )
+        """)
+        conn_r.commit()
+        cur_r.execute("SELECT COUNT(*) FROM receptor_models WHERE receptor_model_name = ?",
+                      (receptor_model_name,))
+        if cur_r.fetchone()[0] > 0:
+            print(f"  Error: receptor model '{receptor_model_name}' already exists.")
+            conn_r.close()
+            return None
+        conn_r.close()
+
+        # --- Step 2: Parse box parameters from .gpf (preferred) or .map header (fallback) ---
+        if gpf_src is not None:
+            configs = self._parse_gpf_box_params(gpf_src)
+        else:
+            map_src = os.path.join(input_folder_path, map_files[0])
+            configs = self._parse_map_box_params(map_src)
+        if configs is None:
+            return None
+        configs['receptor_charge_model'] = charge_model
+
+        # --- Step 3: Build receptor folder tree matching the normal workflow ---
+        # Normal workflow produces:
+        #   receptors/{template_name}/
+        #     processed/receptor_checked_{charge_model}.pdbqt   ← pdbqt_file in DB
+        #     analysis/ grid_files/ logs/ original/             ← scaffolding
+        #     RecMod_{id}_grid_files_{charge_model}/            ← grid maps
+        canonical_stem = f"receptor_checked_{charge_model}"
+        receptor_folder = os.path.join(self.__receptor_path, receptor_model_name)
+        processed_folder = os.path.join(receptor_folder, 'processed')
+        for subdir in ('processed', 'analysis', 'grid_files', 'logs', 'original'):
+            os.makedirs(os.path.join(receptor_folder, subdir), exist_ok=True)
+
+        pdbqt_dest = os.path.join(processed_folder, f"{canonical_stem}.pdbqt")
+        shutil.copy2(pdbqt_src, pdbqt_dest)
+        print(f"  Copied PDBQT: {pdbqt_dest}")
+
+        # Copy the receptor PDB as receptor_checked.pdb so that perform_md_assay()
+        # can load it via tleap (it constructs the path as dirname(pdbqt_file)/receptor_checked.pdb).
+        checked_pdb_dest = os.path.join(processed_folder, "receptor_checked.pdb")
+        if pdb_src is not None:
+            shutil.copy2(pdb_src, checked_pdb_dest)
+            print(f"  Copied receptor PDB: {checked_pdb_dest}")
+
+        # --- Step 4: Create stub pdb_model record ---
+        stub_name = f"stub_{receptor_model_name}"
+        pdbs_db_path = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
+        os.makedirs(os.path.dirname(pdbs_db_path), exist_ok=True)
+        conn_p = sqlite3.connect(pdbs_db_path)
+        cur_p = conn_p.cursor()
+
+        cur_p.execute('''
+            CREATE TABLE IF NOT EXISTS pdb_models (
+                file_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pdb_model_name TEXT UNIQUE NOT NULL,
+                project_name TEXT,
+                pdb_blob BLOB NOT NULL,
+                original_path TEXT,
+                filename TEXT,
+                file_size INTEGER,
+                description TEXT,
+                file_info TEXT,
+                created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_modified TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                notes TEXT
+            )
+        ''')
+        cur_p.execute('''
+            INSERT OR IGNORE INTO pdb_models
+                (pdb_model_name, project_name, pdb_blob, original_path, description, notes)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (
+            stub_name, self.name, b'',
+            input_folder_path,
+            'Auto-generated stub for imported receptor',
+            'Created by import_receptor_model()'
+        ))
+        conn_p.commit()
+
+        # --- Step 5: Create stub pdb_template record ---
+        columns_dict = {
+            'pdb_id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
+            'pdb_template_name': 'TEXT UNIQUE NOT NULL',
+            'pdb_model_name': 'TEXT NOT NULL',
+            'project_name': 'TEXT',
+            'original_pdb_path': 'TEXT NOT NULL',
+            'processed_pdb_path': 'TEXT NOT NULL',
+            'checked_pdb_path': 'TEXT NOT NULL',
+            'template_folder_path': 'TEXT NOT NULL',
+            'pdb_analysis': 'TEXT',
+            'his_names': 'TEXT',
+            'chains': 'TEXT',
+            'resolution': 'REAL',
+            'atom_count': 'INTEGER',
+            'has_ligands': 'BOOLEAN',
+            'renumbering_dict': 'TEXT',
+            'status': "TEXT DEFAULT 'created'",
+            'created_date': "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+            'last_modified': "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+            'notes': 'TEXT',
+        }
+        self._create_table_from_columns_dict(cur_p, 'pdb_templates', columns_dict, verbose=False)
+        self._update_legacy_table_columns(cur_p, 'pdb_templates', columns_dict, verbose=False)
+
+        cur_p.execute("SELECT COUNT(*) FROM pdb_templates WHERE pdb_template_name = ?", (stub_name,))
+        if cur_p.fetchone()[0] == 0:
+            _checked_pdb_for_stub = checked_pdb_dest if pdb_src is not None else pdbqt_dest
+            cur_p.execute('''
+                INSERT INTO pdb_templates
+                    (pdb_template_name, pdb_model_name, project_name,
+                     original_pdb_path, processed_pdb_path, checked_pdb_path,
+                     template_folder_path, renumbering_dict, status, notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                stub_name, stub_name, self.name,
+                pdb_src or pdbqt_dest, pdb_src or pdbqt_dest, _checked_pdb_for_stub,
+                receptor_folder,
+                '{}', 'imported',
+                'Auto-generated stub for imported receptor'
+            ))
+        conn_p.commit()
+        cur_p.execute("SELECT pdb_id FROM pdb_templates WHERE pdb_template_name = ?", (stub_name,))
+        stub_pdb_id = cur_p.fetchone()[0]
+        conn_p.close()
+
+        # --- Step 6: Insert receptor_models record with placeholder configs ---
+        resolved_notes = notes if notes else f"Imported from {input_folder_path}"
+        conn_r = sqlite3.connect(receptors_db_path)
+        cur_r = conn_r.cursor()
+        cur_r.execute('''
+            INSERT INTO receptor_models
+                (pdb_id, receptor_model_name, template_name, pdb_model_name,
+                 pdb_to_convert, pdbqt_file, configs, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            stub_pdb_id,
+            receptor_model_name,
+            stub_name,
+            stub_name,
+            pdbqt_dest,
+            pdbqt_dest,
+            '{}',
+            resolved_notes
+        ))
+        new_id = cur_r.lastrowid
+        conn_r.commit()
+        conn_r.close()
+
+        # --- Step 7: Copy all input files into the properly named grid folder ---
+        # All docking callers expect the FLD and the receptor PDBQT inside the
+        # grids folder to follow the naming convention produced by the normal
+        # workflow (tleap → AutoGrid4):
+        #   receptor_checked_<charge_model>.maps.fld
+        #   receptor_checked_<charge_model>.pdbqt
+        # Files are copied verbatim first, then the FLD and PDBQT are renamed.
+        grids_dest = os.path.join(receptor_folder,
+                                  f"RecMod_{new_id}_grid_files_{charge_model}")
+        os.makedirs(grids_dest, exist_ok=True)
+        for fname in all_files:
+            shutil.copy2(os.path.join(input_folder_path, fname),
+                         os.path.join(grids_dest, fname))
+
+        # Rename the FLD file to the expected canonical name
+        for fname in fld_files:
+            src = os.path.join(grids_dest, fname)
+            dst = os.path.join(grids_dest, f"{canonical_stem}.maps.fld")
+            if src != dst:
+                os.rename(src, dst)
+                print(f"  Renamed FLD: {fname} → {canonical_stem}.maps.fld")
+
+        # Place the receptor PDBQT inside the grids folder under the canonical
+        # name so that the FLD reference and AutoDock/Vina lookups are consistent
+        canonical_pdbqt_in_grids = os.path.join(grids_dest, f"{canonical_stem}.pdbqt")
+        shutil.copy2(pdbqt_src, canonical_pdbqt_in_grids)
+        print(f"  Copied PDBQT into grids folder: {canonical_stem}.pdbqt")
+
+        # Rename all .map/.xyz files to the canonical stem and update the fld's
+        # internal references. Required so Vina (which derives map filenames from
+        # the prefix directly) can find them; AutoDock GPU is unaffected because
+        # it runs from the grid directory and uses the fld's internal references.
+        self._normalize_grid_maps(grids_dest, canonical_stem)
+
+        print(f"  Copied grid files to: {grids_dest}")
+        configs['grids_path'] = grids_dest
+
+        # --- Step 8: Update receptor_models with final configs ---
+        conn_r = sqlite3.connect(receptors_db_path)
+        cur_r = conn_r.cursor()
+        cur_r.execute("UPDATE receptor_models SET configs = ? WHERE id = ?",
+                      (json.dumps(configs, indent=2), new_id))
+        conn_r.commit()
+        conn_r.close()
+
+        # --- Step 9: Collect tleap template (shared by fingerprints and MD) ---
+        print(f"\n{'=' * 70}")
+        print("TLEAP TEMPLATE SETUP")
+        print(f"{'=' * 70}")
+        print("A tleap template is needed for compute_fingerprints() (MMGBSA/ProLIF)")
+        print("and for perform_md_assay() when using this imported receptor.")
+        print("Providing it now avoids prompts during later analyses.")
+        print("Solvation commands in the template are stripped automatically for")
+        print("fingerprints/MMGBSA and kept intact for molecular dynamics.")
+        print()
+        setup_now = input("Set up tleap template now? (yes/skip) [yes]: ").strip().lower()
+        if setup_now not in ('skip', 'no', 'n'):
+            self._show_tleap_template_guide_for_fps()
+            template_content = None
+            while True:
+                tpath = self._prompt("\n📂 Path to tleap template file (or 'skip'): ")
+                if tpath.lower() in ('skip', ''):
+                    print("⚠️  Template skipped — will be requested on first use.")
+                    break
+                tpath = os.path.expanduser(tpath)
+                if not os.path.isfile(tpath):
+                    print(f"❌ File not found: {tpath}")
+                    continue
+                with open(tpath, 'r') as fh:
+                    template_content = fh.read()
+                n_lines = len(template_content.splitlines())
+                print(f"✅ Template loaded: {os.path.basename(tpath)} ({n_lines} lines)")
+                break
+
+            if template_content is not None:
+                print("\nAttach any custom .lib or .frcmod files required by the template.")
+                print("Enter 'done' when finished.")
+                custom_parameter_files = []
+                while True:
+                    raw = input("  Path to custom file (or 'done'): ").strip()
+                    if raw.lower() in ('done', ''):
+                        break
+                    raw = os.path.expanduser(raw)
+                    if not os.path.isfile(raw):
+                        print(f"  ❌ File not found: {raw}")
+                        continue
+                    with open(raw, 'r') as fh:
+                        content = fh.read()
+                    filename = os.path.basename(raw)
+                    custom_parameter_files.append({'filename': filename, 'content': content})
+                    print(f"  ✓ Attached: {filename}")
+
+                tleap_config_to_store = {
+                    'template_content': template_content,
+                    'custom_parameter_files': custom_parameter_files,
+                }
+                conn_r = sqlite3.connect(receptors_db_path)
+                cur_r = conn_r.cursor()
+                try:
+                    cur_r.execute("ALTER TABLE receptor_models ADD COLUMN tleap_config TEXT")
+                except sqlite3.OperationalError:
+                    pass
+                cur_r.execute(
+                    "UPDATE receptor_models SET tleap_config = ? WHERE id = ?",
+                    (json.dumps(tleap_config_to_store), new_id)
+                )
+                conn_r.commit()
+                conn_r.close()
+                print(f"✅ tleap template stored — will not be requested again.")
+
+        print(f"\n{'=' * 80}")
+        print(f"RECEPTOR MODEL IMPORTED SUCCESSFULLY")
+        print(f"{'=' * 80}")
+        print(f"  Name:       {receptor_model_name}  (ID: {new_id})")
+        print(f"  PDBQT:      {pdbqt_dest}")
+        print(f"  Grid files: {grids_dest}")
+        print(f"  Center:     x={configs['center']['x']}, y={configs['center']['y']}, z={configs['center']['z']}")
+        print(f"  Size:       x={configs['size']['x']}, y={configs['size']['y']}, z={configs['size']['z']}")
+        print(f"  Spacing:    {configs['spacing']}")
+        print(f"  Note: ProLIF residue labels will use the imported PDBQT numbering directly.")
+        print(f"{'=' * 80}")
+        return new_id
+
+    def _parse_gpf_box_params(self, gpf_path):
+        """Parse gridcenter, npts, and spacing from an AutoGrid .gpf file."""
+        center = None
+        npts = None
+        spacing = 0.375  # AutoGrid default
+
+        try:
+            with open(gpf_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith('gridcenter'):
+                        parts = line.split()
+                        if len(parts) >= 4:
+                            if parts[1].lower() == 'auto':
+                                print("  Warning: gridcenter is 'auto' in .gpf — center set to 0.0, 0.0, 0.0.")
+                                center = {'x': 0.0, 'y': 0.0, 'z': 0.0}
+                            else:
+                                center = {
+                                    'x': float(parts[1]),
+                                    'y': float(parts[2]),
+                                    'z': float(parts[3])
+                                }
+                    elif line.startswith('npts'):
+                        parts = line.split()
+                        if len(parts) >= 4:
+                            npts = {
+                                'x': int(parts[1]),
+                                'y': int(parts[2]),
+                                'z': int(parts[3])
+                            }
+                    elif line.startswith('spacing'):
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            spacing = float(parts[1])
+
+            if center is None or npts is None:
+                print(f"  Error: could not parse 'gridcenter' or 'npts' from {gpf_path}.")
+                return None
+
+            size = {
+                'x': round(npts['x'] * spacing, 4),
+                'y': round(npts['y'] * spacing, 4),
+                'z': round(npts['z'] * spacing, 4),
+            }
+
+            return {
+                'center': center,
+                'size': size,
+                'spacing': spacing,
+                'dielectric': -0.1465,
+                'smooth': 0.5,
+                'biases': None,
+            }
+
+        except Exception as e:
+            print(f"  Error parsing .gpf file: {e}")
+            return None
+
+    def _parse_map_box_params(self, map_path):
+        """Parse SPACING, NELEMENTS, and CENTER from an AutoGrid .map file header.
+
+        Used as a fallback when no .gpf file is available (e.g. ensemble-derived maps).
+        AutoGrid .map headers contain lines like:
+            SPACING 0.375
+            NELEMENTS 40 40 40
+            CENTER -5.000 10.000 3.000
+        """
+        center = None
+        npts = None
+        spacing = 0.375
+
+        try:
+            with open(map_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith('SPACING'):
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            spacing = float(parts[1])
+                    elif line.startswith('NELEMENTS'):
+                        parts = line.split()
+                        if len(parts) >= 4:
+                            npts = {
+                                'x': int(parts[1]),
+                                'y': int(parts[2]),
+                                'z': int(parts[3])
+                            }
+                    elif line.startswith('CENTER'):
+                        parts = line.split()
+                        if len(parts) >= 4:
+                            center = {
+                                'x': float(parts[1]),
+                                'y': float(parts[2]),
+                                'z': float(parts[3])
+                            }
+
+            if center is None or npts is None:
+                print(f"  Error: could not parse 'CENTER' or 'NELEMENTS' from {map_path}.")
+                return None
+
+            size = {
+                'x': round(npts['x'] * spacing, 4),
+                'y': round(npts['y'] * spacing, 4),
+                'z': round(npts['z'] * spacing, 4),
+            }
+
+            return {
+                'center': center,
+                'size': size,
+                'spacing': spacing,
+                'dielectric': -0.1465,
+                'smooth': 0.5,
+                'biases': None,
+            }
+
+        except Exception as e:
+            print(f"  Error parsing .map file '{map_path}': {e}")
+            return None
+
+
+# --- Module-level worker functions for MolDock._compute_mmgbsa_parallel() ---
+#
+# These must live at module level (rather than as MolDock methods) so they are
+# picklable for concurrent.futures.ProcessPoolExecutor, per the project's
+# convention for parallel worker functions.
+
+_gpu_lock = None
+
+
+def _init_mmgbsa_worker(lock):
+    """
+    ProcessPoolExecutor initializer: stashes the shared GPU lock in each worker
+    process and silences stdout/stderr for the worker's whole lifetime. The helper
+    methods invoked by _compute_mmgbsa_pose_worker() (tleap/sander/MMPBSA.py wrapper
+    calls) print their own status/error lines; with many workers running
+    concurrently these interleave into unreadable output, so each worker is muted
+    and progress is reported solely through the parent process's progress bar.
+    """
+    global _gpu_lock
+    _gpu_lock = lock
+    import sys
+    devnull = open(os.devnull, 'w')
+    sys.stdout = devnull
+    sys.stderr = devnull
+
+
+def _compute_mmgbsa_pose_worker(task):
+    """
+    Runs the full per-pose MMGBSA pipeline (restore pose -> build complex -> minimize
+    -> MMGBSA) inside a worker process for a single docked pose. Every filesystem path
+    used here is scoped to this pose's own subdirectory (task['work_subdir']) so
+    concurrent workers never collide on the fixed-name scratch files written by
+    tleap/sander/MMPBSA.py. GPU minimization (if used) is serialized via the shared
+    lock stashed by _init_mmgbsa_worker().
+
+    Returns a dict: {"success", "pose_id", "ligname", "mmgbsa_df", "total_energy",
+    "gas_energy", "error"}. On any exception the same fallback semantics as the
+    original sequential loop are used (total_energy = gas_energy = -1).
+    """
+    pose_id = task['pose_id']
+    ligname = task['ligname']
+    pose_output_dir = None
+
+    try:
+        moldock = MolDock.from_path(task['project_name'], task['project_path'])
+
+        output_dir, output_file = moldock._restore_single_docked_pose(
+            task['results_db'], ligname, task['run_number'], work_subdir=task['work_subdir']
+        )
+        pose_output_dir = output_dir
+
+        ligand_params_file, frcmod_file = task['ligand_params_file'], task['frcmod_file']
+
+        if task['is_stub_receptor']:
+            _receptor_pdb = os.path.join(
+                os.path.dirname(moldock._remap_project_path(
+                    task['assay_info'].get('receptor_info', {}).get('pdbqt_file', '')
+                )),
+                'receptor_checked.pdb'
+            )
+            prmtop_file, inpcrd_file, output_pdb_file = moldock._prepare_complex_prmtop_inpcrd_from_template_fps(
+                output_file, output_dir, task['fps_tleap_config'], ligand_params_file, frcmod_file, _receptor_pdb
+            )
+        else:
+            prmtop_file, inpcrd_file, output_pdb_file = moldock._prepare_complex_prmtop_inpcrd(
+                ligand_params_file, frcmod_file, task['assay_info'], output_dir, output_file, pose_id, ligname=ligname
+            )
+
+        if task['minimize']:
+            try:
+                rst_cpptraj_file, output_pdb_file = moldock._minimize_complex(
+                    prmtop_file, inpcrd_file, output_dir, ligname, pose_id, output_pdb_file, gpu_lock=_gpu_lock
+                )
+            except Exception:
+                rst_cpptraj_file = inpcrd_file
+        else:
+            rst_cpptraj_file = inpcrd_file
+
+        renumbering_dict = task['renumbering_dict']
+
+        complex_prmtop, receptor_prmtop, ligand_prmtop = moldock._prepare_mmgbsa_files(
+            ligname, pose_id, prmtop_file, output_dir
+        )
+        moldock._compute_mmgbsa_fingerprint(
+            ligname, pose_id, complex_prmtop, receptor_prmtop, ligand_prmtop, rst_cpptraj_file, output_dir
+        )
+        mmgbsa_df = moldock._parse_mmgbsa_decomposition_output(ligname, pose_id, output_dir)
+
+        if not mmgbsa_df.empty:
+            mmgbsa_df['residue'] = mmgbsa_df['residue'].apply(lambda x: renumbering_dict.get(x, x))
+            total_energy = round(mmgbsa_df['total'].sum(), 3)
+            gas_energy = round(mmgbsa_df['gas'].sum(), 3)
+        else:
+            total_energy, gas_energy = -1, -1
+
+        return {
+            "success": True,
+            "pose_id": pose_id,
+            "ligname": ligname,
+            "mmgbsa_df": mmgbsa_df,
+            "total_energy": total_energy,
+            "gas_energy": gas_energy,
+            "error": None,
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "pose_id": pose_id,
+            "ligname": ligname,
+            "mmgbsa_df": None,
+            "total_energy": -1,
+            "gas_energy": -1,
+            "error": str(e),
+        }
+
+    finally:
+        if task.get('clean_files') and pose_output_dir:
+            shutil.rmtree(pose_output_dir, ignore_errors=True)

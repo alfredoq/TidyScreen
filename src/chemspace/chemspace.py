@@ -4,7 +4,7 @@ import sqlite3
 import pandas as pd
 import re
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Tuple, Optional, Any, Callable, Set, Union
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import cpu_count
@@ -31,14 +31,154 @@ ActivateProject = tidyscreen.ActivateProject
 
 ## Module level helper functions for multiprocessing workers
 
-def _process_chunk_worker(chunk_df: pd.DataFrame, smiles_column: str, 
+def _count_stereocenters(mol) -> int:
+    """
+    Count stereocenters (both assigned and unassigned) in a molecule, for use as a
+    physicochemical descriptor alongside RDKit's built-in Descriptors._descList.
+
+    Unassigned centers are included because they are still stereogenic -- a compound
+    with unspecified stereo at a center is exactly as synthetically/analytically
+    complex as one with it defined.
+    """
+    from rdkit import Chem
+
+    return len(Chem.FindMolChiralCenters(mol, includeUnassigned=True, useLegacyImplementation=False))
+
+# Custom descriptors not present in rdkit.Chem.Descriptors._descList, merged in
+# wherever physicochemical descriptor functions are looked up by name.
+CUSTOM_DESCRIPTOR_FUNCS: Dict[str, Callable] = {
+    'NumStereocenters': _count_stereocenters,
+}
+
+def _get_descriptor_funcs() -> Dict[str, Callable]:
+    """
+    Build the full name -> function lookup for physicochemical descriptors: RDKit's
+    built-in Descriptors._descList plus TidyScreen's CUSTOM_DESCRIPTOR_FUNCS (e.g.
+    NumStereocenters). Use this instead of building the dict from Descriptors._descList
+    alone, so custom descriptors are available for workflow creation, filtering, and
+    profiling consistently.
+    """
+    from rdkit.Chem import Descriptors
+
+    descriptor_funcs = {name: func for name, func in Descriptors._descList}
+    descriptor_funcs.update(CUSTOM_DESCRIPTOR_FUNCS)
+    return descriptor_funcs
+
+def _strip_salts_from_smiles(smiles: str, remover) -> Tuple[Optional[str], bool]:
+    """
+    Strip salt/counter-ion fragments (e.g. Cl-, Na+) from a SMILES string using
+    RDKit's SaltRemover. Returns None if the SMILES fails to parse entirely, so the
+    caller can drop the compound instead of inserting an unprocessed/invalid SMILES.
+
+    Args:
+        smiles (str): SMILES string to clean
+        remover: An `rdkit.Chem.SaltRemover.SaltRemover` instance
+
+    Returns:
+        Tuple[Optional[str], bool]: (cleaned SMILES, or None if parsing failed;
+            whether a fragment was actually removed)
+    """
+    from rdkit import Chem
+
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None, False
+
+    stripped_mol = remover.StripMol(mol, dontRemoveEverything=True)
+    if stripped_mol is None or stripped_mol.GetNumAtoms() == 0:
+        return smiles, False
+
+    was_stripped = stripped_mol.GetNumAtoms() != mol.GetNumAtoms()
+    if not was_stripped:
+        return smiles, False
+
+    return Chem.MolToSmiles(stripped_mol), True
+
+def _retain_largest_fragment_from_smiles(smiles: str, chooser) -> Tuple[Optional[str], bool]:
+    """
+    Reduce a multi-fragment SMILES down to only its largest fragment (by atom count)
+    using RDKit's LargestFragmentChooser. This catches disconnected components (solvates,
+    unusual counter-ions, etc.) that SaltRemover's curated salt list doesn't recognize.
+    Returns None if the SMILES fails to parse entirely, so the caller can drop the
+    compound instead of inserting an unprocessed/invalid SMILES.
+
+    Args:
+        smiles (str): SMILES string to clean
+        chooser: An `rdkit.Chem.MolStandardize.rdMolStandardize.LargestFragmentChooser` instance
+
+    Returns:
+        Tuple[Optional[str], bool]: (reduced SMILES, or None if parsing failed;
+            whether a fragment was actually discarded)
+    """
+    from rdkit import Chem
+
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None, False
+
+    if len(Chem.GetMolFrags(mol)) <= 1:
+        return smiles, False
+
+    largest_mol = chooser.choose(mol)
+    if largest_mol is None or largest_mol.GetNumAtoms() == 0:
+        return smiles, False
+
+    was_reduced = largest_mol.GetNumAtoms() != mol.GetNumAtoms()
+    if not was_reduced:
+        return smiles, False
+
+    return Chem.MolToSmiles(largest_mol), True
+
+def _compute_structure_dedup_key(smiles: str, salt_remover, fragment_chooser) -> Optional[str]:
+    """
+    Compute a canonical structure key used purely to detect duplicate molecules,
+    independent of the compound's name and of how its SMILES happens to be written.
+
+    Two rows are considered the same molecule here even when their raw SMILES
+    differ syntactically (e.g. atom/ring-closure ordering) or represent different
+    salt forms of the same parent structure (e.g. a free base vs. its HCl salt) --
+    this always strips salts/counter-ions and reduces to the largest fragment for
+    the purpose of the comparison, regardless of the strip_salts/retain_largest_fragment
+    options controlling what is actually *stored*.
+
+    Args:
+        smiles (str): SMILES string to key
+        salt_remover: An `rdkit.Chem.SaltRemover.SaltRemover` instance
+        fragment_chooser: An `rdkit.Chem.MolStandardize.rdMolStandardize.LargestFragmentChooser` instance
+
+    Returns:
+        Optional[str]: Canonical parent-structure SMILES, or None if the SMILES can't be parsed
+    """
+    from rdkit import Chem
+
+    working_smiles = smiles
+
+    stripped, _ = _strip_salts_from_smiles(working_smiles, salt_remover)
+    if stripped is None:
+        return None
+    working_smiles = stripped
+
+    reduced, _ = _retain_largest_fragment_from_smiles(working_smiles, fragment_chooser)
+    if reduced is None:
+        return None
+    working_smiles = reduced
+
+    mol = Chem.MolFromSmiles(working_smiles)
+    if mol is None:
+        return None
+
+    return Chem.MolToSmiles(mol)
+
+def _process_chunk_worker(chunk_df: pd.DataFrame, smiles_column: str,
                          name_column: Optional[str], flag_column: Optional[str],
-                         name_available: bool, flag_available: bool, 
-                         start_idx: int, flag_description_available) -> List[Tuple[str, str, str]]:
+                         name_available: bool, flag_available: bool,
+                         start_idx: int, flag_description_available,
+                         strip_salts: bool = False,
+                         retain_largest_fragment: bool = False) -> Tuple[List[Tuple[str, str, str, str]], int, int, int, List[str]]:
     """
     Worker function to process a chunk of DataFrame in parallel.
     This function must be at module level to be pickleable for multiprocessing.
-    
+
     Args:
         chunk_df (pd.DataFrame): Chunk of DataFrame to process
         smiles_column (str): Name of the SMILES column
@@ -48,16 +188,38 @@ def _process_chunk_worker(chunk_df: pd.DataFrame, smiles_column: str,
         flag_available (bool): Whether flag column is available
         start_idx (int): Starting index for compound naming
         flag_description_available (bool): Whether flag description column is available
-        
+        strip_salts (bool): Whether to strip salt/counter-ion fragments from SMILES using RDKit's SaltRemover
+        retain_largest_fragment (bool): Whether to reduce multi-fragment SMILES down to only
+            their largest fragment using RDKit's LargestFragmentChooser (applied after strip_salts)
+
     Returns:
-        List[Tuple[str, str, str]]: List of tuples (smiles, name, flag)
+        Tuple[List[Tuple[str, str, str, str]], int, int, int, List[str]]: (list of (smiles, name, flag,
+            flag_description) tuples, count of compounds whose SMILES had a salt/counter-ion
+            fragment removed, count of compounds reduced to their largest fragment, count of
+            compounds dropped because RDKit could not parse their SMILES, the original (pre-cleanup)
+            SMILES strings of those dropped compounds)
     """
     compounds_data = []
-    
+    failed_smiles = []
+    salts_stripped_count = 0
+    fragments_retained_count = 0
+    failed_count = 0
+
+    remover = None
+    if strip_salts:
+        from rdkit.Chem import SaltRemover
+        remover = SaltRemover.SaltRemover()
+
+    fragment_chooser = None
+    if retain_largest_fragment:
+        from rdkit.Chem.MolStandardize import rdMolStandardize
+        fragment_chooser = rdMolStandardize.LargestFragmentChooser()
+
     for local_idx, (_, row) in enumerate(chunk_df.iterrows()):
         global_idx = start_idx + local_idx
         smiles = str(row[smiles_column]).strip()
-        
+        original_smiles = smiles
+
         # Handle name column - use provided column or generate from index
         if name_available:
             name = str(row[name_column]).strip()
@@ -65,7 +227,7 @@ def _process_chunk_worker(chunk_df: pd.DataFrame, smiles_column: str,
                 name = f"compound_{global_idx + 1}"  # Generate name if empty
         else:
             name = f"compound_{global_idx + 1}"  # Generate name if column doesn't exist
-        
+
         # Handle flag column - use provided column or default to "nd"
         if flag_available:
             flag = str(row[flag_column]).strip()
@@ -73,7 +235,7 @@ def _process_chunk_worker(chunk_df: pd.DataFrame, smiles_column: str,
                 flag = "nd"  # Default flag if empty
         else:
             flag = "nd"  # Default flag if column doesn't exist
-        
+
         # Handle flag description - use provided column of default to "nd"
         if flag_description_available:
             flag_description = str(row.get("flag_description", "nd")).strip()
@@ -83,10 +245,28 @@ def _process_chunk_worker(chunk_df: pd.DataFrame, smiles_column: str,
         # Skip empty SMILES rows (only SMILES is mandatory)
         if not smiles or smiles.lower() in ['nan', 'none', '']:
             continue
-        
+
+        if remover is not None:
+            smiles, was_stripped = _strip_salts_from_smiles(smiles, remover)
+            if smiles is None:
+                failed_count += 1
+                failed_smiles.append(original_smiles)
+                continue
+            if was_stripped:
+                salts_stripped_count += 1
+
+        if fragment_chooser is not None:
+            smiles, was_reduced = _retain_largest_fragment_from_smiles(smiles, fragment_chooser)
+            if smiles is None:
+                failed_count += 1
+                failed_smiles.append(original_smiles)
+                continue
+            if was_reduced:
+                fragments_retained_count += 1
+
         compounds_data.append((smiles, name, flag, flag_description))
-    
-    return compounds_data
+
+    return compounds_data, salts_stripped_count, fragments_retained_count, failed_count, failed_smiles
 
 def _compute_inchi_keys_worker(chunk_data: List[Tuple[int, str, str, str]]) -> List[Tuple[int, str, str, str]]:
     """
@@ -137,51 +317,130 @@ def _compute_inchi_keys_worker(chunk_data: List[Tuple[int, str, str, str]]) -> L
         except Exception:
             # Error computing InChI key
             results.append((idx, 'ERROR', name))
-    
+
     return results
 
-def _filter_chunk_worker_by_instances(chunk_data: List[Tuple], filters_list: List[Tuple]) -> List[Dict]:
+def _suppress_tensorflow_logging() -> None:
+    """
+    Quiet TensorFlow's C++ startup logging (oneDNN notice, CUDA plugin registration
+    warnings, CPU feature guard) before something imports it. umap-learn's __init__
+    unconditionally tries to import its optional parametric-UMAP support, which pulls in
+    TensorFlow as a side effect of merely importing umap — even when it's never used.
+    Uses setdefault() so it never overrides an explicit user setting.
+    """
+    os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')
+    os.environ.setdefault('TF_ENABLE_ONEDNN_OPTS', '0')
+
+def _pack_fingerprint_bitstring(bitstring: str) -> bytes:
+    """
+    Pack an RDKit fingerprint bit-string ('0'/'1' chars, one byte each) into a compact
+    bytes blob (one bit per bit), for efficient storage. 8x smaller than the ASCII form.
+    """
+    bits = np.frombuffer(bitstring.encode('ascii'), dtype=np.uint8) - ord('0')
+    return np.packbits(bits).tobytes()
+
+def _compute_morgan_fingerprints_worker(chunk_data: List[Tuple[int, str, str]], radius: int,
+                                        fp_size: int) -> List[Tuple[int, object, str]]:
+    """
+    Worker function to compute Morgan fingerprints for a chunk of SMILES strings in parallel.
+    This function must be at module level to be pickleable for multiprocessing.
+
+    Args:
+        chunk_data (List[Tuple[int, str, str]]): List of tuples (row_index, smiles, compound_name)
+        radius (int): Morgan fingerprint radius
+        fp_size (int): Fingerprint bit-vector length
+
+    Returns:
+        List[Tuple[int, object, str]]: List of tuples (row_index, fingerprint_value, compound_name),
+            where fingerprint_value is a packed bytes blob on success, or the sentinel string
+            'INVALID_SMILES'/'ERROR' on failure
+    """
+    try:
+        # Import RDKit inside worker to avoid import issues
+        from rdkit import Chem
+        from rdkit.Chem import rdFingerprintGenerator
+
+        # Suppress RDKit warnings for cleaner parallel output
+        from rdkit import RDLogger
+        RDLogger.DisableLog('rdApp.*')
+
+        generator = rdFingerprintGenerator.GetMorganGenerator(radius=radius, fpSize=fp_size)
+
+    except ImportError:
+        # If RDKit is not available, return error for all compounds in chunk
+        return [(idx, 'ERROR', name) for idx, smiles, name in chunk_data]
+
+    results = []
+
+    for idx, smiles, name in chunk_data:
+        try:
+            # Skip empty or None SMILES
+            if not smiles or smiles.strip() == '':
+                results.append((idx, 'INVALID_SMILES', name))
+                continue
+
+            # Parse SMILES with RDKit
+            mol = Chem.MolFromSmiles(str(smiles).strip())
+
+            if mol is not None:
+                # Compute Morgan fingerprint, packed into a compact bytes blob for storage
+                fp = generator.GetFingerprint(mol)
+                results.append((idx, _pack_fingerprint_bitstring(fp.ToBitString()), name))
+            else:
+                # Invalid SMILES
+                results.append((idx, 'INVALID_SMILES', name))
+
+        except Exception:
+            # Error computing fingerprint
+            results.append((idx, 'ERROR', name))
+
+    return results
+
+def _filter_chunk_worker_by_instances(chunk_data: List[Tuple], filters_list: List[Tuple]) -> Tuple[List[Dict], Dict[int, int]]:
     """
     Memory-optimized version that only returns essential data.
+
+    Every filter is evaluated for every compound (no early exit), so that
+    compounds excluded overall (because they failed at least one filter) can
+    still be checked against each *other* filter individually.
+
+    Returns:
+        Tuple[List[Dict], Dict[int, int]]: (passing compounds, removed_matching_counts)
+            where removed_matching_counts maps filter index (position in
+            `filters_list`) to the number of compounds in this chunk that were
+            removed overall but still matched that particular filter.
     """
     try:
         from rdkit import Chem, RDLogger
         RDLogger.DisableLog('rdApp.*')
     except ImportError:
-        return [{"error": "RDKit not available"}]
-    
+        return [{"error": "RDKit not available"}], {}
+
     results = []
-    sorted_filters = sorted(filters_list, key=lambda x: (x[1] == 0, x[1]))
-    
+    removed_matching_counts = {i: 0 for i in range(len(filters_list))}
+    compiled_filters = [(Chem.MolFromSmarts(smarts_pattern), required_instances)
+                        for smarts_pattern, required_instances in filters_list]
+
     for compound_id, smiles, name, flag, inchi_key in chunk_data:
         try:
             mol = Chem.MolFromSmiles(smiles)
             if mol is None:
                 continue  # Skip invalid compounds entirely
-            
-            passes_all_filters = True
-            
-            # Apply filters with early termination but minimal metadata
-            for smarts_pattern, required_instances in sorted_filters:
+
+            filter_matches = []
+            for pattern, required_instances in compiled_filters:
+                if pattern is None:
+                    filter_matches.append(False)
+                    continue
+
                 try:
-                    pattern = Chem.MolFromSmarts(smarts_pattern)
-                    if pattern is None:
-                        passes_all_filters = False
-                        break
-                    
-                    matches = mol.GetSubstructMatches(pattern)
-                    match_count = len(matches)
-                    
-                    if match_count != required_instances:
-                        passes_all_filters = False
-                        break  # Early exit - don't process more filters
-                        
+                    match_count = len(mol.GetSubstructMatches(pattern))
+                    filter_matches.append(match_count == required_instances)
                 except Exception:
-                    passes_all_filters = False
-                    break
-            
+                    filter_matches.append(False)
+
             # Only store compounds that pass ALL filters
-            if passes_all_filters:
+            if all(filter_matches):
                 results.append({
                     'id': compound_id,
                     'smiles': smiles,
@@ -190,64 +449,160 @@ def _filter_chunk_worker_by_instances(chunk_data: List[Tuple], filters_list: Lis
                     'inchi_key': inchi_key
                     # Remove all the heavy metadata
                 })
-                
+            else:
+                for filter_idx, matched in enumerate(filter_matches):
+                    if matched:
+                        removed_matching_counts[filter_idx] += 1
+
         except Exception:
             continue  # Skip problematic compounds
-    
-    return results
 
-def _process_bimolecular_chunk_worker(chunk_data: List[Tuple], reaction_smarts: str, 
-                                    reaction_name: str, workflow_name: str) -> List[Dict[str, Any]]:
+    return results, removed_matching_counts
+
+def _filter_chunk_worker_by_descriptor_bounds(chunk_data: List[Tuple], descriptor_filters: List[Tuple]) -> Tuple[List[Dict], Dict[str, int]]:
+    """
+    Worker function applying RDKit descriptor [min, max] bounds to a chunk of compounds.
+    Mirrors _filter_chunk_worker_by_instances() but evaluates numeric descriptor ranges
+    instead of SMARTS+instance counts. Must be at module level to be pickleable for
+    multiprocessing.
+
+    Returns:
+        Tuple[List[Dict], Dict[str, int]]: (passing compounds, removed_counts) where
+            removed_counts maps descriptor name to the number of compounds in this
+            chunk excluded because that descriptor was the first one out of bounds
+            (filters are evaluated in order with early exit, so each removed compound
+            is attributed to exactly one descriptor).
+    """
+    try:
+        from rdkit import Chem
+        from rdkit import RDLogger
+        RDLogger.DisableLog('rdApp.*')
+    except ImportError:
+        return [{"error": "RDKit not available"}], {}
+
+    descriptor_funcs = _get_descriptor_funcs()
+    results = []
+    removed_counts = {name: 0 for name, _, _ in descriptor_filters}
+
+    for compound_id, smiles, name, flag, inchi_key in chunk_data:
+        try:
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is None:
+                continue  # Skip invalid compounds entirely
+
+            passes_all_filters = True
+
+            for descriptor_name, lower_bound, upper_bound in descriptor_filters:
+                descriptor_func = descriptor_funcs.get(descriptor_name)
+                if descriptor_func is None:
+                    passes_all_filters = False
+                    break
+
+                try:
+                    value = descriptor_func(mol)
+                except Exception:
+                    passes_all_filters = False
+                    break
+
+                if value < lower_bound or value > upper_bound:
+                    passes_all_filters = False
+                    removed_counts[descriptor_name] += 1
+                    break  # Early exit - don't process more descriptors
+
+            # Only store compounds that pass ALL descriptor filters
+            if passes_all_filters:
+                results.append({
+                    'id': compound_id,
+                    'smiles': smiles,
+                    'name': name or 'unknown',
+                    'flag': flag or 'nd',
+                    'inchi_key': inchi_key
+                })
+
+        except Exception:
+            continue  # Skip problematic compounds
+
+    return results, removed_counts
+
+def _process_bimolecular_chunk_worker(chunk_data: List[Tuple], reaction_smarts: str,
+                                    reaction_name: str, workflow_name: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Worker function to process a chunk of bimolecular reaction combinations.
     This function must be at module level to be pickleable for multiprocessing.
-    
+
     Args:
         chunk_data (List[Tuple]): List of (primary_compound, secondary_compound) tuples
         reaction_smarts (str): SMARTS pattern for the reaction
         reaction_name (str): Name of the reaction
         workflow_name (str): Name of the workflow
-        
+
     Returns:
-        List[Dict]: List of reaction products
+        Tuple[List[Dict], List[Dict]]: (products, ambiguous_reactants) — ambiguous_reactants has
+            one entry per reactant pair in this chunk for which RunReactants() returned more than
+            one product set (the pair matched the reaction template at more than one site).
     """
     try:
         from rdkit import Chem
         from rdkit.Chem import AllChem
         from rdkit import RDLogger
         RDLogger.DisableLog('rdApp.*')
-        
+
         products = []
-        
+        ambiguous_reactants = []
+
         # Parse reaction
         rxn = AllChem.ReactionFromSmarts(reaction_smarts)
         if rxn is None:
-            return []
-        
+            return [], []
+
         for primary_compound, secondary_compound in chunk_data:
             try:
                 # Parse molecules
                 primary_mol = Chem.MolFromSmiles(primary_compound['smiles'])
                 secondary_mol = Chem.MolFromSmiles(secondary_compound['smiles'])
-                
+
                 if primary_mol is None or secondary_mol is None:
                     continue
-                
+
                 # Run reaction
                 reaction_results = rxn.RunReactants((primary_mol, secondary_mol))
-                
-                # Process products
+
+                # Flag reactant pairs that matched the reaction template at more than one
+                # site, generating more than one product possibility for the same pair
+                if len(reaction_results) > 1:
+                    primary_id = primary_compound.get('id', 'unk')
+                    secondary_id = secondary_compound.get('id', 'unk')
+                    ambiguous_reactants.append({
+                        'reactant1_id': primary_id,
+                        'reactant1_name': primary_compound.get('name', f"cpd_{primary_id}"),
+                        'reactant1_smiles': primary_compound['smiles'],
+                        'reactant2_id': secondary_id,
+                        'reactant2_name': secondary_compound.get('name', f"cpd_{secondary_id}"),
+                        'reactant2_smiles': secondary_compound['smiles'],
+                        'product_possibilities': len(reaction_results),
+                    })
+
+                # Process products. When a reactant pair matches at more than one
+                # site (ambiguous), different product_sets can yield the exact same
+                # product structure (e.g. a symmetric reactant reacting at either of
+                # two equivalent groups) -- dedupe by canonical SMILES within this
+                # pair so the same product isn't written to the database twice.
+                seen_product_smiles = set()
                 for product_set_idx, product_set in enumerate(reaction_results):
                     for product_idx, product_mol in enumerate(product_set):
                         try:
                             Chem.SanitizeMol(product_mol)
                             product_smiles = Chem.MolToSmiles(product_mol)
-                            
+
+                            if product_smiles in seen_product_smiles:
+                                continue
+                            seen_product_smiles.add(product_smiles)
+
                             # Generate product name
                             primary_name = primary_compound.get('name', f"cpd_{primary_compound.get('id', 'unk')}")
                             secondary_name = secondary_compound.get('name', f"cpd_{secondary_compound.get('id', 'unk')}")
                             product_name = f"{primary_name}+{secondary_name}_{reaction_name}_{product_set_idx}_{product_idx}"
-                            
+
                             products.append({
                                 'smiles': product_smiles,
                                 'name': product_name,
@@ -259,69 +614,92 @@ def _process_bimolecular_chunk_worker(chunk_data: List[Tuple], reaction_smarts: 
                                 'reaction_name': reaction_name,
                                 'workflow': workflow_name
                             })
-                            
+
                         except Exception:
                             continue
-            
+
             except Exception:
                 continue
-        
-        return products
-        
-    except Exception:
-        return []
 
-def _process_unimolecular_chunk_worker(chunk_data: List[Dict], reaction_smarts: str, 
-                                     reaction_name: str, workflow_name: str, 
-                                     name_prefix: str) -> List[Dict[str, Any]]:
+        return products, ambiguous_reactants
+
+    except Exception:
+        return [], []
+
+def _process_unimolecular_chunk_worker(chunk_data: List[Dict], reaction_smarts: str,
+                                     reaction_name: str, workflow_name: str,
+                                     name_prefix: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Worker function to process a chunk of unimolecular reactions.
     This function must be at module level to be pickleable for multiprocessing.
-    
+
     Args:
         chunk_data (List[Dict]): List of compound dictionaries
         reaction_smarts (str): SMARTS pattern for the reaction
         reaction_name (str): Name of the reaction
         workflow_name (str): Name of the workflow
         name_prefix (str): Prefix for product names
-        
+
     Returns:
-        List[Dict]: List of reaction products
+        Tuple[List[Dict], List[Dict]]: (products, ambiguous_reactants) — ambiguous_reactants has
+            one entry per reactant in this chunk for which RunReactants() returned more than one
+            product set (the reactant matched the reaction template at more than one site).
     """
     try:
         from rdkit import Chem
         from rdkit.Chem import AllChem
         from rdkit import RDLogger
         RDLogger.DisableLog('rdApp.*')
-        
+
         products = []
-        
+        ambiguous_reactants = []
+
         # Parse reaction
         rxn = AllChem.ReactionFromSmarts(reaction_smarts)
         if rxn is None:
-            return []
-        
+            return [], []
+
         for compound in chunk_data:
             try:
                 # Parse molecule
                 reactant_mol = Chem.MolFromSmiles(compound['smiles'])
                 if reactant_mol is None:
                     continue
-                
+
                 # Run reaction
                 reaction_results = rxn.RunReactants((reactant_mol,))
-                
-                # Process products
+
+                # Flag reactants that matched the reaction template at more than one site,
+                # generating more than one distinct product from that reactant alone
+                if len(reaction_results) > 1:
+                    reactant_id = compound.get('id', 'unk')
+                    ambiguous_reactants.append({
+                        'reactant_id': reactant_id,
+                        'reactant_name': compound.get('name', f"cpd_{reactant_id}"),
+                        'reactant_smiles': compound['smiles'],
+                        'product_possibilities': len(reaction_results),
+                    })
+
+                # Process products. When a reactant matches at more than one site
+                # (ambiguous), different product_sets can yield the exact same
+                # product structure (e.g. a symmetric reactant reacting at either of
+                # two equivalent groups) -- dedupe by canonical SMILES within this
+                # reactant so the same product isn't written to the database twice.
+                seen_product_smiles = set()
                 for product_set_idx, product_set in enumerate(reaction_results):
                     for product_idx, product_mol in enumerate(product_set):
                         try:
                             Chem.SanitizeMol(product_mol)
                             product_smiles = Chem.MolToSmiles(product_mol)
-                            
+
+                            if product_smiles in seen_product_smiles:
+                                continue
+                            seen_product_smiles.add(product_smiles)
+
                             # Generate product name
                             original_name = compound.get('name', f"cpd_{compound.get('id', 'unk')}")
                             product_name = f"{name_prefix}{original_name}_{reaction_name}_{product_set_idx}_{product_idx}"
-                            
+
                             products.append({
                                 'smiles': product_smiles,
                                 'name': product_name,
@@ -331,33 +709,35 @@ def _process_unimolecular_chunk_worker(chunk_data: List[Dict], reaction_smarts: 
                                 'reaction_name': reaction_name,
                                 'workflow': workflow_name
                             })
-                            
+
                         except Exception:
                             continue
-                            
+
             except Exception:
                 continue
-        
-        return products
-        
-    except Exception:
-        return []
 
-def _process_bimolecular_chunk_to_file_worker(chunk_data: List[Tuple], reaction_smarts: str, 
-                                            reaction_name: str, workflow_name: str, 
-                                            output_file_path: str) -> int:
+        return products, ambiguous_reactants
+
+    except Exception:
+        return [], []
+
+def _process_bimolecular_chunk_to_file_worker(chunk_data: List[Tuple], reaction_smarts: str,
+                                            reaction_name: str, workflow_name: str,
+                                            output_file_path: str) -> Tuple[int, List[Dict[str, Any]]]:
     """
     Worker function to process a bimolecular chunk and write results directly to a CSV file.
-    
+
     Args:
         chunk_data (List[Tuple]): List of (primary_compound, secondary_compound) tuples
         reaction_smarts (str): SMARTS pattern for the reaction
         reaction_name (str): Name of the reaction
         workflow_name (str): Name of the workflow
         output_file_path (str): Path to output CSV file
-        
+
     Returns:
-        int: Number of products written to file
+        Tuple[int, List[Dict]]: (products_count, ambiguous_reactants) — ambiguous_reactants has
+            one entry per reactant pair in this chunk for which RunReactants() returned more than
+            one product set (the pair matched the reaction template at more than one site).
     """
     try:
         import csv
@@ -365,45 +745,71 @@ def _process_bimolecular_chunk_to_file_worker(chunk_data: List[Tuple], reaction_
         from rdkit.Chem import AllChem
         from rdkit import RDLogger
         RDLogger.DisableLog('rdApp.*')
-        
+
         products_count = 0
-        
+        ambiguous_reactants = []
+
         # Parse reaction
         rxn = AllChem.ReactionFromSmarts(reaction_smarts)
         if rxn is None:
-            return 0
-        
+            return 0, []
+
         # Open file for writing
         with open(output_file_path, 'w', newline='', encoding='utf-8') as csvfile:
             fieldnames = ['smiles', 'name', 'flag', 'reactant1_name', 'reactant1_smiles',
                          'reactant2_name', 'reactant2_smiles', 'reaction_name', 'workflow']
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
-            
+
             for primary_compound, secondary_compound in chunk_data:
                 try:
                     # Parse molecules
                     primary_mol = Chem.MolFromSmiles(primary_compound['smiles'])
                     secondary_mol = Chem.MolFromSmiles(secondary_compound['smiles'])
-                    
+
                     if primary_mol is None or secondary_mol is None:
                         continue
-                    
+
                     # Run reaction
                     reaction_results = rxn.RunReactants((primary_mol, secondary_mol))
-                    
-                    # Process products and write immediately
+
+                    # Flag reactant pairs that matched the reaction template at more than one
+                    # site, generating more than one product possibility for the same pair
+                    if len(reaction_results) > 1:
+                        primary_id = primary_compound.get('id', 'unk')
+                        secondary_id = secondary_compound.get('id', 'unk')
+                        ambiguous_reactants.append({
+                            'reactant1_id': primary_id,
+                            'reactant1_name': primary_compound.get('name', f"cpd_{primary_id}"),
+                            'reactant1_smiles': primary_compound['smiles'],
+                            'reactant2_id': secondary_id,
+                            'reactant2_name': secondary_compound.get('name', f"cpd_{secondary_id}"),
+                            'reactant2_smiles': secondary_compound['smiles'],
+                            'product_possibilities': len(reaction_results),
+                        })
+
+                    # Process products and write immediately. When a reactant pair
+                    # matches at more than one site (ambiguous), different
+                    # product_sets can yield the exact same product structure
+                    # (e.g. a symmetric reactant reacting at either of two
+                    # equivalent groups) -- dedupe by canonical SMILES within this
+                    # pair so the same product isn't written to the database twice.
+                    seen_product_smiles = set()
                     for product_set_idx, product_set in enumerate(reaction_results):
                         for product_idx, product_mol in enumerate(product_set):
                             try:
                                 Chem.SanitizeMol(product_mol)
                                 product_smiles = Chem.MolToSmiles(product_mol)
-                                
+
+                                if product_smiles in seen_product_smiles:
+                                    continue
+                                seen_product_smiles.add(product_smiles)
+
                                 # Generate product name
                                 primary_name = primary_compound.get('name', f"cpd_{primary_compound.get('id', 'unk')}")
                                 secondary_name = secondary_compound.get('name', f"cpd_{secondary_compound.get('id', 'unk')}")
                                 product_name = f"{primary_name}+{secondary_name}_{reaction_name}_{product_set_idx}_{product_idx}"
-                                
+
                                 # Write product directly to file
                                 writer.writerow({
                                     'smiles': product_smiles,
@@ -417,24 +823,24 @@ def _process_bimolecular_chunk_to_file_worker(chunk_data: List[Tuple], reaction_
                                     'workflow': workflow_name
                                 })
                                 products_count += 1
-                                
+
                             except Exception:
                                 continue
-                                
+
                 except Exception:
                     continue
-        
-        return products_count
-        
-    except Exception:
-        return 0
 
-def _process_unimolecular_chunk_to_file_worker(chunk_data: List[Dict], reaction_smarts: str, 
+        return products_count, ambiguous_reactants
+
+    except Exception:
+        return 0, []
+
+def _process_unimolecular_chunk_to_file_worker(chunk_data: List[Dict], reaction_smarts: str,
                                              reaction_name: str, workflow_name: str,
-                                             name_prefix: str, output_file_path: str) -> int:
+                                             name_prefix: str, output_file_path: str) -> Tuple[int, List[Dict[str, Any]]]:
     """
     Worker function to process a unimolecular chunk and write results directly to a CSV file.
-    
+
     Args:
         chunk_data (List[Dict]): List of compound dictionaries
         reaction_smarts (str): SMARTS pattern for the reaction
@@ -442,9 +848,11 @@ def _process_unimolecular_chunk_to_file_worker(chunk_data: List[Dict], reaction_
         workflow_name (str): Name of the workflow
         name_prefix (str): Prefix for product names
         output_file_path (str): Path to output CSV file
-        
+
     Returns:
-        int: Number of products written to file
+        Tuple[int, List[Dict]]: (products_count, ambiguous_reactants) — ambiguous_reactants has
+            one entry per reactant in this chunk for which RunReactants() returned more than one
+            product set (the reactant matched the reaction template at more than one site).
     """
     try:
         import csv
@@ -452,42 +860,64 @@ def _process_unimolecular_chunk_to_file_worker(chunk_data: List[Dict], reaction_
         from rdkit.Chem import AllChem
         from rdkit import RDLogger
         RDLogger.DisableLog('rdApp.*')
-        
+
         products_count = 0
-        
+        ambiguous_reactants = []
+
         # Parse reaction
         rxn = AllChem.ReactionFromSmarts(reaction_smarts)
         if rxn is None:
-            return 0
-        
+            return 0, []
+
         # Open file for writing
         with open(output_file_path, 'w', newline='', encoding='utf-8') as csvfile:
-            fieldnames = ['smiles', 'name', 'flag', 'reactant_name', 
+            fieldnames = ['smiles', 'name', 'flag', 'reactant_name',
                          'reactant_smiles', 'reaction_name', 'workflow']
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
-            
+
             for compound in chunk_data:
                 try:
                     # Parse molecule
                     reactant_mol = Chem.MolFromSmiles(compound['smiles'])
                     if reactant_mol is None:
                         continue
-                    
+
                     # Run reaction
                     reaction_results = rxn.RunReactants((reactant_mol,))
-                    
-                    # Process products and write immediately
+
+                    # Flag reactants that matched the reaction template at more than one site,
+                    # generating more than one distinct product from that reactant alone
+                    if len(reaction_results) > 1:
+                        reactant_id = compound.get('id', 'unk')
+                        ambiguous_reactants.append({
+                            'reactant_id': reactant_id,
+                            'reactant_name': compound.get('name', f"cpd_{reactant_id}"),
+                            'reactant_smiles': compound['smiles'],
+                            'product_possibilities': len(reaction_results),
+                        })
+
+                    # Process products and write immediately. When a reactant
+                    # matches at more than one site (ambiguous), different
+                    # product_sets can yield the exact same product structure
+                    # (e.g. a symmetric reactant reacting at either of two
+                    # equivalent groups) -- dedupe by canonical SMILES within this
+                    # reactant so the same product isn't written to the database twice.
+                    seen_product_smiles = set()
                     for product_set_idx, product_set in enumerate(reaction_results):
                         for product_idx, product_mol in enumerate(product_set):
                             try:
                                 Chem.SanitizeMol(product_mol)
                                 product_smiles = Chem.MolToSmiles(product_mol)
-                                
+
+                                if product_smiles in seen_product_smiles:
+                                    continue
+                                seen_product_smiles.add(product_smiles)
+
                                 # Generate product name
                                 original_name = compound.get('name', f"cpd_{compound.get('id', 'unk')}")
                                 product_name = f"{name_prefix}{original_name}_{reaction_name}_{product_set_idx}_{product_idx}"
-                                
+
                                 # Write product directly to file
                                 writer.writerow({
                                     'smiles': product_smiles,
@@ -499,17 +929,17 @@ def _process_unimolecular_chunk_to_file_worker(chunk_data: List[Dict], reaction_
                                     'workflow': workflow_name
                                 })
                                 products_count += 1
-                                
+
                             except Exception:
                                 continue
-                                
+
                 except Exception:
                     continue
-        
-        return products_count
-        
+
+        return products_count, ambiguous_reactants
+
     except Exception:
-        return 0
+        return 0, []
 
 class ChemSpace:
     """
@@ -556,7 +986,48 @@ class ChemSpace:
         # Track loaded compounds
         self._compounds_loaded = False
         self._total_compounds = 0
-    
+
+    @staticmethod
+    def _prompt(message):
+        """
+        Clipboard-safe replacement for input() for prompts that contain emoji.
+
+        Problems with plain input(emoji_prompt):
+        1. Bracketed-paste mode: terminals wrap pasted text with ESC[200~/ESC[201~
+           which appear as literal characters when readline does not strip them.
+        2. Emoji in the prompt string: readline counts each emoji as 1 column but
+           they render as 2, so its cursor model drifts — backspace and arrow keys
+           land in the wrong position.
+        3. Writing terminal escape sequences (e.g. \\x1b[?2004l) to stdout before
+           input() can interfere with readline's own terminal initialisation and
+           prevent it from recognising arrow-key sequences, causing ^[[D etc. to
+           be inserted as literal text.
+
+        Fix:
+        - Print the emoji-containing message on its own line so the cursor is at
+          column 0 before readline starts, giving it an accurate starting position.
+        - Use readline.parse_and_bind() to suppress the bracketed-paste sentinels
+          inside readline itself rather than fighting the terminal directly.
+          This keeps readline's terminal setup intact and arrow keys work normally.
+        - Strip any residual escape sequences from the result as a safety net.
+        """
+        import re as _re
+        print(message)
+        try:
+            import readline as _rl
+            # readline ≥ 8.1 exposes this variable directly; fall back to
+            # binding the two sentinel sequences to a no-op on older versions.
+            try:
+                _rl.parse_and_bind('set enable-bracketed-paste off')
+            except Exception:
+                _rl.parse_and_bind(r'"\e[200~": ""')
+                _rl.parse_and_bind(r'"\e[201~": ""')
+        except ImportError:
+            pass  # no readline — residual-strip below is the only defence
+        raw = input('> ')
+        raw = _re.sub(r'\x1b\[\d+~', '', raw)
+        return raw.strip()
+
     def _initialize_chemspace_database(self) -> bool:
         """
         Initialize the chemspace SQLite database file.
@@ -570,6 +1041,8 @@ class ChemSpace:
         try:
             # Simply connect to create the database file if it doesn't exist
             conn = sqlite3.connect(self.__chemspace_db)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
             conn.close()
             
             return True
@@ -620,6 +1093,8 @@ class ChemSpace:
         try:
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             # Create compounds table
             create_table_query = f"""
@@ -645,112 +1120,330 @@ class ChemSpace:
             print(f"❌ Error creating table '{table_name}': {e}")
             return False
 
-    def get_all_tables(self) -> List[str]:
+    @staticmethod
+    def list_tables_at_path(chemspace_db_path: str) -> List[str]:
         """
-        Get list of all compound tables in the database.
-        
+        Get list of all tables in a chemspace database at an arbitrary path, without requiring
+        an instantiated ChemSpace object -- e.g. for callers like the Streamlit GUI that only
+        have a raw db path and no active project instance to hand.
+
+        Args:
+            chemspace_db_path (str): Path to the chemspace.db file
+
         Returns:
             List[str]: List of table names
         """
         try:
-            conn = sqlite3.connect(self.__chemspace_db)
+            conn = sqlite3.connect(chemspace_db_path)
             cursor = conn.cursor()
-            
+
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
             tables = [row[0] for row in cursor.fetchall()]
-            
+
             conn.close()
             return tables
-            
+
         except Exception as e:
             print(f"❌ Error retrieving table list: {e}")
             return []
-    
-    def rename_table(self, old_name: str, new_name: str) -> bool:
+
+    def list_tables(self, chemspace_db_path: Optional[str] = None, verbose: bool = True) -> List[str]:
         """
-        Rename a table in the database.
-        
+        Get list of all tables in a chemspace database, printing a formatted listing (with
+        row counts) by default. Automatically uses the active project's own chemspace
+        database unless an explicit path is given.
+
         Args:
-            old_name (str): Current name of the table
-            new_name (str): New name for the table
-            
+            chemspace_db_path (Optional[str]): Path to a chemspace.db file to inspect instead
+                of the active project's database. If None, uses this instance's database.
+            verbose (bool): Whether to print a formatted listing of the tables found.
+                get_all_tables() passes False, since it's used pervasively throughout this
+                class as internal plumbing to build/filter candidate table lists -- printing
+                there would spam a listing as an unwanted side effect of unrelated operations.
+
         Returns:
-            bool: True if table was renamed successfully
+            List[str]: List of table names
+        """
+        resolved_path = chemspace_db_path or self.__chemspace_db
+        tables = self.list_tables_at_path(resolved_path)
+
+        if verbose:
+            title = "TABLES IN CHEMSPACE DATABASE"
+            if chemspace_db_path is None:
+                title += f" - Project: {self.name}"
+            print("\n" + "=" * 70)
+            print(title)
+            print("=" * 70)
+            if not tables:
+                print("📝 No tables found")
+            else:
+                try:
+                    conn = sqlite3.connect(resolved_path)
+                    cursor = conn.cursor()
+                    for i, t in enumerate(tables, 1):
+                        try:
+                            cursor.execute(f"SELECT COUNT(*) FROM {t}")
+                            count = cursor.fetchone()[0]
+                            print(f"{i:3d}. {t:<40} ({count:,} rows)")
+                        except Exception:
+                            print(f"{i:3d}. {t}")
+                    conn.close()
+                except Exception:
+                    for i, t in enumerate(tables, 1):
+                        print(f"{i:3d}. {t}")
+            print("=" * 70)
+
+        return tables
+
+    def get_all_tables(self) -> List[str]:
+        """
+        Get list of all compound tables in the database.
+
+        Returns:
+            List[str]: List of table names
+        """
+        return self.list_tables(verbose=False)
+    
+    def rename_table(self, old_name: Optional[str] = None, new_name: Optional[str] = None) -> Optional[str]:
+        """
+        Rename an existing table in the chemspace database.
+
+        Uses SQLite's native ALTER TABLE ... RENAME TO, an instant metadata-only operation
+        that preserves the table's schema exactly as-is (PRIMARY KEY/AUTOINCREMENT, UNIQUE
+        constraints, column types, and all existing indexes) -- unlike copying the data into a
+        freshly created table, which would silently drop any constraint not explicitly
+        reproduced on the new table.
+
+        Args:
+            old_name (Optional[str]): Current name of the table to rename. If None, prompts an
+                interactive table selection.
+            new_name (Optional[str]): New name for the table. If None, prompts for a value.
+                Sanitized the same way as other table-creation methods.
+
+        Returns:
+            Optional[str]: The new table name if the rename succeeded, or None if an error
+                occurred or the operation was cancelled
         """
         try:
-            # Check if old table exists
-            tables = self.get_all_tables()
-            if old_name not in tables:
-                print(f"⚠️  Table '{old_name}' does not exist")
-                return False
-            
-            # Sanitize new table name
+            available_tables = self.get_all_tables()
+            if not available_tables:
+                print("❌ No tables available in chemspace database")
+                return None
+
+            if old_name is None:
+                old_name = self._select_table_interactive("SELECT TABLE TO RENAME")
+                if not old_name:
+                    print("❌ No table selected for renaming")
+                    return None
+            elif old_name not in available_tables:
+                print(f"❌ Table '{old_name}' not found")
+                return None
+
+            if new_name is None:
+                try:
+                    new_name = input(f"Enter new name for table '{old_name}': ").strip()
+                except KeyboardInterrupt:
+                    print("\n❌ Rename cancelled")
+                    return None
+                if not new_name:
+                    print("❌ No new name provided")
+                    return None
+
             new_name = self._sanitize_table_name(new_name)
-            
-            # Check if new table name already exists
-            if new_name in tables:
-                print(f"⚠️  Table '{new_name}' already exists")
-                return False
-            
+
+            if new_name == old_name:
+                print(f"❌ New name is the same as the current name '{old_name}'")
+                return None
+
+            available_tables = self.get_all_tables()
+            while new_name in available_tables:
+                print(f"\n⚠️  Table '{new_name}' already exists!")
+                try:
+                    user_new_name = input("Enter a different name (or 'cancel' to abort): ").strip()
+                except KeyboardInterrupt:
+                    print("\n❌ Rename cancelled")
+                    return None
+                if user_new_name.lower() in ['cancel', 'quit', 'exit']:
+                    print("❌ Rename cancelled by user")
+                    return None
+                new_name = self._sanitize_table_name(user_new_name)
+                available_tables = self.get_all_tables()
+
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
-            
-            # SQLite doesn't support RENAME TABLE directly, so we need to:
-            # 1. Create new table with same structure
-            # 2. Copy data
-            # 3. Drop old table
-            
-            # Create new table
-            cursor.execute(f"""
-            CREATE TABLE {new_name} AS 
-            SELECT * FROM {old_name}
-            """)
-            
-            # Recreate indexes for new table
-            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{new_name}_name ON {new_name}(name)")
-            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{new_name}_smiles ON {new_name}(smiles)")
-            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{new_name}_flag ON {new_name}(flag)")
-            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{new_name}_inchi_key ON {new_name}(inchi_key)")
-            
-            # Drop old table and its indexes
-            cursor.execute(f"DROP INDEX IF EXISTS idx_{old_name}_name")
-            cursor.execute(f"DROP INDEX IF EXISTS idx_{old_name}_smiles")
-            cursor.execute(f"DROP INDEX IF EXISTS idx_{old_name}_flag")
-            cursor.execute(f"DROP INDEX IF EXISTS idx_{old_name}_inchi_key")
-            cursor.execute(f"DROP TABLE {old_name}")
-            
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.execute(f"ALTER TABLE {old_name} RENAME TO {new_name}")
             conn.commit()
             conn.close()
-            
+
             print(f"✅ Table '{old_name}' renamed to '{new_name}' successfully")
-            return True
-            
+            return new_name
+
         except Exception as e:
-            print(f"❌ Error renaming table '{old_name}' to '{new_name}': {e}")
-            return False
-    
-    def load_csv_file_as_table(self, csv_file_path: str = None):
-        
-        # Will query the user for the .csv file path if not provided, and load it as a table in the chemspace database, with the table name being queried to the the user. No default is possible. Will check if the table name already exists and ask the user if they want to replace it or not. If not, the process is cancelled.        
-        
+            print(f"❌ Error renaming table '{old_name}': {e}")
+            return None
+
+    @staticmethod
+    def _detect_csv_delimiter_and_header(csv_file_path: str) -> Tuple[Any, Optional[int]]:
+        """
+        Sniff the field delimiter and header presence of a compounds file so that
+        comma/tab/semicolon/pipe-delimited CSVs and whitespace-delimited .smi-style
+        files (no header, SMILES followed by an ID) both load correctly, instead of
+        always assuming a comma-delimited file with a header row.
+
+        Header presence is inferred by checking whether the first row's first field
+        parses as a valid SMILES with RDKit: a real header label (e.g. "smiles")
+        won't parse, while a data row's SMILES value will.
+
+        Args:
+            csv_file_path (str): Path to the file to sniff
+
+        Returns:
+            Tuple[Any, Optional[int]]: (delimiter, header) usable directly as the
+                `sep`/`header` kwargs of `pd.read_csv`. `delimiter` is a single
+                character, or the regex `r'\\s+'` for whitespace-delimited files.
+                `header` is 0 if a header row was detected, otherwise None.
+        """
+        from rdkit import Chem, RDLogger
+        RDLogger.DisableLog('rdApp.*')
+
+        try:
+            with open(csv_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                sample_lines = [f.readline() for _ in range(5)]
+        except Exception:
+            return ',', 0
+
+        sample_lines = [line for line in sample_lines if line.strip()]
+        if not sample_lines:
+            return ',', 0
+
+        sample = ''.join(sample_lines)
+        first_line = sample_lines[0].rstrip('\n')
+
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=',;\t|')
+            delimiter = dialect.delimiter
+            first_fields = first_line.split(delimiter)
+        except csv.Error:
+            # No standard delimiter found; fall back to whitespace splitting,
+            # matching the plain .smi convention (fields separated by spaces/tabs).
+            delimiter = r'\s+'
+            first_fields = first_line.split()
+
+        first_field = first_fields[0].strip() if first_fields else ''
+        has_header = not first_field or Chem.MolFromSmiles(first_field) is None
+        header = 0 if has_header else None
+
+        return delimiter, header
+
+    def _read_compounds_csv(self, csv_file_path: str) -> pd.DataFrame:
+        """
+        Read a compounds file into a DataFrame using an auto-detected delimiter and
+        header presence (see `_detect_csv_delimiter_and_header`), instead of assuming
+        a comma-delimited CSV with a header row.
+        """
+        delimiter, header = self._detect_csv_delimiter_and_header(csv_file_path)
+        read_kwargs = {'sep': delimiter, 'header': header}
+        if delimiter == r'\s+':
+            read_kwargs['engine'] = 'python'
+        return pd.read_csv(csv_file_path, **read_kwargs)
+
+    @staticmethod
+    def _detect_delimiter_mismatch(csv_file_path: str, df: pd.DataFrame) -> Optional[str]:
+        """
+        Heuristic check for the "everything landed in one column" failure mode: a file
+        that is actually delimited by something other than a comma (pipe, tab, semicolon)
+        gets read by `pd.read_csv` as a single column, silently using the first data row
+        as the header and dropping it from the data.
+
+        Args:
+            csv_file_path (str): Path to the CSV file that was read
+            df (pd.DataFrame): The DataFrame produced by `pd.read_csv(csv_file_path)`
+
+        Returns:
+            Optional[str]: A warning message describing the likely delimiter if a mismatch
+                is detected, otherwise None.
+        """
+        if len(df.columns) != 1:
+            return None
+
+        try:
+            with open(csv_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                first_line = f.readline()
+        except Exception:
+            return None
+
+        candidates = {'|': 'pipe', '\t': 'tab', ';': 'semicolon'}
+        found = [name for char, name in candidates.items() if char in first_line]
+        if not found:
+            return None
+
+        return (f"The file parsed as a single column ('{df.columns[0][:60]}'), but its first "
+                f"line contains {', '.join(found)} character(s). This usually means the file "
+                f"is not comma-delimited and pandas silently used the first data row as the "
+                f"header, dropping that row. Re-check the delimiter before loading.")
+
+    @staticmethod
+    def _validate_smiles_column_sample(df: pd.DataFrame, smiles_column: str,
+                                        sample_size: int = 200,
+                                        min_valid_fraction: float = 0.5) -> Tuple[bool, float]:
+        """
+        Sanity-check that a resolved "SMILES" column actually contains parseable SMILES,
+        catching cases where a delimiter/header mismatch produced a column that merely
+        happens to carry the expected name while containing garbage (e.g. several
+        pipe-joined fields glued together).
+
+        Args:
+            df (pd.DataFrame): DataFrame to check
+            smiles_column (str): Column name expected to contain SMILES strings
+            sample_size (int): Maximum number of non-null values to sample
+            min_valid_fraction (float): Minimum fraction of the sample that must parse
+                successfully with RDKit for the column to be considered valid
+
+        Returns:
+            Tuple[bool, float]: (is_valid, valid_fraction)
+        """
+        from rdkit import Chem, RDLogger
+        RDLogger.DisableLog('rdApp.*')
+
+        sample = df[smiles_column].dropna().astype(str)
+        if sample.empty:
+            return False, 0.0
+        sample = sample.sample(n=min(sample_size, len(sample)), random_state=0)
+
+        valid_count = sum(1 for smi in sample if Chem.MolFromSmiles(smi) is not None)
+        valid_fraction = valid_count / len(sample)
+        return valid_fraction >= min_valid_fraction, valid_fraction
+
+    def load_csv_file_as_table(self, csv_file_path: str = None,
+                              strip_salts: Optional[bool] = None,
+                              retain_largest_fragment: Optional[bool] = None):
+
+        # Will query the user for the .csv file path if not provided, and load it as a table in the chemspace database, with the table name being queried to the the user. No default is possible. Will check if the table name already exists and ask the user if they want to replace it or not. If not, the process is cancelled.
+        # strip_salts / retain_largest_fragment: same RDKit-based SMILES cleanup as load_csv_file().
+        # If left None, the user is interactively prompted (y/N); pass True/False explicitly to skip
+        # the prompt. Since this loader has no fixed 'smiles' column, if either is enabled and no
+        # 'smiles' column exists the user is asked which column to clean.
+
         # Prompt for CSV file path if not provided
         if not csv_file_path:
             csv_file_path = input("Enter the path to the CSV file: ").strip()
             while not csv_file_path:
                 print("❌ CSV file path cannot be empty.")
                 csv_file_path = input("Enter the path to the CSV file: ").strip()
-        
+
         # Validate file exists
         if not os.path.exists(csv_file_path):
             print(f"❌ CSV file not found: {csv_file_path}")
             return False
-        
+
         # Prompt for table name
         table_name = input("Enter the desired table name: ").strip()
         while not table_name:
             print("❌ Table name cannot be empty.")
             table_name = input("Enter the desired table name: ").strip()
-        
+
         # Check if table already exists
         existing_tables = self.get_all_tables()
         if table_name in existing_tables:
@@ -758,37 +1451,131 @@ class ChemSpace:
             if response not in ['y', 'yes']:
                 print("❌ Process cancelled.")
                 return False
-        
-        # Load the csv as a dataframe using the first row as header
+
+        # Load the csv as a dataframe, auto-detecting delimiter and header presence
         try:
-            df = pd.read_csv(csv_file_path)
+            df = self._read_compounds_csv(csv_file_path)
         except Exception as e:
             print(f"❌ Error reading CSV file: {e}")
             return False
-        
+
+        # Safety check: catch the "wrong delimiter collapsed everything into one column,
+        # and the first data row got silently used as the header" failure mode.
+        delimiter_warning = self._detect_delimiter_mismatch(csv_file_path, df)
+        if delimiter_warning:
+            print(f"⚠️  {delimiter_warning}")
+            proceed = input("Load it anyway as a single column? (y/N): ").strip().lower()
+            if proceed not in ['y', 'yes']:
+                print("❌ Process cancelled. Re-run with the correct delimiter.")
+                return False
+
+        # Query the user on whether to strip salt/counter-ion fragments from the SMILES,
+        # unless the caller already decided explicitly (e.g. scripted/non-interactive use).
+        if strip_salts is None:
+            strip_salts_choice = input(
+                "🧂 Strip salts/counter-ions (e.g. HCl, Na+) from SMILES before loading? (y/N): "
+            ).strip().lower()
+            strip_salts = strip_salts_choice in ['y', 'yes']
+
+        # Query the user on whether to reduce multi-fragment SMILES to their largest
+        # fragment, unless the caller already decided explicitly.
+        if retain_largest_fragment is None:
+            retain_largest_fragment_choice = input(
+                "🧩 Retain only the largest fragment of multi-fragment SMILES (e.g. solvates)? (y/N): "
+            ).strip().lower()
+            retain_largest_fragment = retain_largest_fragment_choice in ['y', 'yes']
+
+        if strip_salts or retain_largest_fragment:
+            # This loader has no fixed SMILES column (it dumps whatever the CSV contains),
+            # so ask which column to clean if it can't be inferred.
+            if 'smiles' in df.columns:
+                smiles_col_for_cleaning = 'smiles'
+            else:
+                smiles_col_for_cleaning = None
+                print("\nColumns found in CSV:")
+                for idx, col in enumerate(df.columns):
+                    print(f"  [{idx}] {col}")
+                while smiles_col_for_cleaning is None:
+                    col_input = input("Enter the column name or index containing SMILES to clean: ").strip()
+                    if col_input.isdigit() and int(col_input) < len(df.columns):
+                        smiles_col_for_cleaning = df.columns[int(col_input)]
+                    elif col_input in df.columns:
+                        smiles_col_for_cleaning = col_input
+                    else:
+                        print("Invalid input. Please enter a valid column name or index.")
+
+            salt_remover = None
+            if strip_salts:
+                from rdkit.Chem import SaltRemover
+                salt_remover = SaltRemover.SaltRemover()
+            fragment_chooser = None
+            if retain_largest_fragment:
+                from rdkit.Chem.MolStandardize import rdMolStandardize
+                fragment_chooser = rdMolStandardize.LargestFragmentChooser()
+
+            salts_stripped_count = 0
+            fragments_retained_count = 0
+
+            def _clean_smiles(smiles):
+                nonlocal salts_stripped_count, fragments_retained_count
+                smiles = str(smiles).strip()
+                if salt_remover is not None:
+                    smiles, was_stripped = _strip_salts_from_smiles(smiles, salt_remover)
+                    if smiles is None:
+                        return None
+                    if was_stripped:
+                        salts_stripped_count += 1
+                if fragment_chooser is not None:
+                    smiles, was_reduced = _retain_largest_fragment_from_smiles(smiles, fragment_chooser)
+                    if smiles is None:
+                        return None
+                    if was_reduced:
+                        fragments_retained_count += 1
+                return smiles
+
+            df[smiles_col_for_cleaning] = df[smiles_col_for_cleaning].apply(_clean_smiles)
+
+            # Molecules RDKit couldn't parse at all must not be added to the table.
+            failed_mask = df[smiles_col_for_cleaning].isna()
+            cleanup_failures_count = int(failed_mask.sum())
+            if cleanup_failures_count:
+                df = df[~failed_mask].reset_index(drop=True)
+
+            if strip_salts:
+                print(f"   🧂 Salts/counter-ions stripped: {salts_stripped_count}")
+            if retain_largest_fragment:
+                print(f"   🧩 Reduced to largest fragment: {fragments_retained_count}")
+            if cleanup_failures_count:
+                print(f"   🚫 Dropped (unparseable SMILES): {cleanup_failures_count}")
+
         # Load the dataframe into the database table
         try:
             conn = sqlite3.connect(self.__chemspace_db)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
             df.to_sql(table_name, conn, if_exists='append', index=False)
             conn.close()
         except Exception as e:
             print(f"❌ Error loading data into table '{table_name}': {e}")
-    
-    def load_csv_file(self, csv_file_path: str = None, 
-                     smiles_column: str = 'smiles', 
-                     name_column: str = 'name', 
+
+    def load_csv_file(self, csv_file_path: str = None,
+                     smiles_column: str = 'smiles',
+                     name_column: str = 'name',
                      flag_column: str = 'flag',
                      skip_duplicates: bool = True,
                      compute_inchi: bool = True,
+                     strip_salts: Optional[bool] = None,
+                     retain_largest_fragment: Optional[bool] = None,
                      parallel_threshold: int = 10000,
                      max_workers: Optional[int] = None,
-                     chunk_size: Optional[int] = None) -> Dict[str, Any]:
+                     chunk_size: Optional[int] = None,
+                     run_in_background: Optional[bool] = None) -> Dict[str, Any]:
         """
         Load compounds from a CSV file into the chemspace database.
         Creates a table named after the CSV file prefix.
         Automatically computes InChI keys for loaded SMILES.
         Uses parallel processing for large files to improve performance.
-        
+
         Args:
             csv_file_path (str): Path to the CSV file
             smiles_column (str): Name of the column containing SMILES strings
@@ -796,12 +1583,28 @@ class ChemSpace:
             flag_column (Optional[str]): Name of the column containing flags. If None or not found, fills with "nd"
             skip_duplicates (bool): Whether to skip duplicate compounds
             compute_inchi (bool): Whether to automatically compute InChI keys after loading
+            strip_salts (Optional[bool]): Whether to strip salt/counter-ion fragments (e.g. HCl, Na+)
+                from SMILES using RDKit's SaltRemover before storing them. If None (default), the
+                user is interactively prompted (y/N). Pass True/False explicitly to skip the prompt,
+                e.g. for scripted/non-interactive use. The original fragment is discarded once stripped.
+            retain_largest_fragment (Optional[bool]): Whether to reduce multi-fragment SMILES down to
+                only their largest fragment (by atom count) using RDKit's LargestFragmentChooser,
+                applied after strip_salts. Catches disconnected components (solvates, unusual
+                counter-ions) that SaltRemover's curated salt list misses. If None (default), the
+                user is interactively prompted (y/N). Pass True/False explicitly to skip the prompt.
             parallel_threshold (int): Number of rows above which parallel processing is used (default: 10000)
             max_workers (Optional[int]): Maximum number of parallel workers. If None, uses cpu_count()
             chunk_size (Optional[int]): Size of each chunk for parallel processing. If None, automatically calculated
-            
+            run_in_background (Optional[bool]): If True, once the table/column/cleanup options are
+                resolved, hand the actual row parsing/insertion/InChI computation off to a separate
+                background process and return immediately (progress and results are written to a
+                log file instead of stdout). If False, run in the foreground as usual. If None,
+                prompts an interactive fg/bg selection.
+
         Returns:
-            dict: Results containing success status, counts, and messages
+            dict: Results containing success status, counts, and messages. If run_in_background is
+                True, 'compounds_added'/'duplicates_skipped' are 0 and the real counts are only
+                available in the database table / log file once the background process completes.
         """
         try:
             # Prompt for file path if not provided
@@ -849,6 +1652,8 @@ class ChemSpace:
                     try:
                         conn = sqlite3.connect(self.__chemspace_db)
                         cursor = conn.cursor()
+                        cursor.execute("PRAGMA journal_mode=WAL")
+                        cursor.execute("PRAGMA synchronous=NORMAL")
                         cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
                         conn.commit()
                         conn.close()
@@ -886,9 +1691,21 @@ class ChemSpace:
             print(f"📖 Reading CSV file: {csv_file_path}")
             print(f"📋 Target table: {table_name}")
             
-            # Read the .csv file to be inputed
-            df = pd.read_csv(csv_file_path)
-            
+            # Read the .csv file to be inputed, auto-detecting delimiter and header presence
+            df = self._read_compounds_csv(csv_file_path)
+
+            # Safety check: catch the "wrong delimiter collapsed everything into one
+            # column, and the first data row got silently used as the header" failure mode.
+            delimiter_warning = self._detect_delimiter_mismatch(csv_file_path, df)
+            if delimiter_warning:
+                return {
+                    'success': False,
+                    'message': f"Possible delimiter mismatch: {delimiter_warning}",
+                    'compounds_added': 0,
+                    'duplicates_skipped': 0,
+                    'errors': 1
+                }
+
             # Parse the df to check columns and information
             df = self._parse_df_from_csv_file(df, smiles_column, name_column, flag_column)
 
@@ -901,7 +1718,21 @@ class ChemSpace:
                     'duplicates_skipped': 0,
                     'errors': 1
                 }
-            
+
+            # Safety check: the resolved SMILES column must actually contain parseable
+            # SMILES, not garbage produced by a delimiter/column mismatch.
+            smiles_valid, smiles_valid_fraction = self._validate_smiles_column_sample(df, smiles_column)
+            if not smiles_valid:
+                return {
+                    'success': False,
+                    'message': (f"Column '{smiles_column}' does not look like it contains valid SMILES "
+                                f"(only {smiles_valid_fraction:.0%} of a sample parsed with RDKit). "
+                                f"Check the file's delimiter and column mapping before loading."),
+                    'compounds_added': 0,
+                    'duplicates_skipped': 0,
+                    'errors': 1
+                }
+
             # Check if optional columns exist and warn if they don't
             name_available = name_column and name_column in df.columns
             flag_available = flag_column and flag_column in df.columns
@@ -913,7 +1744,77 @@ class ChemSpace:
                 print(f"⚠️  Flag column '{flag_column}' not found. Will use 'nd' as default.")
             if not flag_description_available:
                 print(f"⚠️  Flag description column 'flag_description' not found. Will use 'nd' as default.")
-            
+
+            # Query the user on whether to strip salt/counter-ion fragments from the SMILES,
+            # unless the caller already decided explicitly (e.g. scripted/non-interactive use).
+            if strip_salts is None:
+                strip_salts_choice = input(
+                    "🧂 Strip salts/counter-ions (e.g. HCl, Na+) from SMILES before loading? (y/N): "
+                ).strip().lower()
+                strip_salts = strip_salts_choice in ['y', 'yes']
+
+            # Query the user on whether to reduce multi-fragment SMILES to their largest
+            # fragment, unless the caller already decided explicitly.
+            if retain_largest_fragment is None:
+                retain_largest_fragment_choice = input(
+                    "🧩 Retain only the largest fragment of multi-fragment SMILES (e.g. solvates)? (y/N): "
+                ).strip().lower()
+                retain_largest_fragment = retain_largest_fragment_choice in ['y', 'yes']
+
+            # Every interactive decision (table name/replace, column mapping, cleanup options)
+            # has now been resolved, so this is the last point where it's still cheap to ask
+            # whether the actual (potentially long-running) parsing/insertion/InChI work should
+            # be handed off to a background process instead of blocking the caller.
+            if run_in_background is None:
+                run_mode = input(
+                    "\n⚙️  Do you want to run the CSV loading in the foreground "
+                    "or background? (fg/bg) [default: fg]: "
+                ).strip().lower() or 'fg'
+                run_in_background = run_mode in ['bg', 'background']
+
+            if run_in_background:
+                return self._load_csv_file_in_background(
+                    df, table_name, csv_filename, smiles_column, name_column, flag_column,
+                    name_available, flag_available, flag_description_available,
+                    skip_duplicates, compute_inchi, strip_salts, retain_largest_fragment,
+                    parallel_threshold, max_workers, chunk_size
+                )
+
+            return self._execute_csv_load(
+                df, table_name, csv_filename, smiles_column, name_column, flag_column,
+                name_available, flag_available, flag_description_available,
+                skip_duplicates, compute_inchi, strip_salts, retain_largest_fragment,
+                parallel_threshold, max_workers, chunk_size
+            )
+
+        except Exception as e:
+            error_message = f"Error loading CSV file: {e}"
+            print(f"❌ {error_message}")
+            return {
+                'success': False,
+                'message': error_message,
+                'compounds_added': 0,
+                'duplicates_skipped': 0,
+                'errors': 1
+            }
+
+    def _execute_csv_load(self, df: pd.DataFrame, table_name: str, csv_filename: str,
+                          smiles_column: str, name_column: Optional[str], flag_column: Optional[str],
+                          name_available: bool, flag_available: bool, flag_description_available: bool,
+                          skip_duplicates: bool, compute_inchi: bool,
+                          strip_salts: bool, retain_largest_fragment: bool,
+                          parallel_threshold: int, max_workers: Optional[int],
+                          chunk_size: Optional[int]) -> Dict[str, Any]:
+        """
+        Performs the actual row parsing, insertion, and (optional) InChI key computation for
+        load_csv_file(), once the table, column mapping, and cleanup options have already been
+        resolved. Split out so it can be run either directly (foreground) or inside a separate
+        process (background) via _load_csv_file_in_background().
+
+        Returns:
+            dict: Results containing success status, counts, and messages.
+        """
+        try:
             # Determine if parallel processing should be used
             use_parallel = len(df) > parallel_threshold
             
@@ -929,15 +1830,32 @@ class ChemSpace:
                 # Process in parallel chunks
                 result = self._process_csv_parallel(
                     df, table_name, smiles_column, name_column, flag_column,
-                    name_available, flag_available, flag_description_available, 
-                    skip_duplicates, max_workers, chunk_size
+                    name_available, flag_available, flag_description_available,
+                    skip_duplicates, max_workers, chunk_size, strip_salts, retain_largest_fragment
                 )
             else:
                 print(f"📝 Processing {len(df)} rows sequentially...")
                 # Sequential processing for smaller files
                 compounds_data = []
-                for idx, row in df.iterrows():
+                salts_stripped_count = 0
+                fragments_retained_count = 0
+                cleanup_failures_count = 0
+                cleanup_failures_smiles = []
+                salt_remover = None
+                if strip_salts:
+                    from rdkit.Chem import SaltRemover
+                    salt_remover = SaltRemover.SaltRemover()
+                fragment_chooser = None
+                if retain_largest_fragment:
+                    from rdkit.Chem.MolStandardize import rdMolStandardize
+                    fragment_chooser = rdMolStandardize.LargestFragmentChooser()
+                if TQDM_AVAILABLE:
+                    row_iterator = tqdm(df.iterrows(), total=len(df), desc="Parsing compounds", unit="cmpd")
+                else:
+                    row_iterator = df.iterrows()
+                for idx, row in row_iterator:
                     smiles = str(row[smiles_column]).strip()
+                    original_smiles = smiles
                     # Handle name column - use provided column or generate from index
                     if name_available:
                         name = str(row[name_column]).strip()
@@ -962,10 +1880,32 @@ class ChemSpace:
                     # Skip empty SMILES rows (only SMILES is mandatory)
                     if not smiles or smiles.lower() in ['nan', 'none', '']:
                         continue
+                    if salt_remover is not None:
+                        smiles, was_stripped = _strip_salts_from_smiles(smiles, salt_remover)
+                        if smiles is None:
+                            cleanup_failures_count += 1
+                            cleanup_failures_smiles.append(original_smiles)
+                            continue
+                        if was_stripped:
+                            salts_stripped_count += 1
+                    if fragment_chooser is not None:
+                        smiles, was_reduced = _retain_largest_fragment_from_smiles(smiles, fragment_chooser)
+                        if smiles is None:
+                            cleanup_failures_count += 1
+                            cleanup_failures_smiles.append(original_smiles)
+                            continue
+                        if was_reduced:
+                            fragments_retained_count += 1
                     compounds_data.append((smiles, name, flag, flag_description))
+                    if not TQDM_AVAILABLE and (idx + 1) % max(1, len(df) // 10) == 0:
+                        print(f"   📝 Parsed {idx + 1}/{len(df)} rows...")
                 # Insert compounds into database
-                result = self._insert_compounds(compounds_data, table_name, skip_duplicates)
-            
+                result = self._insert_compounds(compounds_data, table_name, skip_duplicates, show_progress=True)
+                result['salts_stripped'] = salts_stripped_count
+                result['fragments_retained'] = fragments_retained_count
+                result['cleanup_failures'] = cleanup_failures_count
+                result['cleanup_failures_smiles'] = cleanup_failures_smiles
+
             if result['success']:
                 self._compounds_loaded = True
                 table_count = self.get_compound_count(table_name=table_name)
@@ -974,9 +1914,23 @@ class ChemSpace:
                 print(f"   📋 Table: {table_name}")
                 print(f"   📊 Compounds added: {result['compounds_added']}")
                 print(f"   🔄 Duplicates skipped: {result['duplicates_skipped']}")
+                if result.get('duplicate_smiles'):
+                    print(f"      Duplicate SMILES:")
+                    for _dup_smiles in result['duplicate_smiles']:
+                        print(f"      - {_dup_smiles}")
                 print(f"   ❌ Errors: {result['errors']}")
                 print(f"   📈 Total compounds in table '{table_name}': {table_count}")
-                
+                if strip_salts:
+                    print(f"   🧂 Salts/counter-ions stripped: {result.get('salts_stripped', 0)}")
+                if retain_largest_fragment:
+                    print(f"   🧩 Reduced to largest fragment: {result.get('fragments_retained', 0)}")
+                if result.get('cleanup_failures', 0):
+                    print(f"   🚫 Dropped (unparseable SMILES): {result.get('cleanup_failures', 0)}")
+                    if result.get('cleanup_failures_smiles'):
+                        print(f"      Unparseable SMILES:")
+                        for _bad_smiles in result['cleanup_failures_smiles']:
+                            print(f"      - {_bad_smiles}")
+
                 # Automatically compute InChI keys if requested
                 if compute_inchi and result['compounds_added'] > 0:
                     print(f"\n🧪 Computing InChI keys for loaded compounds...")
@@ -1013,14 +1967,137 @@ class ChemSpace:
                 'duplicates_skipped': 0,
                 'errors': 1
             }
-    
-    def load_csv_file_extended_columns(self, csv_file_path: str = None, skip_duplicates: bool = True) -> dict:
+
+    def _load_csv_file_in_background(self, df: pd.DataFrame, table_name: str, csv_filename: str,
+                                     smiles_column: str, name_column: Optional[str], flag_column: Optional[str],
+                                     name_available: bool, flag_available: bool, flag_description_available: bool,
+                                     skip_duplicates: bool, compute_inchi: bool,
+                                     strip_salts: bool, retain_largest_fragment: bool,
+                                     parallel_threshold: int, max_workers: Optional[int],
+                                     chunk_size: Optional[int]) -> Dict[str, Any]:
+        """
+        Launches the CSV loading as a fully independent OS process via subprocess.Popen (the
+        same fg/bg pattern used by project_dimensionality_on_table() /
+        _project_dimensionality_in_background()) and returns immediately, so loading a large
+        CSV doesn't block the caller.
+
+        The table has already been created (or emptied, if the user chose to replace it) and
+        every interactive decision has already been resolved by the time this is called --
+        including _parse_df_from_csv_file()'s column-mapping and flag_description prompts, which
+        it re-asks unconditionally on every call. Re-reading and re-parsing the CSV from scratch
+        in the detached child (as _project_dimensionality_in_background() does for its cheap,
+        non-interactive model reload) would therefore re-trigger those prompts against a closed
+        stdin and crash with an I/O error. Instead, the already-resolved DataFrame is pickled to
+        disk here and the child just loads it back, with no re-parsing involved.
+
+        Returns:
+            dict: Minimal status dict describing the launch; the real load result (counts,
+                InChI keys computed, etc.) is only available in the database table and the log
+                file once the background process completes.
+        """
+        import subprocess
+
+        logs_dir = os.path.join(os.path.dirname(self.__chemspace_db), 'logs')
+        os.makedirs(logs_dir, exist_ok=True)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        base_name = f'csv_load_{table_name}_{timestamp}'
+        log_file_path = os.path.join(logs_dir, f'{base_name}.log')
+        script_path = os.path.join(logs_dir, f'{base_name}.py')
+        data_path = os.path.join(logs_dir, f'{base_name}_data.pkl')
+
+        df.to_pickle(data_path)
+
+        script = f"""
+import os
+import pandas as pd
+from tidyscreen import tidyscreen
+from tidyscreen.chemspace.chemspace import ChemSpace
+
+project = tidyscreen.ActivateProject({self.name!r})
+cs = ChemSpace(project)
+
+df = pd.read_pickle({data_path!r})
+
+try:
+    cs._execute_csv_load(
+        df,
+        {table_name!r},
+        {csv_filename!r},
+        {smiles_column!r},
+        {name_column!r},
+        {flag_column!r},
+        {name_available!r},
+        {flag_available!r},
+        {flag_description_available!r},
+        {skip_duplicates!r},
+        {compute_inchi!r},
+        {strip_salts!r},
+        {retain_largest_fragment!r},
+        {parallel_threshold!r},
+        {max_workers!r},
+        {chunk_size!r},
+    )
+finally:
+    os.remove({data_path!r})
+"""
+        with open(script_path, 'w') as f:
+            f.write(script)
+
+        try:
+            with open(log_file_path, 'w') as log_file:
+                process = subprocess.Popen(
+                    [sys.executable, script_path],
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    cwd=self.path,
+                    start_new_session=True
+                )
+        except Exception as e:
+            error_message = f"Error launching background CSV load: {e}"
+            print(f"❌ {error_message}")
+            return {
+                'success': False,
+                'message': error_message,
+                'compounds_added': 0,
+                'duplicates_skipped': 0,
+                'errors': 1
+            }
+
+        print(f"🚀 CSV loading launched in the background (PID {process.pid})")
+        print(f"   Loading '{csv_filename}' into table '{table_name}'...")
+        print(f"   Progress/results log: {log_file_path}")
+
+        return {
+            'success': True,
+            'message': f"CSV loading launched in the background (PID {process.pid}). See log: {log_file_path}",
+            'compounds_added': 0,
+            'duplicates_skipped': 0,
+            'errors': 0,
+            'table_name': table_name,
+            'background': True,
+            'pid': process.pid,
+            'log_file': log_file_path,
+        }
+
+    def load_csv_file_extended_columns(self, csv_file_path: str = None, skip_duplicates: bool = True,
+                                      strip_salts: Optional[bool] = None,
+                                      retain_largest_fragment: Optional[bool] = None) -> dict:
         """
         Load compounds from a CSV file into the chemspace database, allowing for additional columns.
         Prompts the user to select which columns correspond to SMILES, name, and flag, and loads all other columns as-is, renaming those columns to 'smiles', 'name', and 'flag' in the final table.
 
         Args:
             csv_file_path (str): Path to the CSV file
+            skip_duplicates (bool): Whether to skip duplicate compounds
+            strip_salts (Optional[bool]): Whether to strip salt/counter-ion fragments (e.g. HCl, Na+)
+                from SMILES using RDKit's SaltRemover before storing them. If None (default), the
+                user is interactively prompted (y/N). Pass True/False explicitly to skip the prompt,
+                e.g. for scripted/non-interactive use. The original fragment is discarded once stripped.
+            retain_largest_fragment (Optional[bool]): Whether to reduce multi-fragment SMILES down to
+                only their largest fragment (by atom count) using RDKit's LargestFragmentChooser,
+                applied after strip_salts. Catches disconnected components (solvates, unusual
+                counter-ions) that SaltRemover's curated salt list misses. If None (default), the
+                user is interactively prompted (y/N). Pass True/False explicitly to skip the prompt.
 
         Returns:
             dict: Results containing success status, counts, and messages
@@ -1041,8 +2118,8 @@ class ChemSpace:
                     'errors': 1
                 }
 
-            # Read CSV file
-            df = pd.read_csv(csv_file_path)
+            # Read CSV file, auto-detecting delimiter and header presence
+            df = self._read_compounds_csv(csv_file_path)
             columns = list(df.columns)
             print("\nColumns found in CSV:")
             for idx, col in enumerate(columns):
@@ -1066,6 +2143,60 @@ class ChemSpace:
             # Rename selected columns in the DataFrame
             rename_map = {smiles_col_orig: 'smiles', name_col_orig: 'name', flag_col_orig: 'flag'}
             df = df.rename(columns=rename_map)
+
+            # Query the user on whether to strip salt/counter-ion fragments from the SMILES,
+            # unless the caller already decided explicitly (e.g. scripted/non-interactive use).
+            if strip_salts is None:
+                strip_salts_choice = input(
+                    "🧂 Strip salts/counter-ions (e.g. HCl, Na+) from SMILES before loading? (y/N): "
+                ).strip().lower()
+                strip_salts = strip_salts_choice in ['y', 'yes']
+
+            # Query the user on whether to reduce multi-fragment SMILES to their largest
+            # fragment, unless the caller already decided explicitly.
+            if retain_largest_fragment is None:
+                retain_largest_fragment_choice = input(
+                    "🧩 Retain only the largest fragment of multi-fragment SMILES (e.g. solvates)? (y/N): "
+                ).strip().lower()
+                retain_largest_fragment = retain_largest_fragment_choice in ['y', 'yes']
+
+            salts_stripped_count = 0
+            fragments_retained_count = 0
+            cleanup_failures_count = 0
+            if strip_salts or retain_largest_fragment:
+                salt_remover = None
+                if strip_salts:
+                    from rdkit.Chem import SaltRemover
+                    salt_remover = SaltRemover.SaltRemover()
+                fragment_chooser = None
+                if retain_largest_fragment:
+                    from rdkit.Chem.MolStandardize import rdMolStandardize
+                    fragment_chooser = rdMolStandardize.LargestFragmentChooser()
+
+                def _clean_smiles(smiles):
+                    nonlocal salts_stripped_count, fragments_retained_count
+                    smiles = str(smiles).strip()
+                    if salt_remover is not None:
+                        smiles, was_stripped = _strip_salts_from_smiles(smiles, salt_remover)
+                        if smiles is None:
+                            return None
+                        if was_stripped:
+                            salts_stripped_count += 1
+                    if fragment_chooser is not None:
+                        smiles, was_reduced = _retain_largest_fragment_from_smiles(smiles, fragment_chooser)
+                        if smiles is None:
+                            return None
+                        if was_reduced:
+                            fragments_retained_count += 1
+                    return smiles
+
+                df['smiles'] = df['smiles'].apply(_clean_smiles)
+
+                # Molecules RDKit couldn't parse at all must not be added to the table.
+                failed_mask = df['smiles'].isna()
+                cleanup_failures_count = int(failed_mask.sum())
+                if cleanup_failures_count:
+                    df = df[~failed_mask].reset_index(drop=True)
 
             # Query user for flag_description value
             flag_description_value = input("Enter a description for the 'flag' column to be added to all rows: ").strip()
@@ -1104,6 +2235,8 @@ class ChemSpace:
                 # Drop the existing table
                 conn = sqlite3.connect(self.__chemspace_db)
                 cursor = conn.cursor()
+                cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.execute("PRAGMA synchronous=NORMAL")
                 cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
                 conn.commit()
                 conn.close()
@@ -1127,6 +2260,8 @@ class ChemSpace:
             # Create table
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             cursor.execute(create_table_query)
             conn.commit()
 
@@ -1159,6 +2294,12 @@ class ChemSpace:
             conn.close()
 
             print(f"✅ Loaded {compounds_added} compounds into table '{table_name}' (errors: {errors}, duplicates skipped: {duplicates_skipped})")
+            if strip_salts:
+                print(f"   🧂 Salts/counter-ions stripped: {salts_stripped_count}")
+            if retain_largest_fragment:
+                print(f"   🧩 Reduced to largest fragment: {fragments_retained_count}")
+            if cleanup_failures_count:
+                print(f"   🚫 Dropped (unparseable SMILES): {cleanup_failures_count}")
 
             # Compute InChI keys for the loaded compounds, similar to load_csv_file
             try:
@@ -1173,6 +2314,8 @@ class ChemSpace:
                         # Update table with inchi_key column
                         conn = sqlite3.connect(self.__chemspace_db)
                         cursor = conn.cursor()
+                        cursor.execute("PRAGMA journal_mode=WAL")
+                        cursor.execute("PRAGMA synchronous=NORMAL")
                         cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN inchi_key TEXT")
                         for idx, row in df_loaded.iterrows():
                             cursor.execute(f"UPDATE {table_name} SET inchi_key = ? WHERE id = ?", (row['inchi_key'], row['id']))
@@ -1193,7 +2336,10 @@ class ChemSpace:
                 'duplicates_skipped': duplicates_skipped,
                 'errors': errors,
                 'table_name': table_name,
-                'column_types_fixed': column_types_fixed
+                'column_types_fixed': column_types_fixed,
+                'salts_stripped': salts_stripped_count,
+                'fragments_retained': fragments_retained_count,
+                'cleanup_failures': cleanup_failures_count
             }
 
         except Exception as e:
@@ -1220,6 +2366,8 @@ class ChemSpace:
         try:
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
 
             # Get current schema
             cursor.execute(f"PRAGMA table_info({table_name})")
@@ -1577,64 +2725,122 @@ class ChemSpace:
         
         return df
     
-    def _insert_compounds(self, compounds_data: List[Tuple], table_name: str, skip_duplicates: bool = True) -> Dict[str, Any]:
+    def _insert_compounds(self, compounds_data: List[Tuple], table_name: str, skip_duplicates: bool = True,
+                         show_progress: bool = False,
+                         structure_keys: Optional[Set[str]] = None) -> Dict[str, Any]:
         """
         Insert compounds data into the database.
-        
+
         Args:
             compounds_data (List[Tuple]): List of tuples containing compound data
             table_name (str): Name of the table to insert into
             skip_duplicates (bool): Whether to skip duplicate compounds
-            
+            show_progress (bool): Whether to display a tqdm progress bar for this insert batch.
+                Only meaningful when called with a large, un-chunked batch (e.g. the sequential
+                load_csv_file path); left off for per-chunk inserts in the parallel path since an
+                outer progress bar already tracks overall row throughput there.
+            structure_keys (Optional[Set[str]]): Set of canonical structure keys (see
+                _compute_structure_dedup_key()) already present, used to catch duplicate
+                molecules regardless of name or of salt-form/SMILES-string differences
+                (e.g. a free base and its HCl salt loaded under different names) --
+                the UNIQUE(name, smiles) constraint alone misses these. Mutated in place
+                so callers making repeated calls for the same table (e.g. per parallel
+                chunk) can share one set across calls instead of re-scanning the table
+                each time. If None, it is seeded once from the table's current contents
+                for this call only.
+
         Returns:
             dict: Results containing counts and status
         """
         try:
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
-            
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+
             compounds_added = 0
             duplicates_skipped = 0
             errors = 0
-            
+            duplicate_smiles = []
+            error_smiles = []
+
             insert_query = f"""
             INSERT INTO {table_name} (smiles, name, flag, flag_description)
             VALUES (?, ?, ?, ?)
             """
-            
-            for compound_data in compounds_data:
+
+            salt_remover = None
+            fragment_chooser = None
+            if skip_duplicates:
+                from rdkit.Chem import SaltRemover
+                from rdkit.Chem.MolStandardize import rdMolStandardize
+                salt_remover = SaltRemover.SaltRemover()
+                fragment_chooser = rdMolStandardize.LargestFragmentChooser()
+
+                if structure_keys is None:
+                    structure_keys = set()
+                    cursor.execute(f"SELECT smiles FROM {table_name}")
+                    for (existing_smiles,) in cursor.fetchall():
+                        existing_key = _compute_structure_dedup_key(existing_smiles, salt_remover, fragment_chooser)
+                        if existing_key is not None:
+                            structure_keys.add(existing_key)
+
+            if show_progress and TQDM_AVAILABLE:
+                compound_iterator = tqdm(compounds_data, desc="Inserting compounds", unit="cmpd")
+            else:
+                compound_iterator = compounds_data
+                if show_progress and not TQDM_AVAILABLE:
+                    print(f"   💾 Inserting {len(compounds_data)} compounds into '{table_name}'...")
+
+            for compound_data in compound_iterator:
+                if skip_duplicates:
+                    structure_key = _compute_structure_dedup_key(compound_data[0], salt_remover, fragment_chooser)
+                    if structure_key is not None:
+                        if structure_key in structure_keys:
+                            duplicates_skipped += 1
+                            duplicate_smiles.append(compound_data[0])
+                            continue
+                        structure_keys.add(structure_key)
+
                 try:
                     cursor.execute(insert_query, compound_data)
                     compounds_added += 1
                 except sqlite3.IntegrityError:
                     if skip_duplicates:
                         duplicates_skipped += 1
+                        duplicate_smiles.append(compound_data[0])
                     else:
                         errors += 1
+                        error_smiles.append(compound_data[0])
                 except Exception as e:
                     print(f"⚠️  Error inserting compound {compound_data[1]}: {e}")
                     errors += 1
-            
+                    error_smiles.append(compound_data[0])
+
             conn.commit()
             conn.close()
-            
+
             return {
                 'success': True,
                 'message': f"Inserted {compounds_added} compounds successfully",
                 'compounds_added': compounds_added,
                 'duplicates_skipped': duplicates_skipped,
-                'errors': errors
+                'errors': errors,
+                'duplicate_smiles': duplicate_smiles,
+                'error_smiles': error_smiles
             }
-            
+
         except Exception as e:
             return {
                 'success': False,
                 'message': f"Database error: {e}",
                 'compounds_added': 0,
                 'duplicates_skipped': 0,
-                'errors': len(compounds_data)
+                'errors': len(compounds_data),
+                'duplicate_smiles': [],
+                'error_smiles': [compound_data[0] for compound_data in compounds_data]
             }
-    
+
     def get_compounds(self, table_name: Optional[str] = None,
                      limit: Optional[int] = None, 
                      flag_filter: Optional[str] = None,
@@ -1654,6 +2860,8 @@ class ChemSpace:
         try:
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             # Use default table if none specified
             if table_name is None:
@@ -1712,6 +2920,8 @@ class ChemSpace:
         try:
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             # Use default table if none specified
             if table_name is None:
@@ -1730,20 +2940,50 @@ class ChemSpace:
             print(f"❌ Error counting compounds in table '{table_name}': {e}")
             return 0
     
-    def export_to_csv(self, output_path: str, 
+    def export_to_csv(self, output_path: Optional[str] = None,
                      table_name: Optional[str] = None,
                      flag_filter: Optional[str] = None) -> bool:
         """
         Export compounds to a CSV file.
-        
+
         Args:
-            output_path (str): Path for the output CSV file
+            output_path (Optional[str]): Path for the output CSV file. Queried interactively if not provided.
             table_name (Optional[str]): Name of the table to export from. If None, exports all tables
             flag_filter (Optional[str]): Filter by specific flag value
-            
+
         Returns:
             bool: True if export was successful
         """
+        tables = self.get_all_tables()
+        if not tables:
+            print("No tables found in the database.")
+            return False
+        print("Available tables:")
+        for i, t in enumerate(tables, 1):
+            print(f"  {i}. {t}")
+
+        if table_name is None:
+            raw = input("Select a table by number or name: ").strip()
+            if not raw:
+                print("No table selected. Export cancelled.")
+                return False
+            if raw.isdigit():
+                idx = int(raw) - 1
+                if not (0 <= idx < len(tables)):
+                    print("Invalid selection. Export cancelled.")
+                    return False
+                table_name = tables[idx]
+            else:
+                if raw not in tables:
+                    print(f"Table '{raw}' not found. Export cancelled.")
+                    return False
+                table_name = raw
+
+        if output_path is None:
+            output_path = input("Enter the destination path for the CSV file: ").strip()
+            if not output_path:
+                print("No path provided. Export cancelled.")
+                return False
         try:
             compounds = self.get_compounds(table_name=table_name, flag_filter=flag_filter)
             
@@ -1754,6 +2994,10 @@ class ChemSpace:
             
             # Convert to DataFrame and save
             df = pd.DataFrame(compounds)
+            if 'sdf_blob' in df.columns:
+                keep = input("Retain the 'sdf_blob' column in the CSV? (y/N): ").strip().lower()
+                if keep != 'y':
+                    df = df.drop(columns=['sdf_blob'])
             df.to_csv(output_path, index=False)
             
             table_desc = f" from table '{table_name}'" if table_name else ""
@@ -1863,6 +3107,8 @@ class ChemSpace:
             # Connect to chemspace database and retrieve the table
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             query = f"SELECT id, smiles, name, flag, flag_description, inchi_key FROM {table_name}"
             cursor.execute(query)
             compounds = cursor.fetchall()
@@ -1981,6 +3227,8 @@ class ChemSpace:
             
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             # Create the new table with the same schema as other compound tables
             # Add UNIQUE constraint on SMILES to prevent future duplicates
@@ -1994,27 +3242,36 @@ class ChemSpace:
                     inchi_key TEXT
                 )
             ''')
-            
-            # Create indexes for better performance
+
+            # Insert the unique filtered compounds in a single executemany() batch
+            # rather than one execute() per compound (crossing the sqlite3 C-API
+            # boundary once per row dominates runtime for large tables). Uses
+            # INSERT OR IGNORE instead of catching IntegrityError per row, with
+            # conn.total_changes before/after to recover the exact duplicate count
+            # that the per-row try/except used to give us.
+            insert_query = f'''
+                INSERT OR IGNORE INTO {table_name} (smiles, name, flag, flag_description, inchi_key)
+                VALUES (?, ?, ?, ?, ?)
+            '''
+            batch = [
+                (compound['smiles'], compound['name'], compound['flag'],
+                 compound.get('flag_description', None), compound.get('inchi_key', None))
+                for compound in unique_compounds
+            ]
+            changes_before = conn.total_changes
+            cursor.executemany(insert_query, batch)
+            inserted_count = conn.total_changes - changes_before
+            database_duplicates = len(batch) - inserted_count
+
+            # Create indexes after the table is populated, not before: indexes
+            # created on an empty table force SQLite to rebalance their b-trees on
+            # every single-row insert above, which measured slower than building the
+            # indexes once against fully-populated data (same fix as applied to
+            # _update_table_with_inchi_keys() and _save_step_products()).
             cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_smiles ON {table_name}(smiles)")
             cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_name ON {table_name}(name)")
             cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_flag ON {table_name}(flag)")
-            
-            # Insert the unique filtered compounds
-            inserted_count = 0
-            database_duplicates = 0
-            
-            for compound in unique_compounds:
-                try:
-                    cursor.execute(f'''
-                        INSERT INTO {table_name} (smiles, name, flag, flag_description, inchi_key)
-                        VALUES (?, ?, ?, ?, ?)
-                    ''', (compound['smiles'], compound['name'], compound['flag'], compound.get('flag_description', None), compound.get('inchi_key', None)))
-                    inserted_count += 1
-                except sqlite3.IntegrityError:
-                    # Handle case where compound already exists in database
-                    database_duplicates += 1
-            
+
             conn.commit()
             conn.close()
             
@@ -2052,6 +3309,8 @@ class ChemSpace:
         try:
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             if table_name:
                 # Clear specific table
@@ -2096,7 +3355,9 @@ class ChemSpace:
                     return pd.DataFrame()
             
             conn = sqlite3.connect(self.__chemspace_db)
-            
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+
             # Build query with filters
             query = f"SELECT * FROM {table_name}"
             
@@ -2110,8 +3371,31 @@ class ChemSpace:
         except Exception as e:
             print(f"❌ Error retrieving table '{table_name}' as DataFrame: {e}")
             return pd.DataFrame()
-    
-    def compute_inchi_keys(self, table_name: str, 
+
+    def _get_table_columns(self, table_name: str) -> List[str]:
+        """
+        Get the column names of a table without loading its data.
+
+        Args:
+            table_name (str): Name of the table to inspect
+
+        Returns:
+            List[str]: Column names, empty list on error
+        """
+        try:
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.execute(f"PRAGMA table_info({table_name})")
+            columns = [row[1] for row in cursor.fetchall()]
+            conn.close()
+            return columns
+        except Exception as e:
+            print(f"❌ Error getting columns for table '{table_name}': {e}")
+            return []
+
+    def compute_inchi_keys(self, table_name: str,
                           update_database: bool = True,
                           parallel_threshold: int = 1000,
                           max_workers: Optional[int] = None,
@@ -2416,29 +3700,46 @@ class ChemSpace:
         try:
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             # Check if inchi_key column exists, add if it doesn't (for backward compatibility)
             cursor.execute(f"PRAGMA table_info({table_name})")
             columns = [row[1] for row in cursor.fetchall()]
             
+            newly_added_column = False
             if 'inchi_key' not in columns:
                 try:
                     cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN inchi_key TEXT")
-                    cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_inchi_key ON {table_name}(inchi_key)")
                     print(f"   📋 Added 'inchi_key' column to existing table '{table_name}'")
+                    newly_added_column = True
                 except sqlite3.OperationalError as e:
                     print(f"   ⚠️  Warning: Could not add inchi_key column: {e}")
                     return False
-            
-            # Update each row with computed InChI key
+
+            # Update each row with computed InChI key.
+            # Uses itertuples() + executemany() rather than iterrows() + per-row execute():
+            # iterrows() rebuilds a pandas Series per row, and a separate execute() per row
+            # crosses the sqlite3 C-API boundary once per row. For large CSVs (100k+ rows)
+            # that dominates the runtime of load_csv_file(); a single executemany() batch
+            # is orders of magnitude faster for the same result.
             update_query = f"UPDATE {table_name} SET inchi_key = ? WHERE id = ?"
-            
-            updates_made = 0
-            for _, row in df.iterrows():
-                if pd.notna(row.get('inchi_key')) and row['inchi_key'] not in ['INVALID_SMILES', 'ERROR']:
-                    cursor.execute(update_query, (row['inchi_key'], row['id']))
-                    updates_made += 1
-            
+
+            updates = [
+                (row.inchi_key, row.id)
+                for row in df.itertuples(index=False)
+                if pd.notna(row.inchi_key) and row.inchi_key not in ['INVALID_SMILES', 'ERROR']
+            ]
+            cursor.executemany(update_query, updates)
+            updates_made = len(updates)
+
+            # Build the index after the column is populated, not before: an index
+            # created on an all-NULL column forces SQLite to rebalance the b-tree on
+            # every single-row UPDATE above, which measured ~4x slower on multi-million
+            # row product tables than building the index once against populated data.
+            if newly_added_column:
+                cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_inchi_key ON {table_name}(inchi_key)")
+
             conn.commit()
             conn.close()
             
@@ -2448,7 +3749,4539 @@ class ChemSpace:
         except Exception as e:
             print(f"❌ Error updating database table '{table_name}' with InChI keys: {e}")
             return False
-    
+
+    _MORGAN_FP_SIZE_OPTIONS = (512, 1024, 2048)
+
+    def compute_morgan_fingerprints(self, table_name: Optional[str] = None,
+                                    fp_size: Optional[int] = None,
+                                    radius: Optional[int] = None,
+                                    update_database: bool = True,
+                                    parallel_threshold: int = 1000,
+                                    max_workers: Optional[int] = None,
+                                    chunk_size: Optional[int] = None,
+                                    confirm_overwrite: bool = True) -> pd.DataFrame:
+        """
+        Retrieve a table as DataFrame and compute Morgan fingerprints for each SMILES string using parallel processing.
+
+        Args:
+            table_name (Optional[str]): Name of the table to process. If None, prompts an interactive table selection.
+            fp_size (Optional[int]): Fingerprint bit-vector length, one of 512, 1024 or 2048. If None, prompts an interactive selection.
+            radius (Optional[int]): Morgan fingerprint radius. If None, prompts an interactive selection (default: 3).
+            update_database (bool): Whether to store the computed fingerprints back into the table
+            parallel_threshold (int): Number of compounds above which parallel processing is used (default: 1000)
+            max_workers (Optional[int]): Maximum number of parallel workers. If None, uses cpu_count()
+            chunk_size (Optional[int]): Size of each chunk for parallel processing. If None, automatically calculated
+            confirm_overwrite (bool): If True (default) and this exact radius/fpSize configuration
+                was already computed for the table, prompts an interactive yes/no confirmation
+                before overwriting the existing column's values. Set to False to skip the prompt
+                for scripted/non-interactive use.
+
+        Returns:
+            pd.DataFrame: DataFrame with an added 'morgan_fp_r<radius>_<fp_size>' column, empty DataFrame if error occurs
+        """
+        try:
+            # Check RDKit availability early
+            try:
+                from rdkit import Chem
+                from rdkit.Chem import rdFingerprintGenerator
+            except ImportError:
+                print("❌ RDKit not installed. Please install RDKit to compute Morgan fingerprints:")
+                print("   conda install -c conda-forge rdkit")
+                print("   or")
+                print("   pip install rdkit")
+                return pd.DataFrame()
+
+            # Resolve table interactively if not provided
+            if table_name is None:
+                table_name = self._select_table_interactive("SELECT TABLE FOR MORGAN FINGERPRINT COMPUTATION")
+                if not table_name:
+                    print("❌ No table selected for Morgan fingerprint computation")
+                    return pd.DataFrame()
+
+            # Resolve fpSize interactively if not provided
+            if fp_size is None:
+                fp_size = self._select_morgan_fp_size_interactive()
+                if fp_size is None:
+                    print("❌ No fingerprint size selected")
+                    return pd.DataFrame()
+            elif fp_size not in self._MORGAN_FP_SIZE_OPTIONS:
+                print(f"❌ Invalid fpSize {fp_size}. Must be one of {self._MORGAN_FP_SIZE_OPTIONS}")
+                return pd.DataFrame()
+
+            # Resolve radius interactively if not provided
+            if radius is None:
+                radius = self._select_morgan_radius_interactive()
+                if radius is None:
+                    print("❌ No radius selected")
+                    return pd.DataFrame()
+            elif not isinstance(radius, int) or radius < 0:
+                print(f"❌ Invalid radius {radius}. Must be a non-negative integer")
+                return pd.DataFrame()
+
+            # Get the DataFrame using existing method
+            print(f"📊 Retrieving table '{table_name}' for Morgan fingerprint computation...")
+            df = self._get_table_as_dataframe(table_name)
+
+            if df.empty:
+                print(f"⚠️  No data retrieved from table '{table_name}'")
+                return pd.DataFrame()
+
+            # Check if SMILES column exists
+            if 'smiles' not in df.columns:
+                print("❌ No 'smiles' column found in the DataFrame")
+                return pd.DataFrame()
+
+            # Initialize fingerprint column (named after radius and fpSize so different
+            # combinations can coexist without overwriting each other)
+            fp_column = f"morgan_fp_r{radius}_{fp_size}"
+
+            # Warn if this exact configuration was already computed for this table, since
+            # proceeding will overwrite the existing column's values
+            if update_database and fp_column in df.columns:
+                print(f"⚠️  Column '{fp_column}' already exists in table '{table_name}' "
+                      f"(radius={radius}, fpSize={fp_size}) — it was already computed before.")
+                if confirm_overwrite:
+                    answer = input(f"   Overwrite existing fingerprint values? "
+                                   f"(yes/no, default: no): ").strip().lower()
+                    if answer not in ('y', 'yes'):
+                        print("❌ Fingerprint computation cancelled to avoid overwriting existing data")
+                        return pd.DataFrame()
+
+            df[fp_column] = None
+
+            num_compounds = len(df)
+            print(f"🔬 Computing Morgan fingerprints (radius={radius}, fpSize={fp_size}) for {num_compounds} compounds...")
+
+            # Determine processing method
+            use_parallel = num_compounds > parallel_threshold
+
+            if use_parallel:
+                print(f"🚀 Large dataset detected ({num_compounds} compounds). Using parallel processing...")
+
+                # Set up parallel processing parameters
+                if max_workers is None:
+                    max_workers = min(cpu_count(), 8)  # Limit to reasonable number
+
+                if chunk_size is None:
+                    chunk_size = max(100, num_compounds // (max_workers * 4))  # Ensure reasonable chunk size
+
+                print(f"   👥 Workers: {max_workers}")
+                print(f"   📦 Chunk size: {chunk_size}")
+
+                # Process in parallel
+                successful_computations, failed_computations = self._compute_morgan_fingerprints_parallel(
+                    df, fp_column, radius, fp_size, max_workers, chunk_size
+                )
+            else:
+                print(f"📝 Processing {num_compounds} compounds sequentially...")
+                # Sequential processing for smaller datasets
+                successful_computations, failed_computations = self._compute_morgan_fingerprints_sequential(
+                    df, fp_column, radius, fp_size
+                )
+
+            # Print summary
+            print(f"✅ Morgan fingerprint computation completed:")
+            print(f"   🎯 Successful: {successful_computations}")
+            print(f"   ❌ Failed: {failed_computations}")
+
+            # Optionally update the database table
+            if update_database and successful_computations > 0:
+                print(f"💾 Updating database table '{table_name}' with Morgan fingerprints...")
+                success = self._update_table_with_morgan_fingerprints(table_name, df, fp_column)
+                if success:
+                    print(f"✅ Database table '{table_name}' updated with column '{fp_column}'")
+                else:
+                    print(f"❌ Failed to update database table '{table_name}'")
+
+            return df
+
+        except Exception as e:
+            print(f"❌ Error computing Morgan fingerprints for table '{table_name}': {e}")
+            return pd.DataFrame()
+
+    def _select_morgan_fp_size_interactive(self) -> Optional[int]:
+        """
+        Interactive selection of the Morgan fingerprint bit-vector size (fpSize).
+
+        Returns:
+            Optional[int]: Selected fpSize (512, 1024 or 2048), or None if cancelled
+        """
+        fp_size_options = self._MORGAN_FP_SIZE_OPTIONS
+
+        print(f"\n🔍 SELECT MORGAN FINGERPRINT SIZE (fpSize)")
+        print("=" * 60)
+        for i, option in enumerate(fp_size_options, 1):
+            print(f"{i}. {option}")
+        print("-" * 60)
+        print("Commands: Enter option number, fpSize value, or 'cancel' to abort")
+
+        while True:
+            try:
+                selection = input(f"\n🔍 Select fpSize: ").strip()
+
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    return None
+
+                try:
+                    selection_int = int(selection)
+                except ValueError:
+                    print(f"❌ Invalid input. Please enter 1-{len(fp_size_options)} or one of {fp_size_options}")
+                    continue
+
+                if 1 <= selection_int <= len(fp_size_options):
+                    return fp_size_options[selection_int - 1]
+                if selection_int in fp_size_options:
+                    return selection_int
+
+                print(f"❌ Invalid selection. Please enter 1-{len(fp_size_options)} or one of {fp_size_options}")
+
+            except KeyboardInterrupt:
+                print("\n❌ fpSize selection cancelled")
+                return None
+
+    _MORGAN_RADIUS_DEFAULT = 3
+
+    def _select_morgan_radius_interactive(self) -> Optional[int]:
+        """
+        Interactive selection of the Morgan fingerprint radius.
+
+        Returns:
+            Optional[int]: Selected radius (non-negative integer), or None if cancelled
+        """
+        default_radius = self._MORGAN_RADIUS_DEFAULT
+
+        print(f"\n🔍 SELECT MORGAN FINGERPRINT RADIUS")
+        print("=" * 60)
+        print(f"Enter a non-negative integer radius (press Enter for default: {default_radius})")
+        print("-" * 60)
+        print("Commands: Enter radius value, or 'cancel' to abort")
+
+        while True:
+            try:
+                selection = input(f"\n🔍 Select radius [{default_radius}]: ").strip()
+
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    return None
+
+                if selection == '':
+                    return default_radius
+
+                try:
+                    selection_int = int(selection)
+                except ValueError:
+                    print("❌ Invalid input. Please enter a non-negative integer")
+                    continue
+
+                if selection_int < 0:
+                    print("❌ Invalid radius. Please enter a non-negative integer")
+                    continue
+
+                return selection_int
+
+            except KeyboardInterrupt:
+                print("\n❌ Radius selection cancelled")
+                return None
+
+    def _compute_morgan_fingerprints_parallel(self, df: pd.DataFrame, fp_column: str, radius: int, fp_size: int,
+                                              max_workers: int, chunk_size: int) -> Tuple[int, int]:
+        """
+        Compute Morgan fingerprints using parallel processing.
+
+        Args:
+            df (pd.DataFrame): DataFrame containing SMILES data
+            fp_column (str): Name of the column to store computed fingerprints in
+            radius (int): Morgan fingerprint radius
+            fp_size (int): Fingerprint bit-vector length
+            max_workers (int): Maximum number of parallel workers
+            chunk_size (int): Size of each chunk for parallel processing
+
+        Returns:
+            Tuple[int, int]: (successful_computations, failed_computations)
+        """
+        try:
+            start_time = time.time()
+
+            # Prepare data for parallel processing
+            print(f"   📦 Preparing data for parallel processing...")
+            chunk_data_list = []
+
+            # Split data into chunks
+            for i in range(0, len(df), chunk_size):
+                chunk_df = df.iloc[i:i + chunk_size]
+                chunk_data = []
+
+                for idx, row in chunk_df.iterrows():
+                    smiles = row['smiles']
+                    name = row.get('name', 'unknown')
+                    chunk_data.append((idx, smiles, name))
+
+                if chunk_data:  # Only add non-empty chunks
+                    chunk_data_list.append(chunk_data)
+
+            num_chunks = len(chunk_data_list)
+            print(f"   📊 Split {len(df)} compounds into {num_chunks} chunks")
+
+            # Initialize progress tracking
+            successful_computations = 0
+            failed_computations = 0
+            processed_chunks = 0
+            failed_chunks = 0
+
+            # Initialize progress bar if tqdm is available
+            if TQDM_AVAILABLE:
+                progress_bar = tqdm(
+                    total=len(df),
+                    desc="Computing Morgan fingerprints",
+                    unit="compounds",
+                    bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
+                )
+            else:
+                progress_bar = None
+                print(f"   🚀 Starting parallel processing of {num_chunks} chunks...")
+
+            # Process chunks in parallel
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                # Submit all chunk processing jobs
+                future_to_chunk = {}
+                chunk_submission_start = time.time()
+
+                for i, chunk_data in enumerate(chunk_data_list):
+                    future = executor.submit(_compute_morgan_fingerprints_worker, chunk_data, radius, fp_size)
+                    future_to_chunk[future] = i
+
+                chunk_submission_time = time.time() - chunk_submission_start
+                print(f"   ⏱️  All {num_chunks} chunks submitted in {chunk_submission_time:.2f}s")
+
+                # Collect results
+                for future in as_completed(future_to_chunk):
+                    chunk_idx = future_to_chunk[future]
+
+                    try:
+                        chunk_results = future.result()
+
+                        # Update DataFrame with results
+                        chunk_successful = 0
+                        chunk_failed = 0
+
+                        for idx, fp_value, name in chunk_results:
+                            df.at[idx, fp_column] = fp_value
+
+                            if fp_value in ['INVALID_SMILES', 'ERROR']:
+                                chunk_failed += 1
+                                # Show only first few errors
+                                if failed_computations + chunk_failed <= 5:
+                                    error_type = "Invalid SMILES" if fp_value == 'INVALID_SMILES' else "Computation error"
+                                    print(f"⚠️  {error_type} for compound '{name}' (chunk {chunk_idx})")
+                            else:
+                                chunk_successful += 1
+
+                        successful_computations += chunk_successful
+                        failed_computations += chunk_failed
+                        processed_chunks += 1
+
+                        # Update progress
+                        chunk_size_actual = len(chunk_results)
+                        if progress_bar:
+                            progress_bar.update(chunk_size_actual)
+                        else:
+                            # Print progress every 5 chunks if no tqdm
+                            if processed_chunks % 5 == 0 or processed_chunks == num_chunks:
+                                progress_pct = (processed_chunks / num_chunks) * 100
+                                print(f"   📈 Progress: {processed_chunks}/{num_chunks} chunks ({progress_pct:.1f}%)")
+
+                    except Exception as e:
+                        failed_chunks += 1
+                        chunk_size_est = len(chunk_data_list[chunk_idx]) if chunk_idx < len(chunk_data_list) else chunk_size
+                        failed_computations += chunk_size_est
+                        processed_chunks += 1
+
+                        print(f"   ❌ Error processing chunk {chunk_idx}: {e}")
+
+                        # Update progress even for failed chunks
+                        if progress_bar:
+                            progress_bar.update(chunk_size_est)
+
+            # Close progress bar
+            if progress_bar:
+                progress_bar.close()
+
+            processing_time = time.time() - start_time
+            print(f"   ⏱️  Parallel processing completed in {processing_time:.2f}s")
+
+            if failed_chunks > 0:
+                print(f"   ⚠️  {failed_chunks} chunks failed during processing")
+
+            return successful_computations, failed_computations
+
+        except Exception as e:
+            print(f"❌ Error in parallel Morgan fingerprint computation: {e}")
+            return 0, len(df)
+
+    def _compute_morgan_fingerprints_sequential(self, df: pd.DataFrame, fp_column: str,
+                                                radius: int, fp_size: int) -> Tuple[int, int]:
+        """
+        Compute Morgan fingerprints using sequential processing.
+
+        Args:
+            df (pd.DataFrame): DataFrame containing SMILES data
+            fp_column (str): Name of the column to store computed fingerprints in
+            radius (int): Morgan fingerprint radius
+            fp_size (int): Fingerprint bit-vector length
+
+        Returns:
+            Tuple[int, int]: (successful_computations, failed_computations)
+        """
+        try:
+            from rdkit import Chem
+            from rdkit.Chem import rdFingerprintGenerator
+        except ImportError:
+            print("❌ RDKit not available for sequential processing")
+            return 0, len(df)
+
+        generator = rdFingerprintGenerator.GetMorganGenerator(radius=radius, fpSize=fp_size)
+
+        successful_computations = 0
+        failed_computations = 0
+
+        # Initialize progress bar if tqdm is available
+        if TQDM_AVAILABLE:
+            progress_bar = tqdm(
+                total=len(df),
+                desc="Computing Morgan fingerprints",
+                unit="compounds"
+            )
+        else:
+            progress_bar = None
+
+        for idx, row in df.iterrows():
+            smiles = row['smiles']
+            name = row.get('name', 'unknown')
+
+            try:
+                # Parse SMILES with RDKit
+                mol = Chem.MolFromSmiles(smiles)
+
+                if mol is not None:
+                    # Compute Morgan fingerprint, packed into a compact bytes blob for storage
+                    fp = generator.GetFingerprint(mol)
+                    df.at[idx, fp_column] = _pack_fingerprint_bitstring(fp.ToBitString())
+                    successful_computations += 1
+                else:
+                    # Invalid SMILES
+                    df.at[idx, fp_column] = 'INVALID_SMILES'
+                    failed_computations += 1
+                    if failed_computations <= 5:  # Show only first 5 errors
+                        print(f"⚠️  Invalid SMILES for compound '{name}': {smiles}")
+
+            except Exception as e:
+                df.at[idx, fp_column] = 'ERROR'
+                failed_computations += 1
+                if failed_computations <= 5:  # Show only first 5 errors
+                    print(f"⚠️  Error computing Morgan fingerprint for '{name}': {e}")
+
+            # Update progress
+            if progress_bar:
+                progress_bar.update(1)
+
+        # Close progress bar
+        if progress_bar:
+            progress_bar.close()
+
+        return successful_computations, failed_computations
+
+    def _update_table_with_morgan_fingerprints(self, table_name: str, df: pd.DataFrame, fp_column: str) -> bool:
+        """
+        Update the database table with computed Morgan fingerprint values.
+        Adds the fingerprint column if it doesn't already exist (for backward compatibility).
+
+        Args:
+            table_name (str): Name of the table to update
+            df (pd.DataFrame): DataFrame containing the computed fingerprints
+            fp_column (str): Name of the fingerprint column to write
+
+        Returns:
+            bool: True if update was successful
+        """
+        try:
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+
+            # Check if the fingerprint column exists, add it if it doesn't
+            cursor.execute(f"PRAGMA table_info({table_name})")
+            columns = [row[1] for row in cursor.fetchall()]
+
+            if fp_column not in columns:
+                try:
+                    cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {fp_column} BLOB")
+                    print(f"   📋 Added '{fp_column}' column to existing table '{table_name}'")
+                except sqlite3.OperationalError as e:
+                    print(f"   ⚠️  Warning: Could not add {fp_column} column: {e}")
+                    return False
+
+            # Update each row with the computed fingerprint, packed as a bytes blob.
+            # Uses itertuples() + executemany() rather than iterrows() + per-row execute()
+            # for the same reason as _update_table_with_inchi_keys: a single executemany()
+            # batch avoids crossing the sqlite3 C-API boundary once per row.
+            update_query = f"UPDATE {table_name} SET {fp_column} = ? WHERE id = ?"
+
+            updates = [
+                (getattr(row, fp_column), row.id)
+                for row in df.itertuples(index=False)
+                if pd.notna(getattr(row, fp_column)) and getattr(row, fp_column) not in ['INVALID_SMILES', 'ERROR']
+            ]
+            cursor.executemany(update_query, updates)
+            updates_made = len(updates)
+
+            conn.commit()
+            conn.close()
+
+            print(f"   📊 Updated {updates_made} rows with Morgan fingerprints")
+            return True
+
+        except Exception as e:
+            print(f"❌ Error updating database table '{table_name}' with Morgan fingerprints: {e}")
+            return False
+
+    def delete_morgan_fingerprints(self, table_name: Optional[str] = None,
+                                   fp_column: Optional[str] = None,
+                                   confirm: bool = True) -> bool:
+        """
+        Delete a previously computed Morgan fingerprint column ('morgan_fp_r<radius>_<fpSize>',
+        from compute_morgan_fingerprints()) from a table.
+
+        Note: any dimensionality-reduction model saved for this (table, fp_column) combination
+        in 'dim_reduction_models' (see reduce_dimensionality()) can no longer be used for
+        projection via project_dimensionality_on_table() once its fingerprint column is gone —
+        already-computed coordinate columns ('<method>_<i>') are untouched, though.
+
+        Args:
+            table_name (Optional[str]): Name of the table to clean up. If None, prompts an
+                interactive table selection restricted to tables with at least one Morgan
+                fingerprint column.
+            fp_column (Optional[str]): Name of the fingerprint column to delete (e.g.
+                'morgan_fp_r3_2048'), or 'all' to delete every fingerprint column on the table.
+                If None, prompts an interactive selection among the table's fingerprint
+                columns (offers an "All" option when more than one exists).
+            confirm (bool): If True (default), prompts an interactive yes/no confirmation before
+                deleting. Set to False to skip the prompt for scripted/non-interactive use.
+
+        Returns:
+            bool: True if deleted successfully, False on error or if cancelled
+        """
+        try:
+            # Resolve table interactively if not provided, restricted to tables that already
+            # have at least one Morgan fingerprint column
+            if table_name is None:
+                tables_with_fp = [
+                    t for t in self.get_all_tables()
+                    if any(self._MORGAN_FP_COLUMN_PATTERN.match(c) for c in self._get_table_columns(t))
+                ]
+                if not tables_with_fp:
+                    print("❌ No tables with Morgan fingerprint columns found.")
+                    print("   Run compute_morgan_fingerprints() on a table first.")
+                    return False
+
+                table_name = self._select_table_interactive(
+                    "SELECT TABLE TO DELETE MORGAN FINGERPRINTS FROM", tables_override=tables_with_fp
+                )
+                if not table_name:
+                    print("❌ No table selected")
+                    return False
+
+            available_fp_columns = [c for c in self._get_table_columns(table_name)
+                                    if self._MORGAN_FP_COLUMN_PATTERN.match(c)]
+
+            if not available_fp_columns:
+                print(f"❌ No Morgan fingerprint columns found in table '{table_name}'.")
+                return False
+
+            if fp_column is None:
+                fp_column = self._select_morgan_fp_column_interactive(
+                    available_fp_columns, allow_all=True
+                )
+                if fp_column is None:
+                    print("❌ No fingerprint column selected")
+                    return False
+            elif fp_column != 'all' and fp_column not in available_fp_columns:
+                print(f"❌ Fingerprint column '{fp_column}' not found in table '{table_name}'.")
+                print(f"   Available columns: {available_fp_columns}")
+                return False
+
+            columns_to_delete = list(available_fp_columns) if fp_column == 'all' else [fp_column]
+
+            print(f"🗑️  The following Morgan fingerprint column(s) will be permanently deleted "
+                  f"from '{table_name}':")
+            for col in columns_to_delete:
+                print(f"   - {col}")
+
+            if confirm:
+                answer = input(f"\n⚠️  This cannot be undone. Continue? (yes/no, default: no): ").strip().lower()
+                if answer not in ('y', 'yes'):
+                    print("❌ Deletion cancelled")
+                    return False
+
+            success = self._drop_table_columns(table_name, columns_to_delete)
+            if success:
+                print(f"✅ Deleted {len(columns_to_delete)} column(s) from '{table_name}'")
+            else:
+                print(f"❌ Failed to delete column(s) from '{table_name}'")
+            return success
+
+        except Exception as e:
+            print(f"❌ Error deleting Morgan fingerprints from table '{table_name}': {e}")
+            return False
+
+    _DIM_REDUCTION_METHODS = ('pca', 'tsne', 'umap')
+    _DIM_REDUCTION_LABELS = {'pca': 'PCA', 'tsne': 't-SNE', 'umap': 'UMAP'}
+    # Fixed color for the "full table" background layer in plot_projected_chemspace_density():
+    # a warm, muted tone that stays visually distinct from both the cool lightgray reference
+    # layer and the blue-green-yellow range of the default 'viridis' density colormap.
+    _DENSITY_PLOT_TABLE_BACKGROUND_COLOR = 'darkorange'
+    _MORGAN_FP_COLUMN_PATTERN = re.compile(r'^morgan_fp_r\d+_\d+$')
+    # Row batch size used by project_dimensionality_on_table() when unpacking fingerprint bits
+    # to float32 for reducer.transform(); bounds peak memory to ~size * n_bits * 4 bytes
+    # regardless of table size (e.g. 50_000 x 2048 x 4 bytes ~= 410 MiB per chunk).
+    _PROJECTION_CHUNK_SIZE = 50_000
+
+    def reduce_dimensionality(self, table_name: Optional[str] = None,
+                              fp_column: Optional[str] = None,
+                              method: Optional[str] = None,
+                              n_components: int = 2,
+                              update_database: bool = True,
+                              random_state: int = 42,
+                              n_jobs: int = -1) -> pd.DataFrame:
+        """
+        Retrieve a table as DataFrame and reduce the dimensionality of a previously computed
+        Morgan fingerprint column using PCA, t-SNE or UMAP.
+
+        Every fitted reducer is automatically persisted to the 'dim_reduction_models' table
+        in chemspace.db (keyed by table_name/fp_column/method), alongside the x/y coordinates
+        it produced.
+
+        Args:
+            table_name (Optional[str]): Name of the table to process. If None, prompts an interactive table selection.
+            fp_column (Optional[str]): Name of the fingerprint column to reduce (e.g. 'morgan_fp_r3_2048'),
+                as created by compute_morgan_fingerprints(). If None, prompts an interactive selection
+                among the table's fingerprint columns.
+            method (Optional[str]): One of 'pca', 'tsne', 'umap', or 'all' to run all three.
+                If None, prompts an interactive selection (which also offers an "All" option).
+            n_components (int): Number of output dimensions (default: 2)
+            update_database (bool): Whether to store the reduced coordinates back into the table
+            random_state (int): Random seed for reproducibility (tsne/umap)
+            n_jobs (int): Number of parallel jobs for tsne/umap neighbor search (default: -1, all cores)
+
+        Returns:
+            pd.DataFrame: DataFrame with added '<method>_1'..'<method>_<n_components>' columns,
+                empty DataFrame if error occurs
+        """
+        try:
+            try:
+                import joblib
+            except ImportError:
+                print("❌ joblib not installed. Please install it to save reduction models:")
+                print("   pip install joblib")
+                return pd.DataFrame()
+
+            # Check scikit-learn availability early
+            try:
+                from sklearn.decomposition import PCA
+                from sklearn.manifold import TSNE
+            except ImportError:
+                print("❌ scikit-learn not installed. Please install it to reduce dimensionality:")
+                print("   pip install scikit-learn")
+                return pd.DataFrame()
+
+            # Resolve table interactively if not provided, restricted to tables that
+            # already have at least one Morgan fingerprint column
+            if table_name is None:
+                tables_with_fp = [
+                    t for t in self.get_all_tables()
+                    if any(self._MORGAN_FP_COLUMN_PATTERN.match(c) for c in self._get_table_columns(t))
+                ]
+                if not tables_with_fp:
+                    print("❌ No tables with Morgan fingerprint columns found.")
+                    print("   Run compute_morgan_fingerprints() on a table first.")
+                    return pd.DataFrame()
+
+                table_name = self._select_table_interactive(
+                    "SELECT TABLE FOR DIMENSIONALITY REDUCTION", tables_override=tables_with_fp
+                )
+                if not table_name:
+                    print("❌ No table selected for dimensionality reduction")
+                    return pd.DataFrame()
+
+            # Get the DataFrame using existing method
+            print(f"📊 Retrieving table '{table_name}' for dimensionality reduction...")
+            df = self._get_table_as_dataframe(table_name)
+
+            if df.empty:
+                print(f"⚠️  No data retrieved from table '{table_name}'")
+                return pd.DataFrame()
+
+            # Resolve fingerprint column interactively if not provided
+            available_fp_columns = [c for c in df.columns if self._MORGAN_FP_COLUMN_PATTERN.match(c)]
+
+            if not available_fp_columns:
+                print(f"❌ No Morgan fingerprint columns found in table '{table_name}'.")
+                print("   Run compute_morgan_fingerprints() on this table first.")
+                return pd.DataFrame()
+
+            if fp_column is None:
+                fp_column = self._select_morgan_fp_column_interactive(available_fp_columns)
+                if fp_column is None:
+                    print("❌ No fingerprint column selected")
+                    return pd.DataFrame()
+            elif fp_column not in available_fp_columns:
+                print(f"❌ Fingerprint column '{fp_column}' not found in table '{table_name}'.")
+                print(f"   Available columns: {available_fp_columns}")
+                return pd.DataFrame()
+
+            # Resolve method interactively if not provided
+            if method is None:
+                method = self._select_dimensionality_reduction_method_interactive(allow_all=True)
+                if method is None:
+                    print("❌ No dimensionality reduction method selected")
+                    return pd.DataFrame()
+            elif method != 'all' and method not in self._DIM_REDUCTION_METHODS:
+                print(f"❌ Invalid method '{method}'. Must be one of {self._DIM_REDUCTION_METHODS} or 'all'")
+                return pd.DataFrame()
+
+            methods_to_run = list(self._DIM_REDUCTION_METHODS) if method == 'all' else [method]
+
+            if 'umap' in methods_to_run:
+                try:
+                    _suppress_tensorflow_logging()
+                    from umap import UMAP
+                except ImportError:
+                    print("❌ umap-learn not installed. Please install it to use UMAP:")
+                    print("   pip install umap-learn")
+                    return pd.DataFrame()
+
+            # Keep only rows with a valid (successfully computed) fingerprint
+            valid_mask = ~df[fp_column].isin(['INVALID_SMILES', 'ERROR']) & df[fp_column].notna()
+            num_valid = int(valid_mask.sum())
+
+            if num_valid < n_components + 1:
+                print(f"❌ Not enough valid fingerprints ({num_valid}) to reduce to {n_components} components")
+                return pd.DataFrame()
+
+            # Unpack the stored fingerprint blobs into a numeric matrix once, shared across
+            # all requested methods
+            fp_blobs = df.loc[valid_mask, fp_column].tolist()
+            X = np.array(
+                [np.unpackbits(np.frombuffer(b, dtype=np.uint8)) for b in fp_blobs],
+                dtype=np.float32
+            )
+
+            all_output_columns = []
+
+            for current_method in methods_to_run:
+                label = self._DIM_REDUCTION_LABELS[current_method]
+
+                print(f"🔬 Reducing '{fp_column}' ({num_valid} compounds) with "
+                      f"{label} to {n_components} components...")
+
+                start_time = time.time()
+
+                if current_method == 'pca':
+                    reducer = PCA(n_components=n_components, random_state=random_state)
+                elif current_method == 'tsne':
+                    # Perplexity must be < number of samples; keep it in a sane range for small datasets
+                    perplexity = min(30, max(5, num_valid - 1))
+                    reducer = TSNE(n_components=n_components, random_state=random_state,
+                                  perplexity=perplexity, init='pca', n_jobs=n_jobs)
+                else:  # umap
+                    reducer = UMAP(n_components=n_components, random_state=random_state, n_jobs=n_jobs)
+
+                embedding = reducer.fit_transform(X)
+
+                processing_time = time.time() - start_time
+                print(f"   ⏱️  {label} completed in {processing_time:.2f}s")
+
+                # Persist the newly fitted reducer alongside the x/y values it produced, except
+                # for t-SNE: it has no out-of-sample transform(), so project_dimensionality_on_table()
+                # can never reuse a saved t-SNE model — nothing would ever read the blob back.
+                if current_method != 'tsne':
+                    self._save_reduction_model_to_db(table_name, fp_column, current_method,
+                                                      embedding.shape[1], reducer)
+
+                # Initialize output columns and assign computed coordinates (component count
+                # taken from the actual embedding, in case it ever differs from n_components)
+                output_columns = [f"{current_method}_{i + 1}" for i in range(embedding.shape[1])]
+                for col in output_columns:
+                    df[col] = None
+                df.loc[valid_mask, output_columns] = embedding
+
+                print(f"✅ {label} completed: {num_valid} compounds embedded into {output_columns}")
+
+                all_output_columns.extend(output_columns)
+
+            if not all_output_columns:
+                print("❌ No dimensionality reduction was performed (all requested methods were skipped)")
+                return pd.DataFrame()
+
+            # Optionally update the database table
+            if update_database:
+                print(f"💾 Updating database table '{table_name}' with reduced coordinates...")
+                success = self._update_table_with_reduced_coordinates(table_name, df, all_output_columns)
+                if success:
+                    print(f"✅ Database table '{table_name}' updated with columns {all_output_columns}")
+                else:
+                    print(f"❌ Failed to update database table '{table_name}'")
+
+            return df
+
+        except Exception as e:
+            print(f"❌ Error reducing dimensionality for table '{table_name}': {e}")
+            return pd.DataFrame()
+
+    _DIM_REDUCTION_MODELS_TABLE = 'dim_reduction_models'
+
+    def _ensure_dim_reduction_models_table(self, cursor: sqlite3.Cursor) -> None:
+        """
+        Create the table that indexes fitted dimensionality-reduction models, if it doesn't
+        already exist. One row per (table_name, fp_column, method) combination; the fitted
+        reducer itself is joblib-dumped to a file (see _get_dim_reduction_models_dir()) and
+        only its path is stored here — a pickled UMAP model retains its full training data
+        (plus a second copy inside its pynndescent index) and can exceed SQLite's ~2 GiB
+        per-value BLOB limit for large tables, which storing it as a BLOB column doesn't.
+        """
+        cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS {self._DIM_REDUCTION_MODELS_TABLE} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                table_name TEXT NOT NULL,
+                fp_column TEXT NOT NULL,
+                method TEXT NOT NULL,
+                n_components INTEGER NOT NULL,
+                model_path TEXT NOT NULL,
+                created_date TEXT NOT NULL,
+                UNIQUE(table_name, fp_column, method)
+            )
+        """)
+        self._migrate_legacy_model_blob_column(cursor)
+
+    def _migrate_legacy_model_blob_column(self, cursor: sqlite3.Cursor) -> None:
+        """
+        One-time migration for databases created before model pickles were moved out of
+        SQLite: dumps any existing 'model_blob' values to files under
+        _get_dim_reduction_models_dir(), backfills 'model_path' to point at them, then drops
+        the now-unused 'model_blob' column.
+        """
+        cursor.execute(f"PRAGMA table_info({self._DIM_REDUCTION_MODELS_TABLE})")
+        columns = {row[1] for row in cursor.fetchall()}
+        if 'model_blob' not in columns:
+            return
+
+        if 'model_path' not in columns:
+            cursor.execute(f"ALTER TABLE {self._DIM_REDUCTION_MODELS_TABLE} ADD COLUMN model_path TEXT")
+
+        cursor.execute(f"""
+            SELECT id, table_name, fp_column, method, model_blob
+            FROM {self._DIM_REDUCTION_MODELS_TABLE}
+            WHERE model_blob IS NOT NULL AND (model_path IS NULL OR model_path = '')
+        """)
+        rows = cursor.fetchall()
+        if rows:
+            models_dir = self._get_dim_reduction_models_dir()
+            os.makedirs(models_dir, exist_ok=True)
+            for row_id, t_name, fp_col, method, blob in rows:
+                model_path = os.path.join(models_dir, f"{t_name}__{fp_col}__{method}.joblib")
+                with open(model_path, 'wb') as f:
+                    f.write(blob)
+                cursor.execute(
+                    f"UPDATE {self._DIM_REDUCTION_MODELS_TABLE} SET model_path = ? WHERE id = ?",
+                    (model_path, row_id)
+                )
+            print(f"   🔄 Migrated {len(rows)} legacy in-database model(s) to files under '{models_dir}'")
+
+        cursor.execute(f"ALTER TABLE {self._DIM_REDUCTION_MODELS_TABLE} DROP COLUMN model_blob")
+
+    def _get_dim_reduction_models_dir(self) -> str:
+        """
+        Directory where fitted dimensionality-reduction models are joblib-dumped, next to
+        chemspace.db.
+        """
+        return os.path.join(os.path.dirname(self.__chemspace_db), 'dim_reduction_models')
+
+    def _save_reduction_model_to_db(self, table_name: str, fp_column: str, method: str,
+                                    n_components: int, reducer) -> bool:
+        """
+        Serialize a fitted reducer (via joblib) to a file under _get_dim_reduction_models_dir()
+        and record its path in the 'dim_reduction_models' table, replacing any previously saved
+        model for the same (table_name, fp_column, method).
+
+        Returns:
+            bool: True if the model was saved successfully
+        """
+        try:
+            import joblib
+
+            models_dir = self._get_dim_reduction_models_dir()
+            os.makedirs(models_dir, exist_ok=True)
+            model_path = os.path.join(models_dir, f"{table_name}__{fp_column}__{method}.joblib")
+            joblib.dump(reducer, model_path)
+
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            self._ensure_dim_reduction_models_table(cursor)
+            cursor.execute(f"""
+                INSERT INTO {self._DIM_REDUCTION_MODELS_TABLE}
+                    (table_name, fp_column, method, n_components, model_path, created_date)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(table_name, fp_column, method) DO UPDATE SET
+                    n_components = excluded.n_components,
+                    model_path = excluded.model_path,
+                    created_date = excluded.created_date
+            """, (table_name, fp_column, method, n_components, model_path, datetime.now().isoformat()))
+            conn.commit()
+            conn.close()
+
+            print(f"   💾 Saved {self._DIM_REDUCTION_LABELS[method]} model for '{table_name}' "
+                  f"to '{model_path}'")
+            return True
+
+        except Exception as e:
+            print(f"⚠️  Could not save {method} model for '{table_name}': {e}")
+            return False
+
+    def _get_tables_with_saved_reduction_models(self) -> List[str]:
+        """
+        List the distinct table_name values present in 'dim_reduction_models', i.e. the
+        tables on which at least one reducer has been fitted and saved.
+
+        Returns:
+            List[str]: Sorted table names with at least one saved model, empty on error
+        """
+        try:
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            self._ensure_dim_reduction_models_table(cursor)
+            cursor.execute(f"SELECT DISTINCT table_name FROM {self._DIM_REDUCTION_MODELS_TABLE} ORDER BY table_name")
+            tables = [row[0] for row in cursor.fetchall()]
+            conn.close()
+            return tables
+
+        except Exception as e:
+            print(f"❌ Error listing tables with saved reduction models: {e}")
+            return []
+
+    def _get_saved_reduction_methods_for_table(self, table_name: str) -> List[str]:
+        """
+        List which methods have a saved model for a given table, without deserializing the
+        model blobs. Use this instead of _load_reduction_models_from_db() whenever only the
+        metadata is needed (e.g. to decide what's deletable) — unpickling a saved UMAP/t-SNE
+        model imports its whole library (and, for UMAP, transitively TensorFlow) just to
+        answer "does a model exist", which is unnecessary overhead/noise.
+
+        Args:
+            table_name (str): Name of the table to check
+
+        Returns:
+            List[str]: Method names with a saved model for this table, empty on error
+        """
+        try:
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            self._ensure_dim_reduction_models_table(cursor)
+            cursor.execute(
+                f"SELECT DISTINCT method FROM {self._DIM_REDUCTION_MODELS_TABLE} WHERE table_name = ?",
+                (table_name,)
+            )
+            methods = [row[0] for row in cursor.fetchall()]
+            conn.close()
+            return methods
+
+        except Exception as e:
+            print(f"❌ Error listing saved reduction methods for table '{table_name}': {e}")
+            return []
+
+    def _load_reduction_models_from_db(self, source_table_name: str,
+                                       method: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+        """
+        Load previously fitted reduction model(s) for a given source table from the
+        'dim_reduction_models' table.
+
+        Args:
+            source_table_name (str): Name of the table the model(s) were originally fit on
+            method (Optional[str]): Restrict to a single method; None or 'all' loads every
+                method saved for that table
+
+        Returns:
+            Dict[str, Dict[str, Any]]: {method: {'reducer': obj, 'fp_column': str, 'n_components': int}},
+                empty dict if none found or on error
+        """
+        try:
+            import joblib
+
+            # Unpickling a saved UMAP reducer below imports the umap module transparently,
+            # which pulls in TensorFlow as a side effect — quiet its startup logging first
+            _suppress_tensorflow_logging()
+
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            self._ensure_dim_reduction_models_table(cursor)
+
+            if method and method != 'all':
+                cursor.execute(f"""
+                    SELECT method, fp_column, n_components, model_path
+                    FROM {self._DIM_REDUCTION_MODELS_TABLE}
+                    WHERE table_name = ? AND method = ?
+                """, (source_table_name, method))
+            else:
+                cursor.execute(f"""
+                    SELECT method, fp_column, n_components, model_path
+                    FROM {self._DIM_REDUCTION_MODELS_TABLE}
+                    WHERE table_name = ?
+                """, (source_table_name,))
+
+            rows = cursor.fetchall()
+            conn.close()
+
+            models = {}
+            for saved_method, fp_col, n_comp, model_path in rows:
+                models[saved_method] = {
+                    'reducer': joblib.load(model_path),
+                    'fp_column': fp_col,
+                    'n_components': n_comp
+                }
+            return models
+
+        except Exception as e:
+            print(f"❌ Error loading reduction model(s) for table '{source_table_name}': {e}")
+            return {}
+
+    def project_dimensionality_on_table(self, table_name: Optional[str] = None,
+                                        reference_table: Optional[str] = None,
+                                        method: Optional[str] = None,
+                                        update_database: bool = True,
+                                        run_in_background: Optional[bool] = None) -> pd.DataFrame:
+        """
+        Project a table's already-computed Morgan fingerprints into a dimensionality-reduction
+        embedding previously fit (and auto-saved by reduce_dimensionality()) on another table.
+
+        Args:
+            table_name (Optional[str]): Name of the table to project, which must already have
+                the same Morgan fingerprint column the reference model was fit on. If None,
+                prompts an interactive table selection.
+            reference_table (Optional[str]): Name of the table whose saved model(s) should be
+                loaded from 'dim_reduction_models'. If None, prompts an interactive selection
+                restricted to tables that have at least one saved model.
+            method (Optional[str]): One of 'pca', 'tsne', 'umap', or 'all' to project with every
+                saved method. If None, prompts an interactive selection restricted to the methods
+                actually saved for reference_table. Note t-SNE has no .transform(); a saved t-SNE
+                model is always skipped with a warning.
+            update_database (bool): Whether to store the projected coordinates back into table_name
+            run_in_background (Optional[bool]): If True, retrieve the table and run the projection
+                in a separate background process, returning immediately (progress and results are
+                written to a log file instead of stdout). If False, run in the foreground as usual.
+                If None, prompts an interactive fg/bg selection.
+
+        Returns:
+            pd.DataFrame: DataFrame with added '<method>_from_<reference_table>_1'..'_<n>' columns.
+                Empty DataFrame if an error occurs, or if run_in_background is True (the projected
+                data is only available in the database table / log file once the background process
+                completes).
+        """
+        try:
+            try:
+                import joblib
+            except ImportError:
+                print("❌ joblib not installed. Please install it to load reduction models:")
+                print("   pip install joblib")
+                return pd.DataFrame()
+
+            # Resolve reference table interactively if not provided
+            reference_tables = self._get_tables_with_saved_reduction_models()
+            if not reference_tables:
+                print("❌ No saved reduction models found. Run reduce_dimensionality() on a table first.")
+                return pd.DataFrame()
+
+            if reference_table is None:
+                reference_table = self._select_table_interactive(
+                    "SELECT REFERENCE TABLE (SAVED MODEL)", tables_override=reference_tables
+                )
+                if not reference_table:
+                    print("❌ No reference table selected")
+                    return pd.DataFrame()
+            elif reference_table not in reference_tables:
+                print(f"❌ No saved reduction model(s) found for reference table '{reference_table}'.")
+                print(f"   Tables with saved models: {reference_tables}")
+                return pd.DataFrame()
+
+            # Load every saved model for the reference table, then narrow down to the requested method
+            available_models = self._load_reduction_models_from_db(reference_table)
+            if not available_models:
+                print(f"❌ No saved reduction model(s) found for reference table '{reference_table}'.")
+                return pd.DataFrame()
+
+            if method is None:
+                method = self._select_dimensionality_reduction_method_interactive(
+                    methods=tuple(available_models.keys()), allow_all=True
+                )
+                if method is None:
+                    print("❌ No dimensionality reduction method selected")
+                    return pd.DataFrame()
+            elif method != 'all' and method not in self._DIM_REDUCTION_METHODS:
+                print(f"❌ Invalid method '{method}'. Must be one of {self._DIM_REDUCTION_METHODS} or 'all'")
+                return pd.DataFrame()
+            elif method != 'all' and method not in available_models:
+                print(f"❌ No saved '{method}' model for reference table '{reference_table}'. "
+                      f"Available: {list(available_models.keys())}")
+                return pd.DataFrame()
+
+            methods_to_run = list(available_models.keys()) if method == 'all' else [method]
+
+            # Resolve target table interactively if not provided, restricted to tables that
+            # already have at least one Morgan fingerprint column
+            if table_name is None:
+                tables_with_fp = [
+                    t for t in self.get_all_tables()
+                    if any(self._MORGAN_FP_COLUMN_PATTERN.match(c) for c in self._get_table_columns(t))
+                ]
+                if not tables_with_fp:
+                    print("❌ No tables with Morgan fingerprint columns found.")
+                    print("   Run compute_morgan_fingerprints() on a table first.")
+                    return pd.DataFrame()
+
+                table_name = self._select_table_interactive(
+                    "SELECT TABLE TO PROJECT", tables_override=tables_with_fp
+                )
+                if not table_name:
+                    print("❌ No table selected for dimensionality projection")
+                    return pd.DataFrame()
+
+            if run_in_background is None:
+                run_mode = input(
+                    "\n⚙️  Do you want to run the dimensionality projection in the foreground "
+                    "or background? (fg/bg) [default: fg]: "
+                ).strip().lower() or 'fg'
+                run_in_background = run_mode in ['bg', 'background']
+
+            if run_in_background:
+                return self._project_dimensionality_in_background(
+                    table_name, reference_table, methods_to_run, available_models, update_database
+                )
+
+            return self._run_dimensionality_projection(
+                table_name, reference_table, methods_to_run, available_models, update_database
+            )
+
+        except Exception as e:
+            print(f"❌ Error projecting dimensionality for table '{table_name}': {e}")
+            return pd.DataFrame()
+
+    def _run_dimensionality_projection(self, table_name: str, reference_table: str,
+                                       methods_to_run: List[str], available_models: Dict[str, Dict],
+                                       update_database: bool) -> pd.DataFrame:
+        """
+        Performs the actual retrieval, projection, and (optional) database update for
+        project_dimensionality_on_table(), once table/reference/method(s) have already been
+        resolved. Split out so it can be run either directly (foreground) or inside a
+        separate process (background) via _project_dimensionality_in_background().
+
+        Returns:
+            pd.DataFrame: DataFrame with added projected coordinate columns, empty on error.
+        """
+        conn = None
+        try:
+            print(f"📊 Retrieving table '{table_name}' for dimensionality projection...")
+            df = self._get_table_as_dataframe(table_name)
+
+            if df.empty:
+                print(f"⚠️  No data retrieved from table '{table_name}'")
+                return pd.DataFrame()
+
+            # Chunks are written to the DB as they are computed (see below) instead of once
+            # at the end, so a killed/crashed background run keeps whatever chunks already
+            # landed, and the log shows real incremental progress rather than a single
+            # completion line per method. One connection is kept open across every method's
+            # chunks to avoid re-opening it dozens of times.
+            existing_columns: Set[str] = set()
+            if update_database:
+                conn = sqlite3.connect(self.__chemspace_db)
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                cursor = conn.cursor()
+                cursor.execute(f"PRAGMA table_info({table_name})")
+                existing_columns = {row[1] for row in cursor.fetchall()}
+
+            all_output_columns = []
+
+            for current_method in methods_to_run:
+                label = self._DIM_REDUCTION_LABELS[current_method]
+                model_info = available_models[current_method]
+                reducer = model_info['reducer']
+                fp_column = model_info['fp_column']
+
+                # t-SNE has no out-of-sample transform(): it can only ever refit on the
+                # exact data it was given, so a saved t-SNE model can't project new
+                # compounds into its existing embedding. Skip it with a clear explanation
+                # instead of failing the whole run.
+                if current_method == 'tsne' or not hasattr(reducer, 'transform'):
+                    print(f"⚠️  Skipping {label}: saved t-SNE models don't support transform()-based "
+                          f"projection of new data (t-SNE has no out-of-sample mapping).")
+                    continue
+
+                if fp_column not in df.columns:
+                    print(f"⚠️  Skipping {label}: fingerprint column '{fp_column}' (used to fit "
+                          f"this model on '{reference_table}') is not present in table '{table_name}'.")
+                    continue
+
+                valid_mask = ~df[fp_column].isin(['INVALID_SMILES', 'ERROR']) & df[fp_column].notna()
+                valid_indices = df.index[valid_mask]
+                num_valid = len(valid_indices)
+                if num_valid == 0:
+                    print(f"⚠️  Skipping {label}: no valid fingerprints found in column '{fp_column}'.")
+                    continue
+
+                print(f"🔬 Projecting '{fp_column}' ({num_valid} compounds) into the saved "
+                      f"{label} embedding fit on '{reference_table}'...")
+                start_time = time.time()
+
+                # Unpacking bits to a float32 matrix for the whole table at once doesn't scale
+                # (e.g. 11.6M rows x 2048 bits x 4 bytes = ~88 GiB, enough to OOM outright), so
+                # the fingerprints are unpacked and transformed in bounded-size chunks instead;
+                # only one chunk's worth of expanded floats is ever resident at a time.
+                output_columns = None
+                total_chunks = (num_valid + self._PROJECTION_CHUNK_SIZE - 1) // self._PROJECTION_CHUNK_SIZE
+                db_write_failed = False
+                rows_written = 0
+                for chunk_start in range(0, num_valid, self._PROJECTION_CHUNK_SIZE):
+                    chunk_idx = valid_indices[chunk_start:chunk_start + self._PROJECTION_CHUNK_SIZE]
+                    fp_blobs = df.loc[chunk_idx, fp_column].tolist()
+                    X_chunk = np.array(
+                        [np.unpackbits(np.frombuffer(b, dtype=np.uint8)) for b in fp_blobs],
+                        dtype=np.float32
+                    )
+                    embedding_chunk = reducer.transform(X_chunk)
+
+                    if output_columns is None:
+                        # Column names reference the reference table the loaded model was fit on;
+                        # component count taken from the actual embedding, in case it ever
+                        # differs from the model's recorded n_components
+                        output_columns = [f"{current_method}_from_{reference_table}_{i + 1}"
+                                          for i in range(embedding_chunk.shape[1])]
+                        for col in output_columns:
+                            df[col] = None
+                        if update_database:
+                            self._ensure_reduction_columns_exist(
+                                conn, table_name, output_columns, existing_columns
+                            )
+
+                    df.loc[chunk_idx, output_columns] = embedding_chunk
+
+                    chunk_num = chunk_start // self._PROJECTION_CHUNK_SIZE + 1
+                    if update_database and not db_write_failed:
+                        try:
+                            chunk_ids = df.loc[chunk_idx, 'id'].tolist()
+                            set_clause = ", ".join(f"{col} = ?" for col in output_columns)
+                            update_query = f"UPDATE {table_name} SET {set_clause} WHERE id = ?"
+                            updates = [
+                                tuple(row) + (row_id,)
+                                for row, row_id in zip(embedding_chunk.tolist(), chunk_ids)
+                            ]
+                            conn.cursor().executemany(update_query, updates)
+                            conn.commit()
+                            rows_written += len(updates)
+                            print(f"   📦 Chunk {chunk_num}/{total_chunks}: {len(chunk_idx)} compounds "
+                                  f"projected and written to DB ({rows_written}/{num_valid} total)")
+                        except Exception as e:
+                            db_write_failed = True
+                            print(f"   ⚠️  Chunk {chunk_num}/{total_chunks} DB write failed, continuing "
+                                  f"in-memory only for the rest of this method: {e}")
+                    else:
+                        print(f"   📦 Chunk {chunk_num}/{total_chunks}: {len(chunk_idx)} compounds projected")
+
+                processing_time = time.time() - start_time
+                print(f"   ⏱️  {label} projection completed in {processing_time:.2f}s")
+                print(f"✅ {label} completed: {num_valid} compounds embedded into {output_columns}")
+
+                all_output_columns.extend(output_columns)
+
+            if not all_output_columns:
+                print("❌ No dimensionality projection was performed (all requested methods were skipped)")
+                return pd.DataFrame()
+
+            return df
+
+        except Exception as e:
+            print(f"❌ Error projecting dimensionality for table '{table_name}': {e}")
+            return pd.DataFrame()
+        finally:
+            if conn is not None:
+                conn.close()
+
+    def _project_dimensionality_in_background(self, table_name: str, reference_table: str,
+                                               methods_to_run: List[str], available_models: Dict[str, Dict],
+                                               update_database: bool) -> pd.DataFrame:
+        """
+        Launches the projection as a fully independent OS process via subprocess.Popen (the
+        same fg/bg pattern used by MolDyn's MD/MM-GBSA runs) and returns immediately, so long
+        projections on large tables don't block the caller.
+
+        multiprocessing.Process was tried first, but non-daemon children it spawns are joined
+        at interpreter exit (multiprocessing.util._exit_function walks active_children() and
+        blocks on them), so the terminal stayed locked until the projection finished -- exactly
+        what backgrounding is meant to avoid. A plain Popen child is simply orphaned instead:
+        Python does not wait for it, so control returns immediately and the terminal is free.
+
+        The child re-activates the project and reloads the saved reducer model(s) from disk on
+        its own (rather than being handed the already-loaded 'available_models' objects), since
+        those can't be carried across a Popen boundary the way they could with an in-process
+        fork; reloading is cheap compared to the projection itself.
+
+        Returns:
+            pd.DataFrame: Always empty; the projected data is only available in the database
+                table (if update_database) and the log file once the background process completes.
+        """
+        import subprocess
+
+        logs_dir = os.path.join(os.path.dirname(self.__chemspace_db), 'logs')
+        os.makedirs(logs_dir, exist_ok=True)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        base_name = f'projection_{table_name}_from_{reference_table}_{timestamp}'
+        log_file_path = os.path.join(logs_dir, f'{base_name}.log')
+        script_path = os.path.join(logs_dir, f'{base_name}.py')
+
+        script = f"""
+from tidyscreen import tidyscreen
+from tidyscreen.chemspace.chemspace import ChemSpace
+
+project = tidyscreen.ActivateProject({self.name!r})
+cs = ChemSpace(project)
+
+for method in {methods_to_run!r}:
+    cs.project_dimensionality_on_table(
+        table_name={table_name!r},
+        reference_table={reference_table!r},
+        method=method,
+        update_database={update_database!r},
+        run_in_background=False,
+    )
+"""
+        with open(script_path, 'w') as f:
+            f.write(script)
+
+        try:
+            with open(log_file_path, 'w') as log_file:
+                process = subprocess.Popen(
+                    [sys.executable, script_path],
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    cwd=self.path,
+                    start_new_session=True
+                )
+        except Exception as e:
+            print(f"❌ Error launching background projection: {e}")
+            return pd.DataFrame()
+
+        print(f"🚀 Dimensionality projection launched in the background (PID {process.pid})")
+        print(f"   Projecting '{table_name}' using {methods_to_run} model(s) from '{reference_table}'...")
+        print(f"   Progress/results log: {log_file_path}")
+
+        return pd.DataFrame()
+
+    def _select_morgan_fp_column_interactive(self, available_columns: List[str],
+                                             allow_all: bool = False) -> Optional[str]:
+        """
+        Interactive selection of a previously computed Morgan fingerprint column.
+
+        Args:
+            available_columns (List[str]): Fingerprint columns present in the table
+            allow_all (bool): If True, offer an extra "All" option that selects every column,
+                returned as the sentinel string 'all'.
+
+        Returns:
+            Optional[str]: Selected column name, 'all' (if allow_all), or None if cancelled
+        """
+        print(f"\n🔍 SELECT FINGERPRINT COLUMN")
+        print("=" * 60)
+        for i, col in enumerate(available_columns, 1):
+            print(f"{i}. {col}")
+        if allow_all:
+            print(f"{len(available_columns) + 1}. All ({', '.join(available_columns)})")
+        print("-" * 60)
+        print("Commands: Enter option number, column name, or 'cancel' to abort")
+
+        while True:
+            try:
+                selection = input(f"\n🔍 Select fingerprint column: ").strip()
+
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    return None
+
+                if allow_all and selection.lower() == 'all':
+                    return 'all'
+
+                try:
+                    idx = int(selection) - 1
+                    if 0 <= idx < len(available_columns):
+                        return available_columns[idx]
+                    if allow_all and idx == len(available_columns):
+                        return 'all'
+                    max_option = len(available_columns) + 1 if allow_all else len(available_columns)
+                    print(f"❌ Invalid selection. Please enter 1-{max_option}")
+                    continue
+                except ValueError:
+                    matches = [c for c in available_columns if c.lower() == selection.lower()]
+                    if matches:
+                        return matches[0]
+                    print(f"❌ Column '{selection}' not found")
+
+            except KeyboardInterrupt:
+                print("\n❌ Fingerprint column selection cancelled")
+                return None
+
+    def _select_dimensionality_reduction_method_interactive(self, methods: Optional[Tuple[str, ...]] = None,
+                                                            allow_all: bool = False) -> Optional[str]:
+        """
+        Interactive selection of the dimensionality reduction method.
+
+        Args:
+            methods (Optional[Tuple[str, ...]]): Restrict the offered choices to this subset
+                (e.g. only methods with coordinates already present in a table). Defaults to
+                all supported methods.
+            allow_all (bool): If True, offer an extra "All" option that runs every method
+                in `methods` in sequence, returned as the sentinel string 'all'.
+
+        Returns:
+            Optional[str]: One of 'pca', 'tsne', 'umap', 'all' (if allow_all), or None if cancelled
+        """
+        methods = tuple(methods) if methods else self._DIM_REDUCTION_METHODS
+
+        print(f"\n🔍 SELECT DIMENSIONALITY REDUCTION METHOD")
+        print("=" * 60)
+        for i, m in enumerate(methods, 1):
+            print(f"{i}. {self._DIM_REDUCTION_LABELS[m]}")
+        if allow_all:
+            all_label = " + ".join(self._DIM_REDUCTION_LABELS[m] for m in methods)
+            print(f"{len(methods) + 1}. All ({all_label})")
+        print("-" * 60)
+        print("Commands: Enter option number, method name, or 'cancel' to abort")
+
+        while True:
+            try:
+                selection = input(f"\n🔍 Select method: ").strip()
+
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    return None
+
+                try:
+                    idx = int(selection) - 1
+                    if 0 <= idx < len(methods):
+                        return methods[idx]
+                    if allow_all and idx == len(methods):
+                        return 'all'
+                    max_option = len(methods) + 1 if allow_all else len(methods)
+                    print(f"❌ Invalid selection. Please enter 1-{max_option}")
+                    continue
+                except ValueError:
+                    normalized = selection.lower().replace('-', '').replace('_', '')
+                    if allow_all and normalized == 'all':
+                        return 'all'
+                    for m in methods:
+                        if normalized in (m, self._DIM_REDUCTION_LABELS[m].lower().replace('-', '')):
+                            return m
+                    print(f"❌ Invalid method '{selection}'. Choose one of {methods}"
+                          f"{' or all' if allow_all else ''}")
+
+            except KeyboardInterrupt:
+                print("\n❌ Method selection cancelled")
+                return None
+
+    def _ensure_reduction_columns_exist(self, conn: sqlite3.Connection, table_name: str,
+                                        output_columns: List[str], existing_columns: Set[str]) -> None:
+        """
+        Adds any of output_columns not yet present in table_name via ALTER TABLE, updating
+        existing_columns in place so callers writing many chunks in a row (e.g. the per-chunk
+        DB writes in _run_dimensionality_projection()) don't re-query PRAGMA table_info or
+        retry an ALTER for a column already confirmed to exist.
+        """
+        cursor = conn.cursor()
+        for col in output_columns:
+            if col not in existing_columns:
+                try:
+                    cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {col} REAL")
+                    conn.commit()
+                    existing_columns.add(col)
+                    print(f"   📋 Added '{col}' column to existing table '{table_name}'")
+                except sqlite3.OperationalError as e:
+                    print(f"   ⚠️  Warning: Could not add {col} column: {e}")
+
+    def _update_table_with_reduced_coordinates(self, table_name: str, df: pd.DataFrame,
+                                               output_columns: List[str]) -> bool:
+        """
+        Update the database table with computed dimensionality-reduction coordinates.
+        Adds the coordinate columns if they don't already exist (for backward compatibility).
+
+        Args:
+            table_name (str): Name of the table to update
+            df (pd.DataFrame): DataFrame containing the computed coordinates
+            output_columns (List[str]): Names of the coordinate columns to write
+
+        Returns:
+            bool: True if update was successful
+        """
+        try:
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+
+            cursor.execute(f"PRAGMA table_info({table_name})")
+            existing_columns = [row[1] for row in cursor.fetchall()]
+
+            for col in output_columns:
+                if col not in existing_columns:
+                    try:
+                        cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {col} REAL")
+                        print(f"   📋 Added '{col}' column to existing table '{table_name}'")
+                    except sqlite3.OperationalError as e:
+                        print(f"   ⚠️  Warning: Could not add {col} column: {e}")
+                        return False
+
+            set_clause = ", ".join(f"{col} = ?" for col in output_columns)
+            update_query = f"UPDATE {table_name} SET {set_clause} WHERE id = ?"
+
+            updates = [
+                tuple(getattr(row, col) for col in output_columns) + (row.id,)
+                for row in df.itertuples(index=False)
+                if all(pd.notna(getattr(row, col)) for col in output_columns)
+            ]
+            cursor.executemany(update_query, updates)
+            updates_made = len(updates)
+
+            conn.commit()
+            conn.close()
+
+            print(f"   📊 Updated {updates_made} rows with reduced coordinates")
+            return True
+
+        except Exception as e:
+            print(f"❌ Error updating database table '{table_name}' with reduced coordinates: {e}")
+            return False
+
+    def _detect_reduction_methods_in_columns(self, columns) -> Dict[str, List[str]]:
+        """
+        Detect which dimensionality-reduction methods already have coordinate columns present.
+
+        Args:
+            columns: Iterable of column names to scan (e.g. df.columns)
+
+        Returns:
+            Dict[str, List[str]]: method -> coordinate column names sorted by component index
+                (e.g. 'pca' -> ['pca_1', 'pca_2']); only methods with 2+ components are included
+        """
+        result = {}
+        for m in self._DIM_REDUCTION_METHODS:
+            pattern = re.compile(rf'^{m}_(\d+)$')
+            matches = []
+            for c in columns:
+                match = pattern.match(c)
+                if match:
+                    matches.append((int(match.group(1)), c))
+            if len(matches) >= 2:
+                matches.sort(key=lambda x: x[0])
+                result[m] = [c for _, c in matches]
+        return result
+
+    _PROJECTED_COORD_PATTERN = re.compile(r'^(pca|tsne|umap)_from_(.+)_(\d+)$')
+
+    def _detect_projected_reduction_columns_in_columns(self, columns) -> Dict[Tuple[str, str], List[str]]:
+        """
+        Detect projected dimensionality-reduction coordinate columns produced by
+        project_dimensionality_on_table(), named '<method>_from_<reference_table>_<i>'.
+
+        Args:
+            columns: Iterable of column names to scan (e.g. df.columns)
+
+        Returns:
+            Dict[Tuple[str, str], List[str]]: (method, reference_table) -> coordinate column
+                names sorted by component index; only combinations with 2+ components are included
+        """
+        matches_by_key: Dict[Tuple[str, str], List[Tuple[int, str]]] = {}
+        for c in columns:
+            match = self._PROJECTED_COORD_PATTERN.match(c)
+            if match:
+                proj_method, proj_reference_table, idx = match.group(1), match.group(2), int(match.group(3))
+                matches_by_key.setdefault((proj_method, proj_reference_table), []).append((idx, c))
+
+        result = {}
+        for key, matches in matches_by_key.items():
+            if len(matches) >= 2:
+                matches.sort(key=lambda x: x[0])
+                result[key] = [c for _, c in matches]
+        return result
+
+    def _select_projection_interactive(self, candidates: List[Tuple[str, str]]) -> Optional[Tuple[str, str]]:
+        """
+        Interactive selection among multiple projected (method, reference_table) combinations
+        found in a single table.
+
+        Args:
+            candidates (List[Tuple[str, str]]): (method, reference_table) pairs to choose from
+
+        Returns:
+            Optional[Tuple[str, str]]: Selected (method, reference_table) pair, or None if cancelled
+        """
+        print(f"\n🔍 SELECT PROJECTED EMBEDDING")
+        print("=" * 60)
+        for i, (proj_method, proj_reference_table) in enumerate(candidates, 1):
+            print(f"{i}. {self._DIM_REDUCTION_LABELS[proj_method]} (from '{proj_reference_table}')")
+        print("-" * 60)
+        print("Commands: Enter option number, or 'cancel' to abort")
+
+        while True:
+            try:
+                selection = input(f"\n🔍 Select projection: ").strip()
+
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    return None
+
+                try:
+                    idx = int(selection) - 1
+                    if 0 <= idx < len(candidates):
+                        return candidates[idx]
+                    print(f"❌ Invalid selection. Please enter 1-{len(candidates)}")
+                except ValueError:
+                    print(f"❌ Invalid input '{selection}'")
+
+            except KeyboardInterrupt:
+                print("\n❌ Projection selection cancelled")
+                return None
+
+    def _get_coordinate_columns_in_table(self, table_name: str, columns) -> Dict[Tuple[str, str], List[str]]:
+        """
+        Combine a table's own fitted dimensionality-reduction coordinate columns (from
+        reduce_dimensionality(), keyed by the table's own name) with any projected coordinate
+        columns it holds (from project_dimensionality_on_table(), keyed by their reference
+        table) into a single (method, space_key) -> [x_col, y_col] map.
+
+        'space_key' identifies the 2D coordinate space the columns live in: the table itself
+        when the columns are its own fitted embedding, or the reference table it was projected
+        onto otherwise. Two tables sharing a (method, space_key) entry have directly comparable
+        x/y coordinates -- used by subset_chemical_space_based_on_dimensionality_reduction() to
+        make sure a box computed from one table is meaningful when applied to another.
+
+        Args:
+            table_name (str): Name of the table the columns belong to
+            columns: Iterable of column names to scan (e.g. df.columns)
+
+        Returns:
+            Dict[Tuple[str, str], List[str]]: (method, space_key) -> coordinate column names
+        """
+        result: Dict[Tuple[str, str], List[str]] = {}
+        for m, cols in self._detect_reduction_methods_in_columns(columns).items():
+            result[(m, table_name)] = cols
+        for key, cols in self._detect_projected_reduction_columns_in_columns(columns).items():
+            result[key] = cols
+        return result
+
+    def _select_coordinate_space_interactive(self, candidates: List[Tuple[str, str]],
+                                             context_table: str) -> Optional[Tuple[str, str]]:
+        """
+        Interactive selection among multiple shared (method, space_key) coordinate spaces,
+        for subset_chemical_space_based_on_dimensionality_reduction().
+
+        Args:
+            candidates (List[Tuple[str, str]]): (method, space_key) pairs to choose from
+            context_table (str): Name of the table the space_key is relative to (used to tell
+                apart a table's own fitted embedding from one it was projected onto)
+
+        Returns:
+            Optional[Tuple[str, str]]: Selected (method, space_key) pair, or None if cancelled
+        """
+        print(f"\n🔍 SELECT SHARED COORDINATE SPACE")
+        print("=" * 60)
+        for i, (m, space_key) in enumerate(candidates, 1):
+            origin = "own fitted embedding" if space_key == context_table else f"projected from '{space_key}'"
+            print(f"{i}. {self._DIM_REDUCTION_LABELS[m]} ({origin})")
+        print("-" * 60)
+        print("Commands: Enter option number, or 'cancel' to abort")
+
+        while True:
+            try:
+                selection = input(f"\n🔍 Select coordinate space: ").strip()
+
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    return None
+
+                try:
+                    idx = int(selection) - 1
+                    if 0 <= idx < len(candidates):
+                        return candidates[idx]
+                    print(f"❌ Invalid selection. Please enter 1-{len(candidates)}")
+                except ValueError:
+                    print(f"❌ Invalid input '{selection}'")
+
+            except KeyboardInterrupt:
+                print("\n❌ Coordinate space selection cancelled")
+                return None
+
+    def _export_plot_data_and_script(self, output_path: str, datasets: Dict[str, pd.DataFrame],
+                                     script_text: str) -> Tuple[List[str], str]:
+        """
+        Write the data used to produce a plot as CSV file(s), and a standalone Python script
+        that regenerates the plot from them. All artifacts share the PNG's base name/directory
+        so the trio (png/csv/py) stay named consistently with the plotted coordinate columns.
+
+        Args:
+            output_path (str): Path the PNG was (or will be) saved to
+            datasets (Dict[str, pd.DataFrame]): suffix -> DataFrame to write as '<base><suffix>.csv'.
+                Use suffix '' for a single dataset, or e.g. '_reference'/'_projected' for multiple.
+            script_text (str): Contents of the standalone regeneration script, saved as '<base>.py'
+
+        Returns:
+            Tuple[List[str], str]: (csv paths in insertion order, script path)
+        """
+        base_path = os.path.splitext(output_path)[0]
+
+        csv_paths = []
+        for suffix, data in datasets.items():
+            csv_path = f"{base_path}{suffix}.csv"
+            data.to_csv(csv_path, index=False)
+            csv_paths.append(csv_path)
+
+        script_path = f"{base_path}.py"
+        with open(script_path, 'w') as f:
+            f.write(script_text)
+
+        return csv_paths, script_path
+
+    def _render_reduced_coordinates_plot_script(self, csv_name: str, png_name: str, x_col: str, y_col: str,
+                                                color_by: Optional[str], figsize: Tuple[int, int],
+                                                point_size: float, alpha: float, title: str) -> str:
+        """
+        Render a standalone Python script that reproduces a plot_reduced_coordinates() plot
+        from its exported CSV, with no dependency on TidyScreen.
+        """
+        return f'''#!/usr/bin/env python3
+"""
+Regenerates '{png_name}' from '{csv_name}'.
+Generated by ChemSpace.plot_reduced_coordinates().
+"""
+import os
+import pandas as pd
+import matplotlib.pyplot as plt
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CSV_PATH = os.path.join(SCRIPT_DIR, {csv_name!r})
+OUTPUT_PATH = os.path.join(SCRIPT_DIR, {png_name!r})
+
+X_COL = {x_col!r}
+Y_COL = {y_col!r}
+COLOR_BY = {color_by!r}
+POINT_SIZE = {point_size!r}
+ALPHA = {alpha!r}
+
+df = pd.read_csv(CSV_PATH)
+
+fig, ax = plt.subplots(figsize={tuple(figsize)!r})
+
+if COLOR_BY is None:
+    ax.scatter(df[X_COL], df[Y_COL], s=POINT_SIZE, alpha=ALPHA, color='steelblue')
+elif pd.api.types.is_numeric_dtype(df[COLOR_BY]):
+    scatter = ax.scatter(df[X_COL], df[Y_COL], s=POINT_SIZE, alpha=ALPHA,
+                         c=df[COLOR_BY], cmap='viridis')
+    fig.colorbar(scatter, ax=ax, label=COLOR_BY)
+else:
+    categories = sorted(df[COLOR_BY].astype(str).unique())
+    cmap = plt.get_cmap('tab20' if len(categories) > 10 else 'tab10')
+    category_colors = {{cat: cmap(i % cmap.N) for i, cat in enumerate(categories)}}
+    for cat in categories:
+        mask = df[COLOR_BY].astype(str) == cat
+        ax.scatter(df.loc[mask, X_COL], df.loc[mask, Y_COL],
+                  s=POINT_SIZE, alpha=ALPHA, color=category_colors[cat], label=cat)
+    ax.legend(title=COLOR_BY, loc='best', fontsize=8)
+
+ax.set_xlabel(X_COL)
+ax.set_ylabel(Y_COL)
+ax.set_title({title!r})
+ax.grid(True, alpha=0.3)
+
+fig.savefig(OUTPUT_PATH, dpi=300, bbox_inches='tight')
+plt.show()
+'''
+
+    def _render_density_plot_script(self, csv_name: str, png_name: str, x_col: str, y_col: str,
+                                    figsize: Tuple[int, int], point_size: float, cmap: str,
+                                    title: str, all_csv_name: str, table_label: str,
+                                    ref_csv_name: Optional[str] = None,
+                                    ref_x_col: Optional[str] = None, ref_y_col: Optional[str] = None,
+                                    reference_point_size: float = 15, reference_alpha: float = 0.25,
+                                    reference_label: str = "Reference",
+                                    source_method: str = "plot_projected_chemspace_density") -> str:
+        """
+        Render a standalone Python script that reproduces a plot_projected_chemspace_density()
+        or plot_chemspace_density() plot from its exported CSV (which already includes the
+        computed 'density' column), the full-table background CSV, and, if present, the
+        reference background CSV -- with no dependency on TidyScreen or scipy.
+        """
+        ref_block = ""
+        if ref_csv_name is not None:
+            ref_block = f'''
+REF_CSV_PATH = os.path.join(SCRIPT_DIR, {ref_csv_name!r})
+REF_X_COL = {ref_x_col!r}
+REF_Y_COL = {ref_y_col!r}
+
+ref_df = pd.read_csv(REF_CSV_PATH)
+ax.scatter(ref_df[REF_X_COL], ref_df[REF_Y_COL], s={reference_point_size!r}, alpha={reference_alpha!r},
+          color='lightgray', label={reference_label!r} + f" — n={{len(ref_df)}}")
+'''
+
+        return f'''#!/usr/bin/env python3
+"""
+Regenerates '{png_name}' from '{csv_name}', '{all_csv_name}'{f" and '{ref_csv_name}'" if ref_csv_name else ""}.
+Generated by ChemSpace.{source_method}().
+"""
+import os
+import pandas as pd
+import matplotlib.pyplot as plt
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CSV_PATH = os.path.join(SCRIPT_DIR, {csv_name!r})
+ALL_CSV_PATH = os.path.join(SCRIPT_DIR, {all_csv_name!r})
+OUTPUT_PATH = os.path.join(SCRIPT_DIR, {png_name!r})
+
+X_COL = {x_col!r}
+Y_COL = {y_col!r}
+POINT_SIZE = {point_size!r}
+CMAP = {cmap!r}
+
+df = pd.read_csv(CSV_PATH)
+all_df = pd.read_csv(ALL_CSV_PATH)
+
+# Widen the figure to make room for the colorbar so the plotted data area itself keeps the
+# original figsize shape instead of being squeezed narrower.
+fig, ax = plt.subplots(figsize=({figsize[0]!r} * 1.2, {figsize[1]!r}))
+{ref_block}
+# Every compound in the table, shown as background context even for points excluded from the
+# density estimate (df) by max_points subsampling. Fixed warm color kept distinct from both
+# the lightgray reference layer and the density colormap.
+ax.scatter(all_df[X_COL], all_df[Y_COL], s=POINT_SIZE, alpha=0.35,
+          color={self._DENSITY_PLOT_TABLE_BACKGROUND_COLOR!r},
+          label={table_label!r} + f" — n={{len(all_df)}}")
+
+scatter = ax.scatter(df[X_COL], df[Y_COL], s=POINT_SIZE, c=df['density'], cmap=CMAP)
+fig.colorbar(scatter, ax=ax, label='Point density')
+
+ax.set_xlabel(X_COL)
+ax.set_ylabel(Y_COL)
+ax.set_title({title!r})
+ax.grid(True, alpha=0.3)
+ax.legend(loc='best', fontsize=8)
+
+fig.savefig(OUTPUT_PATH, dpi=300, bbox_inches='tight')
+plt.show()
+'''
+
+    def plot_reduced_coordinates(self, table_name: Optional[str] = None,
+                                 method: Optional[str] = None,
+                                 color_by: Optional[str] = None,
+                                 output_path: Optional[str] = None,
+                                 figsize: Tuple[int, int] = (8, 8),
+                                 point_size: float = 20,
+                                 alpha: float = 0.7,
+                                 show: bool = False) -> Optional[str]:
+        """
+        Visualize previously computed dimensionality-reduction coordinates (from
+        reduce_dimensionality()) as a 2D scatter plot, saved as a PNG.
+
+        Args:
+            table_name (Optional[str]): Name of the table to plot. If None, prompts an interactive table selection.
+            method (Optional[str]): One of 'pca', 'tsne', 'umap'. If None and a single method's coordinates
+                are present in the table, that one is used automatically; otherwise prompts an interactive selection.
+            color_by (Optional[str]): Name of a column to color points by. Numeric columns use a continuous
+                colormap with a colorbar; non-numeric columns use discrete colors with a legend. If None,
+                all points share a single color.
+            output_path (Optional[str]): Path to save the PNG. If None, defaults to
+                '<project>/chemspace/misc/dim_reduction/<table_name>_<method>_<timestamp>.png'
+            figsize (Tuple[int, int]): Matplotlib figure size in inches
+            point_size (float): Marker size for scatter points
+            alpha (float): Marker transparency
+            show (bool): Whether to also display the plot interactively (plt.show())
+
+        Returns:
+            Optional[str]: Path to the saved PNG, or None if an error occurred
+        """
+        try:
+            try:
+                import matplotlib.pyplot as plt
+            except ImportError:
+                print("❌ matplotlib not installed. Please install it to plot reduced coordinates:")
+                print("   pip install matplotlib")
+                return None
+
+            # Resolve table interactively if not provided, restricted to tables that
+            # already have reduced-coordinate columns from reduce_dimensionality()
+            if table_name is None:
+                tables_with_coords = [
+                    t for t in self.get_all_tables()
+                    if self._detect_reduction_methods_in_columns(self._get_table_columns(t))
+                ]
+                if not tables_with_coords:
+                    print("❌ No tables with reduced-coordinate columns found.")
+                    print("   Run reduce_dimensionality() on a table first.")
+                    return None
+
+                table_name = self._select_table_interactive(
+                    "SELECT TABLE FOR REDUCED-COORDINATE PLOT", tables_override=tables_with_coords
+                )
+                if not table_name:
+                    print("❌ No table selected for plotting")
+                    return None
+
+            print(f"📊 Retrieving table '{table_name}' for plotting...")
+            df = self._get_table_as_dataframe(table_name)
+
+            if df.empty:
+                print(f"⚠️  No data retrieved from table '{table_name}'")
+                return None
+
+            # Resolve which method's coordinates to plot
+            available_methods = self._detect_reduction_methods_in_columns(df.columns)
+
+            if not available_methods:
+                print(f"❌ No reduced-coordinate columns found in table '{table_name}'.")
+                print("   Run reduce_dimensionality() on this table first.")
+                return None
+
+            if method is None:
+                if len(available_methods) == 1:
+                    method = next(iter(available_methods))
+                else:
+                    method = self._select_dimensionality_reduction_method_interactive(
+                        tuple(available_methods.keys())
+                    )
+                    if method is None:
+                        print("❌ No dimensionality reduction method selected")
+                        return None
+            elif method not in available_methods:
+                print(f"❌ No reduced coordinates for method '{method}' found in table '{table_name}'.")
+                print(f"   Available: {list(available_methods.keys())}")
+                return None
+
+            coord_columns = available_methods[method][:2]
+            x_col, y_col = coord_columns
+
+            # Only keep rows with both coordinates present
+            plot_df = df.dropna(subset=[x_col, y_col]).copy()
+
+            if plot_df.empty:
+                print(f"❌ No rows with valid '{method}' coordinates in table '{table_name}'")
+                return None
+
+            # Resolve coloring
+            color_values = None
+            is_numeric_color = False
+            if color_by is not None:
+                if color_by not in df.columns:
+                    print(f"❌ Column '{color_by}' not found in table '{table_name}'")
+                    return None
+                plot_df = plot_df.dropna(subset=[color_by])
+                if plot_df.empty:
+                    print(f"❌ No rows with valid '{color_by}' values to color by")
+                    return None
+                color_values = plot_df[color_by]
+                is_numeric_color = pd.api.types.is_numeric_dtype(color_values)
+
+            print(f"🎨 Plotting {len(plot_df)} compounds ({self._DIM_REDUCTION_LABELS[method]}: {x_col} vs {y_col})...")
+
+            fig, ax = plt.subplots(figsize=figsize)
+
+            if color_values is None:
+                ax.scatter(plot_df[x_col], plot_df[y_col], s=point_size, alpha=alpha, color='steelblue')
+            elif is_numeric_color:
+                scatter = ax.scatter(plot_df[x_col], plot_df[y_col], s=point_size, alpha=alpha,
+                                     c=color_values, cmap='viridis')
+                fig.colorbar(scatter, ax=ax, label=color_by)
+            else:
+                categories = sorted(color_values.astype(str).unique())
+                cmap = plt.get_cmap('tab20' if len(categories) > 10 else 'tab10')
+                category_colors = {cat: cmap(i % cmap.N) for i, cat in enumerate(categories)}
+                for cat in categories:
+                    mask = color_values.astype(str) == cat
+                    ax.scatter(plot_df.loc[mask, x_col], plot_df.loc[mask, y_col],
+                              s=point_size, alpha=alpha, color=category_colors[cat], label=cat)
+                ax.legend(title=color_by, loc='best', fontsize=8)
+
+            ax.set_xlabel(x_col)
+            ax.set_ylabel(y_col)
+            ax.set_title(f"{self._DIM_REDUCTION_LABELS[method]} — {table_name}")
+            ax.grid(True, alpha=0.3)
+
+            if output_path is None:
+                output_dir = os.path.join(self.path, 'chemspace', 'misc', 'dim_reduction')
+                os.makedirs(output_dir, exist_ok=True)
+                output_path = os.path.join(output_dir, f"{table_name}_{method}.png")
+            else:
+                os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+
+            if os.path.exists(output_path):
+                print(f"⚠️  '{output_path}' already exists -- overwriting.")
+
+            fig.savefig(output_path, dpi=300, bbox_inches='tight')
+
+            if show:
+                plt.show()
+
+            plt.close(fig)
+
+            # Alongside the PNG, export the plotted data as CSV and a standalone script that
+            # regenerates the plot from it, named consistently (same base name/columns) with the PNG
+            csv_columns = (['id'] if 'id' in plot_df.columns else []) + [x_col, y_col]
+            if color_by is not None and color_by not in csv_columns:
+                csv_columns.append(color_by)
+
+            csv_paths, script_path = self._export_plot_data_and_script(
+                output_path, {'': plot_df[csv_columns]},
+                self._render_reduced_coordinates_plot_script(
+                    csv_name=f"{os.path.splitext(os.path.basename(output_path))[0]}.csv",
+                    png_name=os.path.basename(output_path),
+                    x_col=x_col, y_col=y_col, color_by=color_by,
+                    figsize=figsize, point_size=point_size, alpha=alpha,
+                    title=f"{self._DIM_REDUCTION_LABELS[method]} — {table_name}"
+                )
+            )
+
+            print(f"✅ Plot saved to: {output_path}")
+            print(f"   📄 Data saved to: {csv_paths[0]}")
+            print(f"   📝 Script saved to: {script_path}")
+            return output_path
+
+        except Exception as e:
+            print(f"❌ Error plotting reduced coordinates for table '{table_name}': {e}")
+            return None
+
+    def plot_chemspace_density(self, table_name: Optional[str] = None,
+                                method: Optional[str] = None,
+                                bandwidth: Optional[float] = None,
+                                max_points: int = 10000,
+                                output_path: Optional[str] = None,
+                                figsize: Tuple[int, int] = (8, 8),
+                                point_size: float = 20,
+                                cmap: str = 'viridis',
+                                show: bool = False) -> Optional[str]:
+        """
+        Visualize a table's own dimensionality-reduction coordinates (from
+        reduce_dimensionality()) as a 2D scatter plot where each point is colored by its local
+        point density, estimated via a Gaussian KDE fit on the plotted x,y values. Denser
+        regions of the chemical space stand out via the color scale, while every individual
+        compound remains visible as its own point (unlike a binned heatmap). Every valid
+        (x, y) row of table_name is also plotted underneath as background context (fixed warm
+        color, so no compound disappears from the plot even if excluded from the density
+        estimate by max_points subsampling).
+
+        Behaves like plot_projected_chemspace_density(), but without a reference background
+        layer: these coordinates are table_name's own fitted embedding, not a projection onto
+        another table's chemical space, so there is no separate reference chemical space to
+        plot underneath. Saved as a PNG.
+
+        Args:
+            table_name (Optional[str]): Name of the table to plot, restricted to tables with
+                reduced-coordinate columns ('<method>_1'/'_2' columns, as created by
+                reduce_dimensionality()). If None, prompts an interactive table selection.
+            method (Optional[str]): One of 'pca', 'tsne', 'umap'. If None and a single method's
+                coordinates are present in the table, that one is used automatically;
+                otherwise prompts an interactive selection.
+            bandwidth (Optional[float]): KDE bandwidth passed as gaussian_kde's bw_method. If
+                None, scipy's default (Scott's rule) is used.
+            max_points (int): Cap on the number of points used for the density estimate and
+                plot. A Gaussian KDE evaluated on n points costs O(n^2), so tables larger than
+                this are randomly subsampled (with a printed warning) to stay responsive.
+            output_path (Optional[str]): Path to save the PNG. If None, defaults to
+                '<project>/chemspace/misc/dim_reduction/<table>_density_<method>.png'
+            figsize (Tuple[int, int]): Size in inches of the actual plotted (x, y) data area,
+                matching plot_reduced_coordinates()'s figsize semantics. Since this plot always
+                carries a density colorbar, the figure is internally widened to make room for
+                it so the data area itself keeps this shape instead of being squeezed narrower.
+            point_size (float): Marker size for the density-colored scatter points
+            cmap (str): Colormap used for the density color scale
+            show (bool): Whether to also display the plot interactively (plt.show())
+
+        Returns:
+            Optional[str]: Path to the saved PNG, or None if an error occurred
+        """
+        try:
+            try:
+                import matplotlib.pyplot as plt
+            except ImportError:
+                print("❌ matplotlib not installed. Please install it to plot chemspace density:")
+                print("   pip install matplotlib")
+                return None
+
+            try:
+                from scipy.stats import gaussian_kde
+            except ImportError:
+                print("❌ scipy not installed. Please install it to estimate point density:")
+                print("   pip install scipy")
+                return None
+
+            # Resolve table interactively if not provided, restricted to tables that already
+            # have reduced-coordinate columns from reduce_dimensionality()
+            if table_name is None:
+                tables_with_coords = [
+                    t for t in self.get_all_tables()
+                    if self._detect_reduction_methods_in_columns(self._get_table_columns(t))
+                ]
+                if not tables_with_coords:
+                    print("❌ No tables with reduced-coordinate columns found.")
+                    print("   Run reduce_dimensionality() on a table first.")
+                    return None
+
+                table_name = self._select_table_interactive(
+                    "SELECT TABLE FOR CHEMSPACE DENSITY PLOT", tables_override=tables_with_coords
+                )
+                if not table_name:
+                    print("❌ No table selected for plotting")
+                    return None
+
+            print(f"📊 Retrieving table '{table_name}' for plotting...")
+            df = self._get_table_as_dataframe(table_name)
+
+            if df.empty:
+                print(f"⚠️  No data retrieved from table '{table_name}'")
+                return None
+
+            # Resolve which method's coordinates to plot
+            available_methods = self._detect_reduction_methods_in_columns(df.columns)
+
+            if not available_methods:
+                print(f"❌ No reduced-coordinate columns found in table '{table_name}'.")
+                print("   Run reduce_dimensionality() on this table first.")
+                return None
+
+            if method is None:
+                if len(available_methods) == 1:
+                    method = next(iter(available_methods))
+                else:
+                    method = self._select_dimensionality_reduction_method_interactive(
+                        tuple(available_methods.keys())
+                    )
+                    if method is None:
+                        print("❌ No dimensionality reduction method selected")
+                        return None
+            elif method not in available_methods:
+                print(f"❌ No reduced coordinates for method '{method}' found in table '{table_name}'.")
+                print(f"   Available: {list(available_methods.keys())}")
+                return None
+
+            x_col, y_col = available_methods[method][:2]
+
+            # Every valid row in the table -- kept as-is (not subsampled) so it can be plotted
+            # as background context even if the density estimate below ends up computed on a
+            # smaller subsample of it
+            full_plot_df = df.dropna(subset=[x_col, y_col]).copy()
+
+            if full_plot_df.empty:
+                print(f"❌ No rows with valid '{method}' coordinates in table '{table_name}'")
+                return None
+
+            density_df = full_plot_df
+            if len(density_df) > max_points:
+                print(f"⚠️  {len(density_df):,} points exceeds max_points={max_points:,}; using a "
+                      f"random subsample of {max_points:,} for the density estimate (Gaussian "
+                      f"KDE cost grows quadratically with point count). Pass a higher "
+                      f"max_points to use more, at the cost of runtime. All {len(density_df):,} "
+                      f"points are still shown as background context.")
+                density_df = density_df.sample(n=max_points, random_state=42)
+
+            label = self._DIM_REDUCTION_LABELS[method]
+            print(f"🎨 Estimating point density for {len(density_df):,} compounds "
+                  f"({label}) in '{table_name}'...")
+
+            xy = np.vstack([density_df[x_col].to_numpy(), density_df[y_col].to_numpy()])
+            density = gaussian_kde(xy, bw_method=bandwidth)(xy)
+
+            # Draw points in ascending density order so the densest (most crowded) points are
+            # plotted last and stay visible on top of sparser ones
+            order = np.argsort(density)
+            plot_x = density_df[x_col].to_numpy()[order]
+            plot_y = density_df[y_col].to_numpy()[order]
+            plot_density = density[order]
+
+            # This plot always carries a density colorbar, unlike plot_reduced_coordinates()
+            # where it's conditional -- widen the figure to make room for it so the plotted
+            # data area itself keeps the requested figsize shape instead of being squeezed
+            # narrower (which otherwise reads as the whole point cloud being compressed on
+            # the x axis).
+            fig, ax = plt.subplots(figsize=(figsize[0] * 1.2, figsize[1]))
+
+            # Show every compound in the table as background context -- even those excluded
+            # from the density estimate above by max_points subsampling. Fixed warm color
+            # keeps this layer distinct from the density colormap. No separate reference layer
+            # here, since these coordinates are the table's own fitted embedding.
+            ax.scatter(full_plot_df[x_col], full_plot_df[y_col], s=point_size, alpha=0.35,
+                      color=self._DENSITY_PLOT_TABLE_BACKGROUND_COLOR,
+                      label=f"'{table_name}' (all) — n={len(full_plot_df):,}")
+
+            scatter = ax.scatter(plot_x, plot_y, s=point_size, c=plot_density, cmap=cmap)
+            fig.colorbar(scatter, ax=ax, label='Point density')
+
+            ax.set_xlabel(x_col)
+            ax.set_ylabel(y_col)
+            plot_title = f"{label} — {table_name} (point density)"
+            ax.set_title(plot_title)
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc='best', fontsize=8)
+
+            if output_path is None:
+                output_dir = os.path.join(self.path, 'chemspace', 'misc', 'dim_reduction')
+                os.makedirs(output_dir, exist_ok=True)
+                output_path = os.path.join(output_dir, f"{table_name}_density_{method}.png")
+            else:
+                os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+
+            if os.path.exists(output_path):
+                print(f"⚠️  '{output_path}' already exists -- overwriting.")
+
+            fig.savefig(output_path, dpi=300, bbox_inches='tight')
+
+            if show:
+                plt.show()
+
+            plt.close(fig)
+
+            # Alongside the PNG, export the plotted data (including the computed density
+            # column) and the full table background as CSV(s), plus a standalone script that
+            # regenerates the plot from them
+            export_data = {x_col: plot_x, y_col: plot_y, 'density': plot_density}
+            if 'id' in density_df.columns:
+                export_data = {'id': density_df['id'].to_numpy()[order], **export_data}
+            export_df = pd.DataFrame(export_data)
+
+            base_name = os.path.splitext(os.path.basename(output_path))[0]
+            all_csv_columns = (['id'] if 'id' in full_plot_df.columns else []) + [x_col, y_col]
+            datasets = {'': export_df, '_all': full_plot_df[all_csv_columns]}
+            all_csv_name = f"{base_name}_all.csv"
+
+            csv_paths, script_path = self._export_plot_data_and_script(
+                output_path, datasets,
+                self._render_density_plot_script(
+                    csv_name=f"{base_name}.csv",
+                    png_name=os.path.basename(output_path),
+                    x_col=x_col, y_col=y_col, figsize=figsize, point_size=point_size,
+                    cmap=cmap, title=plot_title,
+                    all_csv_name=all_csv_name, table_label=f"'{table_name}' (all)",
+                    source_method="plot_chemspace_density"
+                )
+            )
+
+            print(f"✅ Plot saved to: {output_path}")
+            print(f"   📄 Data saved to: {', '.join(csv_paths)}")
+            print(f"   📝 Script saved to: {script_path}")
+            return output_path
+
+        except Exception as e:
+            print(f"❌ Error plotting chemspace density for table '{table_name}': {e}")
+            return None
+
+    def plot_projected_chemspace_density(self, table_name: Optional[str] = None,
+                                         method: Optional[str] = None,
+                                         reference_table: Optional[str] = None,
+                                         bandwidth: Optional[float] = None,
+                                         max_points: int = 10000,
+                                         output_path: Optional[str] = None,
+                                         figsize: Tuple[int, int] = (8, 8),
+                                         point_size: float = 20,
+                                         reference_point_size: float = 15,
+                                         reference_alpha: float = 0.25,
+                                         cmap: str = 'viridis',
+                                         show: bool = False) -> Optional[str]:
+        """
+        Visualize a table's projected dimensionality-reduction coordinates (from
+        project_dimensionality_on_table()) as a 2D scatter plot where each point is colored by
+        its local point density, estimated via a Gaussian KDE fit on the plotted x,y values.
+        Denser regions of the projected chemical space stand out via the color scale, while
+        every individual compound remains visible as its own point (unlike a binned heatmap).
+        Two background layers are plotted underneath the density-colored points: every valid
+        (x, y) row of table_name itself (gray, so no compound disappears from the plot even if
+        excluded from the density estimate by max_points subsampling), and the full reference
+        chemical space these coordinates were projected onto (its own fitted embedding from
+        reduce_dimensionality(), light gray) -- the same reference-background convention used
+        by plot_projected_chemical_space(). Saved as a PNG.
+
+        Args:
+            table_name (Optional[str]): Name of the table to plot, restricted to tables with
+                projected-coordinate columns ('<method>_from_<reference_table>_1'/'_2' columns,
+                as created by project_dimensionality_on_table()). If None, prompts an
+                interactive table selection.
+            method (Optional[str]): Restrict to a projected embedding fit with this method
+                ('pca', 'tsne', 'umap'). Combined with reference_table to disambiguate when
+                the table holds more than one projected embedding.
+            reference_table (Optional[str]): Restrict to a projected embedding that was fit
+                on this particular reference table.
+            bandwidth (Optional[float]): KDE bandwidth passed as gaussian_kde's bw_method. If
+                None, scipy's default (Scott's rule) is used.
+            max_points (int): Cap on the number of points used for the density estimate and
+                plot. A Gaussian KDE evaluated on n points costs O(n^2), so tables larger than
+                this are randomly subsampled (with a printed warning) to stay responsive.
+            output_path (Optional[str]): Path to save the PNG. If None, defaults to
+                '<project>/chemspace/misc/dim_reduction/<table>_density_<method>_from_<reference_table>.png'
+            figsize (Tuple[int, int]): Size in inches of the actual plotted (x, y) data area,
+                matching plot_projected_chemical_space()'s figsize semantics. Since this plot
+                always carries a density colorbar (unlike plot_projected_chemical_space(),
+                where it's conditional), the figure is internally widened to make room for it
+                so the data area itself keeps this shape instead of being squeezed narrower.
+            point_size (float): Marker size for the density-colored scatter points
+            reference_point_size (float): Marker size for the background reference points
+            reference_alpha (float): Marker transparency for the background reference points
+            cmap (str): Colormap used for the density color scale
+            show (bool): Whether to also display the plot interactively (plt.show())
+
+        Returns:
+            Optional[str]: Path to the saved PNG, or None if an error occurred
+        """
+        try:
+            try:
+                import matplotlib.pyplot as plt
+            except ImportError:
+                print("❌ matplotlib not installed. Please install it to plot chemspace density:")
+                print("   pip install matplotlib")
+                return None
+
+            try:
+                from scipy.stats import gaussian_kde
+            except ImportError:
+                print("❌ scipy not installed. Please install it to estimate point density:")
+                print("   pip install scipy")
+                return None
+
+            # Resolve table interactively if not provided, restricted to tables that already
+            # have projected-coordinate columns from project_dimensionality_on_table()
+            if table_name is None:
+                tables_with_projections = [
+                    t for t in self.get_all_tables()
+                    if self._detect_projected_reduction_columns_in_columns(self._get_table_columns(t))
+                ]
+                if not tables_with_projections:
+                    print("❌ No tables with projected-coordinate columns found.")
+                    print("   Run project_dimensionality_on_table() on a table first.")
+                    return None
+
+                table_name = self._select_table_interactive(
+                    "SELECT TABLE FOR PROJECTED CHEMSPACE DENSITY PLOT", tables_override=tables_with_projections
+                )
+                if not table_name:
+                    print("❌ No table selected for plotting")
+                    return None
+
+            print(f"📊 Retrieving table '{table_name}' for plotting...")
+            df = self._get_table_as_dataframe(table_name)
+
+            if df.empty:
+                print(f"⚠️  No data retrieved from table '{table_name}'")
+                return None
+
+            # Resolve which projected (method, reference_table) combination to plot
+            projections = self._detect_projected_reduction_columns_in_columns(df.columns)
+
+            if not projections:
+                print(f"❌ No projected-coordinate columns found in table '{table_name}'.")
+                print("   Run project_dimensionality_on_table() on this table first.")
+                return None
+
+            candidate_keys = list(projections.keys())
+
+            if method is not None:
+                candidate_keys = [k for k in candidate_keys if k[0] == method]
+                if not candidate_keys:
+                    print(f"❌ No projected '{method}' coordinates found in table '{table_name}'.")
+                    return None
+
+            if reference_table is not None:
+                candidate_keys = [k for k in candidate_keys if k[1] == reference_table]
+                if not candidate_keys:
+                    print(f"❌ No projected coordinates from reference table '{reference_table}' "
+                          f"found in table '{table_name}'.")
+                    return None
+
+            if len(candidate_keys) == 1:
+                selected_method, selected_reference_table = candidate_keys[0]
+            else:
+                selected_key = self._select_projection_interactive(candidate_keys)
+                if selected_key is None:
+                    print("❌ No projected embedding selected")
+                    return None
+                selected_method, selected_reference_table = selected_key
+
+            x_col, y_col = projections[(selected_method, selected_reference_table)][:2]
+
+            # Every valid row in the table -- kept as-is (not subsampled) so it can be plotted
+            # as background context even if the density estimate below ends up computed on a
+            # smaller subsample of it
+            full_plot_df = df.dropna(subset=[x_col, y_col]).copy()
+
+            if full_plot_df.empty:
+                print(f"❌ No rows with valid projected coordinates in table '{table_name}'")
+                return None
+
+            # Load the reference table's own embedding coordinates for the same method, to
+            # plot the full chemical space these points were projected onto in the background
+            ref_df = None
+            ref_x_col = ref_y_col = None
+            if selected_reference_table not in self.get_all_tables():
+                print(f"⚠️  Reference table '{selected_reference_table}' no longer exists; "
+                      f"plotting projected points only.")
+            else:
+                ref_full_df = self._get_table_as_dataframe(selected_reference_table)
+                ref_methods = self._detect_reduction_methods_in_columns(ref_full_df.columns)
+                if selected_method not in ref_methods:
+                    print(f"⚠️  Reference table '{selected_reference_table}' has no '{selected_method}' "
+                          f"coordinates; plotting projected points only.")
+                else:
+                    ref_x_col, ref_y_col = ref_methods[selected_method][:2]
+                    ref_df = ref_full_df.dropna(subset=[ref_x_col, ref_y_col]).copy()
+
+            density_df = full_plot_df
+            if len(density_df) > max_points:
+                print(f"⚠️  {len(density_df):,} points exceeds max_points={max_points:,}; using a "
+                      f"random subsample of {max_points:,} for the density estimate (Gaussian "
+                      f"KDE cost grows quadratically with point count). Pass a higher "
+                      f"max_points to use more, at the cost of runtime. All {len(density_df):,} "
+                      f"points are still shown as background context.")
+                density_df = density_df.sample(n=max_points, random_state=42)
+
+            label = self._DIM_REDUCTION_LABELS[selected_method]
+            print(f"🎨 Estimating point density for {len(density_df):,} compounds "
+                  f"({label} from '{selected_reference_table}') in '{table_name}'...")
+
+            xy = np.vstack([density_df[x_col].to_numpy(), density_df[y_col].to_numpy()])
+            density = gaussian_kde(xy, bw_method=bandwidth)(xy)
+
+            # Draw points in ascending density order so the densest (most crowded) points are
+            # plotted last and stay visible on top of sparser ones
+            order = np.argsort(density)
+            plot_x = density_df[x_col].to_numpy()[order]
+            plot_y = density_df[y_col].to_numpy()[order]
+            plot_density = density[order]
+
+            # This plot always carries a density colorbar, unlike plot_projected_chemical_space()
+            # where it's conditional -- widen the figure to make room for it so the plotted data
+            # area itself keeps the requested figsize shape instead of being squeezed narrower
+            # (which otherwise reads as the whole point cloud being compressed on the x axis).
+            fig, ax = plt.subplots(figsize=(figsize[0] * 1.2, figsize[1]))
+
+            if ref_df is not None and not ref_df.empty:
+                ax.scatter(ref_df[ref_x_col], ref_df[ref_y_col], s=reference_point_size,
+                          alpha=reference_alpha, color='lightgray',
+                          label=f"Reference ({selected_reference_table}) — n={len(ref_df):,}")
+
+            # Show every compound in the table as background context -- even those excluded
+            # from the density estimate above by max_points subsampling -- so no point ever
+            # disappears from the plot, only its density coloring. A fixed warm color keeps
+            # this layer distinct from both the lightgray reference and the density colormap.
+            ax.scatter(full_plot_df[x_col], full_plot_df[y_col], s=point_size, alpha=0.35,
+                      color=self._DENSITY_PLOT_TABLE_BACKGROUND_COLOR,
+                      label=f"'{table_name}' (all) — n={len(full_plot_df):,}")
+
+            scatter = ax.scatter(plot_x, plot_y, s=point_size, c=plot_density, cmap=cmap)
+            fig.colorbar(scatter, ax=ax, label='Point density')
+
+            ax.set_xlabel(x_col)
+            ax.set_ylabel(y_col)
+            plot_title = f"{label} — {table_name} projected onto {selected_reference_table} (point density)"
+            ax.set_title(plot_title)
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc='best', fontsize=8)
+
+            if output_path is None:
+                output_dir = os.path.join(self.path, 'chemspace', 'misc', 'dim_reduction')
+                os.makedirs(output_dir, exist_ok=True)
+                output_path = os.path.join(
+                    output_dir,
+                    f"{table_name}_density_{selected_method}_from_{selected_reference_table}.png"
+                )
+            else:
+                os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+
+            if os.path.exists(output_path):
+                print(f"⚠️  '{output_path}' already exists -- overwriting.")
+
+            fig.savefig(output_path, dpi=300, bbox_inches='tight')
+
+            if show:
+                plt.show()
+
+            plt.close(fig)
+
+            # Alongside the PNG, export the plotted data (including the computed density
+            # column), the full table background, and the reference background (if any) as
+            # CSV(s), plus a standalone script that regenerates the plot from them
+            export_data = {x_col: plot_x, y_col: plot_y, 'density': plot_density}
+            if 'id' in density_df.columns:
+                export_data = {'id': density_df['id'].to_numpy()[order], **export_data}
+            export_df = pd.DataFrame(export_data)
+
+            base_name = os.path.splitext(os.path.basename(output_path))[0]
+            all_csv_columns = (['id'] if 'id' in full_plot_df.columns else []) + [x_col, y_col]
+            datasets = {'': export_df, '_all': full_plot_df[all_csv_columns]}
+            all_csv_name = f"{base_name}_all.csv"
+
+            ref_csv_name = None
+            if ref_df is not None and not ref_df.empty:
+                ref_csv_columns = (['id'] if 'id' in ref_df.columns else []) + [ref_x_col, ref_y_col]
+                datasets['_reference'] = ref_df[ref_csv_columns]
+                ref_csv_name = f"{base_name}_reference.csv"
+
+            csv_paths, script_path = self._export_plot_data_and_script(
+                output_path, datasets,
+                self._render_density_plot_script(
+                    csv_name=f"{base_name}.csv",
+                    png_name=os.path.basename(output_path),
+                    x_col=x_col, y_col=y_col, figsize=figsize, point_size=point_size,
+                    cmap=cmap, title=plot_title,
+                    all_csv_name=all_csv_name, table_label=f"'{table_name}' (all)",
+                    ref_csv_name=ref_csv_name, ref_x_col=ref_x_col, ref_y_col=ref_y_col,
+                    reference_point_size=reference_point_size, reference_alpha=reference_alpha,
+                    reference_label=f"Reference ({selected_reference_table})"
+                )
+            )
+
+            print(f"✅ Plot saved to: {output_path}")
+            print(f"   📄 Data saved to: {', '.join(csv_paths)}")
+            print(f"   📝 Script saved to: {script_path}")
+            return output_path
+
+        except Exception as e:
+            print(f"❌ Error plotting projected chemspace density for table '{table_name}': {e}")
+            return None
+
+    def plot_projected_chemical_space(self, table_names: Optional[Union[str, List[str]]] = None,
+                                      method: Optional[str] = None,
+                                      reference_table: Optional[str] = None,
+                                      color_by: Optional[str] = None,
+                                      output_path: Optional[str] = None,
+                                      figsize: Tuple[int, int] = (8, 8),
+                                      point_size: float = 20,
+                                      reference_point_size: float = 15,
+                                      alpha: float = 0.8,
+                                      reference_alpha: float = 0.25,
+                                      show: bool = False) -> Optional[str]:
+        """
+        Visualize one or more target tables' projected dimensionality-reduction coordinates
+        (from project_dimensionality_on_table()) as a 2D scatter plot, overlaid on top of the
+        reference table's own coordinates (from reduce_dimensionality()) that were used to
+        fit the embedding. Saved as a PNG.
+
+        Args:
+            table_names (Optional[Union[str, List[str]]]): Name(s) of the target table(s)
+                containing projected coordinates ('<method>_from_<reference_table>_1'/'_2'
+                columns). A single string plots one target chemical space; a list overlays
+                multiple target chemical spaces (each in its own color) on top of the same
+                reference. If None, prompts an interactive multi-selection restricted to
+                tables with such columns. All target tables must share a common projected
+                (method, reference_table) embedding to be overlaid together.
+            method (Optional[str]): Restrict to a projected embedding fit with this method
+                ('pca', 'tsne', 'umap'). Combined with reference_table to disambiguate when
+                the target table(s) hold more than one shared projection.
+            reference_table (Optional[str]): Restrict to a projected embedding that was fit
+                on this particular reference table.
+            color_by (Optional[str]): Name of a column (in the target table) to color the
+                projected points by. Numeric columns use a continuous colormap with a
+                colorbar; non-numeric columns use discrete colors with a legend. Only
+                applies when a single target table is plotted -- ignored (with a warning)
+                when multiple target tables are given, since each is instead colored by
+                its own identity so the overlaid chemical spaces stay distinguishable. The
+                reference points are always drawn in a single neutral background color.
+            output_path (Optional[str]): Path to save the PNG. If None, defaults to
+                '<project>/chemspace/misc/dim_reduction/<table>_projected_<method>_from_<reference_table>_<timestamp>.png'
+                (based on the first target table's name)
+            figsize (Tuple[int, int]): Matplotlib figure size in inches
+            point_size (float): Marker size for the projected points
+            reference_point_size (float): Marker size for the reference points
+            alpha (float): Marker transparency for the projected points
+            reference_alpha (float): Marker transparency for the reference points
+            show (bool): Whether to also display the plot interactively (plt.show())
+
+        Returns:
+            Optional[str]: Path to the saved PNG, or None if an error occurred
+        """
+        try:
+            try:
+                import matplotlib.pyplot as plt
+            except ImportError:
+                print("❌ matplotlib not installed. Please install it to plot projected coordinates:")
+                print("   pip install matplotlib")
+                return None
+
+            tables_with_projections = [
+                t for t in self.get_all_tables()
+                if self._detect_projected_reduction_columns_in_columns(self._get_table_columns(t))
+            ]
+
+            # Resolve target table(s) interactively if not provided, restricted to tables that
+            # already have projected-coordinate columns from project_dimensionality_on_table()
+            if table_names is None:
+                if not tables_with_projections:
+                    print("❌ No tables with projected-coordinate columns found.")
+                    print("   Run project_dimensionality_on_table() on a table first.")
+                    return None
+
+                target_tables = self._select_target_tables_interactive(tables_with_projections)
+                if not target_tables:
+                    print("❌ No target table(s) selected for plotting")
+                    return None
+            else:
+                target_tables = [table_names] if isinstance(table_names, str) else list(dict.fromkeys(table_names))
+                if not target_tables:
+                    print("❌ No target table(s) provided for plotting")
+                    return None
+
+            # Load each target table and its available projected-coordinate combinations
+            target_dfs: Dict[str, pd.DataFrame] = {}
+            target_projections: Dict[str, Dict[Tuple[str, str], List[str]]] = {}
+            for t in target_tables:
+                print(f"📊 Retrieving table '{t}' for plotting...")
+                t_df = self._get_table_as_dataframe(t)
+                if t_df.empty:
+                    print(f"⚠️  No data retrieved from table '{t}' -- skipping")
+                    continue
+                t_projections = self._detect_projected_reduction_columns_in_columns(t_df.columns)
+                if not t_projections:
+                    print(f"⚠️  No projected-coordinate columns found in table '{t}' -- skipping")
+                    continue
+                target_dfs[t] = t_df
+                target_projections[t] = t_projections
+
+            if not target_dfs:
+                print("❌ None of the requested target table(s) have projected coordinates to plot.")
+                print("   Run project_dimensionality_on_table() on them first.")
+                return None
+
+            # Resolve which projected (method, reference_table) combination to plot: it must be
+            # present in every surviving target table, since they all overlay the same embedding
+            candidate_keys = list(set.intersection(*(set(p.keys()) for p in target_projections.values())))
+
+            if not candidate_keys:
+                print("❌ The target table(s) do not share a common projected embedding.")
+                for t, p in target_projections.items():
+                    print(f"   '{t}': {sorted(p.keys())}")
+                return None
+
+            if method is not None:
+                candidate_keys = [k for k in candidate_keys if k[0] == method]
+                if not candidate_keys:
+                    print(f"❌ No shared projected '{method}' coordinates found across the target table(s).")
+                    return None
+
+            if reference_table is not None:
+                candidate_keys = [k for k in candidate_keys if k[1] == reference_table]
+                if not candidate_keys:
+                    print(f"❌ No shared projected coordinates from reference table '{reference_table}' "
+                          f"found across the target table(s).")
+                    return None
+
+            if len(candidate_keys) == 1:
+                selected_method, selected_reference_table = candidate_keys[0]
+            else:
+                selected_key = self._select_projection_interactive(candidate_keys)
+                if selected_key is None:
+                    print("❌ No projected embedding selected")
+                    return None
+                selected_method, selected_reference_table = selected_key
+
+            # Build each target table's plotted DataFrame; the coordinate column names are
+            # identical across target tables since they are named '<method>_from_<reference>_i'
+            proj_x_col = proj_y_col = None
+            target_plot_data: List[Dict[str, Any]] = []
+            for t in target_tables:
+                if t not in target_dfs:
+                    continue
+                proj_x_col, proj_y_col = target_projections[t][(selected_method, selected_reference_table)][:2]
+                t_proj_df = target_dfs[t].dropna(subset=[proj_x_col, proj_y_col]).copy()
+                if t_proj_df.empty:
+                    print(f"⚠️  No rows with valid projected coordinates in table '{t}' -- skipping")
+                    continue
+                target_plot_data.append({'table_name': t, 'proj_df': t_proj_df})
+
+            if not target_plot_data:
+                print("❌ No target table(s) have valid projected coordinates to plot")
+                return None
+
+            multi_target = len(target_plot_data) > 1
+
+            # color_by only makes sense for a single target table's own column; with multiple
+            # target tables, color instead distinguishes which table each point came from
+            if multi_target and color_by is not None:
+                print(f"⚠️  'color_by' is ignored when plotting {len(target_plot_data)} target tables; "
+                      f"coloring by table identity instead.")
+                color_by = None
+
+            color_values = None
+            is_numeric_color = False
+            if not multi_target and color_by is not None:
+                entry = target_plot_data[0]
+                if color_by not in entry['proj_df'].columns:
+                    print(f"❌ Column '{color_by}' not found in table '{entry['table_name']}'")
+                    return None
+                entry['proj_df'] = entry['proj_df'].dropna(subset=[color_by])
+                if entry['proj_df'].empty:
+                    print(f"❌ No rows with valid '{color_by}' values to color by")
+                    return None
+                color_values = entry['proj_df'][color_by]
+                is_numeric_color = pd.api.types.is_numeric_dtype(color_values)
+
+            # Load the reference table's own embedding coordinates for the same method
+            ref_df = None
+            ref_x_col = ref_y_col = None
+            if selected_reference_table not in self.get_all_tables():
+                print(f"⚠️  Reference table '{selected_reference_table}' no longer exists; "
+                      f"plotting projected points only.")
+            else:
+                ref_full_df = self._get_table_as_dataframe(selected_reference_table)
+                ref_methods = self._detect_reduction_methods_in_columns(ref_full_df.columns)
+                if selected_method not in ref_methods:
+                    print(f"⚠️  Reference table '{selected_reference_table}' has no '{selected_method}' "
+                          f"coordinates; plotting projected points only.")
+                else:
+                    ref_x_col, ref_y_col = ref_methods[selected_method][:2]
+                    ref_df = ref_full_df.dropna(subset=[ref_x_col, ref_y_col]).copy()
+
+            label = self._DIM_REDUCTION_LABELS[selected_method]
+            target_names_summary = ', '.join(f"'{d['table_name']}'" for d in target_plot_data)
+            print(f"🎨 Plotting {sum(len(d['proj_df']) for d in target_plot_data)} projected compounds "
+                  f"from {target_names_summary} on top of "
+                  f"{len(ref_df) if ref_df is not None else 0} reference compounds from "
+                  f"'{selected_reference_table}' ({label})...")
+
+            fig, ax = plt.subplots(figsize=figsize)
+
+            if ref_df is not None and not ref_df.empty:
+                ax.scatter(ref_df[ref_x_col], ref_df[ref_y_col], s=reference_point_size,
+                          alpha=reference_alpha, color='lightgray',
+                          label=f"Reference ({selected_reference_table}) — n={len(ref_df):,}")
+
+            target_colors: Dict[str, Any] = {}
+            if multi_target:
+                target_cmap = plt.get_cmap('tab20' if len(target_plot_data) > 10 else 'tab10')
+                target_colors = {d['table_name']: target_cmap(i % target_cmap.N)
+                                 for i, d in enumerate(target_plot_data)}
+
+            for entry in target_plot_data:
+                t_name, proj_df = entry['table_name'], entry['proj_df']
+                plot_label = f"Projected ({t_name}) — n={len(proj_df):,}"
+
+                if multi_target:
+                    ax.scatter(proj_df[proj_x_col], proj_df[proj_y_col], s=point_size, alpha=alpha,
+                              color=target_colors[t_name], label=plot_label)
+                elif color_values is None:
+                    ax.scatter(proj_df[proj_x_col], proj_df[proj_y_col], s=point_size, alpha=alpha,
+                              color='crimson', label=plot_label)
+                elif is_numeric_color:
+                    scatter = ax.scatter(proj_df[proj_x_col], proj_df[proj_y_col], s=point_size, alpha=alpha,
+                                         c=color_values, cmap='viridis', label=plot_label)
+                    fig.colorbar(scatter, ax=ax, label=color_by)
+                else:
+                    categories = sorted(color_values.astype(str).unique())
+                    cmap = plt.get_cmap('tab20' if len(categories) > 10 else 'tab10')
+                    category_colors = {cat: cmap(i % cmap.N) for i, cat in enumerate(categories)}
+                    for cat in categories:
+                        mask = color_values.astype(str) == cat
+                        ax.scatter(proj_df.loc[mask, proj_x_col], proj_df.loc[mask, proj_y_col],
+                                  s=point_size, alpha=alpha, color=category_colors[cat],
+                                  label=f"{cat} — n={mask.sum():,}")
+
+            ax.set_xlabel(proj_x_col)
+            ax.set_ylabel(proj_y_col)
+            title_targets = target_names_summary if multi_target else f"'{target_plot_data[0]['table_name']}'"
+            plot_title = f"{label} — {title_targets} projected onto {selected_reference_table}"
+            ax.set_title(plot_title)
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc='best', fontsize=8)
+
+            if output_path is None:
+                output_dir = os.path.join(self.path, 'chemspace', 'misc', 'dim_reduction')
+                os.makedirs(output_dir, exist_ok=True)
+                base_table_label = target_plot_data[0]['table_name']
+                if multi_target:
+                    base_table_label += f"_and_{len(target_plot_data) - 1}_more"
+                output_path = os.path.join(
+                    output_dir,
+                    f"{base_table_label}_projected_{selected_method}_from_{selected_reference_table}.png"
+                )
+            else:
+                os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+
+            if os.path.exists(output_path):
+                print(f"⚠️  '{output_path}' already exists -- overwriting.")
+
+            fig.savefig(output_path, dpi=300, bbox_inches='tight')
+
+            if show:
+                plt.show()
+
+            plt.close(fig)
+
+            # Alongside the PNG, export the plotted data as CSV(s) and a standalone script that
+            # regenerates the plot from them, named consistently (same base name) with the PNG
+            base_name = os.path.splitext(os.path.basename(output_path))[0]
+
+            datasets: Dict[str, pd.DataFrame] = {}
+            proj_datasets_for_script: List[Dict[str, str]] = []
+            for entry in target_plot_data:
+                t_name, proj_df = entry['table_name'], entry['proj_df']
+                proj_csv_columns = (['id'] if 'id' in proj_df.columns else []) + [proj_x_col, proj_y_col]
+                if not multi_target and color_by is not None and color_by not in proj_csv_columns:
+                    proj_csv_columns.append(color_by)
+
+                suffix = '_projected' if not multi_target else f"_projected_{t_name}"
+                datasets[suffix] = proj_df[proj_csv_columns]
+                proj_datasets_for_script.append({
+                    'csv_name': f"{base_name}{suffix}.csv",
+                    'label': f"Projected ({t_name})",
+                })
+
+            ref_csv_name = None
+            if ref_df is not None and not ref_df.empty:
+                ref_csv_columns = (['id'] if 'id' in ref_df.columns else []) + [ref_x_col, ref_y_col]
+                datasets['_reference'] = ref_df[ref_csv_columns]
+                ref_csv_name = f"{base_name}_reference.csv"
+
+            csv_paths, script_path = self._export_plot_data_and_script(
+                output_path, datasets,
+                self._render_projected_chemical_space_plot_script(
+                    proj_datasets=proj_datasets_for_script,
+                    ref_csv_name=ref_csv_name,
+                    png_name=os.path.basename(output_path),
+                    proj_x_col=proj_x_col, proj_y_col=proj_y_col,
+                    ref_x_col=ref_x_col, ref_y_col=ref_y_col,
+                    color_by=color_by, figsize=figsize,
+                    point_size=point_size, reference_point_size=reference_point_size,
+                    alpha=alpha, reference_alpha=reference_alpha,
+                    title=plot_title,
+                    reference_label=f"Reference ({selected_reference_table})"
+                )
+            )
+
+            print(f"✅ Plot saved to: {output_path}")
+            print(f"   📄 Data saved to: {', '.join(csv_paths)}")
+            print(f"   📝 Script saved to: {script_path}")
+            return output_path
+
+        except Exception as e:
+            print(f"❌ Error plotting projected chemical space for table(s) '{table_names}': {e}")
+            return None
+
+    def subset_chemical_space_based_on_dimensionality_reduction(
+            self,
+            center_table: Optional[str] = None,
+            target_table: Optional[str] = None,
+            method: Optional[str] = None,
+            box_size_x: Optional[float] = None,
+            box_size_y: Optional[float] = None,
+            centroid_method: Optional[str] = None,
+            show_box_plot: bool = True,
+            output_table_name: Optional[str] = None) -> Optional[str]:
+        """
+        Define a rectangular box in dimensionality-reduction (x, y) space -- centered on the
+        centroid of a table's coordinates, sized by the user -- and subset a (possibly
+        different) table's compounds down to those whose coordinates fall inside it.
+
+        Both tables must share a coordinate space produced by reduce_dimensionality() and/or
+        project_dimensionality_on_table(): either the very same fitted embedding (center_table
+        == target_table, using its own '<method>_1'/'_2' columns) or a fitted/projected pair
+        (one table's own embedding, the other's '<method>_from_<that_table>_1'/'_2' projected
+        columns). This guarantees the box is computed and applied in the same 2D space -- see
+        _get_coordinate_columns_in_table().
+
+        Args:
+            center_table (Optional[str]): Table used to compute the box center (centroid of its
+                x,y coordinates in the chosen coordinate space). If None, prompts an interactive
+                selection restricted to tables with dimensionality-reduction coordinate columns.
+            target_table (Optional[str]): Table to subset. May be the same as center_table (the
+                box is then applied to the table it was centered on). If None, prompts an
+                interactive selection restricted to tables sharing a coordinate space with
+                center_table.
+            method (Optional[str]): Restrict to a shared coordinate space fit with this method
+                ('pca', 'tsne', 'umap'), to disambiguate when more than one is shared.
+            box_size_x (Optional[float]): Full width of the box along the x axis (centroid ±
+                box_size_x / 2). If None, prompts for a value. After the resulting compound
+                count is reported, the user is asked whether to redefine the box; answering
+                yes re-prompts for box_size_x/box_size_y (regardless of what was originally
+                passed in) and repeats the preview until accepted.
+            box_size_y (Optional[float]): Full height of the box along the y axis (centroid ±
+                box_size_y / 2). If None, prompts for a value defaulting to box_size_x
+                (a square box).
+            centroid_method (Optional[str]): How to compute the box center from center_table's
+                x,y coordinates -- 'mean' (arithmetic average), 'median' (robust to a few
+                outlier compounds skewing the box off-center), or 'bounding_box' (midpoint of
+                each axis's min/max, i.e. the geometric center of the points' extent --
+                independent of how densely points are distributed within it). If None, prompts
+                an interactive selection.
+            show_box_plot (bool): Once the box dimensions are resolved, plot center_table's own
+                coordinates with the box overlaid (and display it via plt.show()) as a visual
+                check before subsetting. If center_table's coordinates are themselves a
+                projection (space_key != center_table), the full reference chemical space is
+                also plotted in the background for context. Also saved as a PNG. Requires
+                matplotlib; a missing installation only skips the preview, it does not abort
+                the subsetting.
+            output_table_name (Optional[str]): Name for the new table holding the subset. If
+                None, prompts for a name with a timestamp-based default.
+
+        Returns:
+            Optional[str]: Name of the created output table, or None if an error occurred or
+                the operation was cancelled
+        """
+        try:
+            if centroid_method is not None and centroid_method not in ('mean', 'median', 'bounding_box'):
+                print(f"❌ Invalid centroid_method '{centroid_method}'. "
+                      f"Must be 'mean', 'median', or 'bounding_box'")
+                return None
+
+            tables_with_coords = [
+                t for t in self.get_all_tables()
+                if self._get_coordinate_columns_in_table(t, self._get_table_columns(t))
+            ]
+
+            if not tables_with_coords:
+                print("❌ No tables with dimensionality-reduction coordinate columns found.")
+                print("   Run reduce_dimensionality() and/or project_dimensionality_on_table() first.")
+                return None
+
+            # Resolve center table
+            if center_table is None:
+                center_table = self._select_table_interactive(
+                    "SELECT CENTER TABLE (BOX CENTROID SOURCE)", tables_override=tables_with_coords
+                )
+                if not center_table:
+                    print("❌ No center table selected")
+                    return None
+            elif center_table not in tables_with_coords:
+                print(f"❌ Table '{center_table}' not found or has no dimensionality-reduction coordinates.")
+                return None
+
+            print(f"📊 Retrieving table '{center_table}' for box centroid computation...")
+            center_df = self._get_table_as_dataframe(center_table)
+            if center_df.empty:
+                print(f"⚠️  No data retrieved from table '{center_table}'")
+                return None
+
+            center_coords = self._get_coordinate_columns_in_table(center_table, center_df.columns)
+            if not center_coords:
+                print(f"❌ No dimensionality-reduction coordinate columns found in table '{center_table}'")
+                return None
+
+            # Resolve target table, restricted to those sharing a coordinate space with center_table
+            if target_table is None:
+                candidate_targets = [
+                    t for t in tables_with_coords
+                    if set(self._get_coordinate_columns_in_table(t, self._get_table_columns(t)))
+                    & set(center_coords)
+                ]
+                if not candidate_targets:
+                    print(f"❌ No table shares a dimensionality-reduction coordinate space with '{center_table}'.")
+                    return None
+                target_table = self._select_table_interactive(
+                    "SELECT TARGET TABLE TO SUBSET", tables_override=candidate_targets
+                )
+                if not target_table:
+                    print("❌ No target table selected")
+                    return None
+
+            if target_table == center_table:
+                target_df = center_df
+                target_coords = center_coords
+            else:
+                if target_table not in tables_with_coords:
+                    print(f"❌ Table '{target_table}' not found or has no dimensionality-reduction coordinates.")
+                    return None
+                print(f"📊 Retrieving table '{target_table}' for subsetting...")
+                target_df = self._get_table_as_dataframe(target_table)
+                if target_df.empty:
+                    print(f"⚠️  No data retrieved from table '{target_table}'")
+                    return None
+                target_coords = self._get_coordinate_columns_in_table(target_table, target_df.columns)
+
+            # Resolve the shared coordinate space to use
+            shared_keys = sorted(set(center_coords) & set(target_coords))
+            if not shared_keys:
+                print(f"❌ Tables '{center_table}' and '{target_table}' do not share a "
+                      f"dimensionality-reduction coordinate space.")
+                return None
+
+            if method is not None:
+                shared_keys = [k for k in shared_keys if k[0] == method]
+                if not shared_keys:
+                    print(f"❌ No shared '{method}' coordinate space found between "
+                          f"'{center_table}' and '{target_table}'.")
+                    return None
+
+            if len(shared_keys) == 1:
+                selected_key = shared_keys[0]
+            else:
+                selected_key = self._select_coordinate_space_interactive(shared_keys, center_table)
+                if selected_key is None:
+                    print("❌ No coordinate space selected")
+                    return None
+
+            selected_method, space_key = selected_key
+            center_x_col, center_y_col = center_coords[selected_key][:2]
+            target_x_col, target_y_col = target_coords[selected_key][:2]
+
+            # Compute box center from the center table's coordinates
+            center_xy_df = center_df.dropna(subset=[center_x_col, center_y_col])
+            if center_xy_df.empty:
+                print(f"❌ No rows with valid '{center_x_col}'/'{center_y_col}' coordinates in '{center_table}'")
+                return None
+
+            if centroid_method is None:
+                print(f"\n🔍 SELECT CENTROID METRIC")
+                print("=" * 60)
+                print("1. mean         (arithmetic average of x,y)")
+                print("2. median       (robust to outlier compounds)")
+                print("3. bounding_box (geometric center of the points' x/y extent, "
+                      "regardless of point density)")
+                print("-" * 60)
+                while True:
+                    try:
+                        selection = input("🔍 Select centroid metric [1/2/3] (default: 1 - mean): ").strip().lower()
+                        if selection in ('', '1', 'mean'):
+                            centroid_method = 'mean'
+                            break
+                        elif selection in ('2', 'median'):
+                            centroid_method = 'median'
+                            break
+                        elif selection in ('3', 'bounding_box'):
+                            centroid_method = 'bounding_box'
+                            break
+                        else:
+                            print(f"❌ Invalid selection '{selection}'. Enter 1, 2, 3, "
+                                  f"'mean', 'median' or 'bounding_box'")
+                    except KeyboardInterrupt:
+                        print("\n❌ Cancelled")
+                        return None
+
+            if centroid_method == 'median':
+                centroid_x = center_xy_df[center_x_col].median()
+                centroid_y = center_xy_df[center_y_col].median()
+            elif centroid_method == 'bounding_box':
+                centroid_x = (center_xy_df[center_x_col].min() + center_xy_df[center_x_col].max()) / 2
+                centroid_y = (center_xy_df[center_y_col].min() + center_xy_df[center_y_col].max()) / 2
+            else:
+                centroid_x = center_xy_df[center_x_col].mean()
+                centroid_y = center_xy_df[center_y_col].mean()
+
+            label = self._DIM_REDUCTION_LABELS[selected_method]
+            print(f"📍 Box centroid ({label}, {centroid_method}, from '{center_table}', "
+                  f"n={len(center_xy_df):,}): ({centroid_x:.4f}, {centroid_y:.4f})")
+
+            # Resolve box size (width along x, height along y), letting the user preview the
+            # resulting compound count and redefine the box as many times as needed before
+            # committing to a subset
+            while True:
+                if box_size_x is None:
+                    while True:
+                        try:
+                            raw = input("Enter box width (full size along x): ").strip()
+                            box_size_x = float(raw)
+                            if box_size_x <= 0:
+                                print("❌ Box width must be positive")
+                                continue
+                            break
+                        except ValueError:
+                            print(f"❌ Invalid number '{raw}'")
+                        except KeyboardInterrupt:
+                            print("\n❌ Cancelled")
+                            return None
+                elif box_size_x <= 0:
+                    print(f"❌ box_size_x must be positive, got {box_size_x}")
+                    return None
+
+                if box_size_y is None:
+                    try:
+                        raw = input(f"Enter box height (full size along y) [default: {box_size_x} -- square]: ").strip()
+                        box_size_y = float(raw) if raw else box_size_x
+                    except KeyboardInterrupt:
+                        print("\n❌ Cancelled")
+                        return None
+                if box_size_y <= 0:
+                    print(f"❌ box_size_y must be positive, got {box_size_y}")
+                    return None
+
+                x_min, x_max = centroid_x - box_size_x / 2, centroid_x + box_size_x / 2
+                y_min, y_max = centroid_y - box_size_y / 2, centroid_y + box_size_y / 2
+
+                print(f"📦 Box: x ∈ [{x_min:.4f}, {x_max:.4f}] (width={box_size_x}), "
+                      f"y ∈ [{y_min:.4f}, {y_max:.4f}] (height={box_size_y})")
+
+                if show_box_plot:
+                    try:
+                        import matplotlib.pyplot as plt
+                        import matplotlib.patches as patches
+                    except ImportError:
+                        print("⚠️  matplotlib not installed -- skipping box preview plot.")
+                    else:
+                        fig, ax = plt.subplots(figsize=(8, 8))
+
+                        # When center_table's coordinates are themselves a projection onto another
+                        # table (space_key != center_table), show that reference table's own fitted
+                        # embedding in the background for context -- same convention as
+                        # plot_projected_chemical_space(): reference in light gray behind the points
+                        # the box is actually being centered on.
+                        center_point_color = 'lightgray'
+                        if space_key != center_table:
+                            if space_key not in self.get_all_tables():
+                                print(f"⚠️  Reference table '{space_key}' no longer exists; "
+                                      f"plotting '{center_table}' only.")
+                            else:
+                                ref_full_df = self._get_table_as_dataframe(space_key)
+                                ref_methods = self._detect_reduction_methods_in_columns(ref_full_df.columns)
+                                if selected_method not in ref_methods:
+                                    print(f"⚠️  Reference table '{space_key}' has no '{selected_method}' "
+                                          f"coordinates; plotting '{center_table}' only.")
+                                else:
+                                    ref_x_col, ref_y_col = ref_methods[selected_method][:2]
+                                    ref_plot_df = ref_full_df.dropna(subset=[ref_x_col, ref_y_col])
+                                    if not ref_plot_df.empty:
+                                        ax.scatter(ref_plot_df[ref_x_col], ref_plot_df[ref_y_col],
+                                                  s=15, alpha=0.25, color='lightgray',
+                                                  label=f"Reference ('{space_key}') — n={len(ref_plot_df):,}")
+                                        center_point_color = 'crimson'
+
+                        ax.scatter(center_xy_df[center_x_col], center_xy_df[center_y_col],
+                                  s=20, alpha=0.6, color=center_point_color,
+                                  label=f"'{center_table}' — n={len(center_xy_df):,}")
+                        ax.scatter([centroid_x], [centroid_y], s=80, color='black', marker='x',
+                                  label=f"Centroid ({centroid_x:.3f}, {centroid_y:.3f})")
+                        ax.add_patch(patches.Rectangle(
+                            (x_min, y_min), box_size_x, box_size_y,
+                            linewidth=2, edgecolor='crimson', facecolor='none',
+                            label=f"Box ({box_size_x} × {box_size_y})"
+                        ))
+                        ax.set_xlabel(center_x_col)
+                        ax.set_ylabel(center_y_col)
+                        ax.set_title(f"{label} — box preview on '{center_table}'")
+                        ax.grid(True, alpha=0.3)
+                        ax.legend(loc='best', fontsize=8)
+
+                        output_dir = os.path.join(self.path, 'chemspace', 'misc', 'dim_reduction')
+                        os.makedirs(output_dir, exist_ok=True)
+                        box_plot_path = os.path.join(
+                            output_dir,
+                            f"{center_table}_box_preview_{selected_method}_"
+                            f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+                        )
+                        fig.savefig(box_plot_path, dpi=300, bbox_inches='tight')
+                        print(f"🖼️  Box preview saved to: {box_plot_path}")
+
+                        plt.show()
+                        plt.close(fig)
+
+                # Report how many of the center table's own points fall within the box, for
+                # context on how the box relates to the space it was centered on
+                if target_table != center_table:
+                    center_mask = (
+                        (center_xy_df[center_x_col] >= x_min) & (center_xy_df[center_x_col] <= x_max) &
+                        (center_xy_df[center_y_col] >= y_min) & (center_xy_df[center_y_col] <= y_max)
+                    )
+                    center_in_box = center_xy_df[center_mask]
+                    center_retention = (len(center_in_box) / len(center_xy_df) * 100) if len(center_xy_df) else 0.0
+                    print(f"✅ {len(center_in_box):,} / {len(center_xy_df):,} compounds from '{center_table}' "
+                          f"(center table) fall within the box ({center_retention:.2f}%)")
+
+                # Subset the target table down to rows whose coordinates fall within the box
+                target_xy_df = target_df.dropna(subset=[target_x_col, target_y_col])
+                mask = (
+                    (target_xy_df[target_x_col] >= x_min) & (target_xy_df[target_x_col] <= x_max) &
+                    (target_xy_df[target_y_col] >= y_min) & (target_xy_df[target_y_col] <= y_max)
+                )
+                subset_df = target_xy_df[mask]
+
+                retention = (len(subset_df) / len(target_df) * 100) if len(target_df) else 0.0
+                print(f"✅ {len(subset_df):,} / {len(target_df):,} compounds from '{target_table}' fall "
+                      f"within the box ({retention:.2f}%)")
+
+                try:
+                    redefine = input("🔁 Redefine the box? [y/N]: ").strip().lower()
+                except KeyboardInterrupt:
+                    print("\n❌ Cancelled")
+                    return None
+
+                if redefine in ('y', 'yes'):
+                    box_size_x = None
+                    box_size_y = None
+                    continue
+                break
+
+            if subset_df.empty:
+                print("❌ No compounds fall within the defined box")
+                return None
+
+            # Resolve output table name
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            default_table_name = f"{target_table}_boxsubset_{timestamp}"
+            if output_table_name is None:
+                user_table_name = input(f"Enter table name for subset (default: {default_table_name}): ").strip()
+                output_table_name = user_table_name if user_table_name else default_table_name
+            output_table_name = self._sanitize_table_name(output_table_name)
+
+            available_tables = self.get_all_tables()
+            while output_table_name in available_tables:
+                print(f"\n⚠️  Table '{output_table_name}' already exists!")
+                user_table_name = input("Enter a different table name (or 'cancel' to abort): ").strip()
+                if user_table_name.lower() in ['cancel', 'quit', 'exit']:
+                    print("❌ Subsetting cancelled by user")
+                    return None
+                output_table_name = self._sanitize_table_name(user_table_name)
+                available_tables = self.get_all_tables()
+
+            # Save subset to database, replicating the target table's schema
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+
+            cursor.execute(f"PRAGMA table_info({target_table})")
+            columns_info = cursor.fetchall()
+
+            column_defs = []
+            for col_info in columns_info:
+                col_name, col_type, col_notnull, col_default, col_pk = col_info[1:6]
+                col_def = f"{col_name} {col_type}"
+                if col_notnull:
+                    col_def += " NOT NULL"
+                if col_default is not None and str(col_default).strip() != "":
+                    default_str = str(col_default).strip()
+                    if default_str.upper() == "NULL":
+                        col_def += " DEFAULT NULL"
+                    elif default_str.replace(".", "", 1).lstrip("-").isdigit():
+                        col_def += f" DEFAULT {default_str}"
+                    else:
+                        if not (default_str.startswith("'") or default_str.startswith('"')):
+                            default_str = f"'{default_str}'"
+                        col_def += f" DEFAULT {default_str}"
+                if col_pk:
+                    col_def += " PRIMARY KEY AUTOINCREMENT"
+                column_defs.append(col_def)
+
+            unique_constraint = ""
+            cursor.execute(f"SELECT sql FROM sqlite_master WHERE type='table' AND name='{target_table}'")
+            original_sql = cursor.fetchone()
+            if original_sql and 'UNIQUE(smiles, name)' in original_sql[0]:
+                unique_constraint = ", UNIQUE(smiles, name)"
+
+            create_table_sql = f"CREATE TABLE {output_table_name} ({', '.join(column_defs)}{unique_constraint})"
+            cursor.execute(create_table_sql)
+
+            # Insert in a single executemany() batch (see subset_table() for rationale)
+            insert_columns = [col[1] for col in columns_info if col[1] != 'id']
+            placeholders = ', '.join(['?'] * len(insert_columns))
+            insert_sql = f"INSERT OR IGNORE INTO {output_table_name} ({', '.join(insert_columns)}) VALUES ({placeholders})"
+
+            rows = [tuple(row[col] for col in insert_columns) for _, row in subset_df.iterrows()]
+            changes_before = conn.total_changes
+            cursor.executemany(insert_sql, rows)
+            inserted_count = conn.total_changes - changes_before
+
+            if 'smiles' in insert_columns:
+                cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{output_table_name}_smiles ON {output_table_name}(smiles)")
+            if 'name' in insert_columns:
+                cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{output_table_name}_name ON {output_table_name}(name)")
+
+            conn.commit()
+            conn.close()
+
+            print(f"✅ Successfully created subset table '{output_table_name}'")
+            print(f"   📊 Rows inserted: {inserted_count:,}")
+            print(f"   📦 Box ({label}, centroid from '{center_table}'): "
+                  f"x ∈ [{x_min:.4f}, {x_max:.4f}], y ∈ [{y_min:.4f}, {y_max:.4f}]")
+
+            return output_table_name
+
+        except Exception as e:
+            print(f"❌ Error subsetting chemical space based on dimensionality reduction: {e}")
+            return None
+
+    def _greedy_distance_select(self, coords: np.ndarray, n_to_select: int, sampling_mode: str,
+                                initial_dist: Optional[np.ndarray] = None,
+                                random_state: int = 42) -> List[int]:
+        """
+        Greedily select n_to_select positional indices from coords via an incremental
+        farthest-point ('max_distance') or nearest-point ('min_distance') traversal: at each
+        step, the unselected point whose distance to its nearest already-selected point is
+        largest (max_distance) or smallest (min_distance) is added, and the running per-point
+        "distance to nearest selected point" array is updated in O(n) rather than recomputing
+        all pairwise distances every iteration. Total cost is O(n_to_select * len(coords)).
+
+        Used by sample_projected_chemical_space() (seeded by one random point drawn from
+        coords itself) and sample_projected_chemical_space_including_table() (seeded by the
+        distance to an external fixed point set that is not itself selectable from coords).
+
+        Args:
+            coords (np.ndarray): (n, 2) array of candidate point coordinates
+            n_to_select (int): number of points to select (clamped to len(coords))
+            sampling_mode (str): 'max_distance' or 'min_distance'
+            initial_dist (Optional[np.ndarray]): starting per-point distance to the nearest
+                already-selected point, from an external fixed seed set not itself present in
+                coords. If None, the traversal instead seeds itself with one random point
+                drawn from coords, which becomes the first selected index.
+            random_state (int): seed for the random first pick when initial_dist is None
+
+        Returns:
+            List[int]: positional indices into coords, in selection order
+        """
+        n = len(coords)
+        n_to_select = min(n_to_select, n)
+        if n_to_select <= 0:
+            return []
+
+        selected_mask = np.zeros(n, dtype=bool)
+        selected_order: List[int] = []
+
+        if initial_dist is None:
+            rng = np.random.RandomState(random_state)
+            first_idx = int(rng.randint(n))
+            selected_mask[first_idx] = True
+            selected_order.append(first_idx)
+            dist_to_selected = np.linalg.norm(coords - coords[first_idx], axis=1)
+            remaining = n_to_select - 1
+        else:
+            dist_to_selected = initial_dist.copy()
+            remaining = n_to_select
+
+        for _ in range(remaining):
+            candidate_dist = np.where(selected_mask, np.nan, dist_to_selected)
+            if sampling_mode == 'max_distance':
+                next_idx = int(np.nanargmax(candidate_dist))
+            else:
+                next_idx = int(np.nanargmin(candidate_dist))
+
+            selected_mask[next_idx] = True
+            selected_order.append(next_idx)
+
+            new_dist = np.linalg.norm(coords - coords[next_idx], axis=1)
+            dist_to_selected = np.minimum(dist_to_selected, new_dist)
+
+        return selected_order
+
+    def sample_projected_chemical_space(self, table_name: Optional[str] = None,
+                                        method: Optional[str] = None,
+                                        reference_table: Optional[str] = None,
+                                        n_compounds: Optional[int] = None,
+                                        sampling_mode: Optional[str] = None,
+                                        max_points: int = 20000,
+                                        random_state: int = 42,
+                                        output_table_name: Optional[str] = None) -> Optional[str]:
+        """
+        Subset a fixed number of compounds from a table's projected dimensionality-reduction
+        coordinates (from project_dimensionality_on_table()), greedily selected over the 2D
+        (x, y) coordinates via an incremental farthest-point/nearest-point traversal:
+
+        - 'max_distance': at each step, add the unselected point whose distance to its nearest
+          already-selected point is largest. This is the classic MaxMin / farthest-point
+          sampling algorithm and yields a diverse subset spread out across the chemical space.
+        - 'min_distance': the mirrored traversal -- at each step, add the unselected point
+          whose distance to its nearest already-selected point is smallest. This yields a
+          compact subset that grows as a tight chain/cluster from the starting point.
+
+        Both modes start from the same randomly chosen seed point (seeded by random_state) and
+        run in O(n_compounds * n_points) time by incrementally maintaining, for every
+        unselected point, its distance to the nearest already-selected point.
+
+        Args:
+            table_name (Optional[str]): Name of the table to sample from, restricted to tables
+                with projected-coordinate columns ('<method>_from_<reference_table>_1'/'_2'
+                columns, as created by project_dimensionality_on_table()). If None, prompts an
+                interactive table selection.
+            method (Optional[str]): Restrict to a projected embedding fit with this method
+                ('pca', 'tsne', 'umap'). Combined with reference_table to disambiguate when
+                the table holds more than one projected embedding.
+            reference_table (Optional[str]): Restrict to a projected embedding that was fit
+                on this particular reference table.
+            n_compounds (Optional[int]): Number of compounds to select. If None, prompts for a
+                value. Clamped to the number of available valid rows if larger.
+            sampling_mode (Optional[str]): 'max_distance' or 'min_distance' (see above). If
+                None, prompts an interactive selection.
+            max_points (int): Cap on the number of candidate points considered. Each selection
+                step costs O(n_points), so tables larger than this are randomly subsampled
+                first (with a printed warning) to stay responsive.
+            random_state (int): Seed for the initial random seed point and any subsampling.
+            output_table_name (Optional[str]): Name for the new table holding the sampled
+                subset. If None, prompts for a name with a timestamp-based default.
+
+        Returns:
+            Optional[str]: Name of the created output table, or None if an error occurred or
+                the operation was cancelled
+        """
+        try:
+            # Resolve table interactively if not provided, restricted to tables that already
+            # have projected-coordinate columns from project_dimensionality_on_table()
+            if table_name is None:
+                tables_with_projections = [
+                    t for t in self.get_all_tables()
+                    if self._detect_projected_reduction_columns_in_columns(self._get_table_columns(t))
+                ]
+                if not tables_with_projections:
+                    print("❌ No tables with projected-coordinate columns found.")
+                    print("   Run project_dimensionality_on_table() on a table first.")
+                    return None
+
+                table_name = self._select_table_interactive(
+                    "SELECT TABLE FOR PROJECTED CHEMICAL SPACE SAMPLING", tables_override=tables_with_projections
+                )
+                if not table_name:
+                    print("❌ No table selected for sampling")
+                    return None
+
+            print(f"📊 Retrieving table '{table_name}' for sampling...")
+            df = self._get_table_as_dataframe(table_name)
+
+            if df.empty:
+                print(f"⚠️  No data retrieved from table '{table_name}'")
+                return None
+
+            # Resolve which projected (method, reference_table) combination to sample from
+            projections = self._detect_projected_reduction_columns_in_columns(df.columns)
+
+            if not projections:
+                print(f"❌ No projected-coordinate columns found in table '{table_name}'.")
+                print("   Run project_dimensionality_on_table() on this table first.")
+                return None
+
+            candidate_keys = list(projections.keys())
+
+            if method is not None:
+                candidate_keys = [k for k in candidate_keys if k[0] == method]
+                if not candidate_keys:
+                    print(f"❌ No projected '{method}' coordinates found in table '{table_name}'.")
+                    return None
+
+            if reference_table is not None:
+                candidate_keys = [k for k in candidate_keys if k[1] == reference_table]
+                if not candidate_keys:
+                    print(f"❌ No projected coordinates from reference table '{reference_table}' "
+                          f"found in table '{table_name}'.")
+                    return None
+
+            if len(candidate_keys) == 1:
+                selected_method, selected_reference_table = candidate_keys[0]
+            else:
+                selected_key = self._select_projection_interactive(candidate_keys)
+                if selected_key is None:
+                    print("❌ No projected embedding selected")
+                    return None
+                selected_method, selected_reference_table = selected_key
+
+            x_col, y_col = projections[(selected_method, selected_reference_table)][:2]
+
+            plot_df = df.dropna(subset=[x_col, y_col]).copy()
+
+            if plot_df.empty:
+                print(f"❌ No rows with valid projected coordinates in table '{table_name}'")
+                return None
+
+            if len(plot_df) > max_points:
+                print(f"⚠️  {len(plot_df):,} points exceeds max_points={max_points:,}; using a "
+                      f"random subsample of {max_points:,} candidate points (each selection "
+                      f"step costs O(n_points)). Pass a higher max_points to consider more, "
+                      f"at the cost of runtime.")
+                plot_df = plot_df.sample(n=max_points, random_state=random_state)
+
+            # Resolve number of compounds to select
+            if n_compounds is None:
+                while True:
+                    try:
+                        raw = input(f"Enter number of compounds to subset (1-{len(plot_df):,}): ").strip()
+                        n_compounds = int(raw)
+                        if n_compounds <= 0:
+                            print("❌ Number of compounds must be positive")
+                            continue
+                        break
+                    except ValueError:
+                        print(f"❌ Invalid integer '{raw}'")
+                    except KeyboardInterrupt:
+                        print("\n❌ Cancelled")
+                        return None
+            elif n_compounds <= 0:
+                print(f"❌ n_compounds must be positive, got {n_compounds}")
+                return None
+
+            if n_compounds > len(plot_df):
+                print(f"⚠️  Requested {n_compounds:,} compounds but only {len(plot_df):,} are "
+                      f"available; using all {len(plot_df):,}.")
+                n_compounds = len(plot_df)
+
+            # Resolve sampling mode
+            if sampling_mode is None:
+                print(f"\n🔍 SELECT SAMPLING MODE")
+                print("=" * 60)
+                print("1. max_distance (diverse subset, spread out across the chemical space)")
+                print("2. min_distance (compact subset, tightly clustered)")
+                print("-" * 60)
+                while True:
+                    try:
+                        selection = input("🔍 Select sampling mode [1/2]: ").strip().lower()
+                        if selection in ('1', 'max_distance', 'max'):
+                            sampling_mode = 'max_distance'
+                            break
+                        elif selection in ('2', 'min_distance', 'min'):
+                            sampling_mode = 'min_distance'
+                            break
+                        else:
+                            print(f"❌ Invalid selection '{selection}'. Enter 1, 2, "
+                                  f"'max_distance' or 'min_distance'")
+                    except KeyboardInterrupt:
+                        print("\n❌ Cancelled")
+                        return None
+            elif sampling_mode not in ('max_distance', 'min_distance'):
+                print(f"❌ Invalid sampling_mode '{sampling_mode}'. Must be 'max_distance' or 'min_distance'")
+                return None
+
+            label = self._DIM_REDUCTION_LABELS[selected_method]
+            print(f"🎯 Sampling {n_compounds:,} compounds from {len(plot_df):,} candidates "
+                  f"({label} from '{selected_reference_table}') in '{table_name}' "
+                  f"using '{sampling_mode}'...")
+
+            coords = plot_df[[x_col, y_col]].to_numpy()
+            selected_order = self._greedy_distance_select(
+                coords, n_compounds, sampling_mode, random_state=random_state
+            )
+            sampled_df = plot_df.iloc[selected_order]
+
+            print(f"✅ Selected {len(sampled_df):,} compounds from '{table_name}' "
+                  f"using '{sampling_mode}' sampling")
+
+            # Resolve output table name
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            default_table_name = f"{table_name}_sampled_{sampling_mode}_{timestamp}"
+            if output_table_name is None:
+                user_table_name = input(f"Enter table name for sample (default: {default_table_name}): ").strip()
+                output_table_name = user_table_name if user_table_name else default_table_name
+            output_table_name = self._sanitize_table_name(output_table_name)
+
+            available_tables = self.get_all_tables()
+            while output_table_name in available_tables:
+                print(f"\n⚠️  Table '{output_table_name}' already exists!")
+                user_table_name = input("Enter a different table name (or 'cancel' to abort): ").strip()
+                if user_table_name.lower() in ['cancel', 'quit', 'exit']:
+                    print("❌ Sampling cancelled by user")
+                    return None
+                output_table_name = self._sanitize_table_name(user_table_name)
+                available_tables = self.get_all_tables()
+
+            # Save sampled subset to database, replicating the source table's schema
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+
+            cursor.execute(f"PRAGMA table_info({table_name})")
+            columns_info = cursor.fetchall()
+
+            column_defs = []
+            for col_info in columns_info:
+                col_name, col_type, col_notnull, col_default, col_pk = col_info[1:6]
+                col_def = f"{col_name} {col_type}"
+                if col_notnull:
+                    col_def += " NOT NULL"
+                if col_default is not None and str(col_default).strip() != "":
+                    default_str = str(col_default).strip()
+                    if default_str.upper() == "NULL":
+                        col_def += " DEFAULT NULL"
+                    elif default_str.replace(".", "", 1).lstrip("-").isdigit():
+                        col_def += f" DEFAULT {default_str}"
+                    else:
+                        if not (default_str.startswith("'") or default_str.startswith('"')):
+                            default_str = f"'{default_str}'"
+                        col_def += f" DEFAULT {default_str}"
+                if col_pk:
+                    col_def += " PRIMARY KEY AUTOINCREMENT"
+                column_defs.append(col_def)
+
+            unique_constraint = ""
+            cursor.execute(f"SELECT sql FROM sqlite_master WHERE type='table' AND name='{table_name}'")
+            original_sql = cursor.fetchone()
+            if original_sql and 'UNIQUE(smiles, name)' in original_sql[0]:
+                unique_constraint = ", UNIQUE(smiles, name)"
+
+            create_table_sql = f"CREATE TABLE {output_table_name} ({', '.join(column_defs)}{unique_constraint})"
+            cursor.execute(create_table_sql)
+
+            insert_columns = [col[1] for col in columns_info if col[1] != 'id']
+            placeholders = ', '.join(['?'] * len(insert_columns))
+            insert_sql = f"INSERT OR IGNORE INTO {output_table_name} ({', '.join(insert_columns)}) VALUES ({placeholders})"
+
+            rows = [tuple(row[col] for col in insert_columns) for _, row in sampled_df.iterrows()]
+            changes_before = conn.total_changes
+            cursor.executemany(insert_sql, rows)
+            inserted_count = conn.total_changes - changes_before
+
+            if 'smiles' in insert_columns:
+                cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{output_table_name}_smiles ON {output_table_name}(smiles)")
+            if 'name' in insert_columns:
+                cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{output_table_name}_name ON {output_table_name}(name)")
+
+            conn.commit()
+            conn.close()
+
+            print(f"✅ Successfully created sampled table '{output_table_name}'")
+            print(f"   📊 Rows inserted: {inserted_count:,}")
+            print(f"   🎯 Sampling mode: {sampling_mode} ({label} from '{selected_reference_table}')")
+
+            return output_table_name
+
+        except Exception as e:
+            print(f"❌ Error sampling projected chemical space for table '{table_name}': {e}")
+            return None
+
+    def sample_projected_chemical_space_including_table(
+            self,
+            include_table: Optional[str] = None,
+            table_name: Optional[str] = None,
+            method: Optional[str] = None,
+            reference_table: Optional[str] = None,
+            n_compounds: Optional[int] = None,
+            sampling_mode: Optional[str] = None,
+            max_points: int = 20000,
+            random_state: int = 42,
+            output_table_name: Optional[str] = None) -> Optional[str]:
+        """
+        Same behavior as sample_projected_chemical_space(), except the final subset is forced
+        to contain every compound of a user-selected 'include_table', with the remaining
+        compounds sampled from another table to reach the requested total.
+
+        The include_table's compounds are treated as an already-selected seed set: the
+        farthest-point ('max_distance') or nearest-point ('min_distance') traversal is seeded
+        by the distance from every candidate to its nearest point in include_table (instead of
+        a single random point, as in sample_projected_chemical_space()), and grows by
+        n_compounds - len(include_table) additional picks -- i.e. just enough new compounds to
+        reach the requested total. Candidates already present in include_table (matched by
+        smiles + name) are excluded from the candidate pool so they aren't picked twice.
+
+        Args:
+            include_table (Optional[str]): Table whose compounds must all appear in the final
+                subset, restricted to tables with dimensionality-reduction coordinate columns
+                -- either a table's own fitted embedding ('<method>_1'/'_2', from
+                reduce_dimensionality()) or coordinates projected onto another table
+                ('<method>_from_<reference_table>_1'/'_2', from
+                project_dimensionality_on_table()). If None, prompts an interactive table
+                selection. Queried first, before table_name.
+            table_name (Optional[str]): Table to sample the remaining compounds from, restricted
+                to tables sharing a coordinate space with include_table (same rule as above --
+                either side may hold the fitted embedding while the other holds coordinates
+                projected onto it, or both may hold coordinates projected onto the same third
+                table). If None, prompts an interactive table selection. May be the same table
+                as include_table.
+            method (Optional[str]): Restrict to a shared embedding fit with this method
+                ('pca', 'tsne', 'umap'), to disambiguate when more than one is shared.
+            reference_table (Optional[str]): Restrict to a shared coordinate space anchored on
+                this particular reference table (its own fitted embedding, or the table other
+                tables were projected onto).
+            n_compounds (Optional[int]): TOTAL number of compounds in the final subset,
+                including include_table's own compounds. If None, prompts for a value. Clamped
+                to the number of available rows (include_table + remaining candidates) if
+                larger; if include_table alone already meets or exceeds it, no compounds are
+                sampled and only include_table's compounds are used.
+            sampling_mode (Optional[str]): 'max_distance' (new compounds spread out relative to
+                include_table) or 'min_distance' (new compounds clustered close to
+                include_table). If None, prompts an interactive selection.
+            max_points (int): Cap on the number of candidate points considered from table_name
+                (after excluding include_table's own compounds). Each selection step costs
+                O(n_points), so more candidates than this are randomly subsampled first (with
+                a printed warning) to stay responsive. include_table itself is never
+                subsampled -- all of it is always included.
+            random_state (int): Seed for any candidate subsampling (there is no random seed
+                point here, since the traversal is seeded by include_table instead).
+            output_table_name (Optional[str]): Name for the new table holding the final subset.
+                If None, prompts for a name with a timestamp-based default. Only columns
+                common to both include_table and table_name are carried over.
+
+        Returns:
+            Optional[str]: Name of the created output table, or None if an error occurred or
+                the operation was cancelled
+        """
+        try:
+            tables_with_coords = [
+                t for t in self.get_all_tables()
+                if self._get_coordinate_columns_in_table(t, self._get_table_columns(t))
+            ]
+
+            if not tables_with_coords:
+                print("❌ No tables with dimensionality-reduction coordinate columns found.")
+                print("   Run reduce_dimensionality() and/or project_dimensionality_on_table() first.")
+                return None
+
+            # Resolve include_table first, as requested
+            if include_table is None:
+                include_table = self._select_table_interactive(
+                    "SELECT TABLE TO INCLUDE IN THE FINAL SUBSET", tables_override=tables_with_coords
+                )
+                if not include_table:
+                    print("❌ No include table selected")
+                    return None
+            elif include_table not in tables_with_coords:
+                print(f"❌ Table '{include_table}' not found or has no dimensionality-reduction coordinates.")
+                return None
+
+            print(f"📊 Retrieving table '{include_table}' (compounds to include)...")
+            include_df = self._get_table_as_dataframe(include_table)
+            if include_df.empty:
+                print(f"⚠️  No data retrieved from table '{include_table}'")
+                return None
+
+            include_coords = self._get_coordinate_columns_in_table(include_table, include_df.columns)
+            if not include_coords:
+                print(f"❌ No dimensionality-reduction coordinate columns found in table '{include_table}'")
+                return None
+
+            # Resolve source table to sample the remaining compounds from, restricted to those
+            # sharing a coordinate space with include_table (own fitted embedding on one side
+            # and coordinates projected onto it on the other both count, per
+            # _get_coordinate_columns_in_table())
+            if table_name is None:
+                candidate_tables = [
+                    t for t in tables_with_coords
+                    if set(self._get_coordinate_columns_in_table(t, self._get_table_columns(t)))
+                    & set(include_coords)
+                ]
+                if not candidate_tables:
+                    print(f"❌ No table shares a coordinate space with '{include_table}'.")
+                    return None
+                table_name = self._select_table_interactive(
+                    "SELECT TABLE TO SAMPLE ADDITIONAL COMPOUNDS FROM", tables_override=candidate_tables
+                )
+                if not table_name:
+                    print("❌ No table selected for sampling")
+                    return None
+
+            if table_name == include_table:
+                df = include_df
+            else:
+                if table_name not in tables_with_coords:
+                    print(f"❌ Table '{table_name}' not found or has no dimensionality-reduction coordinates.")
+                    return None
+                print(f"📊 Retrieving table '{table_name}' for sampling...")
+                df = self._get_table_as_dataframe(table_name)
+                if df.empty:
+                    print(f"⚠️  No data retrieved from table '{table_name}'")
+                    return None
+
+            projections = self._get_coordinate_columns_in_table(table_name, df.columns)
+            if not projections:
+                print(f"❌ No dimensionality-reduction coordinate columns found in table '{table_name}'")
+                return None
+
+            # Resolve the shared coordinate space to use
+            shared_keys = sorted(set(projections) & set(include_coords))
+            if not shared_keys:
+                print(f"❌ Tables '{include_table}' and '{table_name}' do not share a "
+                      f"coordinate space.")
+                return None
+
+            if method is not None:
+                shared_keys = [k for k in shared_keys if k[0] == method]
+                if not shared_keys:
+                    print(f"❌ No shared '{method}' coordinates found between "
+                          f"'{include_table}' and '{table_name}'.")
+                    return None
+
+            if reference_table is not None:
+                shared_keys = [k for k in shared_keys if k[1] == reference_table]
+                if not shared_keys:
+                    print(f"❌ No shared coordinates from reference table "
+                          f"'{reference_table}' found between '{include_table}' and '{table_name}'.")
+                    return None
+
+            if len(shared_keys) == 1:
+                selected_key = shared_keys[0]
+            else:
+                selected_key = self._select_projection_interactive(shared_keys)
+                if selected_key is None:
+                    print("❌ No coordinate space selected")
+                    return None
+            selected_method, selected_reference_table = selected_key
+
+            include_x_col, include_y_col = include_coords[selected_key][:2]
+            x_col, y_col = projections[selected_key][:2]
+
+            include_xy_df = include_df.dropna(subset=[include_x_col, include_y_col]).copy()
+            if include_xy_df.empty:
+                print(f"❌ No rows with valid projected coordinates in table '{include_table}'")
+                return None
+
+            plot_df = df.dropna(subset=[x_col, y_col]).copy()
+            if plot_df.empty:
+                print(f"❌ No rows with valid projected coordinates in table '{table_name}'")
+                return None
+
+            # Exclude candidates already present in include_table (matched by smiles + name)
+            # so they aren't picked twice
+            if {'smiles', 'name'} <= set(plot_df.columns) and {'smiles', 'name'} <= set(include_xy_df.columns):
+                include_keys = pd.MultiIndex.from_arrays([include_xy_df['smiles'], include_xy_df['name']])
+                candidate_keys = pd.MultiIndex.from_arrays([plot_df['smiles'], plot_df['name']])
+                plot_df = plot_df[~candidate_keys.isin(include_keys)]
+
+            if len(plot_df) > max_points:
+                print(f"⚠️  {len(plot_df):,} candidate points exceeds max_points={max_points:,}; "
+                      f"using a random subsample of {max_points:,} candidates (each selection "
+                      f"step costs O(n_points)). Pass a higher max_points to consider more, at "
+                      f"the cost of runtime.")
+                plot_df = plot_df.sample(n=max_points, random_state=random_state)
+
+            # Resolve total number of compounds to select, including include_table's own
+            max_total = len(include_xy_df) + len(plot_df)
+            if n_compounds is None:
+                while True:
+                    try:
+                        raw = input(
+                            f"Enter TOTAL number of compounds to subset, including the "
+                            f"{len(include_xy_df):,} from '{include_table}' "
+                            f"(up to {max_total:,}): "
+                        ).strip()
+                        n_compounds = int(raw)
+                        if n_compounds <= 0:
+                            print("❌ Number of compounds must be positive")
+                            continue
+                        break
+                    except ValueError:
+                        print(f"❌ Invalid integer '{raw}'")
+                    except KeyboardInterrupt:
+                        print("\n❌ Cancelled")
+                        return None
+            elif n_compounds <= 0:
+                print(f"❌ n_compounds must be positive, got {n_compounds}")
+                return None
+
+            if n_compounds > max_total:
+                print(f"⚠️  Requested {n_compounds:,} compounds but only {max_total:,} are "
+                      f"available ({len(include_xy_df):,} from '{include_table}' + "
+                      f"{len(plot_df):,} candidates); using all {max_total:,}.")
+                n_compounds = max_total
+
+            n_needed = n_compounds - len(include_xy_df)
+            if n_needed <= 0:
+                print(f"⚠️  '{include_table}' alone already has {len(include_xy_df):,} compounds, "
+                      f">= the requested {n_compounds:,}; no additional compounds will be sampled.")
+                n_needed = 0
+
+            # Resolve sampling mode
+            if n_needed > 0 and sampling_mode is None:
+                print(f"\n🔍 SELECT SAMPLING MODE")
+                print("=" * 60)
+                print("1. max_distance (new compounds spread out relative to the include table)")
+                print("2. min_distance (new compounds clustered close to the include table)")
+                print("-" * 60)
+                while True:
+                    try:
+                        selection = input("🔍 Select sampling mode [1/2]: ").strip().lower()
+                        if selection in ('1', 'max_distance', 'max'):
+                            sampling_mode = 'max_distance'
+                            break
+                        elif selection in ('2', 'min_distance', 'min'):
+                            sampling_mode = 'min_distance'
+                            break
+                        else:
+                            print(f"❌ Invalid selection '{selection}'. Enter 1, 2, "
+                                  f"'max_distance' or 'min_distance'")
+                    except KeyboardInterrupt:
+                        print("\n❌ Cancelled")
+                        return None
+            elif sampling_mode is not None and sampling_mode not in ('max_distance', 'min_distance'):
+                print(f"❌ Invalid sampling_mode '{sampling_mode}'. Must be 'max_distance' or 'min_distance'")
+                return None
+
+            label = self._DIM_REDUCTION_LABELS[selected_method]
+            mode_suffix = f" using '{sampling_mode}'" if n_needed > 0 else ""
+            print(f"🎯 Including {len(include_xy_df):,} compounds from '{include_table}', "
+                  f"sampling {n_needed:,} more from {len(plot_df):,} candidates in "
+                  f"'{table_name}' ({label} from '{selected_reference_table}'){mode_suffix}...")
+
+            if n_needed > 0:
+                coords = plot_df[[x_col, y_col]].to_numpy()
+                include_coords = include_xy_df[[include_x_col, include_y_col]].to_numpy()
+
+                # Seed the traversal with the distance from every candidate to its nearest
+                # point in include_table's coordinate set, computed in chunks to bound memory
+                initial_dist = np.full(len(coords), np.inf)
+                chunk_size = 500
+                for start in range(0, len(include_coords), chunk_size):
+                    chunk = include_coords[start:start + chunk_size]
+                    d = np.linalg.norm(coords[:, None, :] - chunk[None, :, :], axis=2).min(axis=1)
+                    initial_dist = np.minimum(initial_dist, d)
+
+                selected_order = self._greedy_distance_select(
+                    coords, n_needed, sampling_mode, initial_dist=initial_dist, random_state=random_state
+                )
+                sampled_df = plot_df.iloc[selected_order]
+            else:
+                sampled_df = plot_df.iloc[0:0]
+
+            final_df = pd.concat([include_xy_df, sampled_df], ignore_index=True)
+
+            print(f"✅ Final subset: {len(final_df):,} compounds "
+                  f"({len(include_xy_df):,} included + {len(sampled_df):,} sampled)")
+
+            # Resolve output table name
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            default_table_name = f"{table_name}_including_{include_table}_{timestamp}"
+            if output_table_name is None:
+                user_table_name = input(f"Enter table name for subset (default: {default_table_name}): ").strip()
+                output_table_name = user_table_name if user_table_name else default_table_name
+            output_table_name = self._sanitize_table_name(output_table_name)
+
+            available_tables = self.get_all_tables()
+            while output_table_name in available_tables:
+                print(f"\n⚠️  Table '{output_table_name}' already exists!")
+                user_table_name = input("Enter a different table name (or 'cancel' to abort): ").strip()
+                if user_table_name.lower() in ['cancel', 'quit', 'exit']:
+                    print("❌ Sampling cancelled by user")
+                    return None
+                output_table_name = self._sanitize_table_name(user_table_name)
+                available_tables = self.get_all_tables()
+
+            # Build the output schema from table_name's columns, restricted to those also
+            # present in include_table -- the two source tables aren't guaranteed to share an
+            # identical schema, so only common columns are carried over
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+
+            cursor.execute(f"PRAGMA table_info({table_name})")
+            source_columns_info = cursor.fetchall()
+            include_table_columns = set(self._get_table_columns(include_table))
+
+            column_defs = []
+            insert_columns = []
+            for col_info in source_columns_info:
+                col_name, col_type, col_notnull, col_default, col_pk = col_info[1:6]
+                if col_name == 'id' or col_name not in include_table_columns:
+                    continue
+
+                col_def = f"{col_name} {col_type}"
+                if col_notnull:
+                    col_def += " NOT NULL"
+                if col_default is not None and str(col_default).strip() != "":
+                    default_str = str(col_default).strip()
+                    if default_str.upper() == "NULL":
+                        col_def += " DEFAULT NULL"
+                    elif default_str.replace(".", "", 1).lstrip("-").isdigit():
+                        col_def += f" DEFAULT {default_str}"
+                    else:
+                        if not (default_str.startswith("'") or default_str.startswith('"')):
+                            default_str = f"'{default_str}'"
+                        col_def += f" DEFAULT {default_str}"
+                column_defs.append(col_def)
+                insert_columns.append(col_name)
+
+            if not insert_columns:
+                print(f"❌ Tables '{include_table}' and '{table_name}' share no common columns "
+                      f"to build the output table.")
+                conn.close()
+                return None
+
+            unique_constraint = ""
+            if {'smiles', 'name'} <= set(insert_columns):
+                cursor.execute(f"SELECT sql FROM sqlite_master WHERE type='table' AND name='{table_name}'")
+                original_sql = cursor.fetchone()
+                if original_sql and 'UNIQUE(smiles, name)' in original_sql[0]:
+                    unique_constraint = ", UNIQUE(smiles, name)"
+
+            create_table_sql = (
+                f"CREATE TABLE {output_table_name} "
+                f"(id INTEGER PRIMARY KEY AUTOINCREMENT, {', '.join(column_defs)}{unique_constraint})"
+            )
+            cursor.execute(create_table_sql)
+
+            placeholders = ', '.join(['?'] * len(insert_columns))
+            insert_sql = f"INSERT OR IGNORE INTO {output_table_name} ({', '.join(insert_columns)}) VALUES ({placeholders})"
+
+            rows = [tuple(row[col] for col in insert_columns) for _, row in final_df.iterrows()]
+            changes_before = conn.total_changes
+            cursor.executemany(insert_sql, rows)
+            inserted_count = conn.total_changes - changes_before
+
+            if 'smiles' in insert_columns:
+                cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{output_table_name}_smiles ON {output_table_name}(smiles)")
+            if 'name' in insert_columns:
+                cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{output_table_name}_name ON {output_table_name}(name)")
+
+            conn.commit()
+            conn.close()
+
+            print(f"✅ Successfully created sampled table '{output_table_name}'")
+            print(f"   📊 Rows inserted: {inserted_count:,}")
+            print(f"   🎯 {len(include_xy_df):,} included from '{include_table}' + "
+                  f"{len(sampled_df):,} sampled from '{table_name}' "
+                  f"({label} from '{selected_reference_table}')")
+
+            return output_table_name
+
+        except Exception as e:
+            print(f"❌ Error sampling projected chemical space including table '{include_table}': {e}")
+            return None
+
+    def _select_target_tables_interactive(self, tables_with_projections: List[str]) -> Optional[List[str]]:
+        """
+        Interactive multi-selection of target table(s) with projected coordinates, for
+        plot_projected_chemical_space(). Selecting more than one overlays multiple target
+        chemical spaces on top of the same reference embedding.
+
+        Args:
+            tables_with_projections (List[str]): Candidate table names to choose from
+
+        Returns:
+            Optional[List[str]]: Selected table names (in the order chosen, de-duplicated),
+                or None if cancelled
+        """
+        print(f"\n🔍 SELECT TARGET TABLE(S) FOR PROJECTED-COORDINATE PLOT")
+        print("=" * 70)
+        for i, t in enumerate(tables_with_projections, 1):
+            try:
+                compound_count = self.get_compound_count(table_name=t)
+                print(f"{i:3d}. {t:<30} ({compound_count:>6,} compounds)")
+            except Exception:
+                print(f"{i:3d}. {t}")
+        print("-" * 70)
+        print("Commands: Enter option number(s) (comma-separated) to overlay multiple targets, "
+              "'all', or 'cancel' to abort")
+
+        while True:
+            try:
+                selection = input(f"\n🔍 Select target table(s): ").strip()
+
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    return None
+
+                if selection.lower() == 'all':
+                    return list(tables_with_projections)
+
+                try:
+                    indices = [int(part.strip()) - 1 for part in selection.split(',') if part.strip()]
+                    if indices and all(0 <= idx < len(tables_with_projections) for idx in indices):
+                        seen = set()
+                        selected = []
+                        for idx in indices:
+                            if idx not in seen:
+                                seen.add(idx)
+                                selected.append(tables_with_projections[idx])
+                        return selected
+                    print(f"❌ Invalid selection. Please enter number(s) between 1-{len(tables_with_projections)}")
+                except ValueError:
+                    print(f"❌ Invalid input '{selection}'")
+
+            except KeyboardInterrupt:
+                print("\n❌ Selection cancelled")
+                return None
+
+    def _render_projected_chemical_space_plot_script(self, proj_datasets: List[Dict[str, str]],
+                                                      ref_csv_name: Optional[str],
+                                                      png_name: str, proj_x_col: str, proj_y_col: str,
+                                                      ref_x_col: Optional[str], ref_y_col: Optional[str],
+                                                      color_by: Optional[str], figsize: Tuple[int, int],
+                                                      point_size: float, reference_point_size: float,
+                                                      alpha: float, reference_alpha: float, title: str,
+                                                      reference_label: str) -> str:
+        """
+        Render a standalone Python script that reproduces a plot_projected_chemical_space() plot
+        from its exported CSV(s), with no dependency on TidyScreen.
+
+        Args:
+            proj_datasets (List[Dict[str, str]]): One entry per target table, in plotted order,
+                each with 'csv_name' and 'label'. A single entry with color_by set reproduces
+                the per-column coloring; multiple entries reproduce the per-table color palette.
+        """
+        ref_block = ""
+        if ref_csv_name is not None:
+            ref_block = f'''
+REF_CSV_PATH = os.path.join(SCRIPT_DIR, {ref_csv_name!r})
+REF_X_COL = {ref_x_col!r}
+REF_Y_COL = {ref_y_col!r}
+
+ref_df = pd.read_csv(REF_CSV_PATH)
+ax.scatter(ref_df[REF_X_COL], ref_df[REF_Y_COL], s={reference_point_size!r}, alpha={reference_alpha!r},
+          color='lightgray', label={reference_label!r} + f" — n={{len(ref_df)}}")
+'''
+
+        proj_csv_names = ', '.join(repr(d['csv_name']) for d in proj_datasets)
+
+        return f'''#!/usr/bin/env python3
+"""
+Regenerates '{png_name}' from {proj_csv_names}{f" and '{ref_csv_name}'" if ref_csv_name else ""}.
+Generated by ChemSpace.plot_projected_chemical_space().
+"""
+import os
+import pandas as pd
+import matplotlib.pyplot as plt
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+OUTPUT_PATH = os.path.join(SCRIPT_DIR, {png_name!r})
+
+PROJ_X_COL = {proj_x_col!r}
+PROJ_Y_COL = {proj_y_col!r}
+COLOR_BY = {color_by!r}
+POINT_SIZE = {point_size!r}
+ALPHA = {alpha!r}
+
+PROJ_DATASETS = {proj_datasets!r}  # one entry per target table: {{'csv_name': ..., 'label': ...}}
+
+fig, ax = plt.subplots(figsize={tuple(figsize)!r})
+{ref_block}
+if len(PROJ_DATASETS) > 1:
+    cmap = plt.get_cmap('tab20' if len(PROJ_DATASETS) > 10 else 'tab10')
+    for i, dataset in enumerate(PROJ_DATASETS):
+        proj_df = pd.read_csv(os.path.join(SCRIPT_DIR, dataset['csv_name']))
+        ax.scatter(proj_df[PROJ_X_COL], proj_df[PROJ_Y_COL], s=POINT_SIZE, alpha=ALPHA,
+                  color=cmap(i % cmap.N), label=dataset['label'] + f" — n={{len(proj_df)}}")
+else:
+    proj_df = pd.read_csv(os.path.join(SCRIPT_DIR, PROJ_DATASETS[0]['csv_name']))
+    proj_label = PROJ_DATASETS[0]['label']
+    if COLOR_BY is None:
+        ax.scatter(proj_df[PROJ_X_COL], proj_df[PROJ_Y_COL], s=POINT_SIZE, alpha=ALPHA,
+                  color='crimson', label=proj_label + f" — n={{len(proj_df)}}")
+    elif pd.api.types.is_numeric_dtype(proj_df[COLOR_BY]):
+        scatter = ax.scatter(proj_df[PROJ_X_COL], proj_df[PROJ_Y_COL], s=POINT_SIZE, alpha=ALPHA,
+                             c=proj_df[COLOR_BY], cmap='viridis', label=proj_label)
+        fig.colorbar(scatter, ax=ax, label=COLOR_BY)
+    else:
+        categories = sorted(proj_df[COLOR_BY].astype(str).unique())
+        cat_cmap = plt.get_cmap('tab20' if len(categories) > 10 else 'tab10')
+        category_colors = {{cat: cat_cmap(i % cat_cmap.N) for i, cat in enumerate(categories)}}
+        for cat in categories:
+            mask = proj_df[COLOR_BY].astype(str) == cat
+            ax.scatter(proj_df.loc[mask, PROJ_X_COL], proj_df.loc[mask, PROJ_Y_COL],
+                      s=POINT_SIZE, alpha=ALPHA, color=category_colors[cat],
+                      label=f"{{cat}} — n={{mask.sum()}}")
+
+ax.set_xlabel(PROJ_X_COL)
+ax.set_ylabel(PROJ_Y_COL)
+ax.set_title({title!r})
+ax.grid(True, alpha=0.3)
+ax.legend(loc='best', fontsize=8)
+
+fig.savefig(OUTPUT_PATH, dpi=300, bbox_inches='tight')
+plt.show()
+'''
+
+    def _select_projections_to_delete_interactive(self, candidates: List[Tuple[str, str]]
+                                                  ) -> Optional[List[Tuple[str, str]]]:
+        """
+        Interactive multi-selection among projected (method, reference_table) combinations,
+        for deletion.
+
+        Args:
+            candidates (List[Tuple[str, str]]): (method, reference_table) pairs to choose from
+
+        Returns:
+            Optional[List[Tuple[str, str]]]: Selected pairs (in the order chosen, de-duplicated),
+                or None if cancelled
+        """
+        print(f"\n🔍 SELECT PROJECTED EMBEDDING(S) TO DELETE")
+        print("=" * 60)
+        for i, (proj_method, proj_reference_table) in enumerate(candidates, 1):
+            print(f"{i}. {self._DIM_REDUCTION_LABELS[proj_method]} (from '{proj_reference_table}')")
+        print("-" * 60)
+        print("Commands: Enter option number(s) (comma-separated), 'all', or 'cancel' to abort")
+
+        while True:
+            try:
+                selection = input(f"\n🔍 Select projection(s): ").strip()
+
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    return None
+
+                if selection.lower() == 'all':
+                    return list(candidates)
+
+                try:
+                    indices = [int(part.strip()) - 1 for part in selection.split(',') if part.strip()]
+                    if indices and all(0 <= idx < len(candidates) for idx in indices):
+                        seen = set()
+                        selected = []
+                        for idx in indices:
+                            if idx not in seen:
+                                seen.add(idx)
+                                selected.append(candidates[idx])
+                        return selected
+                    print(f"❌ Invalid selection. Please enter number(s) between 1-{len(candidates)}")
+                except ValueError:
+                    print(f"❌ Invalid input '{selection}'")
+
+            except KeyboardInterrupt:
+                print("\n❌ Selection cancelled")
+                return None
+
+    def _drop_table_columns(self, table_name: str, columns: List[str]) -> bool:
+        """
+        Drop one or more columns from a table in a single rewrite.
+
+        SQLite's 'ALTER TABLE ... DROP COLUMN' triggers a full table rewrite per call unless
+        the dropped column happens to be the rightmost one — so looping it once per column
+        costs a full copy of the table N times over for N columns. This instead rebuilds the
+        table once with only the surviving columns and copies every row in a single pass,
+        regardless of how many columns are being dropped.
+
+        Args:
+            table_name (str): Name of the table to modify
+            columns (List[str]): Column names to drop
+
+        Returns:
+            bool: True if the column(s) were dropped successfully
+        """
+        try:
+            columns_to_drop = set(columns)
+
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+
+            cursor.execute(f"PRAGMA table_info({table_name})")
+            columns_info = cursor.fetchall()
+
+            surviving_columns = [c for c in columns_info if c[1] not in columns_to_drop]
+
+            if not surviving_columns:
+                print(f"❌ Error: cannot drop all columns from table '{table_name}'")
+                conn.close()
+                return False
+
+            if len(surviving_columns) == len(columns_info):
+                conn.close()
+                return True
+
+            # Reconstruct the surviving columns' definitions
+            column_defs = []
+            for _, col_name, col_type, col_notnull, col_default, col_pk in surviving_columns:
+                col_def = f"{col_name} {col_type}"
+
+                if col_notnull:
+                    col_def += " NOT NULL"
+
+                if col_default is not None and str(col_default).strip() != "":
+                    default_str = str(col_default).strip()
+                    if default_str.upper() == "NULL":
+                        col_def += " DEFAULT NULL"
+                    elif default_str.replace(".", "", 1).lstrip("-").isdigit():
+                        col_def += f" DEFAULT {default_str}"
+                    else:
+                        if not (default_str.startswith("'") or default_str.startswith('"')):
+                            default_str = f"'{default_str}'"
+                        col_def += f" DEFAULT {default_str}"
+
+                if col_pk:
+                    col_def += " PRIMARY KEY AUTOINCREMENT"
+
+                column_defs.append(col_def)
+
+            # Preserve a table-level UNIQUE(...) constraint, if any, as long as it doesn't
+            # reference a column being dropped
+            cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table_name,))
+            original_sql_row = cursor.fetchone()
+            original_sql = original_sql_row[0] if original_sql_row else ""
+
+            unique_constraint = ""
+            unique_match = re.search(r'UNIQUE\s*\(([^)]*)\)', original_sql, re.IGNORECASE)
+            if unique_match:
+                referenced_columns = {c.strip() for c in unique_match.group(1).split(',')}
+                if not (referenced_columns & columns_to_drop):
+                    unique_constraint = f", UNIQUE({unique_match.group(1)})"
+
+            # Capture explicit (non-autoindex) indexes to try to recreate afterward
+            cursor.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type='index' AND tbl_name=? AND sql IS NOT NULL",
+                (table_name,)
+            )
+            index_statements = cursor.fetchall()
+
+            surviving_column_names = [c[1] for c in surviving_columns]
+            columns_str = ', '.join(surviving_column_names)
+            temp_table_name = f"{table_name}_tmp_{int(time.time() * 1000)}"
+
+            cursor.execute(f"CREATE TABLE {temp_table_name} ({', '.join(column_defs)}{unique_constraint})")
+            cursor.execute(f"INSERT INTO {temp_table_name} ({columns_str}) SELECT {columns_str} FROM {table_name}")
+            cursor.execute(f"DROP TABLE {table_name}")
+            cursor.execute(f"ALTER TABLE {temp_table_name} RENAME TO {table_name}")
+
+            for index_name, index_sql in index_statements:
+                try:
+                    cursor.execute(index_sql)
+                except sqlite3.OperationalError:
+                    print(f"   ⚠️  Warning: index '{index_name}' referenced a dropped column and was not recreated")
+
+            conn.commit()
+            conn.close()
+            return True
+
+        except Exception as e:
+            print(f"❌ Error dropping column(s) from table '{table_name}': {e}")
+            return False
+
+    def delete_projected_space(self, table_name: Optional[str] = None,
+                              method: Optional[str] = None,
+                              reference_table: Optional[str] = None,
+                              confirm: bool = True) -> bool:
+        """
+        Delete previously computed projected dimensionality-reduction coordinate columns
+        (from project_dimensionality_on_table(), named '<method>_from_<reference_table>_<i>')
+        from a table. Only the projected columns are removed — any of the table's own fitted
+        coordinates (from reduce_dimensionality(), named '<method>_<i>') are left untouched.
+
+        Args:
+            table_name (Optional[str]): Name of the table to clean up. If None, prompts an
+                interactive table selection restricted to tables with projected-coordinate columns.
+            method (Optional[str]): Restrict to a projected embedding fit with this method
+                ('pca', 'tsne', 'umap'). Combined with reference_table to disambiguate when a
+                table holds more than one projection.
+            reference_table (Optional[str]): Restrict to a projected embedding that was fit on
+                this particular reference table.
+            confirm (bool): If True (default), prompts an interactive yes/no confirmation before
+                deleting. Set to False to skip the prompt for scripted/non-interactive use.
+
+        Returns:
+            bool: True if the column(s) were deleted successfully, False on error or if cancelled
+        """
+        try:
+            # Resolve table interactively if not provided, restricted to tables that already
+            # have projected-coordinate columns from project_dimensionality_on_table()
+            if table_name is None:
+                tables_with_projections = [
+                    t for t in self.get_all_tables()
+                    if self._detect_projected_reduction_columns_in_columns(self._get_table_columns(t))
+                ]
+                if not tables_with_projections:
+                    print("❌ No tables with projected-coordinate columns found.")
+                    print("   Run project_dimensionality_on_table() on a table first.")
+                    return False
+
+                table_name = self._select_table_interactive(
+                    "SELECT TABLE TO DELETE PROJECTED COORDINATES FROM", tables_override=tables_with_projections
+                )
+                if not table_name:
+                    print("❌ No table selected")
+                    return False
+
+            available_projections = self._detect_projected_reduction_columns_in_columns(
+                self._get_table_columns(table_name)
+            )
+
+            if not available_projections:
+                print(f"❌ No projected-coordinate columns found in table '{table_name}'.")
+                return False
+
+            candidate_keys = list(available_projections.keys())
+
+            if method is not None:
+                candidate_keys = [k for k in candidate_keys if k[0] == method]
+                if not candidate_keys:
+                    print(f"❌ No projected '{method}' coordinates found in table '{table_name}'.")
+                    return False
+
+            if reference_table is not None:
+                candidate_keys = [k for k in candidate_keys if k[1] == reference_table]
+                if not candidate_keys:
+                    print(f"❌ No projected coordinates from reference table '{reference_table}' "
+                          f"found in table '{table_name}'.")
+                    return False
+
+            if len(candidate_keys) == 1:
+                selected_keys = candidate_keys
+            else:
+                selected_keys = self._select_projections_to_delete_interactive(candidate_keys)
+                if not selected_keys:
+                    print("❌ No projected embedding(s) selected for deletion")
+                    return False
+
+            columns_to_delete = []
+            for key in selected_keys:
+                columns_to_delete.extend(available_projections[key])
+
+            print(f"🗑️  The following projected coordinate column(s) will be permanently deleted "
+                  f"from '{table_name}':")
+            for proj_method, proj_reference_table in selected_keys:
+                cols = available_projections[(proj_method, proj_reference_table)]
+                print(f"   - {self._DIM_REDUCTION_LABELS[proj_method]} (from '{proj_reference_table}'): "
+                      f"{', '.join(cols)}")
+
+            if confirm:
+                answer = input(f"\n⚠️  This cannot be undone. Continue? (yes/no, default: no): ").strip().lower()
+                if answer not in ('y', 'yes'):
+                    print("❌ Deletion cancelled")
+                    return False
+
+            success = self._drop_table_columns(table_name, columns_to_delete)
+            if success:
+                print(f"✅ Deleted {len(columns_to_delete)} column(s) from '{table_name}'")
+            else:
+                print(f"❌ Failed to delete column(s) from '{table_name}'")
+            return success
+
+        except Exception as e:
+            print(f"❌ Error deleting projected space from table '{table_name}': {e}")
+            return False
+
+    def _delete_reduction_models_from_db(self, table_name: str, methods: List[str]) -> int:
+        """
+        Delete saved reduction model(s) for a table from 'dim_reduction_models', including
+        the joblib-dumped model file(s) on disk each row points to.
+
+        Args:
+            table_name (str): Name of the table whose model(s) to delete
+            methods (List[str]): Method names to delete saved models for
+
+        Returns:
+            int: Number of rows deleted
+        """
+        try:
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            self._ensure_dim_reduction_models_table(cursor)
+            placeholders = ', '.join('?' for _ in methods)
+
+            cursor.execute(
+                f"SELECT model_path FROM {self._DIM_REDUCTION_MODELS_TABLE} "
+                f"WHERE table_name = ? AND method IN ({placeholders})",
+                (table_name, *methods)
+            )
+            model_paths = [row[0] for row in cursor.fetchall()]
+
+            cursor.execute(
+                f"DELETE FROM {self._DIM_REDUCTION_MODELS_TABLE} "
+                f"WHERE table_name = ? AND method IN ({placeholders})",
+                (table_name, *methods)
+            )
+            deleted = cursor.rowcount
+            conn.commit()
+            conn.close()
+
+            for model_path in model_paths:
+                try:
+                    if model_path:
+                        os.remove(model_path)
+                except OSError as e:
+                    print(f"⚠️  Could not remove model file '{model_path}': {e}")
+
+            return deleted
+
+        except Exception as e:
+            print(f"⚠️  Could not delete saved model(s) for '{table_name}': {e}")
+            return 0
+
+    def delete_chemical_space(self, table_name: Optional[str] = None,
+                              method: Optional[str] = None,
+                              confirm: bool = True) -> bool:
+        """
+        Delete all data associated with a dimensionality reduction computed by
+        reduce_dimensionality() on a table: its coordinate columns ('<method>_<i>') and any
+        saved fitted model(s) for that table in 'dim_reduction_models'.
+
+        Note: projected coordinate columns derived from this table's model via
+        project_dimensionality_on_table() in OTHER tables are not touched, but they will no
+        longer be reproducible once the underlying model is deleted here.
+
+        Args:
+            table_name (Optional[str]): Name of the table to clean up. If None, prompts an
+                interactive table selection restricted to tables with reduced-coordinate columns
+                or a saved model.
+            method (Optional[str]): One of 'pca', 'tsne', 'umap', or 'all' to delete every
+                method's data. If None, prompts an interactive selection (offers an "All"
+                option) restricted to the methods actually present for this table.
+            confirm (bool): If True (default), prompts an interactive yes/no confirmation before
+                deleting. Set to False to skip the prompt for scripted/non-interactive use.
+
+        Returns:
+            bool: True if deleted successfully, False on error or if cancelled
+        """
+        try:
+            # Resolve table interactively if not provided, restricted to tables that have
+            # either reduced-coordinate columns or a saved model
+            if table_name is None:
+                candidate_tables = [
+                    t for t in self.get_all_tables()
+                    if self._detect_reduction_methods_in_columns(self._get_table_columns(t))
+                ]
+                for t in self._get_tables_with_saved_reduction_models():
+                    if t not in candidate_tables and t in self.get_all_tables():
+                        candidate_tables.append(t)
+
+                if not candidate_tables:
+                    print("❌ No tables with reduced-coordinate columns or saved models found.")
+                    print("   Run reduce_dimensionality() on a table first.")
+                    return False
+
+                table_name = self._select_table_interactive(
+                    "SELECT TABLE TO DELETE CHEMICAL SPACE FROM", tables_override=candidate_tables
+                )
+                if not table_name:
+                    print("❌ No table selected")
+                    return False
+
+            available_methods = self._detect_reduction_methods_in_columns(self._get_table_columns(table_name))
+            saved_model_methods = self._get_saved_reduction_methods_for_table(table_name)
+
+            candidate_methods = [m for m in self._DIM_REDUCTION_METHODS
+                                 if m in available_methods or m in saved_model_methods]
+
+            if not candidate_methods:
+                print(f"❌ No reduced-coordinate columns or saved models found for table '{table_name}'.")
+                return False
+
+            if method is None:
+                method = self._select_dimensionality_reduction_method_interactive(
+                    tuple(candidate_methods), allow_all=True
+                )
+                if method is None:
+                    print("❌ No dimensionality reduction method selected")
+                    return False
+            elif method != 'all' and method not in candidate_methods:
+                print(f"❌ No reduced coordinates or saved model for method '{method}' found "
+                      f"in table '{table_name}'.")
+                print(f"   Available: {candidate_methods}")
+                return False
+
+            methods_to_delete = list(candidate_methods) if method == 'all' else [method]
+
+            columns_to_delete = []
+            for m in methods_to_delete:
+                columns_to_delete.extend(available_methods.get(m, []))
+
+            methods_with_saved_models = [m for m in methods_to_delete if m in saved_model_methods]
+
+            print(f"🗑️  The following will be permanently deleted for table '{table_name}':")
+            for m in methods_to_delete:
+                cols = available_methods.get(m, [])
+                col_desc = ', '.join(cols) if cols else '(no coordinate columns present)'
+                model_note = " + saved model" if m in methods_with_saved_models else ""
+                print(f"   - {self._DIM_REDUCTION_LABELS[m]}: {col_desc}{model_note}")
+
+            if confirm:
+                answer = input(f"\n⚠️  This cannot be undone. Continue? (yes/no, default: no): ").strip().lower()
+                if answer not in ('y', 'yes'):
+                    print("❌ Deletion cancelled")
+                    return False
+
+            success = True
+            if columns_to_delete:
+                success = self._drop_table_columns(table_name, columns_to_delete)
+
+            models_deleted = 0
+            if methods_with_saved_models:
+                models_deleted = self._delete_reduction_models_from_db(table_name, methods_with_saved_models)
+
+            if success:
+                print(f"✅ Deleted {len(columns_to_delete)} column(s) and {models_deleted} saved model(s) "
+                      f"from '{table_name}'")
+            else:
+                print(f"❌ Failed to delete column(s) from '{table_name}'")
+            return success
+
+        except Exception as e:
+            print(f"❌ Error deleting chemical space from table '{table_name}': {e}")
+            return False
+
     def _create_sql_registers_table(self) -> bool:
         """
         Create the sql_registers table to track SQL import operations.
@@ -2459,6 +8292,8 @@ class ChemSpace:
         try:
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             # Create sql_registers table
             create_table_query = """
@@ -2513,6 +8348,8 @@ class ChemSpace:
             
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             # Get current timestamp
             creation_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -2565,6 +8402,8 @@ class ChemSpace:
             
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             # Build query with filters
             query = "SELECT * FROM sql_registers WHERE 1=1"
@@ -2774,10 +8613,11 @@ class ChemSpace:
     def _process_csv_parallel(self, df: pd.DataFrame, table_name: str,
                              smiles_column: str, name_column: Optional[str], flag_column: Optional[str],
                              name_available: bool, flag_available: bool, flag_description_available: bool, skip_duplicates: bool,
-                             max_workers: int, chunk_size: int) -> Dict[str, Any]:
+                             max_workers: int, chunk_size: int, strip_salts: bool = False,
+                             retain_largest_fragment: bool = False) -> Dict[str, Any]:
         """
         Process CSV data using parallel processing with chunks and comprehensive progress tracking.
-        
+
         Args:
             df (pd.DataFrame): DataFrame containing the CSV data
             table_name (str): Name of the target table
@@ -2789,30 +8629,44 @@ class ChemSpace:
             skip_duplicates (bool): Whether to skip duplicate compounds
             max_workers (int): Maximum number of parallel workers
             chunk_size (int): Size of each chunk
-            
+            strip_salts (bool): Whether to strip salt/counter-ion fragments from SMILES using RDKit's SaltRemover
+            retain_largest_fragment (bool): Whether to reduce multi-fragment SMILES down to only
+                their largest fragment using RDKit's LargestFragmentChooser
+
         Returns:
             dict: Results containing counts and status
         """
         try:
             # Record start time for performance tracking
             start_time = time.time()
-            
+
             # Split DataFrame into chunks
             print(f"   📦 Splitting {len(df)} rows into chunks...")
             chunks = self._split_dataframe_into_chunks(df, chunk_size)
             num_chunks = len(chunks)
-            
+
             print(f"   📊 Parallel Processing Setup:")
             print(f"      📦 Total chunks: {num_chunks}")
             print(f"      📏 Chunk size: {chunk_size}")
             print(f"      👥 Workers: {max_workers}")
-            
+
             # Initialize progress tracking
             total_compounds_added = 0
             total_duplicates_skipped = 0
             total_errors = 0
+            total_salts_stripped = 0
+            total_fragments_retained = 0
+            total_cleanup_failures = 0
+            total_cleanup_failures_smiles = []
+            total_duplicate_smiles = []
             processed_rows = 0
-            
+
+            # Shared across all chunk inserts below (rather than re-seeded from the
+            # table's contents on every call) so per-chunk cost doesn't grow with the
+            # table size, and so a duplicate split across two different chunks is
+            # still caught (see _insert_compounds()'s structure_keys parameter).
+            structure_keys: Set[str] = set()
+
             # Initialize progress bar if tqdm is available
             if TQDM_AVAILABLE:
                 progress_bar = tqdm(
@@ -2834,7 +8688,8 @@ class ChemSpace:
                     future = executor.submit(
                         _process_chunk_worker,
                         chunk, smiles_column, name_column, flag_column,
-                        name_available, flag_available, i * chunk_size, flag_description_available
+                        name_available, flag_available, i * chunk_size, flag_description_available,
+                        strip_salts, retain_largest_fragment
                     )
                     future_to_chunk[future] = {
                         'index': i,
@@ -2857,19 +8712,25 @@ class ChemSpace:
                     try:
                         # Process chunk result
                         chunk_start_time = time.time()
-                        compounds_data = future.result()
+                        compounds_data, chunk_salts_stripped, chunk_fragments_retained, chunk_cleanup_failures, chunk_cleanup_failures_smiles = future.result()
+                        total_salts_stripped += chunk_salts_stripped
+                        total_fragments_retained += chunk_fragments_retained
+                        total_cleanup_failures += chunk_cleanup_failures
+                        total_cleanup_failures_smiles.extend(chunk_cleanup_failures_smiles)
                         chunk_process_time = time.time() - chunk_start_time
-                        
+
                         if compounds_data:
                             # Insert this chunk's data into database
                             insert_start_time = time.time()
-                            chunk_result = self._insert_compounds(compounds_data, table_name, skip_duplicates)
+                            chunk_result = self._insert_compounds(compounds_data, table_name, skip_duplicates,
+                                                                    structure_keys=structure_keys)
                             insert_time = time.time() - insert_start_time
-                            
+
                             if chunk_result['success']:
                                 total_compounds_added += chunk_result['compounds_added']
                                 total_duplicates_skipped += chunk_result['duplicates_skipped']
                                 total_errors += chunk_result['errors']
+                                total_duplicate_smiles.extend(chunk_result.get('duplicate_smiles', []))
                                 
                                 # Detailed chunk statistics (only show every 5th chunk to avoid spam)
                                 if not TQDM_AVAILABLE and (processed_chunks + 1) % 5 == 0:
@@ -2935,13 +8796,24 @@ class ChemSpace:
                 print(f"      ❌ Failed chunks: {failed_chunks}/{num_chunks}")
             print(f"      📊 Final counts: {total_compounds_added:,} added, "
                   f"{total_duplicates_skipped:,} duplicates, {total_errors:,} errors")
-            
+            if strip_salts:
+                print(f"      🧂 Salts/counter-ions stripped: {total_salts_stripped:,}")
+            if retain_largest_fragment:
+                print(f"      🧩 Reduced to largest fragment: {total_fragments_retained:,}")
+            if (strip_salts or retain_largest_fragment) and total_cleanup_failures > 0:
+                print(f"      🚫 Dropped (unparseable SMILES): {total_cleanup_failures:,}")
+
             return {
                 'success': True,
                 'message': f"Parallel processing completed: {total_compounds_added} compounds added",
                 'compounds_added': total_compounds_added,
                 'duplicates_skipped': total_duplicates_skipped,
-                'errors': total_errors
+                'errors': total_errors,
+                'salts_stripped': total_salts_stripped,
+                'fragments_retained': total_fragments_retained,
+                'cleanup_failures': total_cleanup_failures,
+                'cleanup_failures_smiles': total_cleanup_failures_smiles,
+                'duplicate_smiles': total_duplicate_smiles
             }
             
         except Exception as e:
@@ -2950,7 +8822,9 @@ class ChemSpace:
                 'message': f"Parallel processing error: {e}",
                 'compounds_added': 0,
                 'duplicates_skipped': 0,
-                'errors': len(df)
+                'errors': len(df),
+                'cleanup_failures_smiles': [],
+                'duplicate_smiles': []
             }
     
     def _split_dataframe_into_chunks(self, df: pd.DataFrame, chunk_size: int) -> List[pd.DataFrame]:
@@ -2975,16 +8849,17 @@ class ChemSpace:
         
         return chunks
 
-    def filter_using_workflow(self, table_name: Optional[str] = None, workflow_name: Optional[str] = None, 
-                    save_results: Optional[bool] = None, 
+    def filter_using_workflow(self, table_name: Optional[str] = None, workflow_name: Optional[str] = None,
+                    save_results: Optional[bool] = None,
                     result_table_name: Optional[str] = None,
                     parallel_threshold: int = 10000,
                     max_workers: Optional[int] = None,
-                    chunk_size: Optional[int] = None) -> pd.DataFrame:
+                    chunk_size: Optional[int] = None,
+                    progress_callback: Optional[Callable[[int, int], None]] = None) -> pd.DataFrame:
         """
         Apply a chemical filtering workflow to compounds in a table with parallel processing support.
         Shows available tables and workflows for interactive selection if not provided. The filtering will match compounds complying with ALL the filter provided
-        
+
         Args:
             table_name (Optional[str]): Name of the table containing compounds to filter. If None, shows selection.
             workflow_name (Optional[str]): Name of the workflow to apply. If None, shows selection.
@@ -2993,7 +8868,11 @@ class ChemSpace:
             parallel_threshold (int): Minimum number of compounds to trigger parallel processing
             max_workers (Optional[int]): Maximum number of worker processes (default: min(cpu_count(), 8))
             chunk_size (Optional[int]): Size of chunks for parallel processing (auto-calculated if None)
-            
+            progress_callback (Optional[Callable[[int, int], None]]): Optional callback invoked as
+                progress_callback(done, total) while filtering is in progress, e.g. to drive a GUI
+                progress bar. `done`/`total` are compounds for sequential processing or chunks for
+                parallel processing.
+
         Returns:
             pd.DataFrame: DataFrame containing filtered compounds with match information
         """
@@ -3059,26 +8938,43 @@ class ChemSpace:
                 print(f"      👥 Workers: {max_workers}")
                 print(f"      📦 Chunk size: {chunk_size:,}")
             
-                filtered_df = self._apply_filters_parallel(
-                    compounds_df, workflow_filters, max_workers, chunk_size
+                filtered_df, removed_matching_counts = self._apply_filters_parallel(
+                    compounds_df, workflow_filters, max_workers, chunk_size,
+                    progress_callback=progress_callback
                 )
             else:
                 print(f"   🔄 Using sequential processing")
-                filtered_df = self._apply_filters_sequential(compounds_df, workflow_filters)
-            
+                filtered_df, removed_matching_counts = self._apply_filters_sequential(
+                    compounds_df, workflow_filters, progress_callback=progress_callback
+                )
+
             if filtered_df.empty:
                 print("❌ No compounds passed the filtering workflow")
                 return pd.DataFrame()
-            
+
             # Calculate statistics
             compounds_removed = total_compounds - len(filtered_df)
             retention_rate = (len(filtered_df) / total_compounds) * 100
-            
+
             print(f"\n📊 Filtering Results:")
+            print(f"   📥 Compounds evaluated: {total_compounds:,}")
             print(f"   ✅ Compounds passed: {len(filtered_df):,}")
             print(f"   ❌ Compounds removed: {compounds_removed:,}")
             print(f"   📈 Retention rate: {retention_rate:.2f}%")
-            
+
+            # Per-filter breakdown: since the workflow requires ALL filters to
+            # match (AND logic), every passed compound matches every filter by
+            # definition. The informative number is how many of the *removed*
+            # compounds still individually matched each filter (i.e. they were
+            # excluded only because of a *different* filter in the workflow).
+            print(f"\n📊 Per-filter match breakdown:")
+            for i, (filter_smarts, required_instances) in enumerate(workflow_filters):
+                key = keys[i] if i < len(keys) else f"unknown_key_{i+1}"
+                removed_matching = removed_matching_counts.get(i, 0)
+                print(f"   {i+1}. {key} (requires {required_instances} match(es)):")
+                print(f"      ✅ Matching within passed compounds: {len(filtered_df):,}/{len(filtered_df):,}")
+                print(f"      ⚠️  Matching within removed compounds: {removed_matching:,}/{compounds_removed:,}")
+
             # Prompt for save_results if not provided
             if save_results is None:
                 save_choice = input("\n💾 Do you want to save the filtered results to a new table? (y/n): ").strip().lower()
@@ -3089,11 +8985,11 @@ class ChemSpace:
                 # Prompt for table name if not provided
                 if result_table_name is None:
                     default_name = f"{table_name}_filtered_{workflow_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-                    user_table_name = input(f"📝 Enter table name for results (default: {default_name}): ").strip()
+                    user_table_name = self._prompt(f"📝 Enter table name for results (default: {default_name}):")
                     result_table_name = user_table_name if user_table_name else default_name
-                
+
                 print(f"   💾 Saving filtered results to '{result_table_name}'...")
-                
+
                 # Create filter results summary for metadata
                 filter_results = {
                     'workflow_name': workflow_name,
@@ -3120,7 +9016,6 @@ class ChemSpace:
         except Exception as e:
             print(f"❌ Error in filter_using_workflow: {e}")
             return pd.DataFrame()
-
 
     def filter_using_workflow_or(self, table_name: Optional[str] = None, workflow_name: Optional[str] = None, 
                     save_results: Optional[bool] = None, 
@@ -3252,8 +9147,6 @@ class ChemSpace:
             print(f"❌ Error in filter_using_workflow_or: {e}")
             return pd.DataFrame()
 
-
-
     def _select_table_for_filtering(self) -> Optional[str]:
         """
         Interactive selection of table for filtering.
@@ -3351,6 +9244,8 @@ class ChemSpace:
             # Get available filtering workflows
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             # Check if filtering_workflows table exists
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='filtering_workflows'")
@@ -3498,6 +9393,8 @@ class ChemSpace:
             # Connect to chemspace database to retrieve the workflow
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             # Retrieve the workflow by name
             cursor.execute(
@@ -3575,42 +9472,57 @@ class ChemSpace:
             print(f"❌ Error loading workflow filters for '{workflow_name}': {e}")
             return []
 
-    def _apply_filters_parallel(self, compounds_df: pd.DataFrame, 
-                                    workflow_filters: List[Tuple[str, str]], 
-                                    max_workers: int, chunk_size: int) -> pd.DataFrame:
+    def _apply_filters_parallel(self, compounds_df: pd.DataFrame,
+                                    workflow_filters: List[Tuple[str, str]],
+                                    max_workers: int, chunk_size: int,
+                                    progress_callback: Optional[Callable[[int, int], None]] = None) -> Tuple[pd.DataFrame, Dict[int, int]]:
         """
         Ultra-memory-efficient version that streams results to temporary files with progress tracking.
+
+        Returns:
+            Tuple[pd.DataFrame, Dict[int, int]]: (filtered compounds, removed_matching_counts)
+                where removed_matching_counts maps filter index (position in
+                `workflow_filters`) to the number of compounds that were removed
+                overall but still matched that particular filter.
         """
         import tempfile
         import os
-        
+        import csv
+
         # Import tqdm locally to avoid multiprocessing issues
         try:
             from tqdm import tqdm
             tqdm_available = True
         except ImportError:
             tqdm_available = False
-        
+
         try:
             # Create temporary file for results
             temp_dir = tempfile.mkdtemp(prefix='chemspace_filter_')
             temp_file = os.path.join(temp_dir, 'filtered_results.csv')
-            
-            # Write header
-            with open(temp_file, 'w') as f:
-                f.write('id,smiles,name,flag,inchi_key\n')
+
+            # Write header (proper CSV quoting: compound names commonly contain commas)
+            with open(temp_file, 'w', newline='') as f:
+                csv.writer(f).writerow(['id', 'smiles', 'name', 'flag', 'inchi_key'])
             
             # Process in batches and append to file
-            compound_data = [(row.get('id', 0), row['smiles'], row.get('name', 'unknown'),
-                            row.get('flag', 'nd'), row.get('inchi_key', None))
-                            for _, row in compounds_df.iterrows()]
+            # Vectorized column access instead of .iterrows(): iterrows() rebuilds a
+            # Series per row and is single-threaded, so on large tables it can dominate
+            # wall-clock time before the ProcessPoolExecutor below ever starts, making
+            # the run look single-CPU even though the actual filtering is parallel.
+            id_col = compounds_df['id'] if 'id' in compounds_df.columns else pd.Series(0, index=compounds_df.index)
+            name_col = compounds_df['name'] if 'name' in compounds_df.columns else pd.Series('unknown', index=compounds_df.index)
+            flag_col = compounds_df['flag'] if 'flag' in compounds_df.columns else pd.Series('nd', index=compounds_df.index)
+            inchi_key_col = compounds_df['inchi_key'] if 'inchi_key' in compounds_df.columns else pd.Series([None] * len(compounds_df), index=compounds_df.index, dtype=object)
+            compound_data = list(zip(id_col, compounds_df['smiles'], name_col, flag_col, inchi_key_col))
             
             chunks = [compound_data[i:i + chunk_size] 
                     for i in range(0, len(compound_data), chunk_size)]
             
             total_passed = 0
             processed_chunks = 0
-            
+            removed_matching_counts = {i: 0 for i in range(len(workflow_filters))}
+
             print(f"   📦 Processing {len(chunks)} chunks with {max_workers} workers...")
             
             with ProcessPoolExecutor(max_workers=max_workers) as executor:
@@ -3634,21 +9546,27 @@ class ChemSpace:
                     progress_bar = None
                     print(f"   🔄 Started processing {len(chunks)} chunks...")
                 
-                with open(temp_file, 'a') as f:
+                with open(temp_file, 'a', newline='') as f:
+                    csv_writer = csv.writer(f)
                     while future_to_chunk:
                         for future in as_completed(list(future_to_chunk.keys())):
                             chunk_idx = future_to_chunk.pop(future)
-                            
+
                             try:
-                                chunk_results = future.result()
-                                
+                                chunk_results, chunk_removed_matching_counts = future.result()
+
                                 # Write results immediately to disk
                                 chunk_passed = 0
                                 for result in chunk_results:
-                                    f.write(f"{result['id']},{result['smiles']},{result['name']},"
-                                        f"{result['flag']},{result.get('inchi_key', '')}\n")
+                                    csv_writer.writerow([
+                                        result['id'], result['smiles'], result['name'],
+                                        result['flag'], result.get('inchi_key', '')
+                                    ])
                                     chunk_passed += 1
-                                
+
+                                for filter_idx, count in chunk_removed_matching_counts.items():
+                                    removed_matching_counts[filter_idx] = removed_matching_counts.get(filter_idx, 0) + count
+
                                 total_passed += chunk_passed
                                 processed_chunks += 1
                                 
@@ -3672,13 +9590,18 @@ class ChemSpace:
                                         _filter_chunk_worker_by_instances, next_chunk, workflow_filters
                                     )
                                     future_to_chunk[new_future] = len(chunks) - len(remaining_chunks) - 1
-                                    
+
+                                if progress_callback:
+                                    progress_callback(processed_chunks, len(chunks))
+
                             except Exception as e:
                                 processed_chunks += 1
                                 if progress_bar:
                                     progress_bar.update(1)
                                 print(f"   ❌ Chunk {chunk_idx} error: {e}")
-                
+                                if progress_callback:
+                                    progress_callback(processed_chunks, len(chunks))
+
                 if progress_bar:
                     progress_bar.close()
             
@@ -3688,8 +9611,7 @@ class ChemSpace:
                 if tqdm_available:
                     # Use tqdm for reading large files with local import
                     from tqdm import tqdm
-                    import pandas as pd
-                    
+
                     # Get file size for progress bar
                     file_size = os.path.getsize(temp_file)
                     
@@ -3701,7 +9623,7 @@ class ChemSpace:
                     result_df = pd.read_csv(temp_file)
                 
                 print(f"   ✅ Successfully loaded {len(result_df)} filtered compounds")
-                return result_df
+                return result_df, removed_matching_counts
             finally:
                 # Clean up temporary files
                 try:
@@ -3712,12 +9634,23 @@ class ChemSpace:
                     
         except Exception as e:
             print(f"❌ Error in streaming parallel filtering: {e}")
-            return pd.DataFrame()
+            return pd.DataFrame(), {}
    
-    def _apply_filters_sequential(self, compounds_df: pd.DataFrame, 
-                                workflow_filters: List[Tuple[str, str]]) -> pd.DataFrame:
+    def _apply_filters_sequential(self, compounds_df: pd.DataFrame,
+                                workflow_filters: List[Tuple[str, str]],
+                                progress_callback: Optional[Callable[[int, int], None]] = None) -> Tuple[pd.DataFrame, Dict[int, int]]:
         """
         Apply SMARTS filters using sequential processing with enhanced progress tracking.
+
+        Every filter is evaluated for every compound (no early exit), so that
+        compounds excluded overall can still be checked against each *other*
+        filter individually.
+
+        Returns:
+            Tuple[pd.DataFrame, Dict[int, int]]: (filtered compounds, removed_matching_counts)
+                where removed_matching_counts maps filter index (position in
+                `workflow_filters`) to the number of compounds that were removed
+                overall but still matched that particular filter.
         """
         # Import tqdm locally
         try:
@@ -3735,7 +9668,15 @@ class ChemSpace:
             total_compounds = len(compounds_df)
             processed_count = 0
             compounds_passed = 0
-            
+            callback_interval = max(1, total_compounds // 100)
+            removed_matching_counts = {i: 0 for i in range(len(workflow_filters))}
+
+            # Precompile SMARTS patterns once, instead of once per compound.
+            compiled_filters = [
+                (filter_idx, Chem.MolFromSmarts(smarts_pattern), required_instances)
+                for filter_idx, (smarts_pattern, required_instances) in enumerate(workflow_filters)
+            ]
+
             print(f"   🔄 Processing {total_compounds:,} compounds sequentially...")
             
             # Initialize progress tracking with enhanced information
@@ -3754,34 +9695,32 @@ class ChemSpace:
             
             for _, compound in progress_bar:
                 processed_count += 1
-                passes_all_filters = True
                 match_counts = {}
-                
+                filter_matches = {}
+
                 try:
                     mol = Chem.MolFromSmiles(compound['smiles'])
                     if mol is None:
                         continue
-                    
-                    # Apply each filter
-                    for filter_name, smarts_pattern in workflow_filters:
+
+                    # Apply each filter: compound must match each SMARTS exactly
+                    # `required_instances` times (same semantics as the parallel path).
+                    # Every filter is checked (no early exit) so removed compounds
+                    # can still be attributed a match against each other filter.
+                    for filter_idx, pattern, required_instances in compiled_filters:
+                        if pattern is None:
+                            filter_matches[filter_idx] = False
+                            continue
+
                         try:
-                            pattern = Chem.MolFromSmarts(smarts_pattern)
-                            if pattern is None:
-                                match_counts[f"{filter_name}_matches"] = 0
-                                continue
-                            
-                            matches = mol.GetSubstructMatches(pattern)
-                            match_count = len(matches)
-                            match_counts[f"{filter_name}_matches"] = match_count
-                            
-                            # If any filter has matches, compound fails (exclusion filters)
-                            if match_count > 0:
-                                passes_all_filters = False
-                                break
-                        
+                            match_count = len(mol.GetSubstructMatches(pattern))
+                            match_counts[f"filter_{filter_idx}_matches"] = match_count
+                            filter_matches[filter_idx] = (match_count == required_instances)
                         except Exception:
-                            match_counts[f"{filter_name}_matches"] = 0
-                    
+                            filter_matches[filter_idx] = False
+
+                    passes_all_filters = all(filter_matches.values())
+
                     if passes_all_filters:
                         compound_data = {
                             'smiles': compound['smiles'],
@@ -3792,46 +9731,57 @@ class ChemSpace:
                         compound_data.update(match_counts)
                         filtered_compounds.append(compound_data)
                         compounds_passed += 1
-                
+                    else:
+                        for filter_idx, matched in filter_matches.items():
+                            if matched:
+                                removed_matching_counts[filter_idx] += 1
+
                 except Exception:
                     continue
                 
                 # Update progress display
                 if tqdm_available:
-                    progress_bar.set_postfix(str(compounds_passed))
+                    progress_bar.set_postfix(passed=compounds_passed)
                 else:
                     if processed_count % print_interval == 0 or processed_count == total_compounds:
                         progress_pct = (processed_count / total_compounds) * 100
                         retention_rate = (compounds_passed / processed_count) * 100 if processed_count > 0 else 0
                         print(f"      📊 Progress: {progress_pct:.1f}% ({processed_count:,}/{total_compounds:,}) | "
                             f"Passed: {compounds_passed:,} ({retention_rate:.1f}%)")
-            
+
+                if progress_callback and (processed_count % callback_interval == 0 or processed_count == total_compounds):
+                    progress_callback(processed_count, total_compounds)
+
             if tqdm_available and hasattr(progress_bar, 'close'):
                 progress_bar.close()
             
             final_retention_rate = (len(filtered_compounds) / total_compounds) * 100 if total_compounds > 0 else 0
             print(f"   ✅ Sequential processing completed")
             print(f"   📊 Final results: {len(filtered_compounds):,}/{total_compounds:,} compounds passed ({final_retention_rate:.2f}%)")
-            
-            return pd.DataFrame(filtered_compounds)
-            
+
+            return pd.DataFrame(filtered_compounds), removed_matching_counts
+
         except Exception as e:
             print(f"❌ Error in sequential filtering: {e}")
-            return pd.DataFrame()
+            return pd.DataFrame(), {}
 
     def _save_workflow_filtered_compounds(self, compounds_df: pd.DataFrame, 
                                     new_table_name: str, 
                                     workflow_name: str, 
                                     filter_results: Dict[str, Dict]) -> bool:
         """
-        Save filtered compounds from workflow to a new table in chemspace.db with metadata and progress tracking.
-        
+        Save filtered compounds from workflow to a table in chemspace.db with metadata and progress tracking.
+
+        If a table with `new_table_name` already exists, it is dropped and recreated,
+        so the filtered results replace any previously stored data rather than being
+        appended to it.
+
         Args:
             compounds_df (pd.DataFrame): DataFrame containing filtered compounds
-            new_table_name (str): Name of the new table to create
+            new_table_name (str): Name of the table to create (or replace)
             workflow_name (str): Name of the workflow that was applied
             filter_results (Dict[str, Dict]): Results from each filter step
-            
+
         Returns:
             bool: True if compounds were saved successfully, False otherwise
         """
@@ -3869,13 +9819,19 @@ class ChemSpace:
             
             # Sanitize table name
             new_table_name = self._sanitize_table_name(new_table_name)
-            
+
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
-            
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+
+            # Drop any existing table with this name so the filtered results replace
+            # previously stored data instead of being appended to it
+            cursor.execute(f"DROP TABLE IF EXISTS {new_table_name}")
+
             # Create the new table with extended schema including workflow metadata
             cursor.execute(f'''
-                CREATE TABLE IF NOT EXISTS {new_table_name} (
+                CREATE TABLE {new_table_name} (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     smiles TEXT NOT NULL,
                     name TEXT,
@@ -3884,108 +9840,59 @@ class ChemSpace:
                     UNIQUE(smiles)
                 )
             ''')
-            
-            # Create indexes for better performance
-            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{new_table_name}_smiles ON {new_table_name}(smiles)")
-            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{new_table_name}_name ON {new_table_name}(name)")
-            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{new_table_name}_inchi_key ON {new_table_name}(inchi_key)")
-            
+
             # Get current timestamp
             filter_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            
-            # Insert the filtered compounds with progress tracking
-            inserted_count = 0
-            database_duplicates = 0
-            errors = 0
-            
+
+            # Insert the filtered compounds in executemany() batches rather than
+            # one execute() per row (crossing the sqlite3 C-API boundary once per
+            # row dominates runtime for large filtered result sets). INSERT OR
+            # IGNORE replaces the per-row try/except IntegrityError; the table was
+            # just dropped and recreated empty above and compounds_df was already
+            # deduped by SMILES, so a real conflict here isn't expected, but
+            # conn.total_changes still gives an exact duplicate count if one occurs.
             insert_query = f'''
-                INSERT INTO {new_table_name} 
+                INSERT OR IGNORE INTO {new_table_name}
                 (smiles, name, flag, inchi_key)
                 VALUES (?, ?, ?, ?)
             '''
-            
+
             print(f"   💾 Saving {len(compounds_df)} filtered compounds to table '{new_table_name}'...")
-            
-            # Initialize progress bar for saving with proper error handling
-            use_tqdm = tqdm_available and len(compounds_df) > 1000
-            
-            if use_tqdm:
-                try:
-                    progress_bar = tqdm(
-                        compounds_df.iterrows(),
-                        total=len(compounds_df),
-                        desc="Saving compounds",
-                        unit="compounds",
-                        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] Saved: {postfix}",
-                        postfix="0"
-                    )
-                except Exception as e:
-                    print(f"   ⚠️  Progress bar initialization failed, using fallback: {e}")
-                    use_tqdm = False
-                    progress_bar = compounds_df.iterrows()
-            else:
-                progress_bar = compounds_df.iterrows()
-            
-            # Set up manual progress tracking for non-tqdm case
-            if not use_tqdm:
-                save_interval = max(1, len(compounds_df) // 10)
-                saved_count = 0
-            
-            # Process compounds
-            try:
-                for row_data in progress_bar:
-                    # Handle the unpacking based on whether we're using tqdm or not
-                    if use_tqdm:
-                        # tqdm returns (index, row) tuples
-                        try:
-                            _, compound = row_data
-                        except (ValueError, TypeError):
-                            # Fallback if unpacking fails
-                            compound = row_data
-                    else:
-                        # Direct iterrows() returns (index, row) tuples
-                        try:
-                            _, compound = row_data
-                        except (ValueError, TypeError):
-                            # Fallback if unpacking fails
-                            compound = row_data
-                    
-                    try:
-                        cursor.execute(insert_query, (
-                            compound.get('smiles', ''),
-                            compound.get('name', 'unknown'),
-                            compound.get('flag', 'nd'),
-                            compound.get('inchi_key', None)
-                        ))
-                        inserted_count += 1
-                        
-                        if use_tqdm:
-                            try:
-                                progress_bar.set_postfix(str(inserted_count))
-                            except:
-                                pass  # Ignore progress bar update errors
-                        else:
-                            saved_count += 1
-                            if saved_count % save_interval == 0:
-                                progress_pct = (saved_count / len(compounds_df)) * 100
-                                print(f"      💾 Saving progress: {progress_pct:.1f}% ({saved_count}/{len(compounds_df)})")
-                                
-                    except sqlite3.IntegrityError:
-                        # Handle duplicate SMILES
-                        database_duplicates += 1
-                    except Exception as e:
-                        errors += 1
-                        if errors <= 5:  # Show only first few errors
-                            print(f"      ⚠️  Error inserting compound '{compound.get('name', 'unknown')}': {e}")
-            
-            finally:
-                # Close progress bar if it was created successfully
-                if use_tqdm and hasattr(progress_bar, 'close'):
-                    try:
-                        progress_bar.close()
-                    except:
-                        pass  # Ignore close errors
-            
+
+            rows = [
+                (
+                    getattr(row, 'smiles', ''),
+                    getattr(row, 'name', 'unknown'),
+                    getattr(row, 'flag', 'nd'),
+                    getattr(row, 'inchi_key', None),
+                )
+                for row in compounds_df.itertuples(index=False)
+            ]
+
+            batch_size = 1000
+            num_batches = (len(rows) + batch_size - 1) // batch_size
+            batch_starts = range(0, len(rows), batch_size)
+
+            if tqdm_available and num_batches > 1:
+                batch_starts = tqdm(batch_starts, total=num_batches, desc="Saving compounds", unit="batch")
+
+            changes_before = conn.total_changes
+            for start in batch_starts:
+                cursor.executemany(insert_query, rows[start:start + batch_size])
+
+            inserted_count = conn.total_changes - changes_before
+            database_duplicates = len(rows) - inserted_count
+            errors = 0
+
+            # Create indexes after the table is populated, not before: indexes
+            # created on an empty table force SQLite to rebalance their b-trees on
+            # every single-row insert above, which measured slower than building the
+            # indexes once against fully-populated data (same fix as applied to
+            # _update_table_with_inchi_keys() and _save_step_products()).
+            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{new_table_name}_smiles ON {new_table_name}(smiles)")
+            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{new_table_name}_name ON {new_table_name}(name)")
+            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{new_table_name}_inchi_key ON {new_table_name}(inchi_key)")
+
             conn.commit()
             conn.close()
             
@@ -4744,8 +10651,9 @@ class ChemSpace:
                     
                     depiction_success = self.depict_table(temp_table_name, **depiction_kwargs)
                     
-                    # Clean up temporary table
-                    self.drop_table(temp_table_name, confirm=False)
+                    # Clean up temporary table (vacuum=False: this is a scratch table used only for
+                    # depiction, not worth a full-DB rewrite every time it's discarded)
+                    self.drop_table(temp_table_name, confirm=False, vacuum=False)
                     
                     if depiction_success:
                         print(f"✅ Filtered compounds depicted successfully")
@@ -4775,72 +10683,100 @@ class ChemSpace:
             if not os.path.exists(projects_db):
                 print(f"❌ Projects database not found: {projects_db}")
                 return {}
-            
+
             print("🧪 Creating Reaction Workflow")
             print("=" * 80)
+            tidyscreen.list_chemical_reactions()
+            print("=" * 80)
             print("Enter reaction IDs to build your reaction workflow.")
+            print("Enter 'merge' to add a step that combines two tables (e.g. a product table with an existing one).")
             print("Enter -1 when you're done adding reactions.")
             print("=" * 80)
-            
+
             workflow_reactions = {}
             reaction_counter = 1
-            
+
             while True:
                 try:
-                    # Request reaction ID from user
-                    user_input = input(f"\n🔬 Enter reaction ID #{reaction_counter} (or -1 to finish): ").strip()
-                    
+                    # Request reaction ID (or 'merge') from user
+                    user_input = input(f"\n🔬 Enter reaction ID #{reaction_counter}, 'merge' to add a table-merge step, or -1 to finish: ").strip()
+
                     # Check if user wants to finish
                     if user_input == "-1":
                         break
-                    
+
+                    # Handle a table-merge step
+                    if user_input.lower() == "merge":
+                        label = input("   📝 Enter a label for this merge step (optional): ").strip()
+                        if not label:
+                            label = f"Merge tables #{reaction_counter}"
+
+                        step_key = f"merge_{reaction_counter}"
+                        workflow_reactions[step_key] = {
+                            'type': 'merge',
+                            'name': label,
+                            'order': reaction_counter
+                        }
+
+                        print(f"✅ Added merge step: '{label}'")
+                        print(f"   🔀 The two tables to combine will be selected when the workflow is applied.")
+                        reaction_counter += 1
+                        continue
+
                     # Validate input is a number
                     try:
                         reaction_id = int(user_input)
                     except ValueError:
-                        print("❌ Please enter a valid number or -1 to finish")
+                        print("❌ Please enter a valid number, 'merge', or -1 to finish")
                         continue
-                    
+
                     # Skip if already added
-                    if reaction_id in workflow_reactions:
+                    if str(reaction_id) in workflow_reactions:
                         print(f"⚠️  Reaction ID {reaction_id} is already in the workflow")
                         continue
-                    
+
                     # Retrieve reaction from projects database
                     reaction_info = self._get_reaction_by_id(projects_db, reaction_id)
-                    
+
                     if reaction_info:
                         reaction_name, reaction_smarts = reaction_info
-                        workflow_reactions[reaction_id] = {
+                        # Use a string key (JSON would coerce it to one anyway on save/reload,
+                        # and mixing int/str keys here breaks json.dumps(sort_keys=True) below
+                        # once merge steps — which use string keys — are also present).
+                        workflow_reactions[str(reaction_id)] = {
+                            'type': 'reaction',
                             'name': reaction_name,
                             'smarts': reaction_smarts,
                             'order': reaction_counter
                         }
-                        
+
                         print(f"✅ Added reaction: '{reaction_name}' (ID: {reaction_id})")
                         print(f"   🧪 Reaction SMARTS: {reaction_smarts}")
                         reaction_counter += 1
                     else:
                         print(f"❌ No reaction found with ID {reaction_id}")
-                        
+
                 except KeyboardInterrupt:
                     print("\n\n⏹️  Reaction workflow creation cancelled by user")
                     return {}
                 except Exception as e:
                     print(f"❌ Error processing input: {e}")
                     continue
-            
+
             # Display final workflow summary
             if workflow_reactions:
                 print(f"\n✅ Reaction Workflow Created!")
                 print("=" * 80)
-                print(f"🧪 Total reactions: {len(workflow_reactions)}")
+                print(f"🧪 Total steps: {len(workflow_reactions)}")
                 print("\n📋 Workflow Summary:")
-                
+
                 for reaction_id, info in workflow_reactions.items():
-                    print(f"   {info['order']}. '{info['name']}' (ID: {reaction_id})")
-                    print(f"      🧪 SMARTS: {info['smarts']}")
-                
+                    if info.get('type') == 'merge':
+                        print(f"   {info['order']}. '{info['name']}' (merge step)")
+                    else:
+                        print(f"   {info['order']}. '{info['name']}' (ID: {reaction_id})")
+                        print(f"      🧪 SMARTS: {info['smarts']}")
+
                 print("=" * 80)
                 
                 # Ask if user wants to save the workflow
@@ -4902,6 +10838,8 @@ class ChemSpace:
             
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             # Create reaction_workflows table if it doesn't exist
             create_table_query = """
@@ -4975,64 +10913,194 @@ class ChemSpace:
         except Exception as e:
             print(f"❌ Error saving reaction workflow: {e}")
 
+    @staticmethod
+    def save_reaction_workflow(chemspace_db_path: str, workflow_name: str,
+                                workflow_reactions: Dict[int, Dict[str, Any]],
+                                description: Optional[str] = None,
+                                overwrite: bool = False) -> Dict[str, Any]:
+        """
+        Persist a reaction workflow to a chemspace database.
+
+        Non-interactive counterpart to _save_reaction_workflow(), reusing the same
+        'reaction_workflows' table schema, so it can be called from the Streamlit
+        GUI (mirrors the save_filtering_workflow() pattern used for filters).
+
+        Args:
+            chemspace_db_path (str): Path to the project's chemspace.db
+            workflow_name (str): Desired workflow name
+            workflow_reactions (Dict[int, Dict]): Dictionary mapping reaction IDs to
+                {'name', 'smarts', 'order'} entries, as built by create_reaction_workflow()
+            description (Optional[str]): Optional description; a default is generated if omitted
+            overwrite (bool): If a workflow with the same name exists, overwrite it when True;
+                otherwise a unique suffixed name is generated automatically.
+
+        Returns:
+            Dict[str, Any]: On success: {'success': True, 'workflow_name', 'reaction_count',
+                'creation_date', 'description'}. On failure: {'success': False, 'message'}.
+        """
+        if not workflow_reactions:
+            return {'success': False, 'message': 'No workflow reactions to save'}
+
+        try:
+            conn = sqlite3.connect(chemspace_db_path)
+            cursor = conn.cursor()
+
+            # Create reaction_workflows table if it doesn't exist
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS reaction_workflows (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workflow_name TEXT NOT NULL UNIQUE,
+                reactions_dict TEXT NOT NULL,
+                creation_date TEXT NOT NULL,
+                description TEXT
+            )
+            """)
+
+            # Create index for faster searches
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_reaction_workflows_name ON reaction_workflows(workflow_name)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_reaction_workflows_date ON reaction_workflows(creation_date)")
+
+            reaction_count = len(workflow_reactions)
+
+            if not description:
+                description = f"Reaction workflow with {reaction_count} reactions"
+
+            workflow_name = workflow_name.strip() or f"reaction_workflow_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+            # Check if workflow name already exists
+            cursor.execute("SELECT COUNT(*) FROM reaction_workflows WHERE workflow_name = ?", (workflow_name,))
+            if cursor.fetchone()[0] > 0:
+                if overwrite:
+                    cursor.execute("DELETE FROM reaction_workflows WHERE workflow_name = ?", (workflow_name,))
+                else:
+                    # Generate unique name
+                    counter = 1
+                    original_name = workflow_name
+                    while True:
+                        new_name = f"{original_name}_{counter}"
+                        cursor.execute("SELECT COUNT(*) FROM reaction_workflows WHERE workflow_name = ?", (new_name,))
+                        if cursor.fetchone()[0] == 0:
+                            workflow_name = new_name
+                            break
+                        counter += 1
+
+            creation_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            reactions_json = json.dumps(workflow_reactions, sort_keys=True)
+
+            cursor.execute("""
+            INSERT INTO reaction_workflows
+            (workflow_name, reactions_dict, creation_date, description)
+            VALUES (?, ?, ?, ?)
+            """, (workflow_name, reactions_json, creation_date, description))
+
+            conn.commit()
+            conn.close()
+
+            return {
+                'success': True,
+                'workflow_name': workflow_name,
+                'reaction_count': reaction_count,
+                'creation_date': creation_date,
+                'description': description,
+            }
+
+        except Exception as e:
+            return {'success': False, 'message': f"Error saving reaction workflow: {e}"}
+
+    @staticmethod
+    def get_reaction_workflows(chemspace_db_path: str) -> List[Dict[str, Any]]:
+        """
+        Retrieve all saved reaction workflows from a chemspace database.
+
+        Non-interactive counterpart to list_reaction_workflows(), reusing the same
+        'reaction_workflows' table, so it can be called from the Streamlit GUI
+        (mirrors the get_filtering_workflows() pattern used for filters).
+
+        Args:
+            chemspace_db_path (str): Path to the project's chemspace.db
+
+        Returns:
+            List[Dict[str, Any]]: One dict per workflow (workflow_id, workflow_name,
+                creation_date, description, reactions_dict, reaction_count), ordered
+                by creation_date descending. Empty list if none found or on error.
+        """
+        try:
+            if not os.path.exists(chemspace_db_path):
+                return []
+
+            conn = sqlite3.connect(chemspace_db_path)
+            cursor = conn.cursor()
+
+            # Check if reaction_workflows table exists
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='reaction_workflows'")
+            if not cursor.fetchone():
+                conn.close()
+                return []
+
+            # Get all workflows with summary information including ID
+            cursor.execute("""
+            SELECT id, workflow_name, creation_date, description, reactions_dict
+            FROM reaction_workflows
+            ORDER BY creation_date DESC
+            """)
+
+            rows = cursor.fetchall()
+            conn.close()
+
+            workflows = []
+            for workflow_id, name, date, desc, reactions_dict_str in rows:
+                try:
+                    reactions_dict = json.loads(reactions_dict_str)
+                except json.JSONDecodeError:
+                    reactions_dict = {}
+
+                workflows.append({
+                    'workflow_id': workflow_id,
+                    'workflow_name': name,
+                    'creation_date': date,
+                    'description': desc,
+                    'reactions_dict': reactions_dict,
+                    'reaction_count': len(reactions_dict),
+                })
+
+            return workflows
+
+        except Exception as e:
+            print(f"❌ Error listing reaction workflows: {e}")
+            return []
+
     def list_reaction_workflows(self) -> None:
         """
         Display all saved reaction workflows in a formatted table with IDs.
         """
-        try:
-            conn = sqlite3.connect(self.__chemspace_db)
-            cursor = conn.cursor()
-            
-            # Check if reaction_workflows table exists
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='reaction_workflows'")
-            if not cursor.fetchone():
-                print("📝 No reaction workflows table found")
-                conn.close()
-                return
-            
-            # Get all workflows with summary information including ID
-            cursor.execute("""
-            SELECT id, workflow_name, creation_date, description, reactions_dict
-            FROM reaction_workflows 
-            ORDER BY creation_date DESC
-            """)
-            
-            workflows = cursor.fetchall()
-            conn.close()
-            
-            if not workflows:
-                print("📝 No saved reaction workflows found")
-                return
-            
-            print("\n" + "="*100)
-            print(f"SAVED REACTION WORKFLOWS - Project: {self.name}")
-            print("="*100)
-            
-            for i, (workflow_id, name, date, desc, reactions_dict_str) in enumerate(workflows, 1):
-                try:
-                    reactions_dict = json.loads(reactions_dict_str)
-                    reaction_count = len(reactions_dict)
-                    
-                    # Get reaction names for summary
-                    reaction_names = [info['name'] for info in reactions_dict.values()]
-                    reactions_summary = ', '.join(reaction_names[:3])
-                    if len(reaction_names) > 3:
-                        reactions_summary += f" and {len(reaction_names) - 3} more..."
-                    
-                except json.JSONDecodeError:
-                    reaction_count = 0
-                    reactions_summary = "Error parsing reactions"
-                
-                print(f"\n🧪 Workflow name: '{name}' (ID: {workflow_id})")
-                print(f"   📅 Created: {date}")
-                print(f"   🔬 Reactions: {reaction_count}")
-                print(f"   📄 Description: {desc}")
-                print(f"   🧪 Reactions: {reactions_summary}")
-            
-            print("="*100)
-            
-        except Exception as e:
-            print(f"❌ Error listing reaction workflows: {e}")
+        workflows = self.get_reaction_workflows(self.__chemspace_db)
+
+        if not workflows:
+            print("📝 No saved reaction workflows found")
+            return
+
+        print("\n" + "="*100)
+        print(f"SAVED REACTION WORKFLOWS - Project: {self.name}")
+        print("="*100)
+
+        for workflow in workflows:
+            reactions_dict = workflow['reactions_dict']
+
+            # Get reaction names for summary
+            reaction_names = [info['name'] for info in reactions_dict.values()] if reactions_dict else []
+            reactions_summary = ', '.join(reaction_names[:3])
+            if len(reaction_names) > 3:
+                reactions_summary += f" and {len(reaction_names) - 3} more..."
+            elif not reactions_summary:
+                reactions_summary = "Error parsing reactions" if workflow['reaction_count'] == 0 else reactions_summary
+
+            print(f"\n🧪 Workflow name: '{workflow['workflow_name']}' (ID: {workflow['workflow_id']})")
+            print(f"   📅 Created: {workflow['creation_date']}")
+            print(f"   🔬 Reactions: {workflow['reaction_count']}")
+            print(f"   📄 Description: {workflow['description']}")
+            print(f"   🧪 Reactions: {reactions_summary}")
+
+        print("="*100)
 
     def _load_reaction_workflow_by_id(self, workflow_id: int) -> Optional[Dict[str, Any]]:
         """
@@ -5047,6 +11115,8 @@ class ChemSpace:
         try:
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             # Check if reaction_workflows table exists
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='reaction_workflows'")
@@ -5098,6 +11168,8 @@ class ChemSpace:
         try:
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             cursor.execute("""
             SELECT id, workflow_name, creation_date, description
@@ -5364,6 +11436,8 @@ class ChemSpace:
             # Create table
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             # Create products table with extended schema
             cursor.execute(f'''
@@ -5558,15 +11632,20 @@ class ChemSpace:
                     
                     if filter_info:
                         filter_name, smarts_pattern = filter_info
-                        
+
                         # Validate SMARTS pattern
                         if self._validate_smarts_pattern(smarts_pattern):
+                            step_description = input(
+                                "   📝 Enter a description for this filter (rationale for adding it, optional): "
+                            ).strip()
+
                             workflow_filters[filter_name] = {
                                 'instances': instances,
                                 'smarts': smarts_pattern,
-                                'filter_id': filter_id
+                                'filter_id': filter_id,
+                                'description': step_description
                             }
-                            
+
                             print(f"✅ Added filter #{filter_counter}: '{filter_name}' (ID: {filter_id})")
                             print(f"   🧪 SMARTS: {smarts_pattern}")
                             print(f"   🔢 Required instances: {instances}")
@@ -5601,7 +11680,8 @@ class ChemSpace:
                 if save_workflow in ['y', 'yes']:
                     # Convert to simple format for compatibility
                     simple_workflow = {name: info['instances'] for name, info in workflow_filters.items()}
-                    self._save_filtering_workflow(simple_workflow)
+                    filter_descriptions = {name: info.get('description', '') for name, info in workflow_filters.items()}
+                    self._save_filtering_workflow(simple_workflow, filter_descriptions=filter_descriptions)
                     
             else:
                 print("\n⚠️  No filters were added to the workflow")
@@ -5925,7 +12005,8 @@ class ChemSpace:
             print(f"❌ Error retrieving filter ID {filter_id}: {e}")
             return None
     
-    def _validate_smarts_pattern(self, smarts_pattern: str) -> bool:
+    @staticmethod
+    def _validate_smarts_pattern(smarts_pattern: str) -> bool:
         """
         Validate a SMARTS pattern using RDKit.
         
@@ -5941,7 +12022,29 @@ class ChemSpace:
             return mol is not None
         except:
             return False
-    
+
+    @staticmethod
+    def _validate_reaction_smarts_pattern(smarts_pattern: str) -> bool:
+        """
+        Validate a reaction SMARTS pattern (reactants>>products) using RDKit.
+
+        Reaction SMARTS contain a '>>' separator and cannot be parsed by
+        Chem.MolFromSmarts(), which only accepts single-molecule patterns;
+        use this instead of _validate_smarts_pattern() for reaction workflows.
+
+        Args:
+            smarts_pattern (str): Reaction SMARTS pattern to validate
+
+        Returns:
+            bool: True if valid, False otherwise
+        """
+        try:
+            from rdkit.Chem import AllChem
+            rxn = AllChem.ReactionFromSmarts(smarts_pattern)
+            return rxn is not None
+        except:
+            return False
+
     def _show_current_workflow(self, workflow_filters: Dict) -> None:
         """
         Display the current workflow being built.
@@ -6002,6 +12105,8 @@ class ChemSpace:
             print(f"\n{i}. {name} (ID: {info['filter_id']})")
             print(f"   🔢 Required instances: {info['instances']}")
             print(f"   🧪 SMARTS: {info['smarts']}")
+            if info.get('description'):
+                print(f"   📝 Description: {info['description']}")
         
         print("-" * 60)
         
@@ -6023,29 +12128,69 @@ class ChemSpace:
         print(f"   • Moderate patterns: {moderate_patterns}")
         print(f"   • Complex patterns: {complex_patterns}")
     
-    def _save_filtering_workflow(self, workflow_filters: Dict[str, int]) -> None:
+    @staticmethod
+    def _ensure_filter_descriptions_column(chemspace_db_path: str) -> None:
         """
-        Save a filtering workflow to the chemspace database.
-        
+        Back-compat migration: add the 'filter_descriptions' column to an existing
+        filtering_workflows table if it predates this column (CREATE TABLE IF NOT EXISTS
+        is a no-op on a table that already exists, so older chemspace.db files would
+        otherwise never gain it).
+
         Args:
-            workflow_filters (Dict[str, int]): Dictionary mapping filter names to required instances
+            chemspace_db_path (str): Path to the project's chemspace.db
         """
         try:
-            if not workflow_filters:
-                print("⚠️  No workflow filters to save")
-                return
-            
-            # Get workflow name from user
-            workflow_name = input("📝 Enter a name for this filtering workflow: ").strip()
-            if not workflow_name:
-                workflow_name = f"filtering_workflow_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-                print(f"📋 Using default name: {workflow_name}")
-            
-            conn = sqlite3.connect(self.__chemspace_db)
+            conn = sqlite3.connect(chemspace_db_path)
             cursor = conn.cursor()
-            
+
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='filtering_workflows'")
+            if cursor.fetchone():
+                cursor.execute("PRAGMA table_info(filtering_workflows)")
+                columns = {row[1] for row in cursor.fetchall()}
+                if 'filter_descriptions' not in columns:
+                    cursor.execute("ALTER TABLE filtering_workflows ADD COLUMN filter_descriptions TEXT")
+                    conn.commit()
+
+            conn.close()
+        except Exception as e:
+            print(f"⚠️  Could not verify/migrate 'filter_descriptions' column: {e}")
+
+    @staticmethod
+    def save_filtering_workflow(chemspace_db_path: str, workflow_name: str,
+                                 workflow_filters: Dict[str, int],
+                                 description: Optional[str] = None,
+                                 overwrite: bool = False,
+                                 filter_descriptions: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+        """
+        Persist a filtering workflow to a chemspace database.
+
+        Args:
+            chemspace_db_path (str): Path to the project's chemspace.db
+            workflow_name (str): Desired workflow name
+            workflow_filters (Dict[str, int]): Dictionary mapping filter names to required instances
+            description (Optional[str]): Optional description; a default is generated if omitted
+            overwrite (bool): If a workflow with the same name exists, overwrite it when True;
+                otherwise a unique suffixed name is generated automatically.
+            filter_descriptions (Optional[Dict[str, str]]): Optional per-filter rationale, keyed by
+                filter name (why this particular filter was added to this workflow). Stored in a
+                separate column from workflow_filters so the latter's plain int-per-filter shape
+                (relied on by filter_using_workflow()/_load_workflow_filters() and by
+                sum(workflow_filters.values()) below) is left untouched.
+
+        Returns:
+            Dict[str, Any]: On success: {'success': True, 'workflow_name', 'filter_count',
+                'total_instances', 'creation_date', 'description'}. On failure:
+                {'success': False, 'message'}.
+        """
+        if not workflow_filters:
+            return {'success': False, 'message': 'No workflow filters to save'}
+
+        try:
+            conn = sqlite3.connect(chemspace_db_path)
+            cursor = conn.cursor()
+
             # Create filtering_workflows table if it doesn't exist
-            create_table_query = """
+            cursor.execute("""
             CREATE TABLE IF NOT EXISTS filtering_workflows (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 workflow_name TEXT NOT NULL UNIQUE,
@@ -6053,34 +12198,37 @@ class ChemSpace:
                 creation_date TEXT NOT NULL,
                 description TEXT,
                 filter_count INTEGER DEFAULT 0,
-                total_instances INTEGER DEFAULT 0
+                total_instances INTEGER DEFAULT 0,
+                filter_descriptions TEXT
             )
-            """
-            
-            cursor.execute(create_table_query)
-            
+            """)
+
             # Create indexes for faster searches
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_filtering_workflows_name ON filtering_workflows(workflow_name)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_filtering_workflows_date ON filtering_workflows(creation_date)")
-            
-            # Get current timestamp
-            creation_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            
-            # Get optional description from user
-            description = input("📄 Enter a description for this filtering workflow (optional): ").strip()
+
+            conn.commit()
+            conn.close()
+
+            # Migrate older tables (created before filter_descriptions existed)
+            ChemSpace._ensure_filter_descriptions_column(chemspace_db_path)
+
+            conn = sqlite3.connect(chemspace_db_path)
+            cursor = conn.cursor()
+
+            filter_count = len(workflow_filters)
+            total_instances = sum(workflow_filters.values())
+
             if not description:
-                filter_count = len(workflow_filters)
-                total_instances = sum(workflow_filters.values())
                 description = f"Filtering workflow with {filter_count} filters and {total_instances} total instances"
-            
+
+            workflow_name = workflow_name.strip() or f"filtering_workflow_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
             # Check if workflow name already exists
             cursor.execute("SELECT COUNT(*) FROM filtering_workflows WHERE workflow_name = ?", (workflow_name,))
             if cursor.fetchone()[0] > 0:
-                overwrite = input(f"⚠️  Filtering workflow '{workflow_name}' already exists. Overwrite? (y/n): ").strip().lower()
-                if overwrite in ['y', 'yes']:
-                    # Delete existing workflow
+                if overwrite:
                     cursor.execute("DELETE FROM filtering_workflows WHERE workflow_name = ?", (workflow_name,))
-                    print(f"🔄 Overwriting existing filtering workflow '{workflow_name}'")
                 else:
                     # Generate unique name
                     counter = 1
@@ -6092,110 +12240,1583 @@ class ChemSpace:
                             workflow_name = new_name
                             break
                         counter += 1
-                    print(f"📝 Using name: {workflow_name}")
-            
-            # Calculate statistics
-            filter_count = len(workflow_filters)
-            total_instances = sum(workflow_filters.values())
-            
-            # Convert workflow to JSON string for storage
+
+            creation_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             filters_json = json.dumps(workflow_filters, sort_keys=True)
-            
-            # Insert workflow
-            insert_query = """
-            INSERT INTO filtering_workflows 
-            (workflow_name, filters_dict, creation_date, description, filter_count, total_instances)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """
-            
-            cursor.execute(insert_query, (
-                workflow_name, 
-                filters_json, 
-                creation_date, 
-                description,
-                filter_count,
-                total_instances
-            ))
-            
+            filter_descriptions_json = json.dumps(filter_descriptions or {}, sort_keys=True)
+
+            cursor.execute("""
+            INSERT INTO filtering_workflows
+            (workflow_name, filters_dict, creation_date, description, filter_count, total_instances, filter_descriptions)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (workflow_name, filters_json, creation_date, description, filter_count, total_instances, filter_descriptions_json))
+
             conn.commit()
             conn.close()
-            
-            print(f"✅ Successfully saved filtering workflow!")
-            print(f"   📋 Workflow name: '{workflow_name}'")
-            print(f"   🔍 Filters saved: {filter_count}")
-            print(f"   🔢 Total instances: {total_instances}")
-            print(f"   📅 Created: {creation_date}")
-            print(f"   📄 Description: {description}")
-            
-        except sqlite3.IntegrityError as e:
-            print(f"❌ Database integrity error saving filtering workflow: {e}")
+
+            return {
+                'success': True,
+                'workflow_name': workflow_name,
+                'filter_count': filter_count,
+                'total_instances': total_instances,
+                'creation_date': creation_date,
+                'description': description,
+            }
+
         except Exception as e:
-            print(f"❌ Error saving filtering workflow: {e}")
-    
+            return {'success': False, 'message': f"Error saving filtering workflow: {e}"}
+
+    def _save_filtering_workflow(self, workflow_filters: Dict[str, int],
+                                  filter_descriptions: Optional[Dict[str, str]] = None) -> None:
+        """
+        Save a filtering workflow to the chemspace database, prompting the user for
+        the workflow name, description, and an overwrite decision if needed.
+
+        Args:
+            workflow_filters (Dict[str, int]): Dictionary mapping filter names to required instances
+            filter_descriptions (Optional[Dict[str, str]]): Per-filter rationale, keyed by filter name
+        """
+        if not workflow_filters:
+            print("⚠️  No workflow filters to save")
+            return
+
+        # Get workflow name from user
+        workflow_name = input("📝 Enter a name for this filtering workflow: ").strip()
+        if not workflow_name:
+            workflow_name = f"filtering_workflow_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            print(f"📋 Using default name: {workflow_name}")
+
+        # Get optional description from user
+        description = input("📄 Enter a description for this filtering workflow (optional): ").strip()
+
+        overwrite = False
+        conn = sqlite3.connect(self.__chemspace_db)
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='filtering_workflows'")
+        if cursor.fetchone():
+            cursor.execute("SELECT COUNT(*) FROM filtering_workflows WHERE workflow_name = ?", (workflow_name,))
+            if cursor.fetchone()[0] > 0:
+                answer = input(f"⚠️  Filtering workflow '{workflow_name}' already exists. Overwrite? (y/n): ").strip().lower()
+                overwrite = answer in ['y', 'yes']
+        conn.close()
+
+        result = self.save_filtering_workflow(self.__chemspace_db, workflow_name, workflow_filters,
+                                               description or None, overwrite,
+                                               filter_descriptions=filter_descriptions)
+
+        if result['success']:
+            print(f"✅ Successfully saved filtering workflow!")
+            print(f"   📋 Workflow name: '{result['workflow_name']}'")
+            print(f"   🔍 Filters saved: {result['filter_count']}")
+            print(f"   🔢 Total instances: {result['total_instances']}")
+            print(f"   📅 Created: {result['creation_date']}")
+            print(f"   📄 Description: {result['description']}")
+        else:
+            print(f"❌ {result['message']}")
+
+    @staticmethod
+    def get_filtering_workflows(chemspace_db_path: str) -> List[Dict[str, Any]]:
+        """
+        Retrieve all saved filtering workflows from a chemspace database.
+
+        Args:
+            chemspace_db_path (str): Path to the project's chemspace.db
+
+        Returns:
+            List[Dict[str, Any]]: One dict per workflow (workflow_name, creation_date,
+                description, filters_dict, filter_count, total_instances,
+                filter_descriptions), ordered by creation_date descending. Empty list if
+                none found or on error. filter_descriptions is {} for workflows saved
+                before that column existed.
+        """
+        try:
+            if not os.path.exists(chemspace_db_path):
+                return []
+
+            conn = sqlite3.connect(chemspace_db_path)
+            cursor = conn.cursor()
+
+            # Check if filtering_workflows table exists
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='filtering_workflows'")
+            if not cursor.fetchone():
+                conn.close()
+                return []
+
+            conn.close()
+
+            # Migrate older tables (created before filter_descriptions existed)
+            ChemSpace._ensure_filter_descriptions_column(chemspace_db_path)
+
+            conn = sqlite3.connect(chemspace_db_path)
+            cursor = conn.cursor()
+
+            # Get all workflows with summary information
+            cursor.execute("""
+            SELECT workflow_name, creation_date, description, filters_dict, filter_count, total_instances, filter_descriptions
+            FROM filtering_workflows
+            ORDER BY creation_date DESC
+            """)
+
+            rows = cursor.fetchall()
+            conn.close()
+
+            workflows = []
+            for name, date, desc, filters_dict_str, filter_count, total_instances, filter_descriptions_str in rows:
+                try:
+                    filters_dict = json.loads(filters_dict_str)
+                    actual_filter_count = len(filters_dict) if filters_dict else filter_count
+                except json.JSONDecodeError:
+                    filters_dict = {}
+                    actual_filter_count = filter_count or 0
+
+                try:
+                    filter_descriptions = json.loads(filter_descriptions_str) if filter_descriptions_str else {}
+                except json.JSONDecodeError:
+                    filter_descriptions = {}
+
+                workflows.append({
+                    'workflow_name': name,
+                    'creation_date': date,
+                    'description': desc,
+                    'filters_dict': filters_dict,
+                    'filter_count': actual_filter_count,
+                    'total_instances': total_instances or 0,
+                    'filter_descriptions': filter_descriptions,
+                })
+
+            return workflows
+
+        except Exception as e:
+            print(f"❌ Error listing filtering workflows: {e}")
+            return []
+
+    @staticmethod
+    def delete_filtering_workflow_entry(chemspace_db_path: str, workflow_identifier: str) -> Dict[str, Any]:
+        """
+        Delete a filtering workflow by name or ID from a chemspace database.
+
+        Non-interactive counterpart to delete_filtering_workflow(), reusing the same
+        'filtering_workflows' table and the same ID/name lookup semantics, so it can
+        be called from the Streamlit GUI. The two-step interactive confirmation
+        (yes/no, then re-typing the workflow name) is skipped here — the caller is
+        expected to collect its own confirmation before calling this.
+
+        Args:
+            chemspace_db_path (str): Path to the project's chemspace.db
+            workflow_identifier (str): Workflow name or numeric ID to delete
+
+        Returns:
+            Dict[str, Any]: {'success': bool, 'message': str, 'workflow_name': Optional[str],
+                'workflow_id': Optional[int], 'filter_count': int}
+        """
+        try:
+            if not os.path.exists(chemspace_db_path):
+                return {'success': False, 'message': 'ChemSpace database not found.',
+                         'workflow_name': None, 'workflow_id': None, 'filter_count': 0}
+
+            conn = sqlite3.connect(chemspace_db_path)
+            cursor = conn.cursor()
+
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='filtering_workflows'")
+            if not cursor.fetchone():
+                conn.close()
+                return {'success': False, 'message': 'No filtering workflows table found.',
+                         'workflow_name': None, 'workflow_id': None, 'filter_count': 0}
+
+            cursor.execute("""
+                SELECT id, workflow_name, creation_date, description, filters_dict, filter_count
+                FROM filtering_workflows
+                ORDER BY creation_date DESC
+            """)
+            workflows = cursor.fetchall()
+
+            if not workflows:
+                conn.close()
+                return {'success': False, 'message': 'No filtering workflows found to delete.',
+                         'workflow_name': None, 'workflow_id': None, 'filter_count': 0}
+
+            # Find by ID first, then by exact name (case-insensitive)
+            workflow_to_delete = None
+            try:
+                search_id = int(workflow_identifier)
+                for wf in workflows:
+                    if wf[0] == search_id:
+                        workflow_to_delete = wf
+                        break
+            except (TypeError, ValueError):
+                pass
+
+            if workflow_to_delete is None:
+                identifier_lower = str(workflow_identifier).lower()
+                for wf in workflows:
+                    if wf[1].lower() == identifier_lower:
+                        workflow_to_delete = wf
+                        break
+
+            if workflow_to_delete is None:
+                conn.close()
+                return {'success': False, 'message': f"No workflow found with identifier '{workflow_identifier}'.",
+                         'workflow_name': None, 'workflow_id': None, 'filter_count': 0}
+
+            workflow_id, workflow_name, creation_date, description, filters_dict_str, filter_count = workflow_to_delete
+
+            try:
+                actual_filter_count = len(json.loads(filters_dict_str))
+            except json.JSONDecodeError:
+                actual_filter_count = filter_count or 0
+
+            cursor.execute("DELETE FROM filtering_workflows WHERE id = ?", (workflow_id,))
+            deleted_rows = cursor.rowcount
+            conn.commit()
+            conn.close()
+
+            if deleted_rows > 0:
+                return {
+                    'success': True,
+                    'message': f"Deleted filtering workflow '{workflow_name}' ({actual_filter_count} filters).",
+                    'workflow_name': workflow_name,
+                    'workflow_id': workflow_id,
+                    'filter_count': actual_filter_count,
+                }
+            else:
+                return {'success': False, 'message': 'Delete failed (no rows affected).',
+                         'workflow_name': workflow_name, 'workflow_id': workflow_id, 'filter_count': actual_filter_count}
+
+        except Exception as e:
+            return {'success': False, 'message': f"Error deleting filtering workflow: {e}",
+                     'workflow_name': None, 'workflow_id': None, 'filter_count': 0}
+
     def list_filtering_workflows(self) -> None:
         """
         Display all saved filtering workflows in a formatted table.
         """
+        workflows = self.get_filtering_workflows(self.__chemspace_db)
+
+        if not workflows:
+            print("📝 No saved filtering workflows found")
+            return
+
+        print("\n" + "="*100)
+        print(f"SAVED FILTERING WORKFLOWS - Project: {self.name}")
+        print("="*100)
+
+        for i, workflow in enumerate(workflows, 1):
+            filters_dict = workflow['filters_dict']
+
+            # Get filter names for summary
+            filter_names = list(filters_dict.keys()) if filters_dict else []
+            filters_summary = ', '.join(filter_names[:3])
+            if len(filter_names) > 3:
+                filters_summary += f" and {len(filter_names) - 3} more..."
+            elif not filters_summary:
+                filters_summary = "No filters available"
+
+            print(f"\n🔍 Workflow {i}: '{workflow['workflow_name']}'")
+            print(f"   📅 Created: {workflow['creation_date']}")
+            print(f"   🔬 Filters: {workflow['filter_count']}")
+            print(f"   🔢 Total instances: {workflow['total_instances']}")
+            print(f"   📄 Description: {workflow['description']}")
+            print(f"   🔍 Filters: {filters_summary}")
+            print(f"   🔍 Filters dictionary: {filters_dict}")
+
+            # Per-filter rationale, if any was recorded (empty {} for workflows saved
+            # before filter_descriptions existed)
+            filter_descriptions = workflow.get('filter_descriptions') or {}
+            for filter_name in filter_names:
+                filter_desc = filter_descriptions.get(filter_name)
+                if filter_desc:
+                    print(f"      📝 {filter_name}: {filter_desc}")
+
+        print("="*100)
+
+    def create_physicochemical_filtering_workflow(self):
+        """
+        Create a physicochemical filtering workflow by selecting RDKit molecular
+        descriptors (e.g. MolWt, TPSA) and assigning an acceptable [min, max] range
+        to each. Unlike create_filtering_workflow(), which pairs SMARTS patterns
+        with a required instance count, each entry here is a numeric descriptor
+        range evaluated directly on the molecule -- there is no SMARTS involved.
+
+        Returns:
+            dict: Dictionary mapping descriptor name to {'min': ..., 'max': ...}
+        """
         try:
-            conn = sqlite3.connect(self.__chemspace_db)
-            cursor = conn.cursor()
-            
-            # Check if filtering_workflows table exists
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='filtering_workflows'")
-            if not cursor.fetchone():
-                print("📝 No filtering workflows table found")
-                conn.close()
+            descriptor_names = list(_get_descriptor_funcs().keys())
+
+            self._display_rdkit_descriptors(descriptor_names)
+
+            workflow_filters: Dict[str, Dict[str, float]] = {}
+            filter_counter = 1
+
+            print(f"\n📋 Building Physicochemical Filtering Workflow")
+            print("=" * 80)
+            print("Commands:")
+            print("   • Enter descriptor ID to add a descriptor")
+            print("   • Type 'list' to show available descriptors again")
+            print("   • Type 'search <term>' to search descriptors by name")
+            print("   • Type 'remove <descriptor_name>' to remove a descriptor")
+            print("   • Type 'show' to display current workflow")
+            print("   • Type '-1' or 'done' to finish")
+            print("=" * 80)
+
+            while True:
+                try:
+                    raw_input_value = input(f"\n🔍 Command or Descriptor ID #{filter_counter}: ").strip()
+                    lowered = raw_input_value.lower()
+
+                    if lowered in ['-1', 'done', 'finish', 'exit']:
+                        break
+                    elif lowered == 'list':
+                        self._display_rdkit_descriptors(descriptor_names)
+                        continue
+                    elif lowered.startswith('search '):
+                        search_term = raw_input_value[len('search '):].strip()
+                        self._display_rdkit_descriptors(descriptor_names, search_term=search_term)
+                        continue
+                    elif lowered.startswith('remove '):
+                        descriptor_name = raw_input_value[len('remove '):].strip()
+                        if descriptor_name in workflow_filters:
+                            del workflow_filters[descriptor_name]
+                            print(f"✅ Removed descriptor: '{descriptor_name}'")
+                        else:
+                            print(f"❌ Descriptor '{descriptor_name}' not found in workflow")
+                        continue
+                    elif lowered == 'show':
+                        self._show_current_physicochemical_workflow(workflow_filters)
+                        continue
+
+                    # Handle numeric descriptor ID input
+                    try:
+                        descriptor_id = int(raw_input_value)
+                    except ValueError:
+                        print("❌ Invalid command. Enter a descriptor ID, or use 'list'/'search <term>'/'remove <name>'/'show'/'-1'")
+                        continue
+
+                    if descriptor_id < 1 or descriptor_id > len(descriptor_names):
+                        print(f"❌ No descriptor found with ID {descriptor_id}")
+                        continue
+
+                    descriptor_name = descriptor_names[descriptor_id - 1]
+
+                    if descriptor_name in workflow_filters:
+                        print(f"⚠️  Descriptor '{descriptor_name}' is already in the workflow")
+                        continue
+
+                    bounds = self._get_descriptor_bounds(descriptor_name)
+                    if bounds is None:
+                        continue
+
+                    lower_bound, upper_bound = bounds
+                    workflow_filters[descriptor_name] = {'min': lower_bound, 'max': upper_bound}
+
+                    print(f"✅ Added descriptor #{filter_counter}: '{descriptor_name}' (ID: {descriptor_id})")
+                    print(f"   📏 Range: [{lower_bound}, {upper_bound}]")
+                    filter_counter += 1
+
+                except KeyboardInterrupt:
+                    print("\n\n⏹️  Workflow creation cancelled by user")
+                    return {}
+                except Exception as e:
+                    print(f"❌ Error processing input: {e}")
+                    continue
+
+            # Display final workflow summary
+            if workflow_filters:
+                print(f"\n✅ Physicochemical Filtering Workflow Created!")
+                print("=" * 70)
+                self._show_current_physicochemical_workflow(workflow_filters)
+
+                save_workflow = input("\n💾 Save this workflow? (y/n): ").strip().lower()
+                if save_workflow in ['y', 'yes']:
+                    self._save_physicochemical_filtering_workflow(workflow_filters)
+            else:
+                print("\n⚠️  No descriptors were added to the workflow")
+
+            print("\n🏁 Physicochemical filtering workflow creation completed.")
+
+            return workflow_filters
+
+        except Exception as e:
+            print(f"❌ Error creating physicochemical filtering workflow: {e}")
+            return {}
+
+    def _display_rdkit_descriptors(self, descriptor_names: List[str], search_term: Optional[str] = None) -> None:
+        """
+        Display available RDKit physicochemical descriptors with pagination.
+
+        IDs shown always correspond to the descriptor's 1-based position in the
+        full descriptor_names list (not its position within search results), so
+        an ID selected after a 'search' remains valid against the full list.
+
+        Args:
+            descriptor_names (List[str]): Full ordered list of RDKit descriptor names
+            search_term (Optional[str]): If provided, only descriptors whose name
+                contains this term (case-insensitive) are shown
+        """
+        indexed = list(enumerate(descriptor_names, 1))
+
+        if search_term:
+            term_lower = search_term.lower()
+            indexed = [(idx, name) for idx, name in indexed if term_lower in name.lower()]
+            if not indexed:
+                print(f"🔍 No descriptors found matching '{search_term}'")
                 return
-            
+            header = f"\n🔍 Search Results for '{search_term}' ({len(indexed)} found)"
+        else:
+            header = f"\n📋 Available Physicochemical Descriptors ({len(indexed)} total)"
+
+        print(header)
+        print("=" * 60)
+        print(f"{'ID':<5} {'Descriptor Name':<40}")
+        print("=" * 60)
+
+        page_size = 20
+        total_pages = (len(indexed) + page_size - 1) // page_size
+
+        for page in range(total_pages):
+            start_idx = page * page_size
+            end_idx = min(start_idx + page_size, len(indexed))
+
+            for idx, name in indexed[start_idx:end_idx]:
+                print(f"{idx:<5} {name:<40}")
+
+            if total_pages > 1:
+                print(f"\n📄 Page {page + 1}/{total_pages} - Showing descriptors {start_idx + 1}-{end_idx}")
+                if page < total_pages - 1:
+                    continue_display = input("Press Enter to see more descriptors, or 'q' to stop: ").strip().lower()
+                    if continue_display == 'q':
+                        break
+
+        print("=" * 60)
+
+    def _get_descriptor_bounds(self, descriptor_name: str) -> Optional[Tuple[float, float]]:
+        """
+        Prompt for a lower/upper bound pair for a physicochemical descriptor.
+
+        Blank input falls back to the default (-9999 / 9999). Non-numeric input
+        reprompts; a lower bound greater than the upper bound warns and reprompts
+        both values.
+
+        Args:
+            descriptor_name (str): Name of the descriptor being bounded (for the prompt)
+
+        Returns:
+            Optional[Tuple[float, float]]: (lower_bound, upper_bound), or None if
+                the user cancelled
+        """
+        default_min = -9999.0
+        default_max = 9999.0
+
+        while True:
+            try:
+                lower_input = input(f"Enter lower bound for '{descriptor_name}' (default {default_min}): ").strip()
+                if lower_input.lower() in ['cancel', 'skip', 'back']:
+                    return None
+                lower_bound = default_min if lower_input == '' else float(lower_input)
+
+                upper_input = input(f"Enter upper bound for '{descriptor_name}' (default {default_max}): ").strip()
+                if upper_input.lower() in ['cancel', 'skip', 'back']:
+                    return None
+                upper_bound = default_max if upper_input == '' else float(upper_input)
+
+                if lower_bound > upper_bound:
+                    print(f"❌ Lower bound ({lower_bound}) cannot be greater than upper bound ({upper_bound}). Please re-enter both.")
+                    continue
+
+                return lower_bound, upper_bound
+
+            except ValueError:
+                print("❌ Please enter valid numeric bounds")
+                continue
+            except KeyboardInterrupt:
+                return None
+
+    def _show_current_physicochemical_workflow(self, workflow_filters: Dict[str, Dict[str, float]]) -> None:
+        """
+        Display the current physicochemical filtering workflow being built.
+
+        Args:
+            workflow_filters (Dict[str, Dict[str, float]]): Current workflow, mapping
+                descriptor name to {'min': ..., 'max': ...}
+        """
+        if not workflow_filters:
+            print("📋 Current workflow is empty")
+            return
+
+        print(f"\n📋 Current Physicochemical Filtering Workflow ({len(workflow_filters)} descriptors)")
+        print("=" * 60)
+        print(f"{'#':<3} {'Descriptor Name':<30} {'Min':<12} {'Max':<12}")
+        print("=" * 60)
+
+        for i, (name, bounds) in enumerate(workflow_filters.items(), 1):
+            print(f"{i:<3} {name[:29]:<30} {bounds['min']:<12} {bounds['max']:<12}")
+
+        print("=" * 60)
+
+    @staticmethod
+    def save_physicochemical_filtering_workflow(chemspace_db_path: str, workflow_name: str,
+                                                  workflow_filters: Dict[str, Dict[str, float]],
+                                                  description: Optional[str] = None,
+                                                  overwrite: bool = False) -> Dict[str, Any]:
+        """
+        Persist a physicochemical filtering workflow to a chemspace database.
+
+        Mirrors save_filtering_workflow(), but stores per-descriptor {'min', 'max'}
+        ranges rather than SMARTS+instance counts, in a dedicated
+        'physicochemical_filtering_workflows' table (kept separate so existing
+        filter_using_workflow()/GUI code that assumes instances+smarts is unaffected).
+
+        Args:
+            chemspace_db_path (str): Path to the project's chemspace.db
+            workflow_name (str): Desired workflow name
+            workflow_filters (Dict[str, Dict[str, float]]): Dictionary mapping descriptor
+                name to {'min': ..., 'max': ...}
+            description (Optional[str]): Optional description; a default is generated if omitted
+            overwrite (bool): If a workflow with the same name exists, overwrite it when True;
+                otherwise a unique suffixed name is generated automatically.
+
+        Returns:
+            Dict[str, Any]: On success: {'success': True, 'workflow_name', 'filter_count',
+                'creation_date', 'description'}. On failure: {'success': False, 'message'}.
+        """
+        if not workflow_filters:
+            return {'success': False, 'message': 'No workflow filters to save'}
+
+        try:
+            conn = sqlite3.connect(chemspace_db_path)
+            cursor = conn.cursor()
+
+            # Create physicochemical_filtering_workflows table if it doesn't exist
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS physicochemical_filtering_workflows (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workflow_name TEXT NOT NULL UNIQUE,
+                filters_dict TEXT NOT NULL,
+                creation_date TEXT NOT NULL,
+                description TEXT,
+                filter_count INTEGER DEFAULT 0
+            )
+            """)
+
+            # Create indexes for faster searches
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_physicochemical_filtering_workflows_name ON physicochemical_filtering_workflows(workflow_name)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_physicochemical_filtering_workflows_date ON physicochemical_filtering_workflows(creation_date)")
+
+            filter_count = len(workflow_filters)
+
+            if not description:
+                description = f"Physicochemical filtering workflow with {filter_count} descriptors"
+
+            workflow_name = workflow_name.strip() or f"physicochemical_filtering_workflow_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+            # Check if workflow name already exists
+            cursor.execute("SELECT COUNT(*) FROM physicochemical_filtering_workflows WHERE workflow_name = ?", (workflow_name,))
+            if cursor.fetchone()[0] > 0:
+                if overwrite:
+                    cursor.execute("DELETE FROM physicochemical_filtering_workflows WHERE workflow_name = ?", (workflow_name,))
+                else:
+                    # Generate unique name
+                    counter = 1
+                    original_name = workflow_name
+                    while True:
+                        new_name = f"{original_name}_{counter}"
+                        cursor.execute("SELECT COUNT(*) FROM physicochemical_filtering_workflows WHERE workflow_name = ?", (new_name,))
+                        if cursor.fetchone()[0] == 0:
+                            workflow_name = new_name
+                            break
+                        counter += 1
+
+            creation_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            filters_json = json.dumps(workflow_filters, sort_keys=True)
+
+            cursor.execute("""
+            INSERT INTO physicochemical_filtering_workflows
+            (workflow_name, filters_dict, creation_date, description, filter_count)
+            VALUES (?, ?, ?, ?, ?)
+            """, (workflow_name, filters_json, creation_date, description, filter_count))
+
+            conn.commit()
+            conn.close()
+
+            return {
+                'success': True,
+                'workflow_name': workflow_name,
+                'filter_count': filter_count,
+                'creation_date': creation_date,
+                'description': description,
+            }
+
+        except Exception as e:
+            return {'success': False, 'message': f"Error saving physicochemical filtering workflow: {e}"}
+
+    def _save_physicochemical_filtering_workflow(self, workflow_filters: Dict[str, Dict[str, float]]) -> None:
+        """
+        Save a physicochemical filtering workflow to the chemspace database, prompting
+        the user for the workflow name, description, and an overwrite decision if needed.
+
+        Args:
+            workflow_filters (Dict[str, Dict[str, float]]): Dictionary mapping descriptor
+                name to {'min': ..., 'max': ...}
+        """
+        if not workflow_filters:
+            print("⚠️  No workflow filters to save")
+            return
+
+        # Get workflow name from user
+        workflow_name = input("📝 Enter a name for this physicochemical filtering workflow: ").strip()
+        if not workflow_name:
+            workflow_name = f"physicochemical_filtering_workflow_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            print(f"📋 Using default name: {workflow_name}")
+
+        # Get optional description from user
+        description = input("📄 Enter a description for this physicochemical filtering workflow (optional): ").strip()
+
+        overwrite = False
+        conn = sqlite3.connect(self.__chemspace_db)
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='physicochemical_filtering_workflows'")
+        if cursor.fetchone():
+            cursor.execute("SELECT COUNT(*) FROM physicochemical_filtering_workflows WHERE workflow_name = ?", (workflow_name,))
+            if cursor.fetchone()[0] > 0:
+                answer = input(f"⚠️  Physicochemical filtering workflow '{workflow_name}' already exists. Overwrite? (y/n): ").strip().lower()
+                overwrite = answer in ['y', 'yes']
+        conn.close()
+
+        result = self.save_physicochemical_filtering_workflow(self.__chemspace_db, workflow_name, workflow_filters,
+                                                                description or None, overwrite)
+
+        if result['success']:
+            print(f"✅ Successfully saved physicochemical filtering workflow!")
+            print(f"   📋 Workflow name: '{result['workflow_name']}'")
+            print(f"   🔬 Descriptors saved: {result['filter_count']}")
+            print(f"   📅 Created: {result['creation_date']}")
+            print(f"   📄 Description: {result['description']}")
+        else:
+            print(f"❌ {result['message']}")
+
+    @staticmethod
+    def get_physicochemical_filtering_workflows(chemspace_db_path: str) -> List[Dict[str, Any]]:
+        """
+        Retrieve all saved physicochemical filtering workflows from a chemspace database.
+
+        Args:
+            chemspace_db_path (str): Path to the project's chemspace.db
+
+        Returns:
+            List[Dict[str, Any]]: One dict per workflow (workflow_name, creation_date,
+                description, filters_dict, filter_count), ordered by creation_date
+                descending. Empty list if none found or on error.
+        """
+        try:
+            if not os.path.exists(chemspace_db_path):
+                return []
+
+            conn = sqlite3.connect(chemspace_db_path)
+            cursor = conn.cursor()
+
+            # Check if physicochemical_filtering_workflows table exists
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='physicochemical_filtering_workflows'")
+            if not cursor.fetchone():
+                conn.close()
+                return []
+
             # Get all workflows with summary information
             cursor.execute("""
-            SELECT workflow_name, creation_date, description, filters_dict, filter_count, total_instances
-            FROM filtering_workflows 
+            SELECT workflow_name, creation_date, description, filters_dict, filter_count
+            FROM physicochemical_filtering_workflows
             ORDER BY creation_date DESC
             """)
-            
-            workflows = cursor.fetchall()
+
+            rows = cursor.fetchall()
             conn.close()
-            
-            if not workflows:
-                print("📝 No saved filtering workflows found")
-                return
-            
-            print("\n" + "="*100)
-            print(f"SAVED FILTERING WORKFLOWS - Project: {self.name}")
-            print("="*100)
-            
-            for i, (name, date, desc, filters_dict_str, filter_count, total_instances) in enumerate(workflows, 1):
+
+            workflows = []
+            for name, date, desc, filters_dict_str, filter_count in rows:
                 try:
                     filters_dict = json.loads(filters_dict_str)
                     actual_filter_count = len(filters_dict) if filters_dict else filter_count
-                    
-                    # Get filter names for summary
-                    filter_names = list(filters_dict.keys()) if filters_dict else []
-                    filters_summary = ', '.join(filter_names[:3])
-                    if len(filter_names) > 3:
-                        filters_summary += f" and {len(filter_names) - 3} more..."
-                    elif not filters_summary:
-                        filters_summary = "No filters available"
-                    
                 except json.JSONDecodeError:
+                    filters_dict = {}
                     actual_filter_count = filter_count or 0
-                    filters_summary = "Error parsing filters"
-                
-                print(f"\n🔍 Workflow {i}: '{name}'")
-                print(f"   📅 Created: {date}")
-                print(f"   🔬 Filters: {actual_filter_count}")
-                print(f"   🔢 Total instances: {total_instances or 0}")
-                print(f"   📄 Description: {desc}")
-                print(f"   🔍 Filters: {filters_summary}")
-                print(f"   🔍 Filters dictionary: {filters_dict}")
-            
-            print("="*100)
-            
-        except Exception as e:
-            print(f"❌ Error listing filtering workflows: {e}")
 
-    def check_duplicates(self, table_name: str, 
+                workflows.append({
+                    'workflow_name': name,
+                    'creation_date': date,
+                    'description': desc,
+                    'filters_dict': filters_dict,
+                    'filter_count': actual_filter_count,
+                })
+
+            return workflows
+
+        except Exception as e:
+            print(f"❌ Error listing physicochemical filtering workflows: {e}")
+            return []
+
+    @staticmethod
+    def delete_physicochemical_filtering_workflow_entry(chemspace_db_path: str, workflow_identifier: str) -> Dict[str, Any]:
+        """
+        Delete a physicochemical filtering workflow by name or ID from a chemspace database.
+
+        Mirrors delete_filtering_workflow_entry(), but operates on the
+        'physicochemical_filtering_workflows' table. Non-interactive, so it can be
+        called from the Streamlit GUI -- the caller is expected to collect its own
+        confirmation before calling this.
+
+        Args:
+            chemspace_db_path (str): Path to the project's chemspace.db
+            workflow_identifier (str): Workflow name or numeric ID to delete
+
+        Returns:
+            Dict[str, Any]: {'success': bool, 'message': str, 'workflow_name': Optional[str],
+                'workflow_id': Optional[int], 'filter_count': int}
+        """
+        try:
+            if not os.path.exists(chemspace_db_path):
+                return {'success': False, 'message': 'ChemSpace database not found.',
+                         'workflow_name': None, 'workflow_id': None, 'filter_count': 0}
+
+            conn = sqlite3.connect(chemspace_db_path)
+            cursor = conn.cursor()
+
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='physicochemical_filtering_workflows'")
+            if not cursor.fetchone():
+                conn.close()
+                return {'success': False, 'message': 'No physicochemical filtering workflows table found.',
+                         'workflow_name': None, 'workflow_id': None, 'filter_count': 0}
+
+            cursor.execute("""
+                SELECT id, workflow_name, creation_date, description, filters_dict, filter_count
+                FROM physicochemical_filtering_workflows
+                ORDER BY creation_date DESC
+            """)
+            workflows = cursor.fetchall()
+
+            if not workflows:
+                conn.close()
+                return {'success': False, 'message': 'No physicochemical filtering workflows found to delete.',
+                         'workflow_name': None, 'workflow_id': None, 'filter_count': 0}
+
+            # Find by ID first, then by exact name (case-insensitive)
+            workflow_to_delete = None
+            try:
+                search_id = int(workflow_identifier)
+                for wf in workflows:
+                    if wf[0] == search_id:
+                        workflow_to_delete = wf
+                        break
+            except (TypeError, ValueError):
+                pass
+
+            if workflow_to_delete is None:
+                identifier_lower = str(workflow_identifier).lower()
+                for wf in workflows:
+                    if wf[1].lower() == identifier_lower:
+                        workflow_to_delete = wf
+                        break
+
+            if workflow_to_delete is None:
+                conn.close()
+                return {'success': False, 'message': f"No workflow found with identifier '{workflow_identifier}'.",
+                         'workflow_name': None, 'workflow_id': None, 'filter_count': 0}
+
+            workflow_id, workflow_name, creation_date, description, filters_dict_str, filter_count = workflow_to_delete
+
+            try:
+                actual_filter_count = len(json.loads(filters_dict_str))
+            except json.JSONDecodeError:
+                actual_filter_count = filter_count or 0
+
+            cursor.execute("DELETE FROM physicochemical_filtering_workflows WHERE id = ?", (workflow_id,))
+            deleted_rows = cursor.rowcount
+            conn.commit()
+            conn.close()
+
+            if deleted_rows > 0:
+                return {
+                    'success': True,
+                    'message': f"Deleted physicochemical filtering workflow '{workflow_name}' ({actual_filter_count} descriptors).",
+                    'workflow_name': workflow_name,
+                    'workflow_id': workflow_id,
+                    'filter_count': actual_filter_count,
+                }
+            else:
+                return {'success': False, 'message': 'Delete failed (no rows affected).',
+                         'workflow_name': workflow_name, 'workflow_id': workflow_id, 'filter_count': actual_filter_count}
+
+        except Exception as e:
+            return {'success': False, 'message': f"Error deleting physicochemical filtering workflow: {e}",
+                     'workflow_name': None, 'workflow_id': None, 'filter_count': 0}
+
+    def list_physicochemical_filtering_workflows(self) -> None:
+        """
+        Display all saved physicochemical filtering workflows in a formatted table.
+        """
+        workflows = self.get_physicochemical_filtering_workflows(self.__chemspace_db)
+
+        if not workflows:
+            print("📝 No saved physicochemical filtering workflows found")
+            return
+
+        print("\n" + "="*100)
+        print(f"SAVED PHYSICOCHEMICAL FILTERING WORKFLOWS - Project: {self.name}")
+        print("="*100)
+
+        for i, workflow in enumerate(workflows, 1):
+            filters_dict = workflow['filters_dict']
+
+            # Get descriptor names for summary
+            descriptor_names = list(filters_dict.keys()) if filters_dict else []
+            descriptors_summary = ', '.join(descriptor_names[:3])
+            if len(descriptor_names) > 3:
+                descriptors_summary += f" and {len(descriptor_names) - 3} more..."
+            elif not descriptors_summary:
+                descriptors_summary = "No descriptors available"
+
+            print(f"\n🔍 Workflow {i}: '{workflow['workflow_name']}'")
+            print(f"   📅 Created: {workflow['creation_date']}")
+            print(f"   🔬 Descriptors: {workflow['filter_count']}")
+            print(f"   📄 Description: {workflow['description']}")
+            print(f"   🔍 Descriptors: {descriptors_summary}")
+            print(f"   🔍 Descriptors dictionary: {filters_dict}")
+
+        print("="*100)
+
+    def _select_physicochemical_workflow_for_filtering(self) -> Optional[str]:
+        """
+        Interactive selection of a physicochemical filtering workflow.
+
+        Returns:
+            Optional[str]: Selected workflow name or None if cancelled
+        """
+        try:
+            workflows = self.get_physicochemical_filtering_workflows(self.__chemspace_db)
+
+            if not workflows:
+                print("❌ No physicochemical filtering workflows found")
+                print("   Create workflows first using create_physicochemical_filtering_workflow()")
+                return None
+
+            print(f"\n🧪 SELECT PHYSICOCHEMICAL FILTERING WORKFLOW")
+            print("=" * 80)
+            print(f"Available workflows ({len(workflows)} total):")
+            print("-" * 80)
+            print(f"{'#':<3} {'Workflow Name':<25} {'Descriptors':<12} {'Created':<12} {'Description':<25}")
+            print("-" * 80)
+
+            for i, workflow in enumerate(workflows, 1):
+                name = workflow['workflow_name']
+                date_short = (workflow['creation_date'] or "Unknown")[:10]
+                name_display = name[:24] if len(name) <= 24 else name[:21] + "..."
+                desc_display = (workflow['description'] or "No description")[:25]
+
+                print(f"{i:<3} {name_display:<25} {workflow['filter_count']:<12} {date_short:<12} {desc_display:<25}")
+
+            print("-" * 80)
+            print("Commands: Enter workflow number, workflow name, or 'cancel' to abort")
+
+            while True:
+                try:
+                    selection = input(f"\n🔍 Select physicochemical filtering workflow: ").strip()
+
+                    if selection.lower() in ['cancel', 'quit', 'exit']:
+                        return None
+
+                    # Try as number first
+                    try:
+                        workflow_idx = int(selection) - 1
+                        if 0 <= workflow_idx < len(workflows):
+                            selected_workflow = workflows[workflow_idx]['workflow_name']
+                            print(f"\n✅ Selected workflow: '{selected_workflow}'")
+                            return selected_workflow
+                        else:
+                            print(f"❌ Invalid selection. Please enter 1-{len(workflows)}")
+                            continue
+                    except ValueError:
+                        # Try as workflow name
+                        matching_workflows = [w['workflow_name'] for w in workflows if w['workflow_name'].lower() == selection.lower()]
+                        if matching_workflows:
+                            selected_workflow = matching_workflows[0]
+                            print(f"\n✅ Selected workflow: '{selected_workflow}'")
+                            return selected_workflow
+                        else:
+                            print(f"❌ Workflow '{selection}' not found")
+                            continue
+
+                except KeyboardInterrupt:
+                    print("\n❌ Workflow selection cancelled")
+                    return None
+
+        except Exception as e:
+            print(f"❌ Error selecting physicochemical workflow for filtering: {e}")
+            return None
+
+    def _load_physicochemical_workflow_filters(self, workflow_name: str) -> List[Tuple[str, float, float]]:
+        """
+        Load a physicochemical filtering workflow's descriptor bounds from the database.
+
+        Unlike _load_workflow_filters(), no external lookup is needed -- the descriptor
+        name and [min, max] bounds are stored verbatim in filters_dict.
+
+        Args:
+            workflow_name (str): Name of the workflow to load
+
+        Returns:
+            List[Tuple[str, float, float]]: List of (descriptor_name, lower_bound, upper_bound)
+                tuples, empty list if workflow not found or error occurs
+        """
+        try:
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='physicochemical_filtering_workflows'")
+            if not cursor.fetchone():
+                print("❌ No physicochemical filtering workflows table found in chemspace database")
+                print("   Create workflows first using create_physicochemical_filtering_workflow()")
+                conn.close()
+                return []
+
+            cursor.execute(
+                "SELECT filters_dict FROM physicochemical_filtering_workflows WHERE workflow_name = ?",
+                (workflow_name,)
+            )
+            workflow_result = cursor.fetchone()
+            conn.close()
+
+            if not workflow_result:
+                print(f"❌ Workflow '{workflow_name}' not found in physicochemical_filtering_workflows table")
+                return []
+
+            try:
+                filters_dict = json.loads(workflow_result[0])
+            except json.JSONDecodeError as e:
+                print(f"❌ Error parsing filters dictionary for workflow '{workflow_name}': {e}")
+                return []
+
+            if not filters_dict:
+                print(f"⚠️  Workflow '{workflow_name}' contains no descriptor filters")
+                return []
+
+            workflow_filters = [
+                (descriptor_name, bounds['min'], bounds['max'])
+                for descriptor_name, bounds in filters_dict.items()
+            ]
+
+            print(f"✅ Loaded {len(workflow_filters)} descriptor filters for workflow '{workflow_name}'")
+            return workflow_filters
+
+        except Exception as e:
+            print(f"❌ Error loading physicochemical workflow filters for '{workflow_name}': {e}")
+            return []
+
+    def _apply_physicochemical_filters_parallel(self, compounds_df: pd.DataFrame,
+                                    workflow_filters: List[Tuple[str, float, float]],
+                                    max_workers: int, chunk_size: int,
+                                    progress_callback: Optional[Callable[[int, int], None]] = None) -> Tuple[pd.DataFrame, Dict[str, int]]:
+        """
+        Ultra-memory-efficient version that streams results to temporary files with progress tracking.
+        Mirrors _apply_filters_parallel(), but evaluates descriptor [min, max] bounds instead of
+        SMARTS+instance counts.
+
+        Returns:
+            Tuple[pd.DataFrame, Dict[str, int]]: (filtered compounds, removed_counts) where
+                removed_counts maps descriptor name to the number of compounds excluded
+                because that descriptor was the first one out of bounds.
+        """
+        import tempfile
+        import os
+        import csv
+
+        # Import tqdm locally to avoid multiprocessing issues
+        try:
+            from tqdm import tqdm
+            tqdm_available = True
+        except ImportError:
+            tqdm_available = False
+
+        try:
+            # Create temporary file for results
+            temp_dir = tempfile.mkdtemp(prefix='chemspace_physicochemical_filter_')
+            temp_file = os.path.join(temp_dir, 'filtered_results.csv')
+
+            # Write header
+            with open(temp_file, 'w', newline='') as f:
+                csv.writer(f).writerow(['id', 'smiles', 'name', 'flag', 'inchi_key'])
+
+            id_col = compounds_df['id'] if 'id' in compounds_df.columns else pd.Series(0, index=compounds_df.index)
+            name_col = compounds_df['name'] if 'name' in compounds_df.columns else pd.Series('unknown', index=compounds_df.index)
+            flag_col = compounds_df['flag'] if 'flag' in compounds_df.columns else pd.Series('nd', index=compounds_df.index)
+            inchi_key_col = compounds_df['inchi_key'] if 'inchi_key' in compounds_df.columns else pd.Series([None] * len(compounds_df), index=compounds_df.index, dtype=object)
+            compound_data = list(zip(id_col, compounds_df['smiles'], name_col, flag_col, inchi_key_col))
+
+            chunks = [compound_data[i:i + chunk_size]
+                    for i in range(0, len(compound_data), chunk_size)]
+
+            total_passed = 0
+            processed_chunks = 0
+            removed_counts = {name: 0 for name, _, _ in workflow_filters}
+
+            print(f"   📦 Processing {len(chunks)} chunks with {max_workers} workers...")
+
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                future_to_chunk = {
+                    executor.submit(_filter_chunk_worker_by_descriptor_bounds, chunk, workflow_filters): i
+                    for i, chunk in enumerate(chunks[:max_workers])
+                }
+
+                remaining_chunks = chunks[max_workers:]
+
+                if tqdm_available:
+                    progress_bar = tqdm(
+                        total=len(chunks),
+                        desc="Filtering chunks",
+                        unit="chunks",
+                        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
+                    )
+                else:
+                    progress_bar = None
+                    print(f"   🔄 Started processing {len(chunks)} chunks...")
+
+                with open(temp_file, 'a', newline='') as f:
+                    csv_writer = csv.writer(f)
+                    while future_to_chunk:
+                        for future in as_completed(list(future_to_chunk.keys())):
+                            chunk_idx = future_to_chunk.pop(future)
+
+                            try:
+                                chunk_results, chunk_removed_counts = future.result()
+
+                                chunk_passed = 0
+                                for result in chunk_results:
+                                    csv_writer.writerow([
+                                        result['id'], result['smiles'], result['name'],
+                                        result['flag'], result.get('inchi_key', '')
+                                    ])
+                                    chunk_passed += 1
+
+                                for descriptor_name, count in chunk_removed_counts.items():
+                                    removed_counts[descriptor_name] = removed_counts.get(descriptor_name, 0) + count
+
+                                total_passed += chunk_passed
+                                processed_chunks += 1
+
+                                if progress_bar:
+                                    progress_bar.update(1)
+                                    progress_bar.set_postfix({
+                                        'passed': total_passed,
+                                        'chunks': f"{processed_chunks}/{len(chunks)}"
+                                    })
+                                else:
+                                    if processed_chunks % max(1, len(chunks) // 10) == 0:
+                                        progress_pct = (processed_chunks / len(chunks)) * 100
+                                        print(f"      📊 Progress: {progress_pct:.1f}% ({processed_chunks}/{len(chunks)} chunks, {total_passed} passed)")
+
+                                if remaining_chunks:
+                                    next_chunk = remaining_chunks.pop(0)
+                                    new_future = executor.submit(
+                                        _filter_chunk_worker_by_descriptor_bounds, next_chunk, workflow_filters
+                                    )
+                                    future_to_chunk[new_future] = len(chunks) - len(remaining_chunks) - 1
+
+                                if progress_callback:
+                                    progress_callback(processed_chunks, len(chunks))
+
+                            except Exception as e:
+                                processed_chunks += 1
+                                if progress_bar:
+                                    progress_bar.update(1)
+                                print(f"   ❌ Chunk {chunk_idx} error: {e}")
+                                if progress_callback:
+                                    progress_callback(processed_chunks, len(chunks))
+
+                if progress_bar:
+                    progress_bar.close()
+
+            print(f"   📊 Reading {total_passed} filtered compounds from disk...")
+            try:
+                if tqdm_available:
+                    from tqdm import tqdm
+
+                    file_size = os.path.getsize(temp_file)
+
+                    with tqdm(total=file_size, unit='B', unit_scale=True, desc="Reading results") as pbar:
+                        result_df = pd.read_csv(temp_file)
+                        pbar.update(file_size)
+
+                else:
+                    result_df = pd.read_csv(temp_file)
+
+                print(f"   ✅ Successfully loaded {len(result_df)} filtered compounds")
+                return result_df, removed_counts
+            finally:
+                try:
+                    os.unlink(temp_file)
+                    os.rmdir(temp_dir)
+                except:
+                    pass
+
+        except Exception as e:
+            print(f"❌ Error in streaming parallel physicochemical filtering: {e}")
+            return pd.DataFrame(), {}
+
+    def _apply_physicochemical_filters_sequential(self, compounds_df: pd.DataFrame,
+                                workflow_filters: List[Tuple[str, float, float]],
+                                progress_callback: Optional[Callable[[int, int], None]] = None) -> Tuple[pd.DataFrame, Dict[str, int]]:
+        """
+        Apply RDKit descriptor [min, max] filters using sequential processing with progress tracking.
+        Mirrors _apply_filters_sequential(), but evaluates numeric descriptor ranges instead of
+        SMARTS+instance counts.
+
+        Returns:
+            Tuple[pd.DataFrame, Dict[str, int]]: (filtered compounds, removed_counts) where
+                removed_counts maps descriptor name to the number of compounds excluded
+                because that descriptor was the first one out of bounds (filters are
+                evaluated in order with early exit, so each removed compound is
+                attributed to exactly one descriptor).
+        """
+        try:
+            from tqdm import tqdm
+            tqdm_available = True
+        except ImportError:
+            tqdm_available = False
+
+        try:
+            from rdkit import Chem
+            from rdkit import RDLogger
+            RDLogger.DisableLog('rdApp.*')
+
+            descriptor_funcs = _get_descriptor_funcs()
+
+            filtered_compounds = []
+            total_compounds = len(compounds_df)
+            processed_count = 0
+            compounds_passed = 0
+            callback_interval = max(1, total_compounds // 100)
+            removed_counts = {name: 0 for name, _, _ in workflow_filters}
+
+            print(f"   🔄 Processing {total_compounds:,} compounds sequentially...")
+
+            if tqdm_available:
+                progress_bar = tqdm(
+                    compounds_df.iterrows(),
+                    total=total_compounds,
+                    desc="Filtering compounds",
+                    unit="compounds",
+                    bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] Passed: {postfix}",
+                    postfix="0"
+                )
+            else:
+                progress_bar = compounds_df.iterrows()
+                print_interval = max(1, total_compounds // 20)
+
+            for _, compound in progress_bar:
+                processed_count += 1
+                passes_all_filters = True
+                descriptor_values = {}
+
+                try:
+                    mol = Chem.MolFromSmiles(compound['smiles'])
+                    if mol is None:
+                        continue
+
+                    for descriptor_name, lower_bound, upper_bound in workflow_filters:
+                        descriptor_func = descriptor_funcs.get(descriptor_name)
+                        if descriptor_func is None:
+                            passes_all_filters = False
+                            break
+
+                        try:
+                            value = descriptor_func(mol)
+                        except Exception:
+                            passes_all_filters = False
+                            break
+
+                        descriptor_values[descriptor_name] = value
+
+                        if value < lower_bound or value > upper_bound:
+                            passes_all_filters = False
+                            removed_counts[descriptor_name] += 1
+                            break
+
+                    if passes_all_filters:
+                        compound_data = {
+                            'smiles': compound['smiles'],
+                            'name': compound.get('name', 'unknown'),
+                            'flag': compound.get('flag', 'nd'),
+                            'inchi_key': compound.get('inchi_key', None)
+                        }
+                        compound_data.update(descriptor_values)
+                        filtered_compounds.append(compound_data)
+                        compounds_passed += 1
+
+                except Exception:
+                    continue
+
+                if tqdm_available:
+                    progress_bar.set_postfix(passed=compounds_passed)
+                else:
+                    if processed_count % print_interval == 0 or processed_count == total_compounds:
+                        progress_pct = (processed_count / total_compounds) * 100
+                        retention_rate = (compounds_passed / processed_count) * 100 if processed_count > 0 else 0
+                        print(f"      📊 Progress: {progress_pct:.1f}% ({processed_count:,}/{total_compounds:,}) | "
+                            f"Passed: {compounds_passed:,} ({retention_rate:.1f}%)")
+
+                if progress_callback and (processed_count % callback_interval == 0 or processed_count == total_compounds):
+                    progress_callback(processed_count, total_compounds)
+
+            if tqdm_available and hasattr(progress_bar, 'close'):
+                progress_bar.close()
+
+            final_retention_rate = (len(filtered_compounds) / total_compounds) * 100 if total_compounds > 0 else 0
+            print(f"   ✅ Sequential processing completed")
+            print(f"   📊 Final results: {len(filtered_compounds):,}/{total_compounds:,} compounds passed ({final_retention_rate:.2f}%)")
+
+            return pd.DataFrame(filtered_compounds), removed_counts
+
+        except Exception as e:
+            print(f"❌ Error in sequential physicochemical filtering: {e}")
+            return pd.DataFrame(), {}
+
+    def filter_using_physicochemical_workflow(self, table_name: Optional[str] = None, workflow_name: Optional[str] = None,
+                    save_results: Optional[bool] = None,
+                    result_table_name: Optional[str] = None,
+                    parallel_threshold: int = 10000,
+                    max_workers: Optional[int] = None,
+                    chunk_size: Optional[int] = None,
+                    progress_callback: Optional[Callable[[int, int], None]] = None) -> pd.DataFrame:
+        """
+        Apply a physicochemical filtering workflow to compounds in a table with parallel
+        processing support. Mirrors filter_using_workflow(), but evaluates RDKit descriptor
+        [min, max] ranges instead of SMARTS+instance filters. A compound passes only if ALL
+        descriptor values fall within their configured range.
+
+        Args:
+            table_name (Optional[str]): Name of the table containing compounds to filter. If None, shows selection.
+            workflow_name (Optional[str]): Name of the physicochemical workflow to apply. If None, shows selection.
+            save_results (Optional[bool]): Whether to save filtered results to database (prompts if None)
+            result_table_name (Optional[str]): Name for the result table (prompts if save_results=True and None)
+            parallel_threshold (int): Minimum number of compounds to trigger parallel processing
+            max_workers (Optional[int]): Maximum number of worker processes (default: min(cpu_count(), 8))
+            chunk_size (Optional[int]): Size of chunks for parallel processing (auto-calculated if None)
+            progress_callback (Optional[Callable[[int, int], None]]): Optional callback invoked as
+                progress_callback(done, total) while filtering is in progress, e.g. to drive a GUI
+                progress bar. `done`/`total` are compounds for sequential processing or chunks for
+                parallel processing.
+
+        Returns:
+            pd.DataFrame: DataFrame containing filtered compounds with descriptor values
+        """
+        try:
+            print(f"\n🔬 Starting physicochemical workflow filtering...")
+
+            # Interactive table selection if not provided
+            if table_name is None:
+                table_name = self._select_table_for_filtering()
+                if not table_name:
+                    print("❌ No table selected for filtering")
+                    return pd.DataFrame()
+
+            # Interactive workflow selection if not provided
+            if workflow_name is None:
+                workflow_name = self._select_physicochemical_workflow_for_filtering()
+                if not workflow_name:
+                    print("❌ No workflow selected for filtering")
+                    return pd.DataFrame()
+
+            print(f"   📋 Table: '{table_name}'")
+            print(f"   🧪 Workflow: '{workflow_name}'")
+
+            # Load workflow filters
+            print(f"   🔍 Loading workflow filters...")
+            workflow_filters = self._load_physicochemical_workflow_filters(workflow_name)
+
+            if not workflow_filters:
+                print(f"❌ No filters found for workflow '{workflow_name}'")
+                return pd.DataFrame()
+
+            print(f"   ✅ Loaded {len(workflow_filters)} descriptor filters")
+            for i, (descriptor_name, lower_bound, upper_bound) in enumerate(workflow_filters, 1):
+                print(f"      {i}. {descriptor_name} -> [{lower_bound}, {upper_bound}]")
+
+            # Get compounds from table
+            print(f"   📊 Loading compounds from table '{table_name}'...")
+            compounds_df = self._get_table_as_dataframe(table_name)
+            if compounds_df.empty:
+                print(f"❌ No compounds found in table '{table_name}'")
+                return pd.DataFrame()
+
+            total_compounds = len(compounds_df)
+            print(f"   ✅ Loaded {total_compounds:,} compounds to filter")
+
+            # Determine processing method
+            use_parallel = total_compounds >= parallel_threshold
+
+            if use_parallel:
+                print(f"   🚀 Using parallel processing (threshold: {parallel_threshold:,})")
+
+                if max_workers is None:
+                    max_workers = min(os.cpu_count() or 4, 8)
+
+                if chunk_size is None:
+                    chunk_size = max(1000, total_compounds // (max_workers * 4))
+
+                print(f"      👥 Workers: {max_workers}")
+                print(f"      📦 Chunk size: {chunk_size:,}")
+
+                filtered_df, removed_counts = self._apply_physicochemical_filters_parallel(
+                    compounds_df, workflow_filters, max_workers, chunk_size,
+                    progress_callback=progress_callback
+                )
+            else:
+                print(f"   🔄 Using sequential processing")
+                filtered_df, removed_counts = self._apply_physicochemical_filters_sequential(
+                    compounds_df, workflow_filters, progress_callback=progress_callback
+                )
+
+            # Calculate statistics
+            compounds_removed = total_compounds - len(filtered_df)
+            retention_rate = (len(filtered_df) / total_compounds) * 100 if total_compounds > 0 else 0
+
+            print(f"\n📊 Filtering Results:")
+            print(f"   ✅ Compounds passed: {len(filtered_df):,}")
+            print(f"   ❌ Compounds removed: {compounds_removed:,}")
+            print(f"   📈 Retention rate: {retention_rate:.2f}%")
+
+            if removed_counts:
+                print(f"\n📉 Compounds removed per filter (first descriptor out of bounds):")
+                for descriptor_name, count in removed_counts.items():
+                    print(f"      • {descriptor_name}: {count:,}")
+
+            if filtered_df.empty:
+                print("❌ No compounds passed the filtering workflow")
+                return pd.DataFrame()
+
+            # Prompt for save_results if not provided
+            if save_results is None:
+                save_choice = input("\n💾 Do you want to save the filtered results to a new table? (y/n): ").strip().lower()
+                save_results = save_choice in ['y', 'yes']
+
+            # Save results if requested
+            if save_results:
+                if result_table_name is None:
+                    default_name = f"{table_name}_filtered_{workflow_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                    user_table_name = input(f"📝 Enter table name for results (default: {default_name}): ").strip()
+                    result_table_name = user_table_name if user_table_name else default_name
+
+                print(f"   💾 Saving filtered results to '{result_table_name}'...")
+
+                filter_results = {
+                    'workflow_name': workflow_name,
+                    'initial_compounds': total_compounds,
+                    'final_compounds': len(filtered_df),
+                    'compounds_removed': compounds_removed,
+                    'retention_rate': retention_rate,
+                    'processing_method': 'parallel' if use_parallel else 'sequential'
+                }
+
+                success = self._save_workflow_filtered_compounds(
+                    filtered_df, result_table_name, workflow_name, filter_results
+                )
+
+                if success:
+                    print(f"   ✅ Results saved to table: '{result_table_name}'")
+                else:
+                    print(f"   ❌ Failed to save results to database")
+            else:
+                print("   📄 Results not saved to database")
+
+            return filtered_df
+
+        except Exception as e:
+            print(f"❌ Error in filter_using_physicochemical_workflow: {e}")
+            return pd.DataFrame()
+
+    def inform_table_physicochemical_profile(self, table_name: Optional[str] = None,
+                    workflow_name: Optional[str] = None) -> pd.DataFrame:
+        """
+        Report the observed range of physicochemical descriptors (as defined by a
+        saved physicochemical filtering workflow) for the compounds in a given table.
+
+        Unlike filter_using_physicochemical_workflow(), this does not filter or save
+        anything -- it computes each descriptor listed in the workflow for every
+        parseable compound in the table and prints an on-screen summary (min, max,
+        mean, median, std) alongside the workflow's configured [min, max] bounds and
+        how many compounds currently fall outside that range.
+
+        Args:
+            table_name (Optional[str]): Name of the table containing compounds to profile.
+                If None, shows interactive selection.
+            workflow_name (Optional[str]): Name of the physicochemical workflow whose
+                descriptors should be profiled. If None, shows interactive selection.
+
+        Returns:
+            pd.DataFrame: One row per descriptor with columns
+                ['descriptor', 'min', 'max', 'mean', 'median', 'std', 'workflow_min',
+                'workflow_max', 'within_range', 'out_of_range', 'n']. Empty DataFrame
+                on error or if no compounds/descriptors could be evaluated. The count
+                of compounds matching all filters simultaneously is available via
+                `report_df.attrs['matching_all_filters']` (and the valid compound
+                count via `report_df.attrs['valid_compounds']`), and is printed in
+                the on-screen summary.
+        """
+        try:
+            print(f"\n📊 Starting physicochemical profile report...")
+
+            # Interactive workflow selection if not provided
+            if workflow_name is None:
+                workflow_name = self._select_physicochemical_workflow_for_filtering()
+                if not workflow_name:
+                    print("❌ No workflow selected for profiling")
+                    return pd.DataFrame()
+
+            # Interactive table selection if not provided
+            if table_name is None:
+                table_name = self._select_table_for_filtering()
+                if not table_name:
+                    print("❌ No table selected for profiling")
+                    return pd.DataFrame()
+
+            print(f"   📋 Table: '{table_name}'")
+            print(f"   🧪 Workflow: '{workflow_name}'")
+
+            # Load workflow filters (descriptor names + configured bounds)
+            print(f"   🔍 Loading workflow filters...")
+            workflow_filters = self._load_physicochemical_workflow_filters(workflow_name)
+            if not workflow_filters:
+                print(f"❌ No filters found for workflow '{workflow_name}'")
+                return pd.DataFrame()
+
+            # Load compounds from table
+            print(f"   📊 Loading compounds from table '{table_name}'...")
+            compounds_df = self._get_table_as_dataframe(table_name)
+            if compounds_df.empty:
+                print(f"❌ No compounds found in table '{table_name}'")
+                return pd.DataFrame()
+
+            total_compounds = len(compounds_df)
+            print(f"   ✅ Loaded {total_compounds:,} compounds")
+
+            from rdkit import Chem
+            from rdkit import RDLogger
+            RDLogger.DisableLog('rdApp.*')
+
+            descriptor_funcs = _get_descriptor_funcs()
+            descriptor_names = [name for name, _, _ in workflow_filters]
+            configured_bounds = {name: (lower, upper) for name, lower, upper in workflow_filters}
+
+            descriptor_values: Dict[str, List[float]] = {name: [] for name in descriptor_names}
+            invalid_smiles_count = 0
+            matching_all_filters = 0
+
+            print(f"   🧮 Computing {len(descriptor_names)} descriptor(s) for {total_compounds:,} compounds...")
+
+            if TQDM_AVAILABLE:
+                iterator = tqdm(compounds_df.iterrows(), total=total_compounds,
+                                desc="Computing descriptors", unit="compounds")
+            else:
+                iterator = compounds_df.iterrows()
+
+            for _, compound in iterator:
+                mol = Chem.MolFromSmiles(compound.get('smiles', None))
+                if mol is None:
+                    invalid_smiles_count += 1
+                    continue
+
+                compound_values = {}
+                for descriptor_name in descriptor_names:
+                    descriptor_func = descriptor_funcs.get(descriptor_name)
+                    if descriptor_func is None:
+                        continue
+                    try:
+                        value = descriptor_func(mol)
+                        descriptor_values[descriptor_name].append(value)
+                        compound_values[descriptor_name] = value
+                    except Exception:
+                        continue
+
+                if len(compound_values) == len(descriptor_names) and all(
+                        configured_bounds[name][0] <= value <= configured_bounds[name][1]
+                        for name, value in compound_values.items()):
+                    matching_all_filters += 1
+
+            valid_compounds = total_compounds - invalid_smiles_count
+            if valid_compounds == 0:
+                print(f"❌ No valid compounds (parseable SMILES) found in table '{table_name}'")
+                return pd.DataFrame()
+
+            report_rows = []
+            for descriptor_name in descriptor_names:
+                values = descriptor_values[descriptor_name]
+                if not values:
+                    print(f"   ⚠️  Descriptor '{descriptor_name}' could not be computed for any compound (skipped)")
+                    continue
+
+                values_array = np.array(values, dtype=float)
+                lower_bound, upper_bound = configured_bounds[descriptor_name]
+                out_of_range = int(np.sum((values_array < lower_bound) | (values_array > upper_bound)))
+                within_range = len(values) - out_of_range
+
+                report_rows.append({
+                    'descriptor': descriptor_name,
+                    'min': float(np.min(values_array)),
+                    'max': float(np.max(values_array)),
+                    'mean': float(np.mean(values_array)),
+                    'median': float(np.median(values_array)),
+                    'std': float(np.std(values_array)),
+                    'workflow_min': lower_bound,
+                    'workflow_max': upper_bound,
+                    'within_range': within_range,
+                    'out_of_range': out_of_range,
+                    'n': len(values)
+                })
+
+            if not report_rows:
+                print(f"❌ No descriptors from workflow '{workflow_name}' could be evaluated on table '{table_name}'")
+                return pd.DataFrame()
+
+            report_df = pd.DataFrame(report_rows)
+            report_df.attrs['matching_all_filters'] = matching_all_filters
+            report_df.attrs['valid_compounds'] = valid_compounds
+
+            # Print the on-screen report
+            print(f"\n{'=' * 130}")
+            print(f"📊 PHYSICOCHEMICAL PROFILE  |  Table: '{table_name}'  |  Workflow: '{workflow_name}'")
+            print(f"{'=' * 130}")
+            print(f"   Total compounds in table: {total_compounds:,}")
+            print(f"   Valid (parseable) compounds: {valid_compounds:,}")
+            if invalid_smiles_count:
+                print(f"   ⚠️  Invalid/unparseable SMILES skipped: {invalid_smiles_count:,}")
+            matching_all_pct = (matching_all_filters / valid_compounds) * 100 if valid_compounds else 0
+            print(f"   ✅ Compounds matching ALL filters simultaneously: {matching_all_filters:,} "
+                    f"({matching_all_pct:.1f}% of valid compounds)")
+            print(f"{'-' * 130}")
+            print(f"{'Descriptor':<25}{'Min':>10}{'Max':>10}{'Mean':>10}{'Median':>10}{'Std':>10}"
+                    f"{'Workflow Range':>22}{'Within range':>17}{'Out-of-range':>17}")
+            print(f"{'-' * 130}")
+            for row in report_rows:
+                workflow_range_str = f"[{row['workflow_min']}, {row['workflow_max']}]"
+                within_range_pct = (row['within_range'] / row['n']) * 100 if row['n'] else 0
+                out_of_range_pct = (row['out_of_range'] / row['n']) * 100 if row['n'] else 0
+                within_range_str = f"{row['within_range']:,} ({within_range_pct:.1f}%)"
+                out_of_range_str = f"{row['out_of_range']:,} ({out_of_range_pct:.1f}%)"
+                print(f"{row['descriptor']:<25}{row['min']:>10.3f}{row['max']:>10.3f}{row['mean']:>10.3f}"
+                        f"{row['median']:>10.3f}{row['std']:>10.3f}{workflow_range_str:>22}"
+                        f"{within_range_str:>17}{out_of_range_str:>17}")
+            print(f"{'=' * 130}\n")
+
+            return report_df
+
+        except Exception as e:
+            print(f"❌ Error generating physicochemical profile report: {e}")
+            return pd.DataFrame()
+
+    def check_duplicates(self, table_name: Optional[str] = None,
                     duplicate_by: str = 'smiles',
                     show_duplicates: bool = True,
                     remove_duplicates: bool = False,
@@ -6204,26 +13825,33 @@ class ChemSpace:
                     export_path: Optional[str] = None) -> Dict[str, Any]:
         """
         Check for duplicate molecules in a table based on specified criteria.
-        
+
         Args:
-            table_name (str): Name of the table to check for duplicates
+            table_name (Optional[str]): Name of the table to check for duplicates. If None, prompts an interactive table selection.
             duplicate_by (str): Column to check for duplicates ('smiles', 'inchi_key', 'name', or 'all')
             show_duplicates (bool): Whether to display duplicate entries
             remove_duplicates (bool): Whether to remove duplicate entries from the table
             keep_first (bool): If removing duplicates, whether to keep first occurrence (True) or last (False)
             export_duplicates (bool): Whether to export duplicate entries to CSV
             export_path (Optional[str]): Path for export file. If None, uses default naming
-            
+
         Returns:
             Dict[str, Any]: Results dictionary with duplicate statistics and details
         """
         try:
+            # Reuse existing table selection method
+            if table_name is None:
+                table_name = self._select_table_interactive("SELECT TABLE FOR DUPLICATE CHECK")
+                if not table_name:
+                    print("❌ No table selected for duplicate checking")
+                    return {'success': False, 'message': "No table selected"}
+
             # Check if table exists
             tables = self.get_all_tables()
             if table_name not in tables:
                 print(f"❌ Table '{table_name}' does not exist in chemspace database")
                 return {'success': False, 'message': f"Table '{table_name}' not found"}
-            
+
             # Get table data
             compounds_df = self._get_table_as_dataframe(table_name)
             if compounds_df.empty:
@@ -6567,6 +14195,8 @@ class ChemSpace:
             
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             # Get duplicate entries to remove
             if keep_first:
@@ -6830,6 +14460,102 @@ class ChemSpace:
             print(f"❌ Error generating duplicate report: {e}")
             return False
         
+    @staticmethod
+    def delete_reaction_workflow_entry(chemspace_db_path: str, workflow_identifier: str) -> Dict[str, Any]:
+        """
+        Delete a reaction workflow by name or ID from a chemspace database.
+
+        Non-interactive counterpart to delete_reaction_workflow(), reusing the same
+        'reaction_workflows' table and the same ID/name lookup semantics, so it can
+        be called from the Streamlit GUI. The two-step interactive confirmation
+        (yes/no, then re-typing the workflow name) is skipped here — the caller is
+        expected to collect its own confirmation before calling this.
+
+        Args:
+            chemspace_db_path (str): Path to the project's chemspace.db
+            workflow_identifier (str): Workflow name or numeric ID to delete
+
+        Returns:
+            Dict[str, Any]: {'success': bool, 'message': str, 'workflow_name': Optional[str],
+                'workflow_id': Optional[int], 'reaction_count': int}
+        """
+        try:
+            if not os.path.exists(chemspace_db_path):
+                return {'success': False, 'message': 'ChemSpace database not found.',
+                         'workflow_name': None, 'workflow_id': None, 'reaction_count': 0}
+
+            conn = sqlite3.connect(chemspace_db_path)
+            cursor = conn.cursor()
+
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='reaction_workflows'")
+            if not cursor.fetchone():
+                conn.close()
+                return {'success': False, 'message': 'No reaction workflows table found.',
+                         'workflow_name': None, 'workflow_id': None, 'reaction_count': 0}
+
+            cursor.execute("""
+                SELECT id, workflow_name, creation_date, description, reactions_dict
+                FROM reaction_workflows
+                ORDER BY creation_date DESC
+            """)
+            workflows = cursor.fetchall()
+
+            if not workflows:
+                conn.close()
+                return {'success': False, 'message': 'No reaction workflows found to delete.',
+                         'workflow_name': None, 'workflow_id': None, 'reaction_count': 0}
+
+            # Find by ID first, then by exact name (case-insensitive)
+            workflow_to_delete = None
+            try:
+                search_id = int(workflow_identifier)
+                for wf in workflows:
+                    if wf[0] == search_id:
+                        workflow_to_delete = wf
+                        break
+            except (TypeError, ValueError):
+                pass
+
+            if workflow_to_delete is None:
+                identifier_lower = str(workflow_identifier).lower()
+                for wf in workflows:
+                    if wf[1].lower() == identifier_lower:
+                        workflow_to_delete = wf
+                        break
+
+            if workflow_to_delete is None:
+                conn.close()
+                return {'success': False, 'message': f"No workflow found with identifier '{workflow_identifier}'.",
+                         'workflow_name': None, 'workflow_id': None, 'reaction_count': 0}
+
+            workflow_id, workflow_name, creation_date, description, reactions_dict_str = workflow_to_delete
+
+            try:
+                reaction_count = len(json.loads(reactions_dict_str))
+            except json.JSONDecodeError:
+                reaction_count = 0
+
+            cursor.execute("DELETE FROM reaction_workflows WHERE id = ?", (workflow_id,))
+            deleted_rows = cursor.rowcount
+            conn.commit()
+            conn.close()
+
+            if deleted_rows > 0:
+                return {
+                    'success': True,
+                    'message': f"Deleted reaction workflow '{workflow_name}' ({reaction_count} reactions).",
+                    'workflow_name': workflow_name,
+                    'workflow_id': workflow_id,
+                    'reaction_count': reaction_count,
+                }
+            else:
+                return {'success': False, 'message': 'Delete failed (no rows affected).',
+                         'workflow_name': workflow_name, 'workflow_id': workflow_id, 'reaction_count': reaction_count}
+
+        except Exception as e:
+            return {'success': False, 'message': f"Error deleting reaction workflow: {e}",
+                     'workflow_name': None, 'workflow_id': None, 'reaction_count': 0}
+
     def delete_reaction_workflow(self, workflow_identifier: Optional[str] = None) -> bool:
         """
         Delete a reaction workflow from the chemspace database.
@@ -6845,6 +14571,8 @@ class ChemSpace:
             # Check if reaction_workflows table exists
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='reaction_workflows'")
             if not cursor.fetchone():
@@ -7102,6 +14830,8 @@ class ChemSpace:
         try:
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             cursor.execute("SELECT COUNT(*) FROM reaction_workflows")
             count = cursor.fetchone()[0]
@@ -7168,6 +14898,8 @@ class ChemSpace:
             # Check if table exists and get workflow count
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='reaction_workflows'")
             if not cursor.fetchone():
@@ -7713,16 +15445,23 @@ class ChemSpace:
             print(f"❌ Error processing unimolecular workflow: {e}")
 
     def _apply_bimolecular_reaction(self, primary_df: pd.DataFrame, secondary_df: pd.DataFrame,
-                                reaction_info: Dict[str, Any], workflow_name: str) -> List[Dict[str, Any]]:
+                                reaction_info: Dict[str, Any], workflow_name: str,
+                                ambiguous_reactants: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
         """
         Apply a bimolecular reaction between compounds from two tables.
-        
+
         Args:
             primary_df (pd.DataFrame): Primary reactants dataframe
-            secondary_df (pd.DataFrame): Secondary reactants dataframe  
+            secondary_df (pd.DataFrame): Secondary reactants dataframe
             reaction_info (Dict): Reaction information
             workflow_name (str): Name of the workflow
-            
+            ambiguous_reactants (Optional[List[Dict]]): If provided, appended in place with one
+                entry per reactant pair for which RDKit's RunReactants() returned more than one
+                product set — i.e. the pair matched the reaction template at more than one site,
+                so more than one product possibility was generated for the same pair of reactants
+                (a sign that a reactant contains more than one matching functional group). A
+                warning is always printed regardless of whether this is provided.
+
         Returns:
             List[Dict]: List of reaction products
         """
@@ -7784,19 +15523,51 @@ class ChemSpace:
                         else:
                             # Fallback for reactions that might work with single reactant
                             reaction_results = rxn.RunReactants((primary_mol,))
-                        
-                        # Process products
+
+                        # Warn when a reactant pair matches the reaction template at more than
+                        # one site, generating more than one product possibility for that pair
+                        if len(reaction_results) > 1:
+                            primary_id = primary_compound.get('id', 'unk')
+                            secondary_id = secondary_compound.get('id', 'unk')
+                            primary_warn_name = primary_compound.get('name', f"cpd_{primary_id}")
+                            secondary_warn_name = secondary_compound.get('name', f"cpd_{secondary_id}")
+                            print(f"   ⚠️  Multiple product possibilities ({len(reaction_results)}) for reactants "
+                                  f"'{primary_warn_name}' (id={primary_id}, smiles={primary_compound['smiles']}) and "
+                                  f"'{secondary_warn_name}' (id={secondary_id}, smiles={secondary_compound['smiles']}) "
+                                  f"- reactant(s) may contain more than one matching functional group")
+                            if ambiguous_reactants is not None:
+                                ambiguous_reactants.append({
+                                    'reactant1_id': primary_id,
+                                    'reactant1_name': primary_warn_name,
+                                    'reactant1_smiles': primary_compound['smiles'],
+                                    'reactant2_id': secondary_id,
+                                    'reactant2_name': secondary_warn_name,
+                                    'reactant2_smiles': secondary_compound['smiles'],
+                                    'product_possibilities': len(reaction_results),
+                                })
+
+                        # Process products. When a reactant pair matches at more
+                        # than one site (ambiguous), different product_sets can
+                        # yield the exact same product structure (e.g. a symmetric
+                        # reactant reacting at either of two equivalent groups) --
+                        # dedupe by canonical SMILES within this pair so the same
+                        # product isn't written to the database twice.
+                        seen_product_smiles = set()
                         for product_set_idx, product_set in enumerate(reaction_results):
                             for product_idx, product_mol in enumerate(product_set):
                                 try:
                                     Chem.SanitizeMol(product_mol)
                                     product_smiles = Chem.MolToSmiles(product_mol)
-                                    
+
+                                    if product_smiles in seen_product_smiles:
+                                        continue
+                                    seen_product_smiles.add(product_smiles)
+
                                     # Generate product name
                                     primary_name = primary_compound.get('name', f"cpd_{primary_compound.get('id', 'unk')}")
                                     secondary_name = secondary_compound.get('name', f"cpd_{secondary_compound.get('id', 'unk')}")
                                     product_name = f"{primary_name}+{secondary_name}_{reaction_name}_{product_set_idx}_{product_idx}"
-                                    
+
                                     products.append({
                                         'smiles': product_smiles,
                                         'name': product_name,
@@ -7809,7 +15580,7 @@ class ChemSpace:
                                         'workflow': workflow_name
                                     })
                                     successful_reactions += 1
-                                    
+
                                 except Exception:
                                     continue  # Skip invalid products
                                     
@@ -7834,16 +15605,22 @@ class ChemSpace:
             return []
 
     def _apply_unimolecular_reaction(self, compounds_df: pd.DataFrame, reaction_info: Dict[str, Any],
-                                workflow_name: str, name_prefix: str = "") -> List[Dict[str, Any]]:
+                                workflow_name: str, name_prefix: str = "",
+                                ambiguous_reactants: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
         """
         Apply a unimolecular reaction to compounds from a table.
-        
+
         Args:
             compounds_df (pd.DataFrame): Compounds dataframe
             reaction_info (Dict): Reaction information
             workflow_name (str): Name of the workflow
             name_prefix (str): Prefix for product names
-            
+            ambiguous_reactants (Optional[List[Dict]]): If provided, appended in place with one
+                entry per reactant for which RDKit's RunReactants() returned more than one
+                product set — i.e. the single reactant matched the reaction template at more
+                than one site, generating more than one distinct product from that reactant
+                alone. A warning is always printed regardless of whether this is provided.
+
         Returns:
             List[Dict]: List of reaction products
         """
@@ -7885,18 +15662,44 @@ class ChemSpace:
                     
                     # Run unimolecular reaction
                     reaction_results = rxn.RunReactants((reactant_mol,))
-                    
-                    # Process products
+
+                    # Warn when a single reactant matches the reaction template at more than
+                    # one site, generating more than one distinct product from that reactant
+                    if len(reaction_results) > 1:
+                        reactant_id = compound.get('id', 'unk')
+                        reactant_warn_name = compound.get('name', f"cpd_{reactant_id}")
+                        print(f"   ⚠️  Multiple product possibilities ({len(reaction_results)}) for reactant "
+                              f"'{reactant_warn_name}' (id={reactant_id}, smiles={compound['smiles']}) "
+                              f"- reactant may contain more than one matching functional group")
+                        if ambiguous_reactants is not None:
+                            ambiguous_reactants.append({
+                                'reactant_id': reactant_id,
+                                'reactant_name': reactant_warn_name,
+                                'reactant_smiles': compound['smiles'],
+                                'product_possibilities': len(reaction_results),
+                            })
+
+                    # Process products. When a reactant matches at more than one
+                    # site (ambiguous), different product_sets can yield the exact
+                    # same product structure (e.g. a symmetric reactant reacting at
+                    # either of two equivalent groups) -- dedupe by canonical SMILES
+                    # within this reactant so the same product isn't written to the
+                    # database twice.
+                    seen_product_smiles = set()
                     for product_set_idx, product_set in enumerate(reaction_results):
                         for product_idx, product_mol in enumerate(product_set):
                             try:
                                 Chem.SanitizeMol(product_mol)
                                 product_smiles = Chem.MolToSmiles(product_mol)
-                                
+
+                                if product_smiles in seen_product_smiles:
+                                    continue
+                                seen_product_smiles.add(product_smiles)
+
                                 # Generate product name
                                 original_name = compound.get('name', f"cpd_{compound.get('id', 'unk')}")
                                 product_name = f"{name_prefix}{original_name}_{reaction_name}_{product_set_idx}_{product_idx}"
-                                
+
                                 products.append({
                                     'smiles': product_smiles,
                                     'name': product_name,
@@ -7907,7 +15710,7 @@ class ChemSpace:
                                     'workflow': workflow_name
                                 })
                                 successful_reactions += 1
-                                
+
                             except Exception:
                                 continue  # Skip invalid products
                                 
@@ -7927,7 +15730,168 @@ class ChemSpace:
             print(f"   ❌ Error in unimolecular reaction {reaction_info['name']}: {e}")
             return []
 
-    def apply_reaction_workflow(self, workflow_id: Optional[int] = None, 
+    def apply_reaction_workflow_step(self, reaction_info: Dict[str, Any], workflow_name: str, step_num: int,
+                                      primary_tables: List[str], secondary_table: Optional[str] = None,
+                                      output_table_name: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Apply a single reaction-workflow step to explicitly selected reactant tables.
+
+        Non-interactive counterpart to the per-step logic inside apply_reaction_workflow()
+        (reaction-type dispatch, _apply_bimolecular_reaction / _apply_unimolecular_reaction,
+        _save_step_products), with reactant tables passed in directly instead of prompted via
+        input(). Lets a caller (e.g. the Streamlit GUI) drive a workflow step by step, letting
+        a previous step's saved product table be selected as this step's reactant source.
+
+        Args:
+            reaction_info (Dict): {'name', 'smarts'} for this workflow step
+            workflow_name (str): Name of the workflow being applied
+            step_num (int): 1-based step number, used to tag saved products
+            primary_tables (List[str]): One or more table names to use as reactants.
+                For a unimolecular reaction, all listed tables are concatenated as the
+                input compound set. For a bimolecular reaction, only the first table is
+                used as the primary reactant source.
+            secondary_table (Optional[str]): Secondary reactant table, required for
+                bimolecular reactions (may be the same name as the primary table).
+            output_table_name (Optional[str]): If provided, generated products are
+                persisted to a new table with this name (sanitized); otherwise products
+                are returned without being saved, and therefore unavailable as a
+                reactant source for later steps.
+
+        Returns:
+            Dict[str, Any]: {'success': bool, 'reaction_type': str, 'products_generated': int,
+                'products': List[Dict], 'output_table': Optional[str], 'message': Optional[str],
+                'ambiguous_reactants': List[Dict]} — 'ambiguous_reactants' has one entry per
+                reactant (unimolecular) or reactant pair (bimolecular) for which more than one
+                product possibility was generated, i.e. RDKit's RunReactants() matched the
+                reaction template at more than one site on the same reactant(s).
+        """
+        reaction_type = self._analyze_single_reaction_type(reaction_info['smarts'])
+
+        if reaction_type == 'invalid':
+            return {
+                'success': False,
+                'reaction_type': reaction_type,
+                'products_generated': 0,
+                'products': [],
+                'output_table': None,
+                'message': f"Invalid reaction SMARTS: {reaction_info['smarts']}",
+                'ambiguous_reactants': [],
+            }
+
+        if not primary_tables:
+            return {
+                'success': False,
+                'reaction_type': reaction_type,
+                'products_generated': 0,
+                'products': [],
+                'output_table': None,
+                'message': 'No reactant table(s) selected.',
+                'ambiguous_reactants': [],
+            }
+
+        ambiguous_reactants: List[Dict[str, Any]] = []
+
+        if reaction_type == 'bimolecular':
+            if not secondary_table:
+                return {
+                    'success': False,
+                    'reaction_type': reaction_type,
+                    'products_generated': 0,
+                    'products': [],
+                    'output_table': None,
+                    'message': 'Bimolecular reactions require a secondary reactant table.',
+                    'ambiguous_reactants': [],
+                }
+            primary_df = self._get_table_as_dataframe(primary_tables[0])
+            secondary_df = self._get_table_as_dataframe(secondary_table)
+            products = self._apply_bimolecular_reaction(
+                primary_df, secondary_df, reaction_info, workflow_name,
+                ambiguous_reactants=ambiguous_reactants
+            )
+        else:  # unimolecular
+            primary_df = pd.concat(
+                [self._get_table_as_dataframe(t) for t in primary_tables],
+                ignore_index=True
+            )
+            products = self._apply_unimolecular_reaction(
+                primary_df, reaction_info, workflow_name,
+                ambiguous_reactants=ambiguous_reactants
+            )
+
+        output_table = None
+        if products and output_table_name:
+            sanitized_name = self._sanitize_table_name(output_table_name)
+            if self._save_step_products(products, sanitized_name, workflow_name, step_num):
+                output_table = sanitized_name
+
+        return {
+            'success': True,
+            'reaction_type': reaction_type,
+            'products_generated': len(products),
+            'products': products,
+            'output_table': output_table,
+            'message': None,
+            'ambiguous_reactants': ambiguous_reactants,
+        }
+
+    def apply_reaction_workflow_merge_step(self, workflow_name: str, step_num: int,
+                                            table_a: str, table_b: str,
+                                            output_table_name: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Apply a single 'merge' workflow step to two explicitly selected tables.
+
+        Non-interactive counterpart to _process_merge_step() (used inside
+        apply_reaction_workflow()), with the two source tables passed in directly
+        instead of prompted via input(). Lets a caller (e.g. the Streamlit GUI) drive
+        a merge step, letting a previous step's saved product table be selected as
+        one of the two sources.
+
+        Args:
+            workflow_name (str): Name of the workflow being applied
+            step_num (int): 1-based step number, used to tag saved products
+            table_a (str): First table to combine
+            table_b (str): Second table to combine (may be the same as table_a)
+            output_table_name (Optional[str]): If provided, the combined compounds are
+                persisted to a new table with this name (sanitized); otherwise they are
+                returned without being saved, and therefore unavailable as a source for
+                later steps.
+
+        Returns:
+            Dict[str, Any]: {'success': bool, 'reaction_type': 'merge', 'products_generated': int,
+                'products': List[Dict], 'output_table': Optional[str], 'message': Optional[str],
+                'ambiguous_reactants': List[Dict]} — 'ambiguous_reactants' is always empty; the
+                key is kept only for shape-compatibility with apply_reaction_workflow_step().
+        """
+        if not table_a or not table_b:
+            return {
+                'success': False,
+                'reaction_type': 'merge',
+                'products_generated': 0,
+                'products': [],
+                'output_table': None,
+                'message': 'Both tables to merge must be specified.',
+                'ambiguous_reactants': [],
+            }
+
+        products = self._merge_two_tables_to_products(table_a, table_b)
+
+        output_table = None
+        if products and output_table_name:
+            sanitized_name = self._sanitize_table_name(output_table_name)
+            if self._save_step_products(products, sanitized_name, workflow_name, step_num):
+                output_table = sanitized_name
+
+        return {
+            'success': True,
+            'reaction_type': 'merge',
+            'products_generated': len(products),
+            'products': products,
+            'output_table': output_table,
+            'message': None,
+            'ambiguous_reactants': [],
+        }
+
+    def apply_reaction_workflow(self, workflow_id: Optional[int] = None,
                                         max_workers: Optional[int] = None,
                                         chunk_size: Optional[int] = None,
                                         parallel_threshold: int = 1000,
@@ -7987,8 +15951,11 @@ class ChemSpace:
             print(f"\n🔄 STREAMING REACTION WORKFLOW ANALYSIS")
             print("=" * 60)
             for i, (reaction_id, reaction_info) in enumerate(sorted_reactions, 1):
-                reaction_type = self._analyze_single_reaction_type(reaction_info['smarts'])
-                print(f"   Step {i}: {reaction_info['name']} ({reaction_type})")
+                if reaction_info.get('type') == 'merge':
+                    print(f"   Step {i}: {reaction_info['name']} (merge)")
+                else:
+                    reaction_type = self._analyze_single_reaction_type(reaction_info['smarts'])
+                    print(f"   Step {i}: {reaction_info['name']} ({reaction_type})")
             print("=" * 60)
             
             # Confirm execution
@@ -8049,8 +16016,15 @@ class ChemSpace:
             
             # Reuse existing cleanup and summary methods
             self._query_and_delete_prev_step_tables(workflow_state)
+
+            # InChI keys were skipped for each step's table as it was created (see
+            # compute_inchi=False in _save_step_products()/_consolidate_temp_files_to_table())
+            # to avoid computing them for intermediate tables that get discarded above.
+            # Compute them now, once, for whatever tables actually survived cleanup.
+            self._compute_inchi_keys_for_surviving_tables(workflow_state)
+
             self._display_streaming_workflow_summary(workflow_state, workflow_name)
-            
+
             return True
             
         except Exception as e:
@@ -8082,12 +16056,15 @@ class ChemSpace:
             Dict[str, Any]: Step execution results
         """
         try:
+            if reaction_info.get('type') == 'merge':
+                return self._process_merge_step(step_num, reaction_info, workflow_name, workflow_state)
+
             reaction_name = reaction_info['name']
             reaction_smarts = reaction_info['smarts']
-            
+
             # Reuse existing reaction analysis
             reaction_type = self._analyze_single_reaction_type(reaction_smarts)
-            
+
             print(f"🔍 Streaming Reaction Analysis:")
             print(f"   📋 Name: {reaction_name}")
             print(f"   🧪 Type: {reaction_type}")
@@ -8186,7 +16163,9 @@ class ChemSpace:
             
             print(f"\n🌊 Executing Streaming Bimolecular Reaction - Step {step_num}")
             print("-" * 60)
-            
+
+            ambiguous_reactants: List[Dict[str, Any]] = []
+
             # Get compound data
             primary_df = self._get_table_as_dataframe(table_config['primary_table'])
             secondary_df = self._get_table_as_dataframe(table_config['secondary_table'])
@@ -8213,7 +16192,8 @@ class ChemSpace:
                     start_time = time.time()
                     total_products = self._stream_bimolecular_reaction_to_disk(
                         primary_df, secondary_df, reaction_info, workflow_name,
-                        temp_dir, max_workers, chunk_size, temp_files_created
+                        temp_dir, max_workers, chunk_size, temp_files_created,
+                        ambiguous_reactants=ambiguous_reactants
                     )
                     processing_time = time.time() - start_time
                     
@@ -8221,22 +16201,26 @@ class ChemSpace:
                     output_table_name = None
                     if total_products > 0:
                         print(f"\n💾 Consolidating {total_products:,} products from {len(temp_files_created)} files...")
-                        
-                        save_choice = input("Save consolidated products to a new table? (y/n): ").strip().lower()
-                        if save_choice in ['y', 'yes']:
-                            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                            default_name = f"stream_step{step_num}_{reaction_info['name']}_{timestamp}"
-                            user_table_name = input(f"Enter table name (default: {default_name}): ").strip()
-                            chosen_name = user_table_name if user_table_name else default_name
-                            output_table_name = self._sanitize_table_name(chosen_name)
-                            
-                            success = self._consolidate_temp_files_to_table(
-                                temp_files_created, output_table_name, workflow_name, step_num
-                            )
-                            
-                            if not success:
-                                output_table_name = None
-                    
+
+                        # Always persist this step's products to a table (needed so they remain
+                        # available as an input source for later workflow steps); the user can
+                        # discard unwanted intermediate tables in the end-of-workflow cleanup prompt.
+                        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                        default_name = f"stream_step{step_num}_{reaction_info['name']}_{timestamp}"
+                        user_table_name = input(
+                            f"Table name for this step's products (default: {default_name}): "
+                        ).strip()
+                        chosen_name = user_table_name if user_table_name else default_name
+                        output_table_name = self._sanitize_table_name(chosen_name)
+
+                        success = self._consolidate_temp_files_to_table(
+                            temp_files_created, output_table_name, workflow_name, step_num,
+                            compute_inchi=False
+                        )
+
+                        if not success:
+                            output_table_name = None
+
                     result = {
                         'success': True,
                         'products_generated': total_products,
@@ -8248,9 +16232,10 @@ class ChemSpace:
                         'disk_writes': len(temp_files_created),
                         'processing_time': processing_time,
                         'output_table': output_table_name,
-                        'combinations_processed': total_combinations
+                        'combinations_processed': total_combinations,
+                        'ambiguous_reactants': ambiguous_reactants
                     }
-                    
+
                 finally:
                     # Clean up temporary files
                     self._cleanup_temp_files(temp_files_created, temp_dir)
@@ -8265,37 +16250,40 @@ class ChemSpace:
                     # Set default chunk size if not provided
                     if chunk_size is None:
                         chunk_size = max(100, total_combinations // (max_workers * 4))
-                    
+
                     products = self._apply_bimolecular_reaction_parallel(
                         primary_df, secondary_df, reaction_info, workflow_name,
-                        max_workers, chunk_size
+                        max_workers, chunk_size, ambiguous_reactants=ambiguous_reactants
                     )
                 else:
                     # Use existing sequential method
                     products = self._apply_bimolecular_reaction(
-                        primary_df, secondary_df, reaction_info, workflow_name
+                        primary_df, secondary_df, reaction_info, workflow_name,
+                        ambiguous_reactants=ambiguous_reactants
                     )
                 
                 # Save products using existing logic
                 output_table_name = None
                 if products:
                     print(f"\n💾 Generated {len(products)} products from bimolecular reaction")
-                    
-                    save_choice = input("Save products to a new table? (y/n): ").strip().lower()
-                    if save_choice in ['y', 'yes']:
-                        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                        default_name = f"step{step_num}_{reaction_info['name']}_{timestamp}"
-                        user_table_name = input(f"Enter table name (default: {default_name}): ").strip()
-                        chosen_name = user_table_name if user_table_name else default_name
-                        output_table_name = self._sanitize_table_name(chosen_name)
-                        
-                        success = self._save_step_products(
-                            products, output_table_name, workflow_name, step_num
-                        )
-                        
-                        if not success:
-                            output_table_name = None
-                
+
+                    # Always persist this step's products to a table (needed so they remain
+                    # available as an input source for later workflow steps); the user can
+                    # discard unwanted intermediate tables in the end-of-workflow cleanup prompt.
+                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    default_name = f"step{step_num}_{reaction_info['name']}_{timestamp}"
+                    user_table_name = input(f"Table name for this step's products (default: {default_name}): ").strip()
+                    chosen_name = user_table_name if user_table_name else default_name
+                    output_table_name = self._sanitize_table_name(chosen_name)
+
+                    success = self._save_step_products(
+                        products, output_table_name, workflow_name, step_num,
+                        compute_inchi=False
+                    )
+
+                    if not success:
+                        output_table_name = None
+
                 result = {
                     'success': True,
                     'products_generated': len(products),
@@ -8303,18 +16291,20 @@ class ChemSpace:
                     'step_num': step_num,
                     'streaming_used': False,
                     'combinations_processed': total_combinations,
-                    'output_table': output_table_name
+                    'output_table': output_table_name,
+                    'ambiguous_reactants': ambiguous_reactants
                 }
-            
+
             return result
-            
+
         except Exception as e:
             print(f"❌ Error applying streaming bimolecular reaction: {e}")
             return {
                 'success': False,
                 'products_generated': 0,
                 'error': str(e),
-                'streaming_used': False
+                'streaming_used': False,
+                'ambiguous_reactants': []
             }
 
     def _apply_streaming_step_unimolecular_reaction(self, table_config: Dict[str, Any], 
@@ -8347,7 +16337,9 @@ class ChemSpace:
             
             print(f"\n🌊 Executing Streaming Unimolecular Reaction - Step {step_num}")
             print("-" * 60)
-            
+
+            ambiguous_reactants: List[Dict[str, Any]] = []
+
             total_compounds = table_config.get('total_compounds', 0)
             
             # Estimate if streaming is needed
@@ -8377,7 +16369,8 @@ class ChemSpace:
                         source_prefix = f"stream_step{step_num}_{source['name']}_"
                         source_products = self._stream_unimolecular_reaction_to_disk(
                             compounds_df, reaction_info, workflow_name, source_prefix,
-                            temp_dir, max_workers, chunk_size, temp_files_created
+                            temp_dir, max_workers, chunk_size, temp_files_created,
+                            ambiguous_reactants=ambiguous_reactants
                         )
                         
                         total_products += source_products
@@ -8389,22 +16382,26 @@ class ChemSpace:
                     output_table_name = None
                     if total_products > 0:
                         print(f"\n💾 Consolidating {total_products:,} products from {len(temp_files_created)} files...")
-                        
-                        save_choice = input("Save consolidated products to a new table? (y/n): ").strip().lower()
-                        if save_choice in ['y', 'yes']:
-                            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                            default_name = f"stream_step{step_num}_{reaction_info['name']}_{timestamp}"
-                            user_table_name = input(f"Enter table name (default: {default_name}): ").strip()
-                            chosen_name = user_table_name if user_table_name else default_name
-                            output_table_name = self._sanitize_table_name(chosen_name)
-                            
-                            success = self._consolidate_temp_files_to_table(
-                                temp_files_created, output_table_name, workflow_name, step_num
-                            )
-                            
-                            if not success:
-                                output_table_name = None
-                    
+
+                        # Always persist this step's products to a table (needed so they remain
+                        # available as an input source for later workflow steps); the user can
+                        # discard unwanted intermediate tables in the end-of-workflow cleanup prompt.
+                        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                        default_name = f"stream_step{step_num}_{reaction_info['name']}_{timestamp}"
+                        user_table_name = input(
+                            f"Table name for this step's products (default: {default_name}): "
+                        ).strip()
+                        chosen_name = user_table_name if user_table_name else default_name
+                        output_table_name = self._sanitize_table_name(chosen_name)
+
+                        success = self._consolidate_temp_files_to_table(
+                            temp_files_created, output_table_name, workflow_name, step_num,
+                            compute_inchi=False
+                        )
+
+                        if not success:
+                            output_table_name = None
+
                     result = {
                         'success': True,
                         'products_generated': total_products,
@@ -8416,9 +16413,10 @@ class ChemSpace:
                         'chunks_streamed': len(temp_files_created),
                         'disk_writes': len(temp_files_created),
                         'processing_time': processing_time,
-                        'compounds_processed': total_compounds
+                        'compounds_processed': total_compounds,
+                        'ambiguous_reactants': ambiguous_reactants
                     }
-                    
+
                 finally:
                     # Clean up temporary files
                     self._cleanup_temp_files(temp_files_created, temp_dir)
@@ -8450,13 +16448,14 @@ class ChemSpace:
                         source_prefix = f"step{step_num}_{source['name']}_"
                         products = self._apply_unimolecular_reaction_parallel(
                             compounds_df, reaction_info, workflow_name, source_prefix,
-                            max_workers, source_chunk_size
+                            max_workers, source_chunk_size, ambiguous_reactants=ambiguous_reactants
                         )
                     else:
                         # Use existing sequential method
                         source_prefix = f"step{step_num}_{source['name']}_"
                         products = self._apply_unimolecular_reaction(
-                            compounds_df, reaction_info, workflow_name, source_prefix
+                            compounds_df, reaction_info, workflow_name, source_prefix,
+                            ambiguous_reactants=ambiguous_reactants
                         )
                     
                     all_products.extend(products)
@@ -8466,22 +16465,24 @@ class ChemSpace:
                 output_table_name = None
                 if all_products:
                     print(f"\n💾 Total products generated: {len(all_products)}")
-                    
-                    save_choice = input("Save products to a new table? (y/n): ").strip().lower()
-                    if save_choice in ['y', 'yes']:
-                        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                        default_name = f"step{step_num}_{reaction_info['name']}_{timestamp}"
-                        user_table_name = input(f"Enter table name (default: {default_name}): ").strip()
-                        chosen_name = user_table_name if user_table_name else default_name
-                        output_table_name = self._sanitize_table_name(chosen_name)
-                        
-                        success = self._save_step_products(
-                            all_products, output_table_name, workflow_name, step_num
-                        )
-                        
-                        if not success:
-                            output_table_name = None
-                
+
+                    # Always persist this step's products to a table (needed so they remain
+                    # available as an input source for later workflow steps); the user can
+                    # discard unwanted intermediate tables in the end-of-workflow cleanup prompt.
+                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    default_name = f"step{step_num}_{reaction_info['name']}_{timestamp}"
+                    user_table_name = input(f"Table name for this step's products (default: {default_name}): ").strip()
+                    chosen_name = user_table_name if user_table_name else default_name
+                    output_table_name = self._sanitize_table_name(chosen_name)
+
+                    success = self._save_step_products(
+                        all_products, output_table_name, workflow_name, step_num,
+                        compute_inchi=False
+                    )
+
+                    if not success:
+                        output_table_name = None
+
                 result = {
                     'success': True,
                     'products_generated': len(all_products),
@@ -8489,27 +16490,30 @@ class ChemSpace:
                     'reaction_type': 'unimolecular',
                     'step_num': step_num,
                     'streaming_used': False,
-                    'compounds_processed': total_compounds
+                    'compounds_processed': total_compounds,
+                    'ambiguous_reactants': ambiguous_reactants
                 }
-            
+
             return result
-            
+
         except Exception as e:
             print(f"❌ Error applying streaming unimolecular reaction: {e}")
             return {
                 'success': False,
                 'products_generated': 0,
                 'error': str(e),
-                'streaming_used': False
+                'streaming_used': False,
+                'ambiguous_reactants': []
             }
 
     def _stream_bimolecular_reaction_to_disk(self, primary_df: pd.DataFrame, secondary_df: pd.DataFrame,
                                         reaction_info: Dict[str, Any], workflow_name: str,
                                         temp_dir: str, max_workers: int, chunk_size: Optional[int],
-                                        temp_files_created: List[str]) -> int:
+                                        temp_files_created: List[str],
+                                        ambiguous_reactants: Optional[List[Dict[str, Any]]] = None) -> int:
         """
         Stream bimolecular reaction results directly to disk files.
-        
+
         Args:
             primary_df (pd.DataFrame): Primary reactants
             secondary_df (pd.DataFrame): Secondary reactants
@@ -8519,7 +16523,12 @@ class ChemSpace:
             max_workers (int): Maximum workers
             chunk_size (Optional[int]): Chunk size
             temp_files_created (List[str]): List to track created files
-            
+            ambiguous_reactants (Optional[List[Dict]]): If provided, appended in place with one
+                entry per reactant pair (across all chunks) for which RunReactants() returned
+                more than one product set — i.e. the pair matched the reaction template at more
+                than one site. A summary warning is always printed regardless of whether this
+                is provided.
+
         Returns:
             int: Total number of products streamed
         """
@@ -8541,10 +16550,11 @@ class ChemSpace:
             
             print(f"   📦 Created {len(chunks)} chunks for streaming processing")
             print(f"   🌊 Each chunk will be streamed directly to disk")
-            
+
             total_products = 0
             processed_chunks = 0
-            
+            all_ambiguous_reactants = []
+
             # Initialize progress tracking
             if TQDM_AVAILABLE:
                 progress_bar = tqdm(
@@ -8554,7 +16564,7 @@ class ChemSpace:
                 )
             else:
                 progress_bar = None
-            
+
             # Process chunks and stream to disk
             with ProcessPoolExecutor(max_workers=max_workers) as executor:
                 # Submit streaming jobs
@@ -8562,22 +16572,23 @@ class ChemSpace:
                 for i, chunk in enumerate(chunks):
                     temp_file_path = os.path.join(temp_dir, f'bimolecular_chunk_{i:06d}.csv')
                     temp_files_created.append(temp_file_path)
-                    
+
                     future = executor.submit(
                         _process_bimolecular_chunk_to_file_worker,
                         chunk, reaction_smarts, reaction_name, workflow_name, temp_file_path
                     )
                     future_to_chunk[future] = i
-                
+
                 # Collect results
                 for future in as_completed(future_to_chunk):
                     chunk_idx = future_to_chunk[future]
-                    
+
                     try:
-                        chunk_products_count = future.result()
+                        chunk_products_count, chunk_ambiguous = future.result()
                         total_products += chunk_products_count
+                        all_ambiguous_reactants.extend(chunk_ambiguous)
                         processed_chunks += 1
-                        
+
                         if progress_bar:
                             progress_bar.update(1)
                             progress_bar.set_postfix({
@@ -8588,30 +16599,38 @@ class ChemSpace:
                             if processed_chunks % max(1, len(chunks) // 10) == 0:
                                 progress = (processed_chunks / len(chunks)) * 100
                                 print(f"      📊 Progress: {progress:.1f}% ({total_products:,} products streamed)")
-                    
+
                     except Exception as e:
                         print(f"   ❌ Error processing chunk {chunk_idx}: {e}")
                         processed_chunks += 1
                         if progress_bar:
                             progress_bar.update(1)
-            
+
             if progress_bar:
                 progress_bar.close()
-            
+
             print(f"   ✅ Streaming completed: {total_products:,} products in {len(temp_files_created)} files")
+            if all_ambiguous_reactants:
+                print(f"   ⚠️  {len(all_ambiguous_reactants)} reactant pair(s) matched the reaction template "
+                      f"at more than one site (multiple product possibilities from the same pair)")
+                for ambiguous in all_ambiguous_reactants:
+                    print(f"      - {ambiguous['reactant1_smiles']} + {ambiguous['reactant2_smiles']}")
+                if ambiguous_reactants is not None:
+                    ambiguous_reactants.extend(all_ambiguous_reactants)
             return total_products
-            
+
         except Exception as e:
             print(f"   ❌ Error in streaming bimolecular reaction: {e}")
             return 0
 
-    def _stream_unimolecular_reaction_to_disk(self, compounds_df: pd.DataFrame, 
+    def _stream_unimolecular_reaction_to_disk(self, compounds_df: pd.DataFrame,
                                             reaction_info: Dict[str, Any], workflow_name: str,
                                             name_prefix: str, temp_dir: str, max_workers: int,
-                                            chunk_size: Optional[int], temp_files_created: List[str]) -> int:
+                                            chunk_size: Optional[int], temp_files_created: List[str],
+                                            ambiguous_reactants: Optional[List[Dict[str, Any]]] = None) -> int:
         """
         Stream unimolecular reaction results directly to disk files.
-        
+
         Args:
             compounds_df (pd.DataFrame): Compounds dataframe
             reaction_info (Dict): Reaction information
@@ -8621,29 +16640,35 @@ class ChemSpace:
             max_workers (int): Maximum workers
             chunk_size (Optional[int]): Chunk size
             temp_files_created (List[str]): List to track created files
-            
+            ambiguous_reactants (Optional[List[Dict]]): If provided, appended in place with one
+                entry per reactant (across all chunks) for which RunReactants() returned more
+                than one product set — i.e. the reactant matched the reaction template at more
+                than one site. A summary warning is always printed regardless of whether this
+                is provided.
+
         Returns:
             int: Total number of products streamed
         """
         try:
             from concurrent.futures import ProcessPoolExecutor, as_completed
             import os
-            
+
             reaction_smarts = reaction_info['smarts']
             reaction_name = reaction_info['name']
-            
+
             # Set default chunk size if not provided
             if chunk_size is None:
                 chunk_size = max(500, len(compounds_df) // (max_workers * 8))  # Smaller chunks for streaming
-            
+
             # Create chunks for streaming processing
             chunks = self._create_unimolecular_chunks(compounds_df, chunk_size)
-            
+
             print(f"      📦 Created {len(chunks)} chunks for streaming processing")
-            
+
             total_products = 0
             processed_chunks = 0
-            
+            all_ambiguous_reactants = []
+
             # Initialize progress tracking
             if TQDM_AVAILABLE:
                 progress_bar = tqdm(
@@ -8653,7 +16678,7 @@ class ChemSpace:
                 )
             else:
                 progress_bar = None
-            
+
             # Process chunks and stream to disk
             with ProcessPoolExecutor(max_workers=max_workers) as executor:
                 # Submit streaming jobs
@@ -8661,55 +16686,68 @@ class ChemSpace:
                 for i, chunk in enumerate(chunks):
                     temp_file_path = os.path.join(temp_dir, f'unimolecular_chunk_{i:06d}.csv')
                     temp_files_created.append(temp_file_path)
-                    
+
                     future = executor.submit(
                         _process_unimolecular_chunk_to_file_worker,
                         chunk, reaction_smarts, reaction_name, workflow_name, name_prefix, temp_file_path
                     )
                     future_to_chunk[future] = i
-                
+
                 # Collect results
                 for future in as_completed(future_to_chunk):
                     chunk_idx = future_to_chunk[future]
-                    
+
                     try:
-                        chunk_products_count = future.result()
+                        chunk_products_count, chunk_ambiguous = future.result()
                         total_products += chunk_products_count
+                        all_ambiguous_reactants.extend(chunk_ambiguous)
                         processed_chunks += 1
-                        
+
                         if progress_bar:
                             progress_bar.update(1)
                             progress_bar.set_postfix({
                                 'products': total_products
                             })
-                    
+
                     except Exception as e:
                         print(f"      ❌ Error processing chunk {chunk_idx}: {e}")
                         processed_chunks += 1
                         if progress_bar:
                             progress_bar.update(1)
-            
+
             if progress_bar:
                 progress_bar.close()
-            
+
             print(f"      ✅ Streaming completed: {total_products:,} products")
+            if all_ambiguous_reactants:
+                print(f"      ⚠️  {len(all_ambiguous_reactants)} reactant(s) matched the reaction template "
+                      f"at more than one site (multiple product possibilities from the same reactant)")
+                for ambiguous in all_ambiguous_reactants:
+                    print(f"         - {ambiguous['reactant_smiles']}")
+                if ambiguous_reactants is not None:
+                    ambiguous_reactants.extend(all_ambiguous_reactants)
             return total_products
-            
+
         except Exception as e:
             print(f"      ❌ Error in streaming unimolecular reaction: {e}")
             return 0
 
     def _consolidate_temp_files_to_table(self, temp_files: List[str], output_table_name: str,
-                                        workflow_name: str, step_num: int) -> bool:
+                                        workflow_name: str, step_num: int,
+                                        compute_inchi: bool = True) -> bool:
         """
         Consolidate temporary CSV files into a database table with streaming to avoid memory issues.
-        
+
         Args:
             temp_files (List[str]): List of temporary file paths
             output_table_name (str): Name for the output table
             workflow_name (str): Workflow name
             step_num (int): Step number
-            
+            compute_inchi (bool): Whether to compute InChI keys for this table right away.
+                Reaction-workflow steps pass False here to avoid computing (and discarding)
+                InChI keys for intermediate tables; the workflow computes them once at the
+                end for whichever tables survive the end-of-workflow cleanup prompt.
+
         Returns:
             bool: True if consolidation was successful
         """
@@ -8721,6 +16759,8 @@ class ChemSpace:
             
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             # Create products table
             cursor.execute(f'''
@@ -8735,24 +16775,29 @@ class ChemSpace:
                     UNIQUE(smiles, name)
                 )
             ''')
-            
-            # Create indexes
-            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{output_table_name}_smiles ON {output_table_name}(smiles)")
-            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{output_table_name}_step ON {output_table_name}(workflow_step)")
-            
+
             # Insert products from temp files with streaming
             insert_query = f'''
-                INSERT OR IGNORE INTO {output_table_name} 
+                INSERT OR IGNORE INTO {output_table_name}
                 (smiles, name, flag, workflow_step, workflow_name, creation_date)
                 VALUES (?, ?, ?, ?, ?, ?)
             '''
-            
+
             creation_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             total_inserted = 0
-            
+
+            # Track (smiles, name) keys already seen -- both rows already present in
+            # the table and rows seen earlier across temp files/batches in this same
+            # consolidation -- so a product about to be silently dropped by the
+            # UNIQUE(smiles, name) constraint can be reported with its SMILES instead
+            # of only being reflected as a count mismatch (mirrors _save_step_products()).
+            cursor.execute(f"SELECT smiles, name FROM {output_table_name}")
+            seen_keys = set(cursor.fetchall())
+            duplicate_products = []
+
             # Process files in batches to avoid memory issues
             batch_size = 1000
-            
+
             if TQDM_AVAILABLE:
                 progress_bar = tqdm(
                     temp_files,
@@ -8761,43 +16806,80 @@ class ChemSpace:
                 )
             else:
                 progress_bar = temp_files
-            
+
             for temp_file in progress_bar:
                 try:
                     with open(temp_file, 'r', newline='', encoding='utf-8') as f:
-                        reader = csv.DictReader(f)
+                        # Plain csv.reader with positional access instead of DictReader:
+                        # the temp files are written by our own _process_*_chunk_to_file_worker()
+                        # functions, which always emit 'smiles', 'name', 'flag' as the first
+                        # three columns, so the per-row dict construction DictReader does
+                        # (header lookup + dict build) is pure overhead here — ~2x slower
+                        # for no benefit on files we control the format of.
+                        reader = csv.reader(f)
+                        next(reader, None)  # skip header row
                         batch = []
-                        
+
                         for row in reader:
+                            if not row:
+                                continue
+                            key = (row[0], row[1])
+                            if key in seen_keys:
+                                duplicate_products.append({'smiles': row[0], 'name': row[1]})
+                                continue
+                            seen_keys.add(key)
                             batch.append((
-                                row.get('smiles', ''),
-                                row.get('name', ''),
-                                row.get('flag', 'stream_product'),
+                                row[0],
+                                row[1],
+                                row[2],
                                 step_num,
                                 workflow_name,
                                 creation_date
                             ))
-                            
+
                             if len(batch) >= batch_size:
                                 cursor.executemany(insert_query, batch)
-                                total_inserted += len(batch)
+                                total_inserted += cursor.rowcount
                                 batch = []
-                        
+
                         # Insert remaining items in batch
                         if batch:
                             cursor.executemany(insert_query, batch)
-                            total_inserted += len(batch)
-                            
+                            total_inserted += cursor.rowcount
+
                 except Exception as e:
                     print(f"   ⚠️  Error processing file {temp_file}: {e}")
                     continue
-            
+
+            # Build the indexes after the table is populated, not before: indexes
+            # created on an empty table force SQLite to rebalance their b-trees on
+            # every single-row insert above, which measured slower than building the
+            # indexes once against fully-populated data (same fix as applied to
+            # _update_table_with_inchi_keys()).
+            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{output_table_name}_smiles ON {output_table_name}(smiles)")
+            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{output_table_name}_step ON {output_table_name}(workflow_step)")
+
             conn.commit()
             conn.close()
-            
+
             print(f"   💾 Consolidated {total_inserted:,} products to table '{output_table_name}'")
+            if duplicate_products:
+                print(f"   ⚠️  {len(duplicate_products):,} product(s) skipped: duplicate (smiles, name) "
+                      f"already present in this batch/table")
+                for dup in duplicate_products:
+                    print(f"      - {dup['name']}: {dup['smiles']}")
+
+            # Compute InChI keys for the newly consolidated products, mirroring the same
+            # post-save step used by load_csv_file() and _save_step_products()
+            if compute_inchi and total_inserted > 0:
+                try:
+                    print(f"   🧪 Computing InChI keys for table '{output_table_name}'...")
+                    self.compute_inchi_keys(output_table_name, update_database=True)
+                except Exception as inchi_error:
+                    print(f"   ⚠️  Warning: InChI key computation failed: {inchi_error}")
+
             return True
-            
+
         except Exception as e:
             print(f"   ❌ Error consolidating temp files: {e}")
             return False
@@ -9210,10 +17292,11 @@ class ChemSpace:
 
     def _apply_bimolecular_reaction_parallel(self, primary_df: pd.DataFrame, secondary_df: pd.DataFrame,
                                         reaction_info: Dict[str, Any], workflow_name: str,
-                                        max_workers: int, chunk_size: int) -> List[Dict[str, Any]]:
+                                        max_workers: int, chunk_size: int,
+                                        ambiguous_reactants: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
         """
         Apply a bimolecular reaction using parallel processing.
-        
+
         Args:
             primary_df (pd.DataFrame): Primary reactants dataframe
             secondary_df (pd.DataFrame): Secondary reactants dataframe
@@ -9221,7 +17304,12 @@ class ChemSpace:
             workflow_name (str): Name of the workflow
             max_workers (int): Maximum number of parallel workers
             chunk_size (int): Size of each chunk for parallel processing
-            
+            ambiguous_reactants (Optional[List[Dict]]): If provided, appended in place with one
+                entry per reactant pair (across all chunks) for which RunReactants() returned
+                more than one product set — i.e. the pair matched the reaction template at more
+                than one site. A summary warning is always printed regardless of whether this
+                is provided.
+
         Returns:
             List[Dict]: List of reaction products
         """
@@ -9239,11 +17327,12 @@ class ChemSpace:
             chunks = self._create_bimolecular_chunks(primary_df, secondary_df, chunk_size)
             
             print(f"   📦 Created {len(chunks)} chunks for parallel processing")
-            
+
             all_products = []
+            all_ambiguous_reactants = []
             processed_chunks = 0
             successful_reactions = 0
-            
+
             # Initialize progress tracking
             if TQDM_AVAILABLE:
                 progress_bar = tqdm(
@@ -9253,7 +17342,7 @@ class ChemSpace:
                 )
             else:
                 progress_bar = None
-            
+
             # Process chunks in parallel
             with ProcessPoolExecutor(max_workers=max_workers) as executor:
                 # Submit all chunks
@@ -9269,11 +17358,12 @@ class ChemSpace:
                     chunk_idx = future_to_chunk[future]
                     
                     try:
-                        chunk_products = future.result()
+                        chunk_products, chunk_ambiguous = future.result()
                         all_products.extend(chunk_products)
+                        all_ambiguous_reactants.extend(chunk_ambiguous)
                         successful_reactions += len(chunk_products)
                         processed_chunks += 1
-                        
+
                         if progress_bar:
                             progress_bar.update(1)
                             progress_bar.set_postfix({
@@ -9284,30 +17374,38 @@ class ChemSpace:
                             if processed_chunks % max(1, len(chunks) // 10) == 0:
                                 progress = (processed_chunks / len(chunks)) * 100
                                 print(f"      📊 Progress: {progress:.1f}% ({len(all_products)} products)")
-                    
+
                     except Exception as e:
                         print(f"   ❌ Error processing chunk {chunk_idx}: {e}")
                         processed_chunks += 1
                         if progress_bar:
                             progress_bar.update(1)
-            
+
             if progress_bar:
                 progress_bar.close()
-            
+
             print(f"   ✅ Parallel processing completed: {len(all_products)} products from {successful_reactions} reactions")
+            if all_ambiguous_reactants:
+                print(f"   ⚠️  {len(all_ambiguous_reactants)} reactant pair(s) matched the reaction template "
+                      f"at more than one site (multiple product possibilities from the same pair)")
+                for ambiguous in all_ambiguous_reactants:
+                    print(f"      - {ambiguous['reactant1_smiles']} + {ambiguous['reactant2_smiles']}")
+                if ambiguous_reactants is not None:
+                    ambiguous_reactants.extend(all_ambiguous_reactants)
             return all_products
-            
+
         except Exception as e:
             print(f"   ❌ Error in parallel bimolecular reaction: {e}")
             return []
 
-    def _apply_unimolecular_reaction_parallel(self, compounds_df: pd.DataFrame, 
+    def _apply_unimolecular_reaction_parallel(self, compounds_df: pd.DataFrame,
                                             reaction_info: Dict[str, Any], workflow_name: str,
-                                            name_prefix: str, max_workers: int, 
-                                            chunk_size: int) -> List[Dict[str, Any]]:
+                                            name_prefix: str, max_workers: int,
+                                            chunk_size: int,
+                                            ambiguous_reactants: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
         """
         Apply a unimolecular reaction using parallel processing.
-        
+
         Args:
             compounds_df (pd.DataFrame): Compounds dataframe
             reaction_info (Dict): Reaction information
@@ -9315,7 +17413,12 @@ class ChemSpace:
             name_prefix (str): Prefix for product names
             max_workers (int): Maximum number of parallel workers
             chunk_size (int): Size of each chunk for parallel processing
-            
+            ambiguous_reactants (Optional[List[Dict]]): If provided, appended in place with one
+                entry per reactant (across all chunks) for which RunReactants() returned more
+                than one product set — i.e. the reactant matched the reaction template at more
+                than one site. A summary warning is always printed regardless of whether this
+                is provided.
+
         Returns:
             List[Dict]: List of reaction products
         """
@@ -9329,11 +17432,12 @@ class ChemSpace:
             chunks = self._create_unimolecular_chunks(compounds_df, chunk_size)
             
             print(f"      📦 Created {len(chunks)} chunks for parallel processing")
-            
+
             all_products = []
+            all_ambiguous_reactants = []
             processed_chunks = 0
             successful_reactions = 0
-            
+
             # Initialize progress tracking
             if TQDM_AVAILABLE:
                 progress_bar = tqdm(
@@ -9343,7 +17447,7 @@ class ChemSpace:
                 )
             else:
                 progress_bar = None
-            
+
             # Process chunks in parallel
             with ProcessPoolExecutor(max_workers=max_workers) as executor:
                 # Submit all chunks
@@ -9353,35 +17457,43 @@ class ChemSpace:
                         chunk, reaction_smarts, reaction_name, workflow_name, name_prefix
                     ): i for i, chunk in enumerate(chunks)
                 }
-                
+
                 # Collect results
                 for future in as_completed(future_to_chunk):
                     chunk_idx = future_to_chunk[future]
-                    
+
                     try:
-                        chunk_products = future.result()
+                        chunk_products, chunk_ambiguous = future.result()
                         all_products.extend(chunk_products)
+                        all_ambiguous_reactants.extend(chunk_ambiguous)
                         successful_reactions += len(chunk_products)
                         processed_chunks += 1
-                        
+
                         if progress_bar:
                             progress_bar.update(1)
                             progress_bar.set_postfix({
                                 'products': len(all_products)
                             })
-                        
+
                     except Exception as e:
                         print(f"      ❌ Error processing chunk {chunk_idx}: {e}")
                         processed_chunks += 1
                         if progress_bar:
                             progress_bar.update(1)
-            
+
             if progress_bar:
                 progress_bar.close()
-            
+
             print(f"      ✅ Parallel processing completed: {len(all_products)} products")
+            if all_ambiguous_reactants:
+                print(f"      ⚠️  {len(all_ambiguous_reactants)} reactant(s) matched the reaction template "
+                      f"at more than one site (multiple product possibilities from the same reactant)")
+                for ambiguous in all_ambiguous_reactants:
+                    print(f"         - {ambiguous['reactant_smiles']}")
+                if ambiguous_reactants is not None:
+                    ambiguous_reactants.extend(all_ambiguous_reactants)
             return all_products
-            
+
         except Exception as e:
             print(f"      ❌ Error in parallel unimolecular reaction: {e}")
             return []
@@ -9493,6 +17605,8 @@ class ChemSpace:
             # Check if reaction_workflows table exists
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='reaction_workflows'")
             if not cursor.fetchone():
@@ -9516,12 +17630,12 @@ class ChemSpace:
                 return None
             
             print(f"\n🔬 SELECT REACTION WORKFLOW FOR APPLICATION")
-            print("=" * 70)
+            print("=" * 95)
             print(f"Available workflows ({len(workflows)} total):")
-            print("-" * 70)
-            print(f"{'#':<3} {'Workflow Name':<25} {'Reactions':<10} {'Created':<12} {'Description':<20}")
-            print("-" * 70)
-            
+            print("-" * 95)
+            print(f"{'#':<3} {'Workflow Name':<50} {'Reactions':<10} {'Created':<12} {'Description':<20}")
+            print("-" * 95)
+
             workflow_info = []
             for i, (wf_id, name, date, desc, reactions_dict_str) in enumerate(workflows, 1):
                 try:
@@ -9529,14 +17643,14 @@ class ChemSpace:
                     reaction_count = len(reactions_dict)
                 except json.JSONDecodeError:
                     reaction_count = 0
-                
+
                 date_short = date[:10] if date else "Unknown"
-                name_display = name[:24] if len(name) <= 24 else name[:21] + "..."
+                name_display = name[:49] if len(name) <= 49 else name[:46] + "..."
                 desc_display = (desc or "No description")[:19]
                 if len(desc_display) > 19:
                     desc_display = desc_display[:16] + "..."
-                
-                print(f"{i:<3} {name_display:<25} {reaction_count:<10} {date_short:<12} {desc_display:<20}")
+
+                print(f"{i:<3} {name_display:<50} {reaction_count:<10} {date_short:<12} {desc_display:<20}")
                 workflow_info.append({
                     'id': wf_id,
                     'name': name,
@@ -9544,8 +17658,8 @@ class ChemSpace:
                     'description': desc or "No description",
                     'date': date
                 })
-            
-            print("-" * 70)
+
+            print("-" * 95)
             print("Commands: Enter workflow number, workflow name, 'list' for details, or 'cancel' to abort")
             
             while True:
@@ -9887,42 +18001,22 @@ class ChemSpace:
                         'step': product_info['step']
                     })
             
-            # Select input sources
+            # Select input sources (same fine-grained picker for every step, including step 1)
             selected_sources = []
-            
-            if step_num == 1:
-                # First step: allow multiple original tables
-                print(f"\nSelect input sources (comma-separated numbers or 'all'):")
-                selection = input("Selection: ").strip().lower()
-                
-                if selection == 'all':
-                    selected_sources = all_sources
-                else:
-                    try:
-                        indices = [int(x.strip()) - 1 for x in selection.split(',')]
-                        selected_sources = [all_sources[i] for i in indices if 0 <= i < len(all_sources)]
-                    except:
-                        print("❌ Invalid selection")
-                        return {}
+
+            print(f"\nSelect input sources (comma-separated numbers or 'all'):")
+            selection = input("Selection: ").strip().lower()
+
+            if selection == 'all':
+                selected_sources = all_sources
             else:
-                # Later steps: offer choice between original tables and previous products
-                print(f"\nChoose input strategy:")
-                print(f"   1. Use original tables")
-                print(f"   2. Use products from previous steps")
-                print(f"   3. Use both original tables and previous products")
-                
-                strategy = input("Enter choice (1-3): ").strip()
-                
-                if strategy == '1':
-                    selected_sources = [s for s in all_sources if s['type'] == 'original']
-                elif strategy == '2':
-                    selected_sources = [s for s in all_sources if s['type'] == 'products']
-                elif strategy == '3':
-                    selected_sources = all_sources
-                else:
-                    print("❌ Invalid strategy selection")
+                try:
+                    indices = [int(x.strip()) - 1 for x in selection.split(',')]
+                    selected_sources = [all_sources[i] for i in indices if 0 <= i < len(all_sources)]
+                except:
+                    print("❌ Invalid selection")
                     return {}
-            
+
             if not selected_sources:
                 print("❌ No sources selected")
                 return {}
@@ -9946,6 +18040,199 @@ class ChemSpace:
         except Exception as e:
             print(f"❌ Error selecting tables for unimolecular step: {e}")
             return {}
+
+    def _select_tables_for_step_merge(self, input_sources: Dict[str, Any],
+                                       step_num: int, step_name: str) -> Dict[str, Any]:
+        """
+        Select the two tables to combine for a 'merge' workflow step.
+
+        Args:
+            input_sources (Dict): Available input sources
+            step_num (int): Current step number
+            step_name (str): Label of the merge step
+
+        Returns:
+            Dict[str, Any]: Table configuration
+        """
+        try:
+            print(f"\n🔀 MERGE STEP {step_num} SETUP")
+            print("=" * 60)
+            print(f"Step: {step_name}")
+            print("This step combines compounds from two tables into one.")
+
+            # Display available sources
+            print(f"\n📋 Available Input Sources:")
+            all_sources = []
+
+            print(f"\n🗂️  Original Tables:")
+            for table in input_sources['original_tables']:
+                compound_count = self.get_compound_count(table_name=table)
+                print(f"   {len(all_sources)+1}. {table} ({compound_count} compounds) [Original]")
+                all_sources.append({
+                    'name': table,
+                    'type': 'original',
+                    'count': compound_count
+                })
+
+            if input_sources['previous_products']:
+                print(f"\n🔬 Previous Step Products:")
+                for product_info in input_sources['previous_products']:
+                    print(f"   {len(all_sources)+1}. {product_info['table_name']} "
+                        f"({product_info['count']} products from Step {product_info['step']}: "
+                        f"{product_info['reaction_name']}) [Products]")
+                    all_sources.append({
+                        'name': product_info['table_name'],
+                        'type': 'products',
+                        'count': product_info['count'],
+                        'step': product_info['step']
+                    })
+
+            if not all_sources:
+                print("❌ No tables available to merge")
+                return {}
+
+            # Select first table
+            print(f"\n📋 Select FIRST table to merge:")
+            first_idx = self._select_source_by_index(all_sources, "first table")
+            if first_idx is None:
+                return {}
+
+            first_source = all_sources[first_idx]
+
+            # Select second table (allow the same table, though that just duplicates it)
+            print(f"\n📋 Select SECOND table to merge:")
+            second_idx = self._select_source_by_index(all_sources, "second table")
+            if second_idx is None:
+                return {}
+
+            second_source = all_sources[second_idx]
+
+            print(f"\n✅ Merge Step Configuration:")
+            print(f"   🅰️  Table A: '{first_source['name']}' ({first_source['count']} compounds)")
+            print(f"   🅱️  Table B: '{second_source['name']}' ({second_source['count']} compounds)")
+
+            return {
+                'type': 'merge',
+                'table_a': first_source['name'],
+                'table_b': second_source['name'],
+                'step_num': step_num
+            }
+
+        except Exception as e:
+            print(f"❌ Error selecting tables for merge step: {e}")
+            return {}
+
+    def _merge_two_tables_to_products(self, table_a: str, table_b: str) -> List[Dict[str, Any]]:
+        """
+        Combine compounds from two tables into a single product list.
+
+        Reuses the same product shape produced by _apply_bimolecular_reaction /
+        _apply_unimolecular_reaction ({'smiles', 'name', 'flag'}) so the result can be
+        saved via _save_step_products() and consumed as an input source by later steps.
+
+        Args:
+            table_a (str): First table to combine
+            table_b (str): Second table to combine (may be the same as table_a)
+
+        Returns:
+            List[Dict[str, Any]]: Combined list of compound dicts
+        """
+        products = []
+        for table_name in (table_a, table_b):
+            df = self._get_table_as_dataframe(table_name)
+            for _, row in df.iterrows():
+                products.append({
+                    'smiles': row['smiles'],
+                    'name': row.get('name'),
+                    'flag': 'merged'
+                })
+        return products
+
+    def _process_merge_step(self, step_num: int, reaction_info: Dict[str, Any],
+                             workflow_name: str, workflow_state: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Process a single 'merge' workflow step: combine two selected tables into one
+        output table that later steps can use as an input source.
+
+        Args:
+            step_num (int): Current step number
+            reaction_info (Dict): Merge step info ({'type': 'merge', 'name', 'order'})
+            workflow_name (str): Name of the workflow
+            workflow_state (Dict): Current workflow state
+
+        Returns:
+            Dict[str, Any]: Step execution results, shaped like the reaction step results
+                so downstream summary/cleanup code needs no special-casing.
+        """
+        try:
+            step_name = reaction_info.get('name', 'Merge tables')
+
+            print(f"🔍 Merge Step Analysis:")
+            print(f"   📋 Name: {step_name}")
+
+            # Reuse existing input source detection
+            input_sources = self._get_available_input_sources(step_num, workflow_state)
+
+            if not input_sources['original_tables'] and not input_sources['previous_products']:
+                return {
+                    'success': False,
+                    'message': 'No input sources available',
+                    'products_generated': 0,
+                    'streaming_used': False
+                }
+
+            table_config = self._select_tables_for_step_merge(input_sources, step_num, step_name)
+
+            if not table_config:
+                return {
+                    'success': False,
+                    'message': 'No tables selected for merge step',
+                    'products_generated': 0,
+                    'streaming_used': False
+                }
+
+            products = self._merge_two_tables_to_products(table_config['table_a'], table_config['table_b'])
+
+            output_table_name = None
+            if products:
+                print(f"\n💾 Combined {len(products)} compound row(s) from "
+                      f"'{table_config['table_a']}' and '{table_config['table_b']}'")
+
+                # Always persist this step's products to a table (needed so they remain
+                # available as an input source for later workflow steps); the user can
+                # discard unwanted intermediate tables in the end-of-workflow cleanup prompt.
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                default_name = f"step{step_num}_{step_name}_{timestamp}"
+                user_table_name = input(f"Table name for this step's products (default: {default_name}): ").strip()
+                chosen_name = user_table_name if user_table_name else default_name
+                output_table_name = self._sanitize_table_name(chosen_name)
+
+                success = self._save_step_products(
+                    products, output_table_name, workflow_name, step_num,
+                    compute_inchi=False
+                )
+
+                if not success:
+                    output_table_name = None
+
+            return {
+                'success': True,
+                'products_generated': len(products),
+                'reaction_type': 'merge',
+                'step_num': step_num,
+                'streaming_used': False,
+                'output_table': output_table_name,
+                'ambiguous_reactants': []
+            }
+
+        except Exception as e:
+            print(f"❌ Error processing merge step {step_num}: {e}")
+            return {
+                'success': False,
+                'message': f'Error in merge step {step_num}: {e}',
+                'products_generated': 0,
+                'streaming_used': False
+            }
 
     def _select_source_by_index(self, sources: List[Dict], source_type: str) -> Optional[int]:
         """
@@ -10146,17 +18433,21 @@ class ChemSpace:
                 'error': str(e)
             }
 
-    def _save_step_products(self, products: List[Dict[str, Any]], table_name: str, 
-                        workflow_name: str, step_num: int) -> bool:
+    def _save_step_products(self, products: List[Dict[str, Any]], table_name: str,
+                        workflow_name: str, step_num: int, compute_inchi: bool = True) -> bool:
         """
         Save products from a reaction step to a new table.
-        
+
         Args:
             products (List[Dict]): List of product dictionaries
             table_name (str): Name for the new table
             workflow_name (str): Name of the workflow
             step_num (int): Current step number
-            
+            compute_inchi (bool): Whether to compute InChI keys for this table right away.
+                Reaction-workflow steps pass False here to avoid computing (and discarding)
+                InChI keys for intermediate tables; the workflow computes them once at the
+                end for whichever tables survive the end-of-workflow cleanup prompt.
+
         Returns:
             bool: True if saved successfully
         """
@@ -10166,6 +18457,8 @@ class ChemSpace:
             
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             # Create products table with step metadata
             cursor.execute(f'''
@@ -10180,41 +18473,77 @@ class ChemSpace:
                     UNIQUE(smiles, name)
                 )
             ''')
-            
-            # Create indexes
-            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_smiles ON {table_name}(smiles)")
-            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_step ON {table_name}(workflow_step)")
-            
-            # Insert products
+
+            # Insert products. Uses a single executemany() batch rather than a
+            # per-product execute() in a loop: a separate execute() per row crosses
+            # the sqlite3 C-API boundary once per row, which dominates runtime for
+            # large product sets (same reasoning as _update_table_with_inchi_keys()'s
+            # itertuples()+executemany() switch).
             insert_query = f'''
-                INSERT OR IGNORE INTO {table_name} 
+                INSERT OR IGNORE INTO {table_name}
                 (smiles, name, flag, workflow_step, workflow_name, creation_date)
                 VALUES (?, ?, ?, ?, ?, ?)
             '''
-            
+
             creation_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            inserted_count = 0
-            
+
+            # Track (smiles, name) keys already seen -- both rows already present in
+            # the table (e.g. an existing table name being reused) and rows seen
+            # earlier in this same products list -- so that a product about to be
+            # silently dropped by the UNIQUE(smiles, name) constraint can be reported
+            # with its SMILES instead of only being reflected as a count mismatch.
+            cursor.execute(f"SELECT smiles, name FROM {table_name}")
+            seen_keys = set(cursor.fetchall())
+
+            batch = []
+            duplicate_products = []
             for product in products:
-                try:
-                    cursor.execute(insert_query, (
-                        product['smiles'],
-                        product['name'],
-                        product.get('flag', 'step_product'),
-                        step_num,
-                        workflow_name,
-                        creation_date
-                    ))
-                    inserted_count += 1
-                except sqlite3.IntegrityError:
+                key = (product['smiles'], product['name'])
+                if key in seen_keys:
+                    duplicate_products.append(product)
                     continue
-            
+                seen_keys.add(key)
+                batch.append((
+                    product['smiles'],
+                    product['name'],
+                    product.get('flag', 'step_product'),
+                    step_num,
+                    workflow_name,
+                    creation_date
+                ))
+
+            cursor.executemany(insert_query, batch)
+            inserted_count = cursor.rowcount
+
+            # Build the indexes after the table is populated, not before: indexes
+            # created on an empty table force SQLite to rebalance their b-trees on
+            # every single-row insert above, which measured slower than building the
+            # indexes once against fully-populated data (same fix as applied to
+            # _update_table_with_inchi_keys() and _consolidate_temp_files_to_table()).
+            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_smiles ON {table_name}(smiles)")
+            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_step ON {table_name}(workflow_step)")
+
             conn.commit()
             conn.close()
-            
+
             print(f"   💾 Saved {inserted_count} products to table '{table_name}'")
+            if duplicate_products:
+                print(f"   ⚠️  {len(duplicate_products)} product(s) skipped: duplicate (smiles, name) "
+                      f"already present in this batch/table")
+                for dup in duplicate_products:
+                    print(f"      - {dup['name']}: {dup['smiles']}")
+
+            # Compute InChI keys for the newly stored products, mirroring the same
+            # post-save step used by load_csv_file()
+            if compute_inchi and inserted_count > 0:
+                try:
+                    print(f"   🧪 Computing InChI keys for table '{table_name}'...")
+                    self.compute_inchi_keys(table_name, update_database=True)
+                except Exception as inchi_error:
+                    print(f"   ⚠️  Warning: InChI key computation failed: {inchi_error}")
+
             return True
-            
+
         except Exception as e:
             print(f"   ❌ Error saving step products: {e}")
             return False
@@ -10234,28 +18563,48 @@ class ChemSpace:
             
             total_products = 0
             successful_steps = 0
-            
+            total_ambiguous = 0
+
             for step_num, result in workflow_state['step_results'].items():
                 status_icon = "✅" if result['success'] else "❌"
                 products = result.get('products_generated', 0)
                 total_products += products
-                
+
                 if result['success']:
                     successful_steps += 1
-                
+
                 print(f"\n{status_icon} Step {step_num}: {products:,} products generated")
-                
+
                 if result.get('output_table'):
                     print(f"   💾 Saved to: '{result['output_table']}'")
-                
+
                 if not result['success']:
                     print(f"   ❌ Error: {result.get('error', 'Unknown error')}")
-            
+
+                step_ambiguous = result.get('ambiguous_reactants') or []
+                if step_ambiguous:
+                    total_ambiguous += len(step_ambiguous)
+                    print(f"   ⚠️  {len(step_ambiguous)} reactant(s)/pair(s) matched the reaction at more "
+                          f"than one site (multiple matching functional groups):")
+                    for amb in step_ambiguous:
+                        if 'reactant2_id' in amb:
+                            print(f"      - '{amb['reactant1_name']}' (id={amb['reactant1_id']}, "
+                                  f"smiles={amb.get('reactant1_smiles', 'n/a')}) + "
+                                  f"'{amb['reactant2_name']}' (id={amb['reactant2_id']}, "
+                                  f"smiles={amb.get('reactant2_smiles', 'n/a')}): "
+                                  f"{amb['product_possibilities']} product possibilities")
+                        else:
+                            print(f"      - '{amb['reactant_name']}' (id={amb['reactant_id']}, "
+                                  f"smiles={amb.get('reactant_smiles', 'n/a')}): "
+                                  f"{amb['product_possibilities']} product possibilities")
+
             print(f"\n📊 FINAL RESULTS:")
             print(f"   🔬 Total steps: {len(workflow_state['step_results'])}")
             print(f"   ✅ Successful steps: {successful_steps}")
             print(f"   🧪 Total products generated: {total_products:,}")
-            
+            if total_ambiguous:
+                print(f"   ⚠️  Total ambiguous reactant(s)/pair(s) across workflow: {total_ambiguous}")
+
             if workflow_state['step_products']:
                 print(f"\n📋 Product Tables Created:")
                 for step, product_info in workflow_state['step_products'].items():
@@ -10266,7 +18615,42 @@ class ChemSpace:
             
         except Exception as e:
             print(f"❌ Error displaying workflow summary: {e}")
-            
+
+    def _compute_inchi_keys_for_surviving_tables(self, state: Dict[str, Any]) -> None:
+        """
+        Compute InChI keys for the workflow's step-product tables that survived
+        _query_and_delete_prev_step_tables() — the final step's table plus any
+        intermediate tables the user chose to keep. Must be called after that
+        cleanup step so deleted tables are excluded.
+
+        Args:
+            state (Dict[str, Any]): Workflow state, as populated by apply_reaction_workflow()
+                ('step_products' mapping step -> {'table_name', 'product_count', ...}) and by
+                _query_and_delete_prev_step_tables() ('deleted_step_tables' list).
+        """
+        try:
+            step_products = state.get('step_products', {})
+            if not step_products:
+                return
+
+            deleted_tables = set(state.get('deleted_step_tables', []))
+            surviving_tables = [
+                info['table_name'] for info in step_products.values()
+                if info.get('table_name') and info['table_name'] not in deleted_tables
+            ]
+
+            if not surviving_tables:
+                return
+
+            print(f"\n🧪 Computing InChI keys for {len(surviving_tables)} surviving table(s)...")
+            for table_name in surviving_tables:
+                try:
+                    self.compute_inchi_keys(table_name, update_database=True)
+                except Exception as inchi_error:
+                    print(f"   ⚠️  Warning: InChI key computation failed for '{table_name}': {inchi_error}")
+        except Exception as e:
+            print(f"⚠️  Error computing InChI keys for surviving tables: {e}")
+
     def _query_and_delete_prev_step_tables(self, state: Dict[str, Any]) -> None:
                 try:
                     step_products = state.get('step_products', {})
@@ -10362,8 +18746,10 @@ class ChemSpace:
                     deleted = []
                     for tbl in to_delete:
                         try:
-                            # Use confirm=False to avoid nested prompts; drop_table already prints status
-                            success = self.drop_table(tbl, confirm=False)
+                            # Use confirm=False to avoid nested prompts; drop_table already prints status.
+                            # vacuum=False since VACUUM rewrites the whole DB file -- do it once below
+                            # instead of once per dropped table.
+                            success = self.drop_table(tbl, confirm=False, vacuum=False)
                             if success:
                                 deleted.append(tbl)
                         except Exception as e:
@@ -10373,6 +18759,9 @@ class ChemSpace:
                     state.setdefault('deleted_step_tables', []).extend(deleted)
 
                     print(f"🗑️  Deleted {len(deleted)}/{len(to_delete)} requested tables.")
+
+                    if deleted:
+                        self._vacuum_chemspace_db()
                 except Exception as e:
                     print(f"⚠️  Error during deletion query: {e}")
 
@@ -10745,7 +19134,8 @@ class ChemSpace:
                     print(f"\n🗑️  Deleting table: '{table_name}'")
                     
                     # Use existing drop_table method with appropriate confirmation
-                    success = self.drop_table(table_name, confirm=confirm_each)
+                    # Vacuum once after the whole batch instead of after each table
+                    success = self.drop_table(table_name, confirm=confirm_each, vacuum=False)
                     results[table_name] = success
                     
                     if success:
@@ -10771,7 +19161,8 @@ class ChemSpace:
             
             if successful_deletions > 0:
                 print(f"🗑️  {successful_deletions} table(s) have been permanently removed")
-            
+                self._vacuum_chemspace_db()
+
             if failed_deletions > 0:
                 print(f"\n❌ Failed deletions:")
                 for table_name, success in results.items():
@@ -10786,14 +19177,53 @@ class ChemSpace:
             print(f"❌ Error executing table deletions: {e}")
             return {table: False for table in selected_tables}
 
-    def drop_table(self, table_name: Optional[str] = None, confirm: bool = True) -> bool:
+    def _vacuum_chemspace_db(self, ask: bool = True) -> bool:
+        """
+        Reclaim disk space freed by dropped tables by running VACUUM on the
+        chemspace database. This rewrites the whole file, so it should be run
+        once after a batch of drops rather than after each individual table.
+
+        Args:
+            ask (bool): Whether to prompt the user before running VACUUM. VACUUM
+                rewrites the entire database file and can be noticeably slow on
+                large databases (e.g. mid-workflow table cleanup), so by default
+                the user is asked whether to pay that cost now or defer it -
+                skipping is safe, since the freed space is simply reclaimed by a
+                future VACUUM.
+
+        Returns:
+            bool: True if VACUUM completed successfully, False if it failed or was skipped
+        """
+        try:
+            if ask:
+                response = input(
+                    "🧹 Reclaim disk space now by running VACUUM? This rewrites the whole "
+                    "database file and can be slow on large databases (y/n): "
+                ).strip().lower()
+                if response not in ('y', 'yes'):
+                    print("⏭️  Skipping VACUUM. Space will be reclaimed on a future VACUUM run.")
+                    return False
+
+            print("🧹 Reclaiming disk space (VACUUM)...")
+            conn = sqlite3.connect(self.__chemspace_db)
+            conn.execute("VACUUM")
+            conn.close()
+            print("✅ VACUUM complete")
+            return True
+        except sqlite3.Error as e:
+            print(f"⚠️  VACUUM failed (space will be reclaimed on a future attempt): {e}")
+            return False
+
+    def drop_table(self, table_name: Optional[str] = None, confirm: bool = True, vacuum: bool = True) -> bool:
         """
         Drop a single table from the chemspace database.
-        
+
         Args:
             table_name (Optional[str]): Name of the table to drop. If None, prompts user to select one.
             confirm (bool): Whether to ask for confirmation before deletion
-            
+            vacuum (bool): Whether to VACUUM the database afterwards to reclaim freed disk space.
+                Set to False when dropping several tables in a loop and vacuum once at the end instead.
+
         Returns:
             bool: True if table was dropped successfully, False otherwise
         """
@@ -10877,7 +19307,9 @@ class ChemSpace:
             # Connect to database and drop table
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
-            
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+
             # Drop associated indexes first (if any)
             index_prefixes = [f"idx_{table_name}_", f"index_{table_name}_"]
             for prefix in index_prefixes:
@@ -10906,6 +19338,8 @@ class ChemSpace:
             
             if not table_still_exists:
                 print(f"✅ Successfully dropped table '{table_name}' ({compound_count:,} compounds)")
+                if vacuum:
+                    self._vacuum_chemspace_db()
                 return True
             else:
                 print(f"❌ Failed to drop table '{table_name}' (table still exists)")
@@ -10976,7 +19410,8 @@ class ChemSpace:
             
             for table_name in all_tables:
                 try:
-                    success = self.drop_table(table_name, confirm=False)
+                    # Vacuum once after the whole batch instead of after each table
+                    success = self.drop_table(table_name, confirm=False, vacuum=False)
                     if success:
                         deleted_count += 1
                     else:
@@ -10984,12 +19419,15 @@ class ChemSpace:
                 except Exception as e:
                     print(f"❌ Error deleting '{table_name}': {e}")
                     failed_count += 1
-            
+
+            if deleted_count > 0:
+                self._vacuum_chemspace_db()
+
             print(f"\n✅ Chemspace database cleared!")
             print(f"   🗑️  Tables deleted: {deleted_count}")
             print(f"   ❌ Deletion failures: {failed_count}")
             print(f"   📊 Compounds removed: {total_compounds:,}")
-            
+
             return failed_count == 0
             
         except Exception as e:
@@ -11011,6 +19449,8 @@ class ChemSpace:
             # Check if filtering_workflows table exists
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='filtering_workflows'")
             if not cursor.fetchone():
@@ -11274,6 +19714,8 @@ class ChemSpace:
         try:
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             cursor.execute("""
             SELECT id, workflow_name, creation_date, description, filter_count, total_instances
@@ -11313,6 +19755,8 @@ class ChemSpace:
         try:
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             cursor.execute("SELECT COUNT(*) FROM filtering_workflows")
             count = cursor.fetchone()[0]
@@ -11381,6 +19825,8 @@ class ChemSpace:
             # Check if table exists and get workflow count
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='filtering_workflows'")
             if not cursor.fetchone():
@@ -11908,6 +20354,8 @@ class ChemSpace:
         try:
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             # Create table with extended schema including prediction columns (no metadata columns)
             base_schema = """
@@ -11946,24 +20394,24 @@ class ChemSpace:
                     {full_schema}
                 )
             ''')
-            
-            # Create indexes for better performance (no model index)
-            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_smiles ON {table_name}(smiles)")
-            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_name ON {table_name}(name)")
-            
+
             # Prepare insert query with prefixed column names (no metadata columns)
             columns = ['smiles', 'name', 'flag', 'inchi_key'] + list(prefixed_column_mapping.values())
             placeholders = ', '.join(['?'] * len(columns))
-            
+
             insert_query = f'''
-                INSERT OR REPLACE INTO {table_name} 
+                INSERT OR REPLACE INTO {table_name}
                 ({', '.join(columns)})
                 VALUES ({placeholders})
             '''
-            
-            # Insert data (no metadata)
-            inserted_count = 0
-            
+
+            # Prepare row data first (NaN/float coercion is per-row data validation,
+            # not a DB call, so malformed rows are still skipped individually here),
+            # then insert everything in a single executemany() batch rather than one
+            # execute() per row: a separate execute() per row crosses the sqlite3
+            # C-API boundary once per row, which dominates runtime for large
+            # prediction tables.
+            rows = []
             for _, row in merged_df.iterrows():
                 try:
                     # Prepare row data (no metadata columns)
@@ -11973,7 +20421,7 @@ class ChemSpace:
                         row.get('flag', 'nd'),
                         row.get('inchi_key', None)
                     ]
-                    
+
                     # Add prediction values only with original column names
                     for original_col in prediction_columns:
                         value = row.get(original_col)
@@ -11985,15 +20433,24 @@ class ChemSpace:
                                 row_data.append(float(value))
                             except (ValueError, TypeError):
                                 row_data.append(None)
-                    
-                    # No metadata added here
-                    cursor.execute(insert_query, row_data)
-                    inserted_count += 1
-                    
+
+                    rows.append(tuple(row_data))
+
                 except Exception as e:
-                    print(f"⚠️  Error inserting row: {e}")
+                    print(f"⚠️  Error preparing row: {e}")
                     continue
-            
+
+            cursor.executemany(insert_query, rows)
+            inserted_count = len(rows)
+
+            # Create indexes after the table is populated, not before: indexes
+            # created on an empty table force SQLite to rebalance their b-trees on
+            # every single-row insert above, which measured slower than building the
+            # indexes once against fully-populated data (same fix as applied to
+            # _update_table_with_inchi_keys() and _save_step_products()).
+            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_smiles ON {table_name}(smiles)")
+            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_name ON {table_name}(name)")
+
             conn.commit()
             conn.close()
             
@@ -12037,6 +20494,182 @@ class ChemSpace:
             sanitized = sanitized[:50]
         
         return sanitized.lower()
+
+    def remove_stereochemistry(self, table_name: Optional[str] = None,
+                               output_table_name: Optional[str] = None) -> Optional[str]:
+        """
+        Create a new table with stereochemistry stripped from a table's 'smiles' column.
+
+        Each SMILES is parsed with RDKit and re-serialized as a canonical non-isomeric SMILES
+        (Chem.MolToSmiles(mol, isomericSmiles=False)) rather than naively deleting '@'/'/'/'\\'
+        characters, which could produce an invalid or non-canonical SMILES string.
+
+        Only the compound-identity columns are carried over from the source table (e.g.
+        'smiles', 'name', 'flag', 'flag_description', and any other plain columns present) --
+        computed descriptor columns are dropped, since they were computed on the original
+        (possibly stereo) structures and no longer apply once stereo is stripped: Morgan
+        fingerprint columns, dimensionality-reduction coordinate columns (both a table's own
+        fitted embedding and coordinates projected onto another table), and 'inchi_key'. A
+        fresh 'inchi_key' is then computed for the destereo'd SMILES via compute_inchi_keys().
+
+        Args:
+            table_name (Optional[str]): Name of the table to process. If None, prompts an
+                interactive table selection.
+            output_table_name (Optional[str]): Name for the new table. If None, prompts for a
+                name defaulting to '<table_name>_no_stereo'.
+
+        Returns:
+            Optional[str]: Name of the created output table, or None if an error occurred or
+                the operation was cancelled
+        """
+        try:
+            try:
+                from rdkit import Chem
+            except ImportError:
+                print("❌ RDKit not installed. Please install RDKit to remove stereochemistry:")
+                print("   conda install -c conda-forge rdkit")
+                print("   or")
+                print("   pip install rdkit")
+                return None
+
+            available_tables = self.get_all_tables()
+            if not available_tables:
+                print("❌ No tables available in chemspace database")
+                return None
+
+            if table_name is None:
+                table_name = self._select_table_interactive("SELECT TABLE TO REMOVE STEREOCHEMISTRY FROM")
+                if not table_name:
+                    print("❌ No table selected")
+                    return None
+            elif table_name not in available_tables:
+                print(f"❌ Table '{table_name}' not found")
+                return None
+
+            print(f"📊 Retrieving table '{table_name}'...")
+            df = self._get_table_as_dataframe(table_name)
+            if df.empty:
+                print(f"⚠️  No data retrieved from table '{table_name}'")
+                return None
+
+            if 'smiles' not in df.columns:
+                print(f"❌ No 'smiles' column found in table '{table_name}'")
+                return None
+
+            # Identify computed/derived columns to drop -- they were computed on the original
+            # (possibly stereo) structures and no longer apply once stereo is stripped
+            drop_columns = {'id', 'inchi_key'}
+            drop_columns.update(c for c in df.columns if self._MORGAN_FP_COLUMN_PATTERN.match(c))
+            for cols in self._detect_reduction_methods_in_columns(df.columns).values():
+                drop_columns.update(cols)
+            for cols in self._detect_projected_reduction_columns_in_columns(df.columns).values():
+                drop_columns.update(cols)
+
+            keep_columns = [c for c in df.columns if c not in drop_columns]
+
+            print(f"🔬 Removing stereochemistry from {len(df):,} SMILES...")
+            new_smiles = []
+            failed = 0
+            try:
+                from tqdm import tqdm
+                iterator = tqdm(df['smiles'], desc="Removing stereochemistry")
+            except ImportError:
+                iterator = df['smiles']
+
+            for smiles in iterator:
+                try:
+                    mol = Chem.MolFromSmiles(str(smiles)) if pd.notna(smiles) else None
+                    if mol is None:
+                        new_smiles.append(None)
+                        failed += 1
+                        continue
+                    new_smiles.append(Chem.MolToSmiles(mol, isomericSmiles=False))
+                except Exception:
+                    new_smiles.append(None)
+                    failed += 1
+
+            result_df = df[keep_columns].copy()
+            result_df['smiles'] = new_smiles
+            result_df = result_df.dropna(subset=['smiles'])
+
+            print(f"✅ Removed stereochemistry: {len(result_df):,} succeeded, {failed:,} failed")
+
+            if result_df.empty:
+                print("❌ No compounds left after removing stereochemistry")
+                return None
+
+            # Resolve output table name
+            default_table_name = f"{table_name}_no_stereo"
+            if output_table_name is None:
+                user_table_name = input(f"Enter table name for output (default: {default_table_name}): ").strip()
+                output_table_name = user_table_name if user_table_name else default_table_name
+            output_table_name = self._sanitize_table_name(output_table_name)
+
+            available_tables = self.get_all_tables()
+            while output_table_name in available_tables:
+                print(f"\n⚠️  Table '{output_table_name}' already exists!")
+                user_table_name = input("Enter a different table name (or 'cancel' to abort): ").strip()
+                if user_table_name.lower() in ['cancel', 'quit', 'exit']:
+                    print("❌ Operation cancelled by user")
+                    return None
+                output_table_name = self._sanitize_table_name(user_table_name)
+                available_tables = self.get_all_tables()
+
+            # Create the output table, replicating the kept columns' source types
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+
+            cursor.execute(f"PRAGMA table_info({table_name})")
+            source_columns_info = {col[1]: col for col in cursor.fetchall()}
+
+            column_defs = ["id INTEGER PRIMARY KEY AUTOINCREMENT"]
+            insert_columns = []
+            for col_name in keep_columns:
+                col_info = source_columns_info.get(col_name)
+                col_type = col_info[2] if col_info else "TEXT"
+                column_defs.append(f"{col_name} {col_type}")
+                insert_columns.append(col_name)
+
+            unique_constraint = ""
+            if {'smiles', 'name'} <= set(insert_columns):
+                cursor.execute(f"SELECT sql FROM sqlite_master WHERE type='table' AND name='{table_name}'")
+                original_sql = cursor.fetchone()
+                if original_sql and 'UNIQUE(smiles, name)' in original_sql[0]:
+                    unique_constraint = ", UNIQUE(smiles, name)"
+
+            create_table_sql = f"CREATE TABLE {output_table_name} ({', '.join(column_defs)}{unique_constraint})"
+            cursor.execute(create_table_sql)
+
+            placeholders = ', '.join(['?'] * len(insert_columns))
+            insert_sql = f"INSERT OR IGNORE INTO {output_table_name} ({', '.join(insert_columns)}) VALUES ({placeholders})"
+
+            rows = [tuple(row[col] for col in insert_columns) for _, row in result_df.iterrows()]
+            changes_before = conn.total_changes
+            cursor.executemany(insert_sql, rows)
+            inserted_count = conn.total_changes - changes_before
+
+            if 'smiles' in insert_columns:
+                cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{output_table_name}_smiles ON {output_table_name}(smiles)")
+            if 'name' in insert_columns:
+                cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{output_table_name}_name ON {output_table_name}(name)")
+
+            conn.commit()
+            conn.close()
+
+            print(f"✅ Successfully created table '{output_table_name}' with {inserted_count:,} rows")
+
+            # Recompute InChI keys for the destereo'd SMILES, since any original values no
+            # longer correspond to the modified structures
+            print(f"🔬 Recomputing InChI keys for '{output_table_name}'...")
+            self.compute_inchi_keys(output_table_name)
+
+            return output_table_name
+
+        except Exception as e:
+            print(f"❌ Error removing stereochemistry from table '{table_name}': {e}")
+            return None
 
     def enumerate_stereoisomers(self, table_name: Optional[str] = None,
                             max_stereoisomers: int = 20,
@@ -12677,6 +21310,8 @@ class ChemSpace:
         try:
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             # Create stereoisomers table with extended schema (excluding stereocenter_atoms column)
             cursor.execute(f'''
@@ -12693,44 +21328,51 @@ class ChemSpace:
                 )
             ''')
             
-            # Create indexes for better performance (excluding stereocenter_atoms)
+            # Prepare insert query with stereochemical columns (excluding stereocenter_atoms)
+            insert_query = f'''
+                INSERT OR IGNORE INTO {table_name}
+                (smiles, name, flag, inchi_key, total_stereoisomers, stereochemical_config,
+                num_stereocenters)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            '''
+
+            # Prepare row data first (stereochemical config cleanup is per-row data
+            # transformation, not a DB call), then insert everything in a single
+            # executemany() batch rather than one execute() per row: a separate
+            # execute() per row crosses the sqlite3 C-API boundary once per row,
+            # which dominates runtime for large stereoisomer enumeration results.
+            # conn.total_changes before/after recovers the exact inserted count that
+            # the per-row try/except IntegrityError used to give us.
+            rows = [
+                (
+                    row['stereoisomer_smiles'],
+                    row['stereoisomer_name'],
+                    row.get('flag', 'nd'),  # ← Use original flag or default to 'nd'
+                    row.get('inchi_key'),
+                    row.get('total_stereoisomers', 1),
+                    self._clean_stereochemical_config(row.get('stereochemical_config', 'unknown')),
+                    row.get('num_stereocenters', 0)
+                )
+                for _, row in results_df.iterrows()
+            ]
+
+            changes_before = conn.total_changes
+            cursor.executemany(insert_query, rows)
+            inserted_count = conn.total_changes - changes_before
+
+            # Create indexes after the table is populated, not before: indexes
+            # created on an empty table force SQLite to rebalance their b-trees on
+            # every single-row insert above, which measured slower than building the
+            # indexes once against fully-populated data (same fix as applied to
+            # _update_table_with_inchi_keys() and _save_step_products()). This table
+            # has six indexes, so the win from reordering is largest here.
             cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_smiles ON {table_name}(smiles)")
             cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_name ON {table_name}(name)")
             cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_flag ON {table_name}(flag)")
             cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_inchi_key ON {table_name}(inchi_key)")
             cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_stereocenters ON {table_name}(num_stereocenters)")
             cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_total_stereo ON {table_name}(total_stereoisomers)")
-            
-            # Prepare insert query with stereochemical columns (excluding stereocenter_atoms)
-            insert_query = f'''
-                INSERT OR IGNORE INTO {table_name} 
-                (smiles, name, flag, inchi_key, total_stereoisomers, stereochemical_config, 
-                num_stereocenters)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            '''
-            
-            # Insert stereoisomer data including stereochemical information
-            inserted_count = 0
-            
-            for _, row in results_df.iterrows():
-                try:
-                    # Clean up the stereochemical configuration format
-                    config = row.get('stereochemical_config', 'unknown')
-                    clean_config = self._clean_stereochemical_config(config)
-                    
-                    cursor.execute(insert_query, (
-                        row['stereoisomer_smiles'],
-                        row['stereoisomer_name'],
-                        row.get('flag', 'nd'),  # ← Use original flag or default to 'nd'
-                        row.get('inchi_key'),
-                        row.get('total_stereoisomers', 1),
-                        clean_config,
-                        row.get('num_stereocenters', 0)
-                    ))
-                    inserted_count += 1
-                except sqlite3.IntegrityError:
-                    continue  # Skip duplicates
-            
+
             conn.commit()
             conn.close()
             
@@ -13017,29 +21659,33 @@ class ChemSpace:
             print(f"❌ Error analyzing stereocenters: {e}")
             return pd.DataFrame()
 
-    def _select_table_interactive(self, prompt_title: str = "SELECT TABLE", 
+    def _select_table_interactive(self, prompt_title: str = "SELECT TABLE",
                                 filter_type: Optional[str] = None,
-                                show_compound_count: bool = True) -> Optional[str]:
+                                show_compound_count: bool = True,
+                                tables_override: Optional[List[str]] = None) -> Optional[str]:
         """
         Unified interactive table selection method.
-        
+
         Args:
             prompt_title (str): Title for the selection prompt
             filter_type (Optional[str]): Optional filter for table types
             show_compound_count (bool): Whether to show compound counts
-            
+            tables_override (Optional[List[str]]): If provided, restrict selection to exactly
+                this list of tables instead of every table in the database (filter_type is
+                ignored in this case, since the caller has already pre-filtered)
+
         Returns:
             Optional[str]: Selected table name or None if cancelled
         """
         try:
-            available_tables = self.get_all_tables()
-            
+            available_tables = tables_override if tables_override is not None else self.get_all_tables()
+
             if not available_tables:
                 print("❌ No tables available for selection")
                 return None
-            
+
             # Filter tables if type specified
-            if filter_type:
+            if filter_type and tables_override is None:
                 filtered_tables = []
                 for table in available_tables:
                     table_type = self._classify_table_type(table)
@@ -13155,18 +21801,29 @@ class ChemSpace:
     def generate_mols_in_table(self, max_molecules: Optional[int] = None,
                             generate_conformers: bool = True,
                             nbr_confs: int = 10,
-                            conf_percentile: float = 0.25) -> Optional[List[Dict[str, Any]]]:
+                            conf_percentile: float = 0.25,
+                            mmff: str ='MMFF94',
+                            run_in_background: Optional[bool] = None) -> Optional[List[Dict[str, Any]]]:
         """
         Generate RDKit molecule objects from SMILES in a selected table.
         Uses existing helper methods for table selection and follows established patterns.
-        
+
         Args:
             max_molecules (Optional[int]): Maximum number of molecules to process. If None, prompts user.
             generate_conformers (bool): Whether to generate 3D conformers for molecules
             conformer_count (int): Number of conformers to generate per molecule
-            
+            run_in_background (Optional[bool]): If True, once the table and molecule count have
+                been resolved, hand the actual conformer generation/storage off to a separate
+                background process and return immediately (progress and results are written to a
+                log file instead of stdout). If False, run in the foreground as usual. If None,
+                prompts an interactive fg/bg selection. Useful for large tables where generation
+                (especially with conformers) can take a long time.
+
         Returns:
-            Optional[List[Dict]]: List of molecule dictionaries with RDKit objects and metadata
+            Optional[List[Dict]]: List of molecule dictionaries with RDKit objects and metadata.
+                If run_in_background is True, this is always None -- the generated molecules are
+                only persisted (as sdf_blob data) in the source table once the background process
+                completes; see the returned/logged message for the log file path.
         """
         try:
             print(f"🧬 GENERATE MOLECULE OBJECTS FROM TABLE")
@@ -13216,13 +21873,59 @@ class ChemSpace:
             
             processing_count = len(compounds_df)
             print(f"🧬 Generating molecule objects for {processing_count:,} compounds...")
-            
+
+            # Resolve the sdf_blob column y/n prompt here (in the foreground), before the
+            # fg/bg decision below -- _execute_mol_generation() no longer does this itself
+            # since it can also run detached in a background process, where input() would
+            # block forever waiting on a prompt nobody can answer.
+            self._check_sdf_blob_column(selected_table)
+
+            # Every interactive decision (table selection, molecule count, sdf_blob column)
+            # has now been resolved, so this is the last point where it's still cheap to ask
+            # whether the actual (potentially long-running) conformer generation/storage work
+            # should be handed off to a background process instead of blocking the caller.
+            # Mirrors the fg/bg pattern used by load_csv_file() / _load_csv_file_in_background().
+            if run_in_background is None:
+                run_mode = input(
+                    "\n⚙️  Do you want to run molecule generation in the foreground "
+                    "or background? (fg/bg) [default: fg]: "
+                ).strip().lower() or 'fg'
+                run_in_background = run_mode in ['bg', 'background']
+
+            if run_in_background:
+                return self._generate_mols_in_table_in_background(
+                    compounds_df, selected_table, generate_conformers, nbr_confs,
+                    conf_percentile, mmff
+                )
+
+            return self._execute_mol_generation(
+                compounds_df, selected_table, generate_conformers, nbr_confs,
+                conf_percentile, mmff
+            )
+
+        except Exception as e:
+            print(f"❌ Error in generate_mols_in_table: {e}")
+            return None
+
+    def _execute_mol_generation(self, compounds_df: pd.DataFrame, selected_table: str,
+                                generate_conformers: bool, nbr_confs: int,
+                                conf_percentile: float, mmff: str) -> Optional[List[Dict[str, Any]]]:
+        """
+        Performs the actual conformer generation/storage for generate_mols_in_table(), once the
+        table and molecule count have already been resolved. Split out so it can be run either
+        directly (foreground) or inside a separate process (background) via
+        _generate_mols_in_table_in_background().
+
+        Returns:
+            Optional[List[Dict]]: List of molecule dictionaries with RDKit objects and metadata.
+        """
+        try:
             # Show processing configuration
             print(f"\n⚙️  Processing Configuration:")
             print(f"   🧪 Generate conformers: {'Yes' if generate_conformers else 'No'}")
             if generate_conformers:
                 print(f"   🔄 Conformers per molecule: {nbr_confs}")
-            
+
             # Check RDKit availability (reuse existing pattern)
             try:
                 from rdkit import Chem
@@ -13233,7 +21936,7 @@ class ChemSpace:
                 print("❌ RDKit not installed. Please install RDKit:")
                 print("   conda install -c conda-forge rdkit")
                 return None
-            
+
             # Process molecules with progress tracking
             print(f"\n🔬 Processing molecules...")
             generated_molecules = []
@@ -13256,9 +21959,7 @@ class ChemSpace:
             else:
                 progress_bar = compounds_df.iterrows()
                 processed_count = 0
-            
-            self._check_sdf_blob_column(selected_table)
-            
+
             for _, compound in progress_bar:
                 processing_stats['processed'] += 1
                 
@@ -13299,7 +22000,7 @@ class ChemSpace:
                         try:
 
                             mol, molecule_datamol = self._generate_molecule_conformer(
-                                mol_hs, nbr_confs, compound_name, conf_percentile
+                                mol_hs, nbr_confs, compound_name, conf_percentile, mmff
                             )
                         
                             self._store_mol(mol, molecule_data)
@@ -13342,10 +22043,86 @@ class ChemSpace:
                 print(f"   📈 Success rate: {success_rate:.1f}%")
             
             return generated_molecules if generated_molecules else None
-            
+
         except Exception as e:
-            print(f"❌ Error in generate_mols_in_table: {e}")
+            print(f"❌ Error in _execute_mol_generation: {e}")
             return None
+
+    def _generate_mols_in_table_in_background(self, compounds_df: pd.DataFrame, selected_table: str,
+                                               generate_conformers: bool, nbr_confs: int,
+                                               conf_percentile: float, mmff: str) -> None:
+        """
+        Launches molecule generation as a fully independent OS process via subprocess.Popen (the
+        same fg/bg pattern used by load_csv_file()/_load_csv_file_in_background() and
+        project_dimensionality_on_table()/_project_dimensionality_in_background()), so generating
+        conformers for a large table doesn't block the caller.
+
+        The table and molecule count have already been resolved by the time this is called, so
+        the already-sliced compounds_df is pickled to disk and the child just loads it back --
+        no re-querying or re-prompting involved. Generated molecules are persisted as sdf_blob
+        data in the source table by _store_mol(); the in-memory RDKit objects themselves cannot
+        cross the Popen boundary.
+
+        Returns:
+            None: the generated molecule dictionaries are only available to a foreground call;
+                backgrounded runs persist results to the database and the log file only.
+        """
+        import subprocess
+
+        logs_dir = os.path.join(os.path.dirname(self.__chemspace_db), 'logs')
+        os.makedirs(logs_dir, exist_ok=True)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        base_name = f'mol_generation_{selected_table}_{timestamp}'
+        log_file_path = os.path.join(logs_dir, f'{base_name}.log')
+        script_path = os.path.join(logs_dir, f'{base_name}.py')
+        data_path = os.path.join(logs_dir, f'{base_name}_data.pkl')
+
+        compounds_df.to_pickle(data_path)
+
+        script = f"""
+import os
+import pandas as pd
+from tidyscreen import tidyscreen
+from tidyscreen.chemspace.chemspace import ChemSpace
+
+project = tidyscreen.ActivateProject({self.name!r})
+cs = ChemSpace(project)
+
+compounds_df = pd.read_pickle({data_path!r})
+
+try:
+    cs._execute_mol_generation(
+        compounds_df,
+        {selected_table!r},
+        {generate_conformers!r},
+        {nbr_confs!r},
+        {conf_percentile!r},
+        {mmff!r},
+    )
+finally:
+    os.remove({data_path!r})
+"""
+        with open(script_path, 'w') as f:
+            f.write(script)
+
+        try:
+            with open(log_file_path, 'w') as log_file:
+                process = subprocess.Popen(
+                    [sys.executable, script_path],
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    cwd=self.path,
+                    start_new_session=True
+                )
+        except Exception as e:
+            print(f"❌ Error launching background molecule generation: {e}")
+            return None
+
+        print(f"🚀 Molecule generation launched in the background (PID {process.pid})")
+        print(f"   Generating molecules for {len(compounds_df):,} compounds from table '{selected_table}'...")
+        print(f"   Progress/results log: {log_file_path}")
+
+        return None
 
     def _prompt_for_processing_count(self, total_available: int, item_type: str = "items") -> Optional[int]:
         """
@@ -13428,7 +22205,8 @@ class ChemSpace:
             return None
 
     def _generate_molecule_conformer(self, mol_hs, nbr_confs: int, 
-                                    compound_name: str, conf_percentile) -> List[Dict[str, Any]]:
+                                    compound_name: str, conf_percentile,
+                                    mmff) -> List[Dict[str, Any]]:
         """
         Generate 3D conformers for a molecule.
         Reuses existing conformer generation patterns from _generate_conformers.
@@ -13445,16 +22223,16 @@ class ChemSpace:
             from rdkit.Chem import AllChem
             
             # Use existing conformer generation method
-            mol_hs, confs, ps = self._generate_conformers(
-                mol_hs, nbr_confs=nbr_confs, mmff='MMFF94s'
+            mol_hs, confs_id, ps = self._generate_conformers(
+                mol_hs, nbr_confs, mmff
             )
 
-            if not confs:
+            if not confs_id:
                 return []
             
             # Create conformer data
             conformers_data = []
-            for i, conf_id in enumerate(confs):
+            for i, conf_id in enumerate(confs_id):
                 try:
                     # Get conformer energy if MMFF properties (ps) available
                     energy = None
@@ -13462,8 +22240,10 @@ class ChemSpace:
                         try:
                             # Use the molecule with hydrogens returned by _generate_conformers (mol_hs)
                             ff = AllChem.MMFFGetMoleculeForceField(mol_hs, ps, confId=int(conf_id))
+                            
                             if ff is not None:
                                 energy = float(ff.CalcEnergy())
+                        
                         except Exception:
                             energy = None
                     
@@ -13568,48 +22348,43 @@ class ChemSpace:
                 # older signature
                 try:
                     conf_ids = list(AllChem.EmbedMultipleConfs(mol_hs, nbr_confs, params))
-                except Exception:
-                    conf_ids = []
-            except Exception:
-                conf_ids = []
-
-            if not conf_ids:
-                return mol_hs, [], None
+                except Exception as e:
+                    print(f"Error generating conformer ids: {e}.")
+                    confs_ids = []
 
             # Prepare MMFF properties
             try:
                 ps = AllChem.MMFFGetMoleculeProperties(mol_hs, mmffVariant='MMFF94s')
-            except Exception:
-                try:
-                    ps = AllChem.MMFFGetMoleculeProperties(mol_hs)
-                except Exception:
-                    ps = None
+            except Exception as e:
+                print(f"Error preparing forcefield properties: {e}.")
+                ps = []
 
             # Try bulk optimization; fall back to per-conformer optimize if signature differs
             try:
-                # modern RDKit: MMFFOptimizeMoleculeConfs returns list of (confId, status)
-                try:
-                    AllChem.MMFFOptimizeMoleculeConfs(mol_hs, confIds=conf_ids, maxIters=100, mmffVariant='MMFF94s')
-                except TypeError:
-                    # older signature without keyword args
-                    AllChem.MMFFOptimizeMoleculeConfs(mol_hs, conf_ids, 100)
-            except Exception:
-                # best-effort per-conformer optimization
-                for cid in conf_ids:
-                    try:
-                        ff = AllChem.MMFFGetMoleculeForceField(mol_hs, ps, confId=int(cid))
-                        if ff is not None:
-                            ff.Minimize(maxIts=100)
-                    except Exception:
-                        continue
+                #AllChem.MMFFOptimizeMoleculeConfs(mol_hs, confIds=conf_ids, maxIters=100, mmffVariant='MMFF94s')
+                #AllChem.MMFFOptimizeMoleculeConfs(mol_hs, maxIters=100, mmffVariant='MMFF94s')
+                
+                ## Try a per-conformer optimization
+                for conf_id in conf_ids:
+                    conf = mol_hs.GetConformer(conf_id)
+                    # Minimize the conformer
+                    #AllChem.UFFOptimizeMolecule(mol_hs, confId=conf_id, maxIters=200)
+                    AllChem.MMFFOptimizeMolecule(mol_hs, confId=conf_id, maxIters=200, mmffVariant=mmff)
+
+
+            except TypeError as e:
+                # older signature without keyword args
+                #AllChem.MMFFOptimizeMoleculeConfs(mol_hs, conf_ids, 100)
+
+                print("Error minimizing the conformers in bulk... Error:", e)
+                
+                mol_hs = []
 
             return mol_hs, conf_ids, ps
 
-        except Exception as error:
-            
-            print(f"Exiting conformer generation with failure... Error: {error}")
-            
-            return None, [], None
+        except Exception as e:
+            print("Error generating conformers: {e}. Stopping")
+            sys.exit(1)
 
     def _sort_conf_by_energy(self, conformers_data, mol_hs, ps, conf_percentile):
         """
@@ -13767,6 +22542,8 @@ class ChemSpace:
             # Check if sdf_blob column exists
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             cursor.execute(f"PRAGMA table_info({source_table})")
             columns = [row[1] for row in cursor.fetchall()]
@@ -13780,6 +22557,8 @@ class ChemSpace:
                 # Count existing blobs
                 conn = sqlite3.connect(self.__chemspace_db)
                 cursor = conn.cursor()
+                cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.execute("PRAGMA synchronous=NORMAL")
                 cursor.execute(f"SELECT COUNT(*) FROM {source_table} WHERE sdf_blob IS NOT NULL")
                 existing_blobs = cursor.fetchone()[0]
                 conn.close()
@@ -13841,6 +22620,8 @@ class ChemSpace:
         try:
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             # Get current table schema
             cursor.execute(f"PRAGMA table_info({table_name})")
@@ -14019,6 +22800,8 @@ class ChemSpace:
             # Connect to database and update the table
             conn = sqlite3.connect(self.__chemspace_db)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             
             # First, check if the table has a 'sdf_blob' column, add it if it doesn't exist
             cursor.execute(f"PRAGMA table_info({source_table})")
@@ -14411,6 +23194,8 @@ class ChemSpace:
             try:
                 conn = sqlite3.connect(self.__chemspace_db)
                 cursor = conn.cursor()
+                cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.execute("PRAGMA synchronous=NORMAL")
                 
                 # Create new table with same schema as original
                 # Get original table schema
@@ -14459,25 +23244,34 @@ class ChemSpace:
                 create_table_sql = f"CREATE TABLE {output_table_name} ({', '.join(column_defs)}{unique_constraint})"
 
                 cursor.execute(create_table_sql)
-                
-                # Create indexes
-                cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{output_table_name}_smiles ON {output_table_name}(smiles)")
-                cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{output_table_name}_name ON {output_table_name}(name)")
-                
-                # Insert subset data
+
+                # Insert subset data in a single executemany() batch rather than one
+                # execute() per row (crossing the sqlite3 C-API boundary once per row
+                # dominates runtime for large subsets). INSERT OR IGNORE replaces the
+                # per-row try/except IntegrityError (a no-op when the source table
+                # had no UNIQUE(smiles, name) constraint to carry over); total_changes
+                # before/after still gives an exact duplicate count either way.
                 insert_columns = [col[1] for col in columns_info if col[1] != 'id']  # Exclude auto-increment id
                 placeholders = ', '.join(['?'] * len(insert_columns))
-                insert_sql = f"INSERT INTO {output_table_name} ({', '.join(insert_columns)}) VALUES ({placeholders})"
-                
-                inserted_count = 0
-                for _, row in subset_df.iterrows():
-                    try:
-                        values = [row[col] for col in insert_columns]
-                        cursor.execute(insert_sql, values)
-                        inserted_count += 1
-                    except sqlite3.IntegrityError:
-                        continue  # Skip duplicates
-                
+                insert_sql = f"INSERT OR IGNORE INTO {output_table_name} ({', '.join(insert_columns)}) VALUES ({placeholders})"
+
+                rows = [
+                    tuple(row[col] for col in insert_columns)
+                    for _, row in subset_df.iterrows()
+                ]
+                changes_before = conn.total_changes
+                cursor.executemany(insert_sql, rows)
+                inserted_count = conn.total_changes - changes_before
+
+                # Create indexes after the table is populated, not before: indexes
+                # created on an empty table force SQLite to rebalance their b-trees
+                # on every single-row insert above, which measured slower than
+                # building the indexes once against fully-populated data (same fix
+                # as applied to _update_table_with_inchi_keys() and
+                # _save_step_products()).
+                cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{output_table_name}_smiles ON {output_table_name}(smiles)")
+                cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{output_table_name}_name ON {output_table_name}(name)")
+
                 conn.commit()
                 conn.close()
                 
@@ -14593,6 +23387,8 @@ class ChemSpace:
             try:
                 conn = sqlite3.connect(self.__chemspace_db)
                 cursor = conn.cursor()
+                cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.execute("PRAGMA synchronous=NORMAL")
                 # Create table with basic schema
                 columns = merged_df.columns
                 schema_parts = []
@@ -14767,6 +23563,8 @@ class ChemSpace:
             try:
                 conn = sqlite3.connect(self.__chemspace_db)
                 cursor = conn.cursor()
+                cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.execute("PRAGMA synchronous=NORMAL")
                 # Save result_df to the database
                 columns = result_df.columns
                 schema_parts = []
@@ -14813,9 +23611,283 @@ class ChemSpace:
                 return
         
         except Exception as e:
-            print(f"❌ Error in substract_tables method: {e}")                  
-                
-                
+            print(f"❌ Error in substract_tables method: {e}")
+
+    def contrast_two_tables(self) -> pd.DataFrame:
+        """
+        Show the user a list of available tables, let them select two, and check
+        which compounds in the first table are also present in the second table.
+
+        Matching is done via 'inchi_key' rather than raw SMILES strings, since the
+        same molecule can be represented by different (but chemically equivalent)
+        SMILES depending on how/when it was canonicalized — the same approach used
+        by substract_tables(). Both tables must already have an 'inchi_key' column
+        populated (see compute_inchi_keys()).
+
+        After reporting the summary counts, prompts the user to optionally print
+        the matching and/or non-matching compounds (id, name, smiles, inchi_key).
+
+        Returns:
+            pd.DataFrame: A copy of table 1 with an added boolean column
+                'contained_in_<table2>' flagging rows whose inchi_key is present
+                in table 2. Empty DataFrame on error or if cancelled.
+        """
+        try:
+            # Get all available tables
+            available_tables = self.get_all_tables()
+            if not available_tables:
+                print("❌ No tables found in chemspace database")
+                return pd.DataFrame()
+
+            print("\n📋 CONTRAST TWO TABLES")
+            print("=" * 60)
+            print(f"Available tables ({len(available_tables)}):")
+            print("-" * 60)
+            for i, table_name in enumerate(available_tables, 1):
+                try:
+                    compound_count = self.get_compound_count(table_name=table_name)
+                    print(f"{i:2d}. {table_name:<35} ({compound_count} compounds)")
+                except Exception as e:
+                    print(f"{i:2d}. {table_name:<35} (Error: {e})")
+            print("-" * 60)
+
+            # Query user for table 1 (the table whose molecules will be checked)
+            print("\nSelect table 1 (molecules to check), by number or name, or 'cancel' to abort.")
+            while True:
+                selection = input("Table 1: ").strip()
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    print("❌ Contrast operation cancelled.")
+                    return pd.DataFrame()
+                if selection.isdigit():
+                    idx = int(selection)
+                    if 1 <= idx <= len(available_tables):
+                        table1 = available_tables[idx - 1]
+                        break
+                    else:
+                        print(f"⚠️  Invalid table index: {idx}")
+                elif selection in available_tables:
+                    table1 = selection
+                    break
+                else:
+                    print(f"⚠️  Table not found: {selection}")
+            print(f"✅ Selected table 1: {table1}")
+
+            # Query user for table 2 (the table to check against)
+            print("\nSelect table 2 (checked against), by number or name, or 'cancel' to abort.")
+            while True:
+                selection = input("Table 2: ").strip()
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    print("❌ Contrast operation cancelled.")
+                    return pd.DataFrame()
+                if selection.isdigit():
+                    idx = int(selection)
+                    if 1 <= idx <= len(available_tables):
+                        candidate = available_tables[idx - 1]
+                    else:
+                        print(f"⚠️  Invalid table index: {idx}")
+                        continue
+                elif selection in available_tables:
+                    candidate = selection
+                else:
+                    print(f"⚠️  Table not found: {selection}")
+                    continue
+                if candidate == table1:
+                    print("⚠️  Table 2 must be different from table 1.")
+                    continue
+                table2 = candidate
+                break
+            print(f"✅ Selected table 2: {table2}")
+
+            # Load both tables
+            table1_df = self._get_table_as_dataframe(table1)
+            if table1_df.empty:
+                print(f"❌ Table '{table1}' is empty or could not be loaded.")
+                return pd.DataFrame()
+
+            table2_df = self._get_table_as_dataframe(table2)
+            if table2_df.empty:
+                print(f"❌ Table '{table2}' is empty or could not be loaded.")
+                return pd.DataFrame()
+
+            if 'inchi_key' not in table1_df.columns or 'inchi_key' not in table2_df.columns:
+                print("❌ Cannot perform contrast because 'inchi_key' column is missing in one of the tables.")
+                print("   Run compute_inchi_keys() on both tables first.")
+                return pd.DataFrame()
+
+            table1_df['inchi_key'] = table1_df['inchi_key'].fillna('')
+            table2_keys = set(table2_df['inchi_key'].fillna(''))
+            table2_keys.discard('')
+
+            result_column = f"contained_in_{table2}"
+            result_df = table1_df.copy()
+            result_df[result_column] = result_df['inchi_key'].isin(table2_keys)
+
+            total_count = len(result_df)
+            contained_count = int(result_df[result_column].sum())
+            not_contained_count = total_count - contained_count
+
+            print("\n" + "=" * 60)
+            print(f"📊 CONTRAST RESULTS: '{table1}' vs '{table2}'")
+            print("=" * 60)
+            print(f"Total compounds in '{table1}':   {total_count}")
+            print(f"✅ Contained in '{table2}':      {contained_count} ({contained_count / total_count * 100:.1f}%)")
+            print(f"❌ Not contained in '{table2}':  {not_contained_count} ({not_contained_count / total_count * 100:.1f}%)")
+            print("=" * 60)
+
+            # Ask the user whether to print the matching and/or non-matching compounds
+            print("\nPrint which compounds?")
+            print("  1. Matching only")
+            print("  2. Non-matching only")
+            print("  3. Both")
+            print("  4. None")
+            while True:
+                print_choice = input("Select an option (1-4, default=4): ").strip() or "4"
+                if print_choice in ('1', '2', '3', '4'):
+                    break
+                print(f"⚠️  Invalid option: {print_choice}")
+
+            display_cols = [c for c in ['id', 'name', 'smiles', 'inchi_key'] if c in result_df.columns]
+
+            if print_choice in ('1', '3'):
+                matching_df = result_df[result_df[result_column]]
+                print(f"\n✅ Matching compounds ({len(matching_df)}):")
+                print("-" * 60)
+                print(matching_df[display_cols].to_string(index=False) if not matching_df.empty else "(none)")
+                print("-" * 60)
+
+            if print_choice in ('2', '3'):
+                non_matching_df = result_df[~result_df[result_column]]
+                print(f"\n❌ Non-matching compounds ({len(non_matching_df)}):")
+                print("-" * 60)
+                print(non_matching_df[display_cols].to_string(index=False) if not non_matching_df.empty else "(none)")
+                print("-" * 60)
+
+            return result_df
+
+        except Exception as e:
+            print(f"❌ Error in contrast_two_tables method: {e}")
+            return pd.DataFrame()
+
+    def export_table_as_pdb(self):
+
+        """
+        Will query the user which table to export as .pdb file from the existing .sdf objects present in the table
+        """
+        try:
+            # List available tables
+            available_tables = self.get_all_tables()
+            if not available_tables:
+                print("❌ No tables available in the chemspace database.")
+                return False
+
+            print("\n📋 EXPORT TABLE AS PDB")
+            print("=" * 60)
+            print("Available tables with SDF blobs:")
+            tables_with_sdf = []
+            for table in available_tables:
+                # Check if table has 'sdf_blob' column
+                conn = sqlite3.connect(self.__chemspace_db)
+                cursor = conn.cursor()
+                cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.execute("PRAGMA synchronous=NORMAL")
+                cursor.execute(f"PRAGMA table_info({table})")
+                columns = [row[1] for row in cursor.fetchall()]
+                conn.close()
+                if 'sdf_blob' in columns:
+                    tables_with_sdf.append(table)
+            for i, table in enumerate(tables_with_sdf, 1):
+                print(f"  {i}. {table}")
+            if not tables_with_sdf:
+                print("❌ No tables with 'sdf_blob' column found. Generate molecules with SDF first.")
+                return False
+
+            # Prompt user to select table
+            while True:
+                table_input = input("Enter table number or name to export as PDB (or 'cancel' to abort): ").strip()
+                if table_input.lower() in ['cancel', 'exit', 'quit']:
+                    print("Operation cancelled.")
+                    return False
+                if table_input.isdigit():
+                    idx = int(table_input) - 1
+                    if 0 <= idx < len(tables_with_sdf):
+                        selected_table = tables_with_sdf[idx]
+                        break
+                    else:
+                        print("Invalid table number. Try again.")
+                elif table_input in tables_with_sdf:
+                    selected_table = table_input
+                    break
+                else:
+                    print("Invalid input. Try again.")
+
+            ## Output directory is set to the /misc folder and creating a subfolder named after the selected table containing the suffix '_pdbs'
+
+            output_dir = os.path.join(self.path, 'chemspace', 'misc', f'{selected_table}_pdbs')
+
+            print(output_dir)
+
+            try:
+                os.makedirs(output_dir, exist_ok=True)
+            except Exception as e:
+                print("Problem creating the pdbs output directory")
+                sys.exit(1)
+
+            # Query all rows with sdf_blob
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.execute(f"SELECT id, name, inchi_key, sdf_blob FROM {selected_table} WHERE sdf_blob IS NOT NULL")
+            rows = cursor.fetchall()
+            conn.close()
+
+            if not rows:
+                print(f"❌ No SDF blobs found in table '{selected_table}'.")
+                return False
+
+            # Export each SDF blob as PDB
+            from rdkit import Chem
+            from rdkit.Chem import AllChem
+
+            exported = 0
+            failed = 0
+            for row in rows:
+                cmpd_id, name, inchi_key, sdf_blob = row
+                try:
+                    # Write SDF blob to temp file
+                    temp_sdf = f"/tmp/{inchi_key or cmpd_id}.sdf"
+                    with open(temp_sdf, "wb") as f:
+                        f.write(sdf_blob)
+                    # Read molecule from SDF
+                    suppl = Chem.SDMolSupplier(temp_sdf, removeHs=False)
+                    mols = [m for m in suppl if m is not None]
+                    if not mols:
+                        failed += 1
+                        continue
+                    mol = mols[0]
+                    # Generate 3D coordinates if not present
+                    if mol.GetNumConformers() == 0:
+                        AllChem.EmbedMolecule(mol, AllChem.ETKDG())
+                    # Write as PDB
+                    safe_name = self._sanitize_filename(name or f"mol_{cmpd_id}")
+                    pdb_path = os.path.join(output_dir, f"{safe_name}.pdb")
+                    with Chem.rdmolfiles.PDBWriter(pdb_path) as writer:
+                        writer.write(mol)
+                    exported += 1
+                except Exception as e:
+                    failed += 1
+                    continue
+
+            print(f"\n✅ Exported {exported} molecules as PDB to: {output_dir}")
+            if failed > 0:
+                print(f"⚠️  {failed} molecules failed to export.")
+            return exported > 0
+
+        except Exception as e:
+            print(f"❌ Error exporting table as PDB: {e}")
+            return False    
+
+
             
 
 

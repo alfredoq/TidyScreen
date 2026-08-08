@@ -45,25 +45,28 @@ def refresh_reactions():
     
     return success
 
-def list_chemical_filters(pattern=None):
+def get_chemical_filters(pattern=None):
     """
-    List all chemical filters available in the database.
+    Retrieve chemical filters available in the database.
     This can be called independently without activating a specific project.
-    
+
     Args:
         pattern (str, optional): Filter names containing this pattern
+
+    Returns:
+        list[tuple]: (id, filter_name, smarts) tuples, empty list if none found or on error.
     """
     db_manager = DatabaseManager()
     projects_db = f"{site.getsitepackages()[0]}/tidyscreen/projects_db/projects_database.db"
-    
+
     if not os.path.exists(projects_db):
         print("❌ Projects database does not exist. Create a project first.")
-        return
-    
+        return []
+
     try:
         conn = db_manager.connect_db(projects_db)
         cursor = conn.cursor()
-        
+
         # Build query
         if pattern:
             query = "SELECT id, filter_name, smarts FROM chem_filters WHERE filter_name LIKE ? ORDER BY filter_name"
@@ -71,17 +74,33 @@ def list_chemical_filters(pattern=None):
         else:
             query = "SELECT id, filter_name, smarts FROM chem_filters ORDER BY filter_name"
             cursor.execute(query)
-        
+
         filters = cursor.fetchall()
         conn.close()
-        
-        if not filters:
-            if pattern:
-                print(f"No chemical filters found matching pattern: {pattern}")
-            else:
-                print("No chemical filters found in database.")
-            return
-        
+        return filters
+
+    except Exception as e:
+        print(f"❌ Error listing chemical filters: {e}")
+        return []
+
+def list_chemical_filters(pattern=None):
+    """
+    List all chemical filters available in the database.
+    This can be called independently without activating a specific project.
+
+    Args:
+        pattern (str, optional): Filter names containing this pattern
+    """
+    filters = get_chemical_filters(pattern)
+
+    if not filters:
+        if pattern:
+            print(f"No chemical filters found matching pattern: {pattern}")
+        else:
+            print("No chemical filters found in database.")
+        return
+
+    try:
         print("\n" + "="*80)
         print("CHEMICAL FILTERS")
         print("="*80)
@@ -100,25 +119,28 @@ def list_chemical_filters(pattern=None):
     except Exception as e:
         print(f"❌ Error listing chemical filters: {e}")
 
-def list_chemical_reactions(pattern=None):
+def get_chemical_reactions(pattern=None):
     """
-    List all chemical reactions available in the database.
+    Retrieve chemical reactions available in the database.
     This can be called independently without activating a specific project.
-    
+
     Args:
         pattern (str, optional): Reaction names containing this pattern
+
+    Returns:
+        list[tuple]: (id, reaction_name, smarts) tuples, empty list if none found or on error.
     """
     db_manager = DatabaseManager()
     projects_db = f"{site.getsitepackages()[0]}/tidyscreen/projects_db/projects_database.db"
-    
+
     if not os.path.exists(projects_db):
         print("❌ Projects database does not exist. Create a project first.")
-        return
-    
+        return []
+
     try:
         conn = db_manager.connect_db(projects_db)
         cursor = conn.cursor()
-        
+
         # Build query
         if pattern:
             query = "SELECT id, reaction_name, smarts FROM chem_reactions WHERE reaction_name LIKE ? ORDER BY reaction_name"
@@ -126,34 +148,229 @@ def list_chemical_reactions(pattern=None):
         else:
             query = "SELECT id, reaction_name, smarts FROM chem_reactions ORDER BY reaction_name"
             cursor.execute(query)
-        
+
         reactions = cursor.fetchall()
         conn.close()
-        
-        if not reactions:
-            if pattern:
-                print(f"No chemical reactions found matching pattern: {pattern}")
-            else:
-                print("No chemical reactions found in database.")
-            return
-        
+        return reactions
+
+    except Exception as e:
+        print(f"❌ Error listing chemical reactions: {e}")
+        return []
+
+def list_chemical_reactions(pattern=None):
+    """
+    List all chemical reactions available in the database.
+    This can be called independently without activating a specific project.
+
+    Args:
+        pattern (str, optional): Reaction names containing this pattern
+    """
+    reactions = get_chemical_reactions(pattern)
+
+    if not reactions:
+        if pattern:
+            print(f"No chemical reactions found matching pattern: {pattern}")
+        else:
+            print("No chemical reactions found in database.")
+        return
+
+    try:
         print("\n" + "="*80)
         print("CHEMICAL REACTIONS")
         print("="*80)
         print(f"{'ID':<4} {'Reaction Name':<30} {'SMARTS Pattern':<80}")
         print("-"*80)
-        
+
         for reaction_id, reaction_name, smarts in reactions:
             print(f"{reaction_id:<4} {reaction_name:<30} {smarts:<80}")
 
         print("="*80)
         print(f"Total reactions: {len(reactions)}")
-        
+
         if pattern:
             print(f"Filtered by: {pattern}")
-        
+
     except Exception as e:
-        print(f"❌ Error listing chemical filters: {e}")
+        print(f"❌ Error listing chemical reactions: {e}")
+
+def add_chemical_filter_entry(filter_name, smarts_pattern, overwrite=False):
+    """
+    Add (or overwrite) a chemical filter entry in the chem_filters.json config
+    file and refresh the chem_filters table in the projects database.
+
+    Non-interactive core shared by add_chemical_filter() (CLI, prompts for
+    input via input()) and the Streamlit GUI, which collects the same fields
+    through text inputs instead.
+
+    Args:
+        filter_name (str): Name of the filter.
+        smarts_pattern (str): SMARTS pattern for the filter.
+        overwrite (bool): If True, replace an existing filter with the same
+            name. If False and the name already exists, no write happens and
+            the result's 'exists' flag is set so the caller can ask the user
+            to confirm before retrying with overwrite=True.
+
+    Returns:
+        dict: {'success': bool, 'message': str, 'exists': bool}
+    """
+    filter_name = (filter_name or "").strip()
+    smarts_pattern = (smarts_pattern or "").strip()
+
+    if not filter_name:
+        return {'success': False, 'message': "Filter name cannot be empty.", 'exists': False}
+
+    if not smarts_pattern:
+        return {'success': False, 'message': "SMARTS pattern cannot be empty.", 'exists': False}
+
+    try:
+        # Get path to JSON file
+        config_path = os.path.join(os.path.dirname(__file__), 'config', 'chem_filters.json')
+
+        # Read existing filters
+        if os.path.exists(config_path):
+            with open(config_path, 'r', encoding='utf-8') as f:
+                filters_data = json.load(f)
+        else:
+            filters_data = []
+
+        # Check if filter name already exists
+        existing_names = [f['filter_name'] for f in filters_data]
+        if filter_name in existing_names and not overwrite:
+            return {
+                'success': False,
+                'message': f"Filter '{filter_name}' already exists in the configuration file.",
+                'exists': True,
+            }
+
+        # Remove existing filter with same name (no-op if it wasn't there)
+        filters_data = [f for f in filters_data if f['filter_name'] != filter_name]
+
+        # Add new filter
+        filters_data.append({"filter_name": filter_name, "smarts": smarts_pattern})
+
+        # Sort filters alphabetically by name
+        filters_data.sort(key=lambda x: x['filter_name'])
+
+        # Write back to JSON file
+        with open(config_path, 'w', encoding='utf-8') as f:
+            json.dump(filters_data, f, indent=2, ensure_ascii=False)
+
+        print(f"✅ Filter '{filter_name}' added to configuration file.")
+        print(f"📍 Updated file: {config_path}")
+
+        # Refresh filters in database
+        print("\n🔄 Refreshing filters in database...")
+        success = refresh_filters()
+
+        if success:
+            return {
+                'success': True,
+                'message': f"Chemical filter '{filter_name}' added and database updated successfully!",
+                'exists': False,
+            }
+        else:
+            return {
+                'success': False,
+                'message': f"Filter '{filter_name}' was added to configuration but database update failed.",
+                'exists': False,
+            }
+
+    except Exception as e:
+        return {'success': False, 'message': f"Error adding chemical filter: {e}", 'exists': False}
+
+def modify_chemical_filter_entry(old_filter_name, new_filter_name, new_smarts_pattern, overwrite=False):
+    """
+    Modify an existing chemical filter entry in the chem_filters.json config
+    file and refresh the chem_filters table in the projects database.
+
+    Non-interactive core used by the Streamlit GUI to edit a filter's name
+    and/or SMARTS pattern in place.
+
+    Args:
+        old_filter_name (str): Name of the filter to modify.
+        new_filter_name (str): New name for the filter (may be unchanged).
+        new_smarts_pattern (str): New SMARTS pattern for the filter.
+        overwrite (bool): If True and new_filter_name collides with a
+            different, already-existing filter, replace that filter too. If
+            False and such a collision exists, no write happens and the
+            result's 'exists' flag is set so the caller can ask the user to
+            confirm before retrying with overwrite=True.
+
+    Returns:
+        dict: {'success': bool, 'message': str, 'exists': bool}
+    """
+    old_filter_name = (old_filter_name or "").strip()
+    new_filter_name = (new_filter_name or "").strip()
+    new_smarts_pattern = (new_smarts_pattern or "").strip()
+
+    if not old_filter_name:
+        return {'success': False, 'message': "No filter selected to modify.", 'exists': False}
+
+    if not new_filter_name:
+        return {'success': False, 'message': "Filter name cannot be empty.", 'exists': False}
+
+    if not new_smarts_pattern:
+        return {'success': False, 'message': "SMARTS pattern cannot be empty.", 'exists': False}
+
+    try:
+        config_path = os.path.join(os.path.dirname(__file__), 'config', 'chem_filters.json')
+
+        if os.path.exists(config_path):
+            with open(config_path, 'r', encoding='utf-8') as f:
+                filters_data = json.load(f)
+        else:
+            filters_data = []
+
+        existing_names = [f['filter_name'] for f in filters_data]
+        if old_filter_name not in existing_names:
+            return {
+                'success': False,
+                'message': f"Filter '{old_filter_name}' was not found in the configuration file.",
+                'exists': False,
+            }
+
+        # Renaming into a different, already-existing filter is a collision
+        name_changed = new_filter_name != old_filter_name
+        collides_with_other = name_changed and new_filter_name in existing_names
+        if collides_with_other and not overwrite:
+            return {
+                'success': False,
+                'message': f"Filter '{new_filter_name}' already exists in the configuration file.",
+                'exists': True,
+            }
+
+        # Remove the original entry, and the colliding entry if overwriting
+        filters_data = [f for f in filters_data if f['filter_name'] != old_filter_name]
+        if collides_with_other:
+            filters_data = [f for f in filters_data if f['filter_name'] != new_filter_name]
+
+        filters_data.append({"filter_name": new_filter_name, "smarts": new_smarts_pattern})
+        filters_data.sort(key=lambda x: x['filter_name'])
+
+        with open(config_path, 'w', encoding='utf-8') as f:
+            json.dump(filters_data, f, indent=2, ensure_ascii=False)
+
+        print(f"✅ Filter '{old_filter_name}' modified to '{new_filter_name}' in configuration file.")
+        print(f"📍 Updated file: {config_path}")
+
+        print("\n🔄 Refreshing filters in database...")
+        success = refresh_filters()
+
+        if success:
+            return {
+                'success': True,
+                'message': f"Chemical filter '{new_filter_name}' updated and database refreshed successfully!",
+                'exists': False,
+            }
+        else:
+            return {
+                'success': False,
+                'message': f"Filter '{new_filter_name}' was updated in configuration but database update failed.",
+                'exists': False,
+            }
+
+    except Exception as e:
+        return {'success': False, 'message': f"Error modifying chemical filter: {e}", 'exists': False}
 
 def add_chemical_filter():
     """
@@ -164,167 +381,226 @@ def add_chemical_filter():
     print("\n" + "="*60)
     print("ADD NEW CHEMICAL FILTER")
     print("="*60)
-    
-    try:
-        # Get user input
-        filter_name = input("Enter filter name: ").strip()
-        if not filter_name:
-            print("❌ Filter name cannot be empty.")
-            return False
-        
-        smarts_pattern = input("Enter SMARTS pattern: ").strip()
-        if not smarts_pattern:
-            print("❌ SMARTS pattern cannot be empty.")
-            return False
-        
-        # Confirm input
-        print(f"\n📋 Filter details:")
-        print(f"   Name: {filter_name}")
-        print(f"   SMARTS: {smarts_pattern}")
-        
-        confirm = input("\nSave this filter? (y/n): ").strip().lower()
-        if confirm not in ['y', 'yes']:
-            print("Filter addition cancelled.")
-            return False
-        
-        # Get path to JSON file
-        config_path = os.path.join(os.path.dirname(__file__), 'config', 'chem_filters.json')
-        
-        # Read existing filters
-        if os.path.exists(config_path):
-            with open(config_path, 'r', encoding='utf-8') as f:
-                filters_data = json.load(f)
-        else:
-            filters_data = []
-        
-        # Check if filter name already exists
-        existing_names = [f['filter_name'] for f in filters_data]
-        if filter_name in existing_names:
-            print(f"❌ Filter '{filter_name}' already exists in the configuration file.")
-            overwrite = input("Do you want to overwrite it? (y/n): ").strip().lower()
-            if overwrite not in ['y', 'yes']:
-                print("Filter addition cancelled.")
-                return False
-            
-            # Remove existing filter with same name
-            filters_data = [f for f in filters_data if f['filter_name'] != filter_name]
-        
-        # Add new filter
-        new_filter = {
-            "filter_name": filter_name,
-            "smarts": smarts_pattern
-        }
-        filters_data.append(new_filter)
-        
-        # Sort filters alphabetically by name
-        filters_data.sort(key=lambda x: x['filter_name'])
-        
-        # Write back to JSON file
-        with open(config_path, 'w', encoding='utf-8') as f:
-            json.dump(filters_data, f, indent=2, ensure_ascii=False)
-        
-        print(f"✅ Filter '{filter_name}' added to configuration file.")
-        print(f"📍 Updated file: {config_path}")
-        
-        # Refresh filters in database
-        print("\n🔄 Refreshing filters in database...")
-        success = refresh_filters()
-        
-        if success:
-            print("✅ Chemical filter added and database updated successfully!")
-            return True
-        else:
-            print("❌ Filter was added to configuration but database update failed.")
-            return False
-            
-    except Exception as e:
-        print(f"❌ Error adding chemical filter: {e}")
+
+    # Get user input
+    filter_name = input("Enter filter name: ").strip()
+    if not filter_name:
+        print("❌ Filter name cannot be empty.")
         return False
 
-def add_chemical_reaction():
+    smarts_pattern = input("Enter SMARTS pattern: ").strip()
+    if not smarts_pattern:
+        print("❌ SMARTS pattern cannot be empty.")
+        return False
+
+    # Confirm input
+    print(f"\n📋 Filter details:")
+    print(f"   Name: {filter_name}")
+    print(f"   SMARTS: {smarts_pattern}")
+
+    confirm = input("\nSave this filter? (y/n): ").strip().lower()
+    if confirm not in ['y', 'yes']:
+        print("Filter addition cancelled.")
+        return False
+
+    result = add_chemical_filter_entry(filter_name, smarts_pattern, overwrite=False)
+
+    if result['exists']:
+        print(f"❌ {result['message']}")
+        overwrite = input("Do you want to overwrite it? (y/n): ").strip().lower()
+        if overwrite not in ['y', 'yes']:
+            print("Filter addition cancelled.")
+            return False
+        result = add_chemical_filter_entry(filter_name, smarts_pattern, overwrite=True)
+
+    if result['success']:
+        print(f"✅ {result['message']}")
+        return True
+    else:
+        print(f"❌ {result['message']}")
+        return False
+
+def add_chemical_reaction_entry(reaction_name, smarts_pattern, overwrite=False):
     """
-    Add a new chemical reaction by prompting user for input.
-    Updates the JSON file and refreshes the filters table.
-    This can be called independently without activating a specific project.
+    Add (or overwrite) a chemical reaction entry in the chem_reactions.json config
+    file and refresh the chem_reactions table in the projects database.
+
+    Non-interactive core shared by add_chemical_reaction() (CLI, prompts for
+    input via input()) and the Streamlit GUI, which collects the same fields
+    through text inputs instead.
+
+    Args:
+        reaction_name (str): Name of the reaction.
+        smarts_pattern (str): SMARTS pattern for the reaction.
+        overwrite (bool): If True, replace an existing reaction with the same
+            name. If False and the name already exists, no write happens and
+            the result's 'exists' flag is set so the caller can ask the user
+            to confirm before retrying with overwrite=True.
+
+    Returns:
+        dict: {'success': bool, 'message': str, 'exists': bool}
     """
-    print("\n" + "="*60)
-    print("ADD NEW CHEMICAL REACTION")
-    print("="*60)
-    
+    reaction_name = (reaction_name or "").strip()
+    smarts_pattern = (smarts_pattern or "").strip()
+
+    if not reaction_name:
+        return {'success': False, 'message': "Reaction name cannot be empty.", 'exists': False}
+
+    if not smarts_pattern:
+        return {'success': False, 'message': "SMARTS pattern cannot be empty.", 'exists': False}
+
     try:
-        # Get user input
-        reaction_name = input("Enter reaction name: ").strip()
-        if not reaction_name:
-            print("❌ Reaction name cannot be empty.")
-            return False
-        
-        smarts_pattern = input("Enter SMARTS pattern: ").strip()
-        if not smarts_pattern:
-            print("❌ SMARTS pattern cannot be empty.")
-            return False
-        
-        # Confirm input
-        print(f"\n📋 Reaction details:")
-        print(f"   Name: {reaction_name}")
-        print(f"   SMARTS: {smarts_pattern}")
-        
-        confirm = input("\nSave this reaction? (y/n): ").strip().lower()
-        if confirm not in ['y', 'yes']:
-            print("Reaction addition cancelled.")
-            return False
-        
         # Get path to JSON file
         config_path = os.path.join(os.path.dirname(__file__), 'config', 'chem_reactions.json')
-        
+
         # Read existing reactions
         if os.path.exists(config_path):
             with open(config_path, 'r', encoding='utf-8') as f:
                 reactions_data = json.load(f)
         else:
-            filters_data = []
-        
+            reactions_data = []
+
         # Check if reaction name already exists
         existing_names = [f['reaction_name'] for f in reactions_data]
-        if reaction_name in existing_names:
-            print(f"❌ Reaction '{reaction_name}' already exists in the configuration file.")
-            overwrite = input("Do you want to overwrite it? (y/n): ").strip().lower()
-            if overwrite not in ['y', 'yes']:
-                print("Reaction addition cancelled.")
-                return False
-            
-            # Remove existing reaction with same name
-            reactions_data = [f for f in reactions_data if f['reaction_name'] != reaction_name]
-        
-        # Add new reactin
-        new_reaction = {
-            "reaction_name": reaction_name,
-            "smarts": smarts_pattern
-        }
-        reactions_data.append(new_reaction)
-        
+        if reaction_name in existing_names and not overwrite:
+            return {
+                'success': False,
+                'message': f"Reaction '{reaction_name}' already exists in the configuration file.",
+                'exists': True,
+            }
+
+        # Remove existing reaction with same name (no-op if it wasn't there)
+        reactions_data = [f for f in reactions_data if f['reaction_name'] != reaction_name]
+
+        # Add new reaction
+        reactions_data.append({"reaction_name": reaction_name, "smarts": smarts_pattern})
+
         # Sort reactions alphabetically by name
         reactions_data.sort(key=lambda x: x['reaction_name'])
-        
+
         # Write back to JSON file
         with open(config_path, 'w', encoding='utf-8') as f:
-            json.dump(filters_data, f, indent=2, ensure_ascii=False)
-        
+            json.dump(reactions_data, f, indent=2, ensure_ascii=False)
+
         print(f"✅ Reaction '{reaction_name}' added to configuration file.")
         print(f"📍 Updated file: {config_path}")
-        
+
         # Refresh reactions in database
         print("\n🔄 Refreshing reactions in database...")
         success = refresh_reactions()
-        
+
         if success:
-            print("✅ Chemical reaction added and database updated successfully!")
-            return True
+            return {
+                'success': True,
+                'message': f"Chemical reaction '{reaction_name}' added and database updated successfully!",
+                'exists': False,
+            }
         else:
-            print("❌ Reaction was added to configuration but database update failed.")
-            return False
-            
+            return {
+                'success': False,
+                'message': f"Reaction '{reaction_name}' was added to configuration but database update failed.",
+                'exists': False,
+            }
+
     except Exception as e:
-        print(f"❌ Error adding chemical reaction: {e}")
+        return {'success': False, 'message': f"Error adding chemical reaction: {e}", 'exists': False}
+
+def delete_chemical_reaction_entry(reaction_name):
+    """
+    Delete a chemical reaction entry from the chem_reactions.json config file
+    and from the chem_reactions table in the projects database.
+
+    Non-interactive core meant for the Streamlit GUI. refresh_chem_reactions()
+    is additive-only (it never removes rows absent from the JSON file), so the
+    database row is deleted explicitly here rather than relying on a refresh.
+
+    Args:
+        reaction_name (str): Name of the reaction to delete.
+
+    Returns:
+        dict: {'success': bool, 'message': str}
+    """
+    reaction_name = (reaction_name or "").strip()
+
+    if not reaction_name:
+        return {'success': False, 'message': "Reaction name cannot be empty."}
+
+    try:
+        config_path = os.path.join(os.path.dirname(__file__), 'config', 'chem_reactions.json')
+
+        if os.path.exists(config_path):
+            with open(config_path, 'r', encoding='utf-8') as f:
+                reactions_data = json.load(f)
+        else:
+            reactions_data = []
+
+        if not any(f['reaction_name'] == reaction_name for f in reactions_data):
+            return {'success': False, 'message': f"Reaction '{reaction_name}' not found in configuration file."}
+
+        reactions_data = [f for f in reactions_data if f['reaction_name'] != reaction_name]
+
+        with open(config_path, 'w', encoding='utf-8') as f:
+            json.dump(reactions_data, f, indent=2, ensure_ascii=False)
+
+        projects_db = f"{site.getsitepackages()[0]}/tidyscreen/projects_db/projects_database.db"
+        if os.path.exists(projects_db):
+            conn = sqlite3.connect(projects_db)
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM chem_reactions WHERE reaction_name = ?", (reaction_name,))
+            conn.commit()
+            conn.close()
+
+        return {'success': True, 'message': f"Chemical reaction '{reaction_name}' deleted successfully."}
+
+    except Exception as e:
+        return {'success': False, 'message': f"Error deleting chemical reaction: {e}"}
+
+def add_chemical_reaction():
+    """
+    Add a new chemical reaction by prompting user for input.
+    Updates the JSON file and refreshes the reactions table.
+    This can be called independently without activating a specific project.
+    """
+    print("\n" + "="*60)
+    print("ADD NEW CHEMICAL REACTION")
+    print("="*60)
+
+    # Get user input
+    reaction_name = input("Enter reaction name: ").strip()
+    if not reaction_name:
+        print("❌ Reaction name cannot be empty.")
+        return False
+
+    smarts_pattern = input("Enter SMARTS pattern: ").strip()
+    if not smarts_pattern:
+        print("❌ SMARTS pattern cannot be empty.")
+        return False
+
+    # Confirm input
+    print(f"\n📋 Reaction details:")
+    print(f"   Name: {reaction_name}")
+    print(f"   SMARTS: {smarts_pattern}")
+
+    confirm = input("\nSave this reaction? (y/n): ").strip().lower()
+    if confirm not in ['y', 'yes']:
+        print("Reaction addition cancelled.")
+        return False
+
+    result = add_chemical_reaction_entry(reaction_name, smarts_pattern, overwrite=False)
+
+    if result['exists']:
+        print(f"❌ {result['message']}")
+        overwrite = input("Do you want to overwrite it? (y/n): ").strip().lower()
+        if overwrite not in ['y', 'yes']:
+            print("Reaction addition cancelled.")
+            return False
+        result = add_chemical_reaction_entry(reaction_name, smarts_pattern, overwrite=True)
+
+    if result['success']:
+        print(f"✅ {result['message']}")
+        return True
+    else:
+        print(f"❌ {result['message']}")
         return False
 
 def update_tidyscreen():
@@ -362,11 +638,59 @@ def update_tidyscreen():
         ]
         
         subprocess.run(cmd, check=True)
-        
+
         print("✅ TidyScreen updated successfully.")
+
+        # The Streamlit GUI (tidyscreen.gui()) is launched via `conda run -n streamlit`,
+        # which resolves `import tidyscreen` against that environment's OWN site-packages,
+        # not the one just updated above. If that env also has tidyscreen installed, it
+        # must be refreshed too, otherwise the GUI subprocess keeps importing a stale copy
+        # (e.g. missing functions added on this branch) while the launcher script itself
+        # looks up to date.
+        _update_tidyscreen_in_streamlit_env(branch)
+
         print("🔄 Please restart your Python session for changes to take effect.")
     except subprocess.CalledProcessError as e:
-        print(f"❌ Failed to update TidyScreen: {e}")  
+        print(f"❌ Failed to update TidyScreen: {e}")
+
+def _update_tidyscreen_in_streamlit_env(branch):
+    """
+    If a conda environment named 'streamlit' exists and has tidyscreen installed,
+    refresh it too, so the GUI subprocess (run via `conda run -n streamlit`) doesn't
+    import a stale copy of the package from its own separate site-packages.
+    """
+    import subprocess
+
+    try:
+        check_cmd = [
+            "conda", "run", "-n", "streamlit",
+            "python", "-c", "import tidyscreen"
+        ]
+        result = subprocess.run(check_cmd, capture_output=True)
+
+        if result.returncode != 0:
+            # Either the 'streamlit' conda env doesn't exist, or it doesn't have
+            # tidyscreen installed (GUI never used from it) - nothing to update.
+            return
+
+        print("🔄 Updating TidyScreen in the 'streamlit' conda environment (used by tidyscreen.gui())...")
+
+        install_cmd = [
+            "conda", "run", "-n", "streamlit",
+            "python", "-m", "pip", "install",
+            "--upgrade", "--force-reinstall", "--no-deps",
+            f"git+https://github.com/alfredoq/TidyScreen.git@{branch}"
+        ]
+        subprocess.run(install_cmd, check=True)
+
+        print("✅ TidyScreen updated in the 'streamlit' conda environment as well.")
+    except FileNotFoundError:
+        # conda not on PATH - skip silently, the primary env update already succeeded.
+        pass
+    except subprocess.CalledProcessError as e:
+        print(f"⚠️  Failed to update TidyScreen in the 'streamlit' conda environment: {e}")
+        print("   The GUI (tidyscreen.gui()) may keep failing to import until you run manually:")
+        print(f"   conda run -n streamlit pip install --upgrade --force-reinstall git+https://github.com/alfredoq/TidyScreen.git@{branch}")
 
 def gui():
     """

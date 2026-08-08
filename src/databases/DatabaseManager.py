@@ -449,13 +449,13 @@ def remove_legacy_table_columns(cursor: sqlite3.Cursor, table_name: str, columns
             print(f"   🗑️  Removing {len(columns_to_remove)} legacy column(s) from '{table_name}'")
             print(f"      Columns to remove: {', '.join(sorted(columns_to_remove))}")
         
-        # Confirm destructive operation
-        print(f"   ⚠️  WARNING: This will permanently delete column data!")
-        confirm = input(f"   Continue with column removal? (yes/no, default: no): ").strip().lower()
-        
-        if confirm != 'yes':
-            print(f"   ❌ Column removal cancelled by user")
-            return
+        # Confirm destructive operation only in verbose (interactive) mode
+        if verbose:
+            print(f"   ⚠️  WARNING: This will permanently delete column data!")
+            confirm = input(f"   Continue with column removal? (yes/no, default: no): ").strip().lower()
+            if confirm != 'yes':
+                print(f"   ❌ Column removal cancelled by user")
+                return
         
         # SQLite approach: Create new table with desired columns, copy data, rename
         # Get columns to keep (in original order)
