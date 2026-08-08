@@ -12028,9 +12028,20 @@ class MolDock:
             #self._check_table_in_db(results_db, "processed_prolif_fps_json") # Deprecated since the existence is checked at the moment of storing the results in the database.
         if mmbgsa:
             print("I will compute MMGBSA FPS")
-            # Check already existing fingerprints tables in the database
-            self._check_table_in_db(results_db, "processed_mmgbsa_decomposition_json")
-        
+            if not prolif:
+                # MMGBSA-only mode runs through the parallel path (_compute_mmgbsa_parallel),
+                # which is the long-running job most exposed to an unexpected shutdown.
+                # Offer to resume instead of forcing a full overwrite or a cancel.
+                mmgbsa_resume = self._check_mmgbsa_table_for_resume(results_db, "processed_mmgbsa_decomposition_json")
+                if mmgbsa_resume == 'resume':
+                    computed_pose_ids = self._get_computed_mmgbsa_pose_ids(results_db)
+                    n_before = len(df)
+                    df = df[~df['Pose_ID'].isin(computed_pose_ids)].reset_index(drop=True)
+                    print(f"   ℹ️  {n_before - len(df)} pose(s) already have MMGBSA results; {len(df)} pose(s) remain to be computed.")
+            else:
+                # Check already existing fingerprints tables in the database
+                self._check_table_in_db(results_db, "processed_mmgbsa_decomposition_json")
+
         ## Loop over dataframe to process each docked pose
         processed_ligands = []
 
@@ -15034,7 +15045,86 @@ class MolDock:
                         except KeyboardInterrupt:
                             print("\n   ❌ Operation cancelled by user.")
                             return False
-                        
+
+    def _check_mmgbsa_table_for_resume(self, results_db, table_name):
+        """
+        Like _check_table_in_db(), but for the MMGBSA-only path: offers to resume
+        an interrupted run (keep existing rows, compute only the poses still
+        missing) in addition to overwriting everything or cancelling.
+
+        Returns:
+            None      - table does not exist yet, nothing to resume/overwrite.
+            'resume'  - table left intact; caller should skip already-computed poses.
+            'overwrite' - table dropped; caller should (re)compute every pose.
+        Raises SystemExit if the user cancels.
+        """
+        import sqlite3
+
+        conn = sqlite3.connect(results_db)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table_name,)
+        )
+        table_exists = cursor.fetchone() is not None
+        conn.close()
+
+        if not table_exists:
+            return None
+
+        print(f"   ⚠️  Warning: {table_name} table already exists in the {results_db}.")
+
+        while True:
+            try:
+                response = input(
+                    "   Existing MMGBSA results found. "
+                    "(r)esume unfinished poses, (o)verwrite all, (c)ancel? [r/o/c]: "
+                ).strip().lower()
+            except KeyboardInterrupt:
+                raise SystemExit("\n   ❌ Operation cancelled by user.")
+
+            if response in ('r', 'resume'):
+                print("   ℹ️  Resuming: only poses without existing MMGBSA results will be computed.")
+                return 'resume'
+            elif response in ('o', 'overwrite'):
+                conn = sqlite3.connect(results_db)
+                cursor = conn.cursor()
+                cursor.execute(f"DROP TABLE IF EXISTS {table_name};")
+                conn.commit()
+                conn.close()
+                print(f"   ℹ️  Proceeding to overwrite existing {table_name} table.")
+                return 'overwrite'
+            elif response in ('c', 'cancel'):
+                raise SystemExit("   ❌ Operation cancelled to avoid overwriting existing data.")
+            else:
+                print("   ❌ Please answer 'r', 'o', or 'c'")
+
+    def _get_computed_mmgbsa_pose_ids(self, results_db):
+        """
+        Return the set of Pose_ID values already present in
+        processed_mmgbsa_decomposition_json, i.e. poses that have already had
+        an MMGBSA computation attempt stored (successful or not). Used to skip
+        already-processed poses when resuming an interrupted run.
+        """
+        import sqlite3
+
+        try:
+            conn = sqlite3.connect(results_db)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='processed_mmgbsa_decomposition_json'"
+            )
+            if cursor.fetchone() is None:
+                conn.close()
+                return set()
+
+            cursor.execute("SELECT pose_id FROM processed_mmgbsa_decomposition_json")
+            pose_ids = {row[0] for row in cursor.fetchall()}
+            conn.close()
+            return pose_ids
+        except Exception as e:
+            print(f"❌ Error retrieving already-computed MMGBSA pose IDs: {e}")
+            return set()
+
     def _clean_ligand_names_in_results_db(self, results_db_file):
         import sqlite3
         try:
