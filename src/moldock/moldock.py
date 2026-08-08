@@ -5649,6 +5649,12 @@ class MolDock:
             his_names = self._parse_histidine_names(original_pdb_path, selected_chains)
             his_names = self._customize_histidine_names(his_names)
 
+            ## Detect and (optionally) model disulfide bridges
+            ################################
+            disulfide_candidates = self._find_disulfide_candidates(processed_pdb_path, selected_chains)
+            disulfide_bonds = self._customize_disulfide_bonds(disulfide_candidates)
+            analysis['disulfide_bonds'] = disulfide_bonds
+
             ## Process ligands if any exist
             ################################
             selected_ligands = None
@@ -5755,6 +5761,9 @@ class MolDock:
 
             # Manage HIS residue naming based on previous selection
             self._fix_histine_names(his_names, processed_pdb_path) 
+
+            # Rename confirmed disulfide-bonded CYS residues to CYX
+            self._fix_cysteine_names(disulfide_bonds, processed_pdb_path)
 
             # Create reference ligand file if ligands were kept
             if selected_ligands:
@@ -5881,6 +5890,13 @@ class MolDock:
             his_names = self._parse_histidine_names_batch_mode(original_pdb_path, selected_chains, processing_index)
             his_names = self._customize_histidine_names(his_names)
 
+            ## Detect and (optionally) model disulfide bridges
+            ################################
+            # In batch mode, the candidate pairs are detected for the first template and
+            # re-validated (re-measured) against each subsequent structure afterwards.
+            disulfide_candidates = self._find_disulfide_candidates_batch_mode(processed_pdb_path, selected_chains, processing_index)
+            disulfide_bonds = self._customize_disulfide_bonds(disulfide_candidates)
+            analysis['disulfide_bonds'] = disulfide_bonds
 
             ## Process ligands if any exist
             ################################
@@ -5993,7 +6009,10 @@ class MolDock:
                 print(f"   ✅ No filtering needed - processed PDB ready")
 
             # Manage HIS residue naming based on previous selection
-            self._fix_histine_names(his_names, processed_pdb_path) 
+            self._fix_histine_names(his_names, processed_pdb_path)
+
+            # Rename confirmed disulfide-bonded CYS residues to CYX
+            self._fix_cysteine_names(disulfide_bonds, processed_pdb_path)
 
             # Create reference ligand file if ligands were kept
             if selected_ligands:
@@ -7420,8 +7439,13 @@ class MolDock:
 
                             """))    
             
+            disulfide_bonds = receptor_info.get('disulfide_bonds', [])
+            bond_lines = self._get_tleap_bond_lines(receptor_file, disulfide_bonds, 'mol')
+
             with open(tleap_file, "a") as f:
                 f.write(f"mol = loadpdb {receptor_file}\n")
+                for bond_line in bond_lines:
+                    f.write(bond_line)
                 f.write(f"savepdb mol {tleap_processed_file}\n")
                 f.write(f"quit")
             f.close()
@@ -11406,7 +11430,7 @@ class MolDock:
     def _refine_receptor_model(self, tleap_processed_file, processed_pdb_path, analysis):
 
         # Minize the receptor model as processed with tleap
-        minimized_pdb_file = self._minimize_receptor(tleap_processed_file, analysis)
+        minimized_pdb_file = self._minimize_receptor(tleap_processed_file, analysis, processed_pdb_path)
 
         if minimized_pdb_file is None:
             print(f"❌ Receptor minimization failed — cannot refine model.")
@@ -11567,7 +11591,7 @@ class MolDock:
         # Return the moldf like dataframe
         return df
     
-    def _minimize_receptor(self, tleap_processed_file, analysis):
+    def _minimize_receptor(self, tleap_processed_file, analysis, processed_pdb_path=None):
         """
         Will minimize the receptor under processing using sander
         """
@@ -11622,8 +11646,22 @@ class MolDock:
                     f.write(f"loadamberparams {cofactor_frcmod}\n")
         
         # Finish the writting of the tleap input file with the receptor loading and saving commands
+        #
+        # Bond indices are computed against processed_pdb_path (the file fed into the
+        # PRECEDING tleap call, _add_missing_atoms_in_pdb_tleap2), not tleap_processed_file
+        # (that call's own savepdb output). tleap renumbers residues sequentially in its
+        # savepdb output (resSeq becomes 1..N in file order, chain IDs dropped) — so a
+        # residue's ORIGINAL chain/resnum can no longer be matched reliably in
+        # tleap_processed_file. Residue order and count are preserved 1:1 across that
+        # tleap round trip, so the ordinal position computed from processed_pdb_path is
+        # still valid when tleap_processed_file is freshly loaded here.
+        disulfide_bonds = analysis.get('disulfide_bonds', [])
+        bond_lines = self._get_tleap_bond_lines(processed_pdb_path or tleap_processed_file, disulfide_bonds, 'rec')
+
         with open(tleap_in_file, 'a') as f:
             f.write(f"rec = loadpdb {tleap_processed_file}\n")
+            for bond_line in bond_lines:
+                f.write(bond_line)
             f.write(f"saveamberparm rec {os.path.join(os.path.dirname(tleap_processed_file), 'receptor.prmtop')} {os.path.join(os.path.dirname(tleap_processed_file), 'receptor.inpcrd')}\n")
             f.write("quit\n")
                 
@@ -12772,6 +12810,10 @@ class MolDock:
         pdb_template_name = assay_info.get('receptor_info', None).get('template_name', None)
         ligands_in_template, cofactors_names, mol2_files_names, frcmod_files_names = self._check_ligands_in_template(pdb_template_name)
 
+        ### Determine if the receptor has confirmed disulfide bridges to bond explicitly
+        disulfide_bonds = self._check_disulfides_in_template(pdb_template_name)
+        disulfide_bond_lines = self._get_tleap_bond_lines(receptor_pdb_path, disulfide_bonds, 'rec')
+
         # Will write the header of the tleap input file
         with open(tleap_in_file, 'w') as f:
             f.write(textwrap.dedent("""\
@@ -12805,6 +12847,10 @@ class MolDock:
                 # Load receptor
                 rec = loadpdb "{receptor_pdb_path}"
 
+                """))
+            for bond_line in disulfide_bond_lines:
+                f.write(bond_line)
+            f.write(textwrap.dedent(f"""\
                 # Load ligand parameters
                 loadamberprep {prepin_file}
                 loadamberparams {frcmod_file}
@@ -15356,8 +15402,62 @@ class MolDock:
             temp_file_path = "/tmp/his_names_batch_mode.json"
             with open(temp_file_path, 'w') as temp_file:
                 json.dump(his_names, temp_file)
-            
+
             return his_names
+
+    def _find_disulfide_candidates_batch_mode(self, pdb_path, selected_chains, processing_index, threshold=2.2):
+        """
+        Batch-mode variant of _find_disulfide_candidates(). The first structure
+        in a batch run detects candidate disulfide pairs and caches them (same
+        /tmp-file convention as _parse_histidine_names_batch_mode); subsequent
+        structures re-measure each cached pair's own SG-SG distance (batch
+        structures are expected to share chain/residue numbering, but not
+        necessarily identical conformations) and drop pairs that no longer
+        meet the threshold, rather than trusting the cached distance blindly.
+
+        Returns:
+            List[Dict]: candidate disulfide bridges for this specific structure
+        """
+        import json
+
+        temp_file_path = "/tmp/disulfide_candidates_batch_mode.json"
+
+        if processing_index > 1:
+            print("\nReusing cached disulfide bridge candidate pairs from the first structure in this batch.")
+            try:
+                with open(temp_file_path, 'r') as temp_file:
+                    cached_pairs = json.load(temp_file)
+            except (OSError, json.JSONDecodeError):
+                cached_pairs = []
+
+            all_candidates = self._find_disulfide_candidates(pdb_path, selected_chains, threshold)
+            all_by_key = {
+                frozenset({(c['chain1'], c['resnum1']), (c['chain2'], c['resnum2'])}): c
+                for c in all_candidates
+            }
+
+            candidates = []
+            for pair in cached_pairs:
+                key = frozenset({(pair['chain1'], pair['resnum1']), (pair['chain2'], pair['resnum2'])})
+                match = all_by_key.get(key)
+                if match:
+                    candidates.append(match)
+                else:
+                    print(
+                        f"   ⚠️  Cached disulfide pair CYS{pair['resnum1']}_{pair['chain1']}--"
+                        f"CYS{pair['resnum2']}_{pair['chain2']} is not within {threshold} Å in this "
+                        f"structure; skipping."
+                    )
+            return candidates
+
+        else:
+            candidates = self._find_disulfide_candidates(pdb_path, selected_chains, threshold)
+            try:
+                with open(temp_file_path, 'w') as temp_file:
+                    json.dump(candidates, temp_file)
+            except OSError:
+                pass
+            return candidates
 
     def _customize_histidine_names(self, his_names):
 
@@ -15427,7 +15527,224 @@ class MolDock:
                         new_res_name = his_names[res_key]
                         if new_res_name != res_name:
                             line = line[:17] + new_res_name.ljust(3) + line[20:]
-                pdb_file.write(line)    
+                pdb_file.write(line)
+
+    def _find_disulfide_candidates(self, pdb_path, selected_chains, threshold=2.2):
+        """
+        Scan pdb_path for CYS/CYX/CYM side-chain sulfur (SG) atoms within
+        selected_chains, and return every pair whose SG-SG distance is below
+        threshold (Angstrom, default matches the accepted disulfide bond
+        distance) as a candidate disulfide bridge.
+
+        Returns:
+            List[Dict]: each entry has chain1, resnum1, chain2, resnum2, distance
+        """
+        import math
+
+        cysteine_resnames = ('CYS', 'CYX', 'CYM')
+        sg_atoms = []
+
+        with open(pdb_path, 'r') as f:
+            for line in f:
+                if line.startswith('ATOM'):
+                    res_name = line[17:20].strip()
+                    atom_name = line[12:16].strip()
+                    if res_name in cysteine_resnames and atom_name == 'SG':
+                        chain_id = line[21].strip()
+                        if chain_id not in selected_chains:
+                            continue
+                        try:
+                            resnum = int(line[22:26])
+                            x = float(line[30:38])
+                            y = float(line[38:46])
+                            z = float(line[46:54])
+                        except ValueError:
+                            continue
+                        sg_atoms.append({'chain_id': chain_id, 'resnum': resnum, 'x': x, 'y': y, 'z': z})
+
+        candidates = []
+        for i in range(len(sg_atoms)):
+            for j in range(i + 1, len(sg_atoms)):
+                a, b = sg_atoms[i], sg_atoms[j]
+                if a['chain_id'] == b['chain_id'] and a['resnum'] == b['resnum']:
+                    continue
+                distance = math.sqrt(
+                    (a['x'] - b['x']) ** 2 + (a['y'] - b['y']) ** 2 + (a['z'] - b['z']) ** 2
+                )
+                if distance < threshold:
+                    candidates.append({
+                        'chain1': a['chain_id'], 'resnum1': a['resnum'],
+                        'chain2': b['chain_id'], 'resnum2': b['resnum'],
+                        'distance': round(distance, 3),
+                    })
+
+        return candidates
+
+    def _customize_disulfide_bonds(self, candidates):
+        """
+        Present detected disulfide bridge candidates to the user and let them
+        confirm, pair by pair, which ones should be explicitly modeled (the
+        cysteines renamed to CYX and their sulfur atoms bonded in tleap).
+
+        Returns:
+            List[Dict]: the confirmed subset of `candidates`
+        """
+        if not candidates:
+            print("No disulfide bridge candidates detected.")
+            return []
+
+        print(f"\n🔗 {len(candidates)} potential disulfide bridge(s) detected (SG-SG < 2.2 Å):")
+        for c in candidates:
+            print(f"   • CYS{c['resnum1']}_{c['chain1']} -- CYS{c['resnum2']}_{c['chain2']}  (SG-SG {c['distance']} Å)")
+
+        confirmed = []
+        for c in candidates:
+            while True:
+                try:
+                    response = input(
+                        f"\n   Model CYS{c['resnum1']}_{c['chain1']} -- CYS{c['resnum2']}_{c['chain2']} "
+                        f"(SG-SG {c['distance']} Å) as a disulfide bond (CYX)? (y/N): "
+                    ).strip().lower()
+                except KeyboardInterrupt:
+                    print("\n   ⚠️  Cancelled — leaving this pair unbonded.")
+                    response = 'n'
+
+                if not response:
+                    response = 'n'
+                if response in ('y', 'yes'):
+                    confirmed.append(c)
+                    break
+                elif response in ('n', 'no'):
+                    break
+                else:
+                    print("   ❌ Please answer 'y' or 'n'")
+                    continue
+
+        if confirmed:
+            print(f"\n   ✅ Will model {len(confirmed)} disulfide bridge(s) as CYX.")
+        else:
+            print("\n   ℹ️  No disulfide bridges will be explicitly modeled.")
+
+        return confirmed
+
+    def _fix_cysteine_names(self, disulfide_bonds, processed_pdb_path):
+        """
+        Rename CYS residues participating in a confirmed disulfide bond to
+        CYX in processed_pdb_path, so tleap builds them without a thiol
+        hydrogen (the actual S-S bond is added separately via an explicit
+        tleap `bond` command — see _get_tleap_bond_lines()).
+        """
+        if not disulfide_bonds:
+            return
+
+        cyx_keys = set()
+        for bond in disulfide_bonds:
+            cyx_keys.add((bond['chain1'], bond['resnum1']))
+            cyx_keys.add((bond['chain2'], bond['resnum2']))
+
+        with open(processed_pdb_path, 'r') as pdb_file:
+            pdb_lines = pdb_file.readlines()
+        with open(processed_pdb_path, 'w') as pdb_file:
+            for line in pdb_lines:
+                if line.startswith(('ATOM', 'HETATM')):
+                    chain_id = line[21].strip()
+                    res_name = line[17:20].strip()
+                    try:
+                        res_num = int(line[22:26])
+                    except ValueError:
+                        pdb_file.write(line)
+                        continue
+                    if res_name == 'CYS' and (chain_id, res_num) in cyx_keys:
+                        line = line[:17] + 'CYX'.ljust(3) + line[20:]
+                pdb_file.write(line)
+
+    def _get_tleap_bond_lines(self, pdb_path, disulfide_bonds, unit_name):
+        """
+        Compute each disulfide-bonded residue's 1-based ordinal position in
+        file order within pdb_path, and return the corresponding tleap
+        `bond` command lines for `unit_name`. tleap numbers residues
+        sequentially within a freshly loaded unit purely by loading order,
+        independent of the PDB resSeq/chain fields — so this ordinal count
+        is what a `bond <unit>.<idx>.SG ...` command must address.
+
+        IMPORTANT: pdb_path must carry the ORIGINAL chain/resnum identity
+        (chain1/resnum1/chain2/resnum2 as recorded in disulfide_bonds), not
+        a file that has already been through a prior tleap `loadpdb`+`savepdb`
+        round trip. tleap's savepdb rewrites resSeq to match its own
+        sequential unit-residue numbering (1..N in file order) and drops
+        chain IDs — so on such a file, a residue's *original* resnum no
+        longer identifies the same residue, and the resnum-only fallback
+        below would silently match the wrong atom (see
+        _construct_resnumbers_matching_dictionary for the same renumbering
+        behavior in a different context). Residue order and count are
+        preserved 1:1 across a tleap round trip, so it is safe to compute
+        indices from the PRE-tleap file and reuse them for the POST-tleap
+        file's own subsequent loadpdb, as _minimize_receptor() does.
+
+        Matching is primarily by (chain_id, resnum); when a residue isn't
+        found under its original chain (e.g. a later pipeline stage, such as
+        the ambpdb round trip, dropped chain identifiers but preserved the
+        original/crystal resSeq numbering), matching falls back to resnum
+        alone as long as that resnum is unambiguous among the queried
+        residues.
+
+        Returns:
+            List[str]: ready-to-write tleap script lines (newline-terminated)
+        """
+        if not disulfide_bonds:
+            return []
+
+        residue_keys = set()
+        for bond in disulfide_bonds:
+            residue_keys.add((bond['chain1'], bond['resnum1']))
+            residue_keys.add((bond['chain2'], bond['resnum2']))
+
+        resnum_counts = {}
+        for _chain_id, resnum in residue_keys:
+            resnum_counts[resnum] = resnum_counts.get(resnum, 0) + 1
+        ambiguous_resnums = {r for r, n in resnum_counts.items() if n > 1}
+
+        index_by_chain_resnum = {}
+        index_by_resnum = {}
+        seen_residue = None
+        ordinal = 0
+        with open(pdb_path, 'r') as f:
+            for line in f:
+                if line.startswith(('ATOM', 'HETATM')):
+                    chain_id = line[21].strip()
+                    try:
+                        resnum = int(line[22:26])
+                    except ValueError:
+                        continue
+                    res_uid = (chain_id, resnum)
+                    if res_uid != seen_residue:
+                        ordinal += 1
+                        seen_residue = res_uid
+                        index_by_chain_resnum.setdefault(res_uid, ordinal)
+                        index_by_resnum.setdefault(resnum, ordinal)
+
+        def _resolve(chain_id, resnum):
+            idx = index_by_chain_resnum.get((chain_id, resnum))
+            if idx is not None:
+                return idx
+            if resnum not in ambiguous_resnums:
+                return index_by_resnum.get(resnum)
+            return None
+
+        bond_lines = []
+        for bond in disulfide_bonds:
+            idx1 = _resolve(bond['chain1'], bond['resnum1'])
+            idx2 = _resolve(bond['chain2'], bond['resnum2'])
+            if idx1 is None or idx2 is None:
+                print(
+                    f"   ⚠️  Could not locate disulfide partner residue(s) for "
+                    f"CYX{bond['resnum1']}_{bond['chain1']}--CYX{bond['resnum2']}_{bond['chain2']} "
+                    f"in {pdb_path}; skipping explicit tleap bond for this pair."
+                )
+                continue
+            bond_lines.append(f"bond {unit_name}.{idx1}.SG {unit_name}.{idx2}.SG\n")
+
+        return bond_lines
 
     def _get_last_receptor_model_id(self):
 
@@ -15759,6 +16076,38 @@ class MolDock:
         except Exception as e:
             print(f"Error accessing PDB templates database: {e}. Stopping")
             sys.exit(1)
+
+    def _check_disulfides_in_template(self, pdb_template_name):
+        """
+        Retrieve the confirmed disulfide_bonds list stored for pdb_template_name
+        in pdbs.db (persisted inside the pdb_analysis JSON blob, same channel
+        used for cofactors — see _check_ligands_in_template()).
+
+        Returns:
+            List[Dict]: disulfide bond entries (chain1, resnum1, chain2,
+            resnum2, distance), or [] if none are recorded / on any error.
+        """
+        import sqlite3
+        import json
+
+        try:
+            pdb_templates_db_path = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
+            conn = sqlite3.connect(pdb_templates_db_path)
+            cursor = conn.cursor()
+
+            cursor.execute("SELECT pdb_analysis FROM pdb_templates WHERE pdb_template_name = ?", (pdb_template_name,))
+            result = cursor.fetchone()
+            conn.close()
+
+            if result is None or result[0] is None:
+                return []
+
+            pdb_analysis = json.loads(result[0])
+            return pdb_analysis.get('disulfide_bonds', []) or []
+
+        except Exception as e:
+            print(f"Error retrieving disulfide bonds for template '{pdb_template_name}': {e}")
+            return []
 
     def _show_tleap_template_guide_for_fps(self):
         """Print guidance for writing a tleap template for stub receptors."""

@@ -1338,7 +1338,107 @@ class MolDyn:
 
         except Exception as e:
             print(f"❌ Error creating MD assay register entry: {e}")
-            
+
+    def _check_disulfides_in_template(self, pdb_template_name):
+        """
+        Retrieve the confirmed disulfide_bonds list stored for pdb_template_name
+        in pdbs.db (persisted inside the pdb_analysis JSON blob by
+        MolDock.create_pdb_template()). Mirrors MolDock._check_disulfides_in_template().
+
+        Returns:
+            List[Dict]: disulfide bond entries (chain1, resnum1, chain2,
+            resnum2, distance), or [] if none are recorded / on any error.
+        """
+        import sqlite3
+        import json
+
+        try:
+            pdb_templates_db_path = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
+            conn = sqlite3.connect(pdb_templates_db_path)
+            cursor = conn.cursor()
+
+            cursor.execute("SELECT pdb_analysis FROM pdb_templates WHERE pdb_template_name = ?", (pdb_template_name,))
+            result = cursor.fetchone()
+            conn.close()
+
+            if result is None or result[0] is None:
+                return []
+
+            pdb_analysis = json.loads(result[0])
+            return pdb_analysis.get('disulfide_bonds', []) or []
+
+        except Exception as e:
+            print(f"Error retrieving disulfide bonds for template '{pdb_template_name}': {e}")
+            return []
+
+    def _get_tleap_bond_lines(self, pdb_path, disulfide_bonds, unit_name):
+        """
+        Given the exact pdb_path that is about to be tleap `loadpdb`-ed as
+        `unit_name`, compute each disulfide-bonded residue's 1-based ordinal
+        position in file order and return the corresponding `bond` command
+        lines. Mirrors MolDock._get_tleap_bond_lines() — see that method for
+        the rationale (tleap numbers residues sequentially per loaded unit,
+        independent of PDB resSeq/chain fields, and can drop chain
+        identifiers across a savepdb/ambpdb round trip).
+
+        Returns:
+            List[str]: ready-to-write tleap script lines (newline-terminated)
+        """
+        if not disulfide_bonds:
+            return []
+
+        residue_keys = set()
+        for bond in disulfide_bonds:
+            residue_keys.add((bond['chain1'], bond['resnum1']))
+            residue_keys.add((bond['chain2'], bond['resnum2']))
+
+        resnum_counts = {}
+        for _chain_id, resnum in residue_keys:
+            resnum_counts[resnum] = resnum_counts.get(resnum, 0) + 1
+        ambiguous_resnums = {r for r, n in resnum_counts.items() if n > 1}
+
+        index_by_chain_resnum = {}
+        index_by_resnum = {}
+        seen_residue = None
+        ordinal = 0
+        with open(pdb_path, 'r') as f:
+            for line in f:
+                if line.startswith(('ATOM', 'HETATM')):
+                    chain_id = line[21].strip()
+                    try:
+                        resnum = int(line[22:26])
+                    except ValueError:
+                        continue
+                    res_uid = (chain_id, resnum)
+                    if res_uid != seen_residue:
+                        ordinal += 1
+                        seen_residue = res_uid
+                        index_by_chain_resnum.setdefault(res_uid, ordinal)
+                        index_by_resnum.setdefault(resnum, ordinal)
+
+        def _resolve(chain_id, resnum):
+            idx = index_by_chain_resnum.get((chain_id, resnum))
+            if idx is not None:
+                return idx
+            if resnum not in ambiguous_resnums:
+                return index_by_resnum.get(resnum)
+            return None
+
+        bond_lines = []
+        for bond in disulfide_bonds:
+            idx1 = _resolve(bond['chain1'], bond['resnum1'])
+            idx2 = _resolve(bond['chain2'], bond['resnum2'])
+            if idx1 is None or idx2 is None:
+                print(
+                    f"   ⚠️  Could not locate disulfide partner residue(s) for "
+                    f"CYX{bond['resnum1']}_{bond['chain1']}--CYX{bond['resnum2']}_{bond['chain2']} "
+                    f"in {pdb_path}; skipping explicit tleap bond for this pair."
+                )
+                continue
+            bond_lines.append(f"bond {unit_name}.{idx1}.SG {unit_name}.{idx2}.SG\n")
+
+        return bond_lines
+
     def _prepare_complex_prmtop_inpcrd_for_md(self, mol2_file, frcmod_file, assay_info, output_dir, output_file, md_parameters_dict, pdb_file):
         
         import subprocess
@@ -1395,6 +1495,11 @@ class MolDyn:
         
         tleap_log_file = os.path.join(output_dir, 'tleap.log')
 
+        # Confirmed disulfide bridges (if any) for this receptor template
+        pdb_template_name = receptor_details.get('template_name', None)
+        disulfide_bonds = self._check_disulfides_in_template(pdb_template_name)
+        disulfide_bond_lines = self._get_tleap_bond_lines(receptor_pdb_path, disulfide_bonds, 'rec')
+
         try:
             with open(tleap_in_file, 'w') as f:
                 f.write(f"source leaprc.protein.{protein_ff}\n")
@@ -1404,6 +1509,8 @@ class MolDyn:
                     f.write(f"source leaprc.water.{water_model}\n")
                     f.write(f"HOH = WAT\n")
                 f.write(f"rec = loadpdb {receptor_pdb_path}\n")
+                for bond_line in disulfide_bond_lines:
+                    f.write(bond_line)
                 f.write(f"UNL = loadmol2 {mol2_file}\n")
                 f.write(f"loadamberparams {frcmod_file}\n")
                 f.write(f"lig = loadpdb {pdb_file}\n")
@@ -2084,7 +2191,8 @@ class MolDyn:
                         )
                     else:
                         prmtop_file, inpcrd_file = self._prepare_receptor_only_prmtop_inpcrd_for_md(
-                            template_dict['checked_pdb_path'], md_assay_folder, md_parameters_dict
+                            template_dict['checked_pdb_path'], md_assay_folder, md_parameters_dict,
+                            pdb_template_name=template_dict['pdb_template_name'],
                         )
 
                     # Prepare AMBER input files
@@ -2196,7 +2304,7 @@ class MolDyn:
                 print("\n❌ Template selection cancelled.")
                 return None
 
-    def _prepare_receptor_only_prmtop_inpcrd_for_md(self, checked_pdb_path, output_dir, md_parameters_dict):
+    def _prepare_receptor_only_prmtop_inpcrd_for_md(self, checked_pdb_path, output_dir, md_parameters_dict, pdb_template_name=None):
         """
         Build AMBER topology (prmtop) and coordinate (inpcrd) files for a receptor-only
         (apo) system using tleap.  Output files are named complex.prmtop / complex.inpcrd
@@ -2216,6 +2324,10 @@ class MolDyn:
         tleap_in_file = os.path.join(output_dir, 'complex.in')
         tleap_log_file = os.path.join(output_dir, 'tleap.log')
 
+        # Confirmed disulfide bridges (if any) for this receptor template
+        disulfide_bonds = self._check_disulfides_in_template(pdb_template_name)
+        disulfide_bond_lines = self._get_tleap_bond_lines(checked_pdb_path, disulfide_bonds, 'rec')
+
         try:
             with open(tleap_in_file, 'w') as f:
                 f.write(f"source leaprc.protein.{protein_ff}\n")
@@ -2225,6 +2337,8 @@ class MolDyn:
                     f.write(f"source leaprc.water.{water_model}\n")
                     f.write("HOH = WAT\n")
                 f.write(f"rec = loadpdb {checked_pdb_path}\n")
+                for bond_line in disulfide_bond_lines:
+                    f.write(bond_line)
                 if solvent_type == 'explicit':
                     water_type = tleap_params.get('water_type', 'TIP3PBOX')
                     box_type = tleap_params.get('box_type', 'Box')
