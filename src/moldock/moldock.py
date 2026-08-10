@@ -5776,7 +5776,11 @@ class MolDock:
             #tleap_processed_file = self._add_missing_atoms_in_pdb_tleap(processed_pdb_path, analysis)
             # Modified to process receptors containing cobound ligands
             tleap_processed_file = self._add_missing_atoms_in_pdb_tleap2(processed_pdb_path, analysis, processed_dir)
-                                  
+
+            if tleap_processed_file is None:
+                print(f"❌ tleap failed to add missing atoms — aborting template creation.")
+                return None
+
             # Process tleap_processed_file to add the element name column if missing
             receptor_moldf_dict, renumbering_dict = self._refine_receptor_model(tleap_processed_file, processed_pdb_path, analysis)
 
@@ -5788,8 +5792,8 @@ class MolDock:
             from moldf import write_pdb
 
             write_pdb(receptor_moldf_dict, tleap_processed_file)
-            
-            
+
+
             print(f"✅ tleap processing complete. Output: {tleap_processed_file}")
             
             return processed_pdb_path, tleap_processed_file, renumbering_dict, his_names
@@ -6025,7 +6029,11 @@ class MolDock:
             #tleap_processed_file = self._add_missing_atoms_in_pdb_tleap(processed_pdb_path, analysis)
             # Modified to process receptors containing cobound ligands
             tleap_processed_file = self._add_missing_atoms_in_pdb_tleap2(processed_pdb_path, analysis, processed_dir)
-                                  
+
+            if tleap_processed_file is None:
+                print(f"❌ tleap failed to add missing atoms — aborting template creation.")
+                return None
+
             # Process tleap_processed_file to add the element name column if missing
             receptor_moldf_dict, renumbering_dict = self._refine_receptor_model(tleap_processed_file, processed_pdb_path, analysis)
 
@@ -6037,7 +6045,7 @@ class MolDock:
             from moldf import write_pdb
 
             write_pdb(receptor_moldf_dict, tleap_processed_file)
-            
+
             print(f"✅ tleap processing complete. Output: {tleap_processed_file}")
             
             return processed_pdb_path, tleap_processed_file, renumbering_dict, his_names
@@ -11656,7 +11664,10 @@ class MolDock:
         # tleap round trip, so the ordinal position computed from processed_pdb_path is
         # still valid when tleap_processed_file is freshly loaded here.
         disulfide_bonds = analysis.get('disulfide_bonds', [])
-        bond_lines = self._get_tleap_bond_lines(processed_pdb_path or tleap_processed_file, disulfide_bonds, 'rec')
+        bond_lines = self._get_tleap_bond_lines(
+            processed_pdb_path or tleap_processed_file, disulfide_bonds, 'rec',
+            target_already_tleap_processed=True
+        )
 
         with open(tleap_in_file, 'a') as f:
             f.write(f"rec = loadpdb {tleap_processed_file}\n")
@@ -15658,28 +15669,54 @@ class MolDock:
                         line = line[:17] + 'CYX'.ljust(3) + line[20:]
                 pdb_file.write(line)
 
-    def _get_tleap_bond_lines(self, pdb_path, disulfide_bonds, unit_name):
+    def _get_tleap_bond_lines(self, pdb_path, disulfide_bonds, unit_name, target_already_tleap_processed=False):
         """
-        Compute each disulfide-bonded residue's 1-based ordinal position in
-        file order within pdb_path, and return the corresponding tleap
-        `bond` command lines for `unit_name`. tleap numbers residues
-        sequentially within a freshly loaded unit purely by loading order,
-        independent of the PDB resSeq/chain fields — so this ordinal count
-        is what a `bond <unit>.<idx>.SG ...` command must address.
+        Compute each disulfide-bonded residue's tleap-internal residue index
+        and return the corresponding tleap `bond` command lines for
+        `unit_name`.
 
-        IMPORTANT: pdb_path must carry the ORIGINAL chain/resnum identity
-        (chain1/resnum1/chain2/resnum2 as recorded in disulfide_bonds), not
-        a file that has already been through a prior tleap `loadpdb`+`savepdb`
-        round trip. tleap's savepdb rewrites resSeq to match its own
-        sequential unit-residue numbering (1..N in file order) and drops
-        chain IDs — so on such a file, a residue's *original* resnum no
-        longer identifies the same residue, and the resnum-only fallback
-        below would silently match the wrong atom (see
-        _construct_resnumbers_matching_dictionary for the same renumbering
-        behavior in a different context). Residue order and count are
-        preserved 1:1 across a tleap round trip, so it is safe to compute
-        indices from the PRE-tleap file and reuse them for the POST-tleap
-        file's own subsequent loadpdb, as _minimize_receptor() does.
+        tleap's `unit.<idx>` addressing on a FRESH loadpdb (a file tleap has
+        never processed before) is NOT a simple 1-based ordinal count of
+        distinct residues in file order — that was the original, incorrect
+        assumption here and caused tleap parser errors on receptors with
+        resSeq gaps (missing/unmodeled loop residues). Empirically verified
+        actual rule for a fresh load:
+
+        - Within a single chain, tleap's internal residue index tracks the
+          PDB resSeq value directly: when tleap detects a break in the chain
+          (a resSeq gap), it jumps the internal counter by the same gap so
+          the index keeps matching the literal resSeq for the rest of that
+          chain. Net effect: for the first chain loaded, internal index ==
+          literal resSeq.
+        - At a chain boundary (new chain ID, e.g. separated by a TER record),
+          the internal counter advances by exactly 1 from the previous
+          chain's last index, regardless of the new chain's own resSeq
+          numbering (it does NOT jump to align with it).
+
+        So for a receptor unit built from N chains loaded in file order, the
+        first chain's residues address as `idx == resnum`, and each
+        subsequent chain's residues address as
+        `idx == (previous_chain_last_idx + 1) + (resnum - first_resnum_of_chain)`.
+
+        `target_already_tleap_processed` selects which file the computed
+        indices must address:
+
+        - False (default): `pdb_path` IS the file about to be `loadpdb`'d
+          for the first time (e.g. _add_missing_atoms_in_pdb_tleap2() loading
+          the freshly-filtered receptor). Uses the resSeq-aware rule above.
+        - True: `pdb_path` is an EARLIER-stage file (still carrying original
+          chain/resnum identity) used only as a stand-in to predict indices
+          for a DIFFERENT file that has already been through one
+          `loadpdb`+`savepdb` round trip and will now be loaded again (e.g.
+          _minimize_receptor() computes from processed_pdb_path but loads
+          tleap_processed_file). savepdb rewrites resSeq to plain sequential
+          1..N in file order and drops chain IDs, so a residue's original
+          resnum can no longer be matched directly in that output file — but
+          residue order and count are preserved 1:1 across the round trip,
+          so the residue's plain ordinal position (1-based, gaps NOT
+          preserved) in the pre-tleap `pdb_path` equals its resSeq in the
+          post-tleap file. Uses simple ordinal counting instead of the
+          resSeq-aware rule.
 
         Matching is primarily by (chain_id, resnum); when a residue isn't
         found under its original chain (e.g. a later pipeline stage, such as
@@ -15707,7 +15744,10 @@ class MolDock:
         index_by_chain_resnum = {}
         index_by_resnum = {}
         seen_residue = None
-        ordinal = 0
+        current_chain = None
+        chain_base_index = 0
+        chain_first_resnum = None
+        tleap_index = 0
         with open(pdb_path, 'r') as f:
             for line in f:
                 if line.startswith(('ATOM', 'HETATM')):
@@ -15718,10 +15758,18 @@ class MolDock:
                         continue
                     res_uid = (chain_id, resnum)
                     if res_uid != seen_residue:
-                        ordinal += 1
                         seen_residue = res_uid
-                        index_by_chain_resnum.setdefault(res_uid, ordinal)
-                        index_by_resnum.setdefault(resnum, ordinal)
+                        if target_already_tleap_processed:
+                            tleap_index += 1
+                        elif chain_id != current_chain:
+                            tleap_index = resnum if current_chain is None else tleap_index + 1
+                            current_chain = chain_id
+                            chain_base_index = tleap_index
+                            chain_first_resnum = resnum
+                        else:
+                            tleap_index = chain_base_index + (resnum - chain_first_resnum)
+                        index_by_chain_resnum.setdefault(res_uid, tleap_index)
+                        index_by_resnum.setdefault(resnum, tleap_index)
 
         def _resolve(chain_id, resnum):
             idx = index_by_chain_resnum.get((chain_id, resnum))
