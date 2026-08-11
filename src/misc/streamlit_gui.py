@@ -5201,21 +5201,37 @@ elif page == "ML features management":
                                     except Exception as _e:
                                         st.error(f"Could not save VMD script: {_e}")
 
-                            ## Remove current pose from positive registry
+                            ## Remove / send current pose from positive registry
                             current_row_pos = df_pos.iloc[st.session_state[idx_key_pos]]
-                            if st.button("🗑️ Remove pose from set", key=f"ml_pos_remove_{st.session_state[idx_key_pos]}"):
-                                result = st_funcs.remove_binder(
-                                    project_path=project_path,
-                                    binder_type="positive",
-                                    assay_name=current_row_pos["assay_name"],
-                                    pose_file=current_row_pos["pose_file"],
-                                    directory=current_row_pos["directory"],
-                                )
-                                if result == "removed":
-                                    st.session_state[idx_key_pos] = max(0, st.session_state[idx_key_pos] - 1)
-                                    st.rerun()
-                                else:
-                                    st.error(f"Could not remove pose: {result}")
+                            _col_pos_remove, _col_pos_send = st.columns(2)
+                            with _col_pos_remove:
+                                if st.button("🗑️ Remove pose from set", key=f"ml_pos_remove_{st.session_state[idx_key_pos]}"):
+                                    result = st_funcs.remove_binder(
+                                        project_path=project_path,
+                                        binder_type="positive",
+                                        assay_name=current_row_pos["assay_name"],
+                                        pose_file=current_row_pos["pose_file"],
+                                        directory=current_row_pos["directory"],
+                                    )
+                                    if result == "removed":
+                                        st.session_state[idx_key_pos] = max(0, st.session_state[idx_key_pos] - 1)
+                                        st.rerun()
+                                    else:
+                                        st.error(f"Could not remove pose: {result}")
+                            with _col_pos_send:
+                                if st.button("➡️ Send to Negative", key=f"ml_pos_send_neg_{st.session_state[idx_key_pos]}"):
+                                    _mv_result = st_funcs.move_binder_to_negative(
+                                        project_path=project_path,
+                                        assay_name=current_row_pos["assay_name"],
+                                        pose_file=current_row_pos["pose_file"],
+                                        directory=current_row_pos["directory"],
+                                        pose_full_path=current_row_pos["pose_full_path"],
+                                    )
+                                    if _mv_result in ("moved", "duplicate"):
+                                        st.session_state[idx_key_pos] = max(0, st.session_state[idx_key_pos] - 1)
+                                        st.rerun()
+                                    else:
+                                        st.error(f"Could not send pose to negative binders: {_mv_result}")
                         else:
                             st.warning(f"Pose file not found on disk: {full_path_pos}")
 
@@ -5430,21 +5446,37 @@ elif page == "ML features management":
                                     except Exception as _e:
                                         st.error(f"Could not save VMD script: {_e}")
 
-                            ## Remove current pose from negative registry
+                            ## Remove / send current pose from negative registry
                             current_row_neg = df_neg.iloc[st.session_state[idx_key_neg]]
-                            if st.button("🗑️ Remove pose from set", key=f"ml_neg_remove_{st.session_state[idx_key_neg]}"):
-                                result = st_funcs.remove_binder(
-                                    project_path=project_path,
-                                    binder_type="negative",
-                                    assay_name=current_row_neg["assay_name"],
-                                    pose_file=current_row_neg["pose_file"],
-                                    directory=current_row_neg["directory"],
-                                )
-                                if result == "removed":
-                                    st.session_state[idx_key_neg] = max(0, st.session_state[idx_key_neg] - 1)
-                                    st.rerun()
-                                else:
-                                    st.error(f"Could not remove pose: {result}")
+                            _col_neg_remove, _col_neg_send = st.columns(2)
+                            with _col_neg_remove:
+                                if st.button("🗑️ Remove pose from set", key=f"ml_neg_remove_{st.session_state[idx_key_neg]}"):
+                                    result = st_funcs.remove_binder(
+                                        project_path=project_path,
+                                        binder_type="negative",
+                                        assay_name=current_row_neg["assay_name"],
+                                        pose_file=current_row_neg["pose_file"],
+                                        directory=current_row_neg["directory"],
+                                    )
+                                    if result == "removed":
+                                        st.session_state[idx_key_neg] = max(0, st.session_state[idx_key_neg] - 1)
+                                        st.rerun()
+                                    else:
+                                        st.error(f"Could not remove pose: {result}")
+                            with _col_neg_send:
+                                if st.button("➡️ Send to Positive", key=f"ml_neg_send_pos_{st.session_state[idx_key_neg]}"):
+                                    _mv_result = st_funcs.move_binder_to_positive(
+                                        project_path=project_path,
+                                        assay_name=current_row_neg["assay_name"],
+                                        pose_file=current_row_neg["pose_file"],
+                                        directory=current_row_neg["directory"],
+                                        pose_full_path=current_row_neg["pose_full_path"],
+                                    )
+                                    if _mv_result in ("moved", "duplicate"):
+                                        st.session_state[idx_key_neg] = max(0, st.session_state[idx_key_neg] - 1)
+                                        st.rerun()
+                                    else:
+                                        st.error(f"Could not send pose to positive binders: {_mv_result}")
                         else:
                             st.warning(f"Pose file not found on disk: {full_path_neg}")
 
