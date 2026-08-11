@@ -1371,15 +1371,36 @@ class MolDyn:
             print(f"Error retrieving disulfide bonds for template '{pdb_template_name}': {e}")
             return []
 
-    def _get_tleap_bond_lines(self, pdb_path, disulfide_bonds, unit_name):
+    def _get_tleap_bond_lines(self, pdb_path, disulfide_bonds, unit_name, target_already_tleap_processed=False):
         """
-        Given the exact pdb_path that is about to be tleap `loadpdb`-ed as
-        `unit_name`, compute each disulfide-bonded residue's 1-based ordinal
-        position in file order and return the corresponding `bond` command
-        lines. Mirrors MolDock._get_tleap_bond_lines() — see that method for
-        the rationale (tleap numbers residues sequentially per loaded unit,
-        independent of PDB resSeq/chain fields, and can drop chain
-        identifiers across a savepdb/ambpdb round trip).
+        Compute each disulfide-bonded residue's tleap-internal residue index
+        and return the corresponding tleap `bond` command lines for
+        `unit_name`. Mirrors MolDock._get_tleap_bond_lines() — see that
+        method for the full rationale.
+
+        tleap's `unit.<idx>` addressing on a FRESH loadpdb is NOT a simple
+        1-based ordinal count of distinct residues in file order — that was
+        the original, incorrect assumption here and caused tleap parser
+        errors on receptors with resSeq gaps (missing/unmodeled loop
+        residues) or multiple chains. Empirically verified actual rule for a
+        fresh load:
+
+        - Within a single chain, tleap's internal residue index tracks the
+          PDB resSeq value directly: when tleap detects a break in the chain
+          (a resSeq gap), it jumps the internal counter by the same gap so
+          the index keeps matching the literal resSeq for the rest of that
+          chain. Net effect: for the first chain loaded, internal index ==
+          literal resSeq.
+        - At a chain boundary (new chain ID, e.g. separated by a TER record),
+          the internal counter advances by exactly 1 from the previous
+          chain's last index, regardless of the new chain's own resSeq
+          numbering (it does NOT jump to align with it).
+
+        `target_already_tleap_processed` selects which file the computed
+        indices must address (see MolDock._get_tleap_bond_lines() for the
+        full explanation of the True case, used when pdb_path is an
+        earlier-stage file standing in for a different, already
+        loadpdb+savepdb-processed file).
 
         Returns:
             List[str]: ready-to-write tleap script lines (newline-terminated)
@@ -1400,7 +1421,10 @@ class MolDyn:
         index_by_chain_resnum = {}
         index_by_resnum = {}
         seen_residue = None
-        ordinal = 0
+        current_chain = None
+        chain_base_index = 0
+        chain_first_resnum = None
+        tleap_index = 0
         with open(pdb_path, 'r') as f:
             for line in f:
                 if line.startswith(('ATOM', 'HETATM')):
@@ -1411,10 +1435,18 @@ class MolDyn:
                         continue
                     res_uid = (chain_id, resnum)
                     if res_uid != seen_residue:
-                        ordinal += 1
                         seen_residue = res_uid
-                        index_by_chain_resnum.setdefault(res_uid, ordinal)
-                        index_by_resnum.setdefault(resnum, ordinal)
+                        if target_already_tleap_processed:
+                            tleap_index += 1
+                        elif chain_id != current_chain:
+                            tleap_index = resnum if current_chain is None else tleap_index + 1
+                            current_chain = chain_id
+                            chain_base_index = tleap_index
+                            chain_first_resnum = resnum
+                        else:
+                            tleap_index = chain_base_index + (resnum - chain_first_resnum)
+                        index_by_chain_resnum.setdefault(res_uid, tleap_index)
+                        index_by_resnum.setdefault(resnum, tleap_index)
 
         def _resolve(chain_id, resnum):
             idx = index_by_chain_resnum.get((chain_id, resnum))
