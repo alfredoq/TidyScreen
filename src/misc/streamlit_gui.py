@@ -3875,24 +3875,44 @@ elif page == "Docking analysis":
                                     glob.glob(os.path.join(entry["path"], "*.pdb")),
                                     key=lambda f: filename_to_pose_id.get(os.path.basename(f), {}).get("pose_id", float("inf"))
                                 )
-                                pdb_names = [os.path.basename(f) for f in pdb_files]
+                                pdb_names_all = [os.path.basename(f) for f in pdb_files]
+
+                                ## Filter poses by InChIKey (LigName) substring, case-insensitive
+                                _sp, _col = st.columns([2, 8])
+                                with _col:
+                                    _filter_text = st.text_input(
+                                        f"Filter poses by InChIKey ({entry['directory']}):",
+                                        key=f"pose_filter_{entry['directory']}",
+                                    ).strip()
+                                if _filter_text:
+                                    pdb_names = [
+                                        name for name in pdb_names_all
+                                        if _filter_text.lower() in filename_to_pose_id.get(name, {}).get("ligname", name).lower()
+                                    ]
+                                else:
+                                    pdb_names = pdb_names_all
+
                                 idx_key = f"pose_idx_{entry['directory']}"
                                 if idx_key not in st.session_state:
                                     st.session_state[idx_key] = 0
-                                ## Clamp index to valid range (e.g. folder contents changed)
+                                ## Clamp index to valid range (e.g. folder contents changed, or filter narrowed results)
                                 st.session_state[idx_key] = max(0, min(st.session_state[idx_key], len(pdb_names) - 1))
 
-                                ## Selectbox with NO key — driven entirely by idx_key via index param
-                                _sp, _col = st.columns([2, 8])
-                                with _col:
-                                    selected_file = st.selectbox(
-                                        f"Select a pose file from {entry['directory']}:",
-                                        pdb_names,
-                                        index=st.session_state[idx_key],
-                                    )
-                                ## Keep index in sync when user picks from the selectbox directly
-                                if selected_file:
-                                    st.session_state[idx_key] = pdb_names.index(selected_file)
+                                if not pdb_names:
+                                    st.warning("No poses match the filter.")
+                                    selected_file = None
+                                else:
+                                    ## Selectbox with NO key — driven entirely by idx_key via index param
+                                    _sp, _col = st.columns([2, 8])
+                                    with _col:
+                                        selected_file = st.selectbox(
+                                            f"Select a pose file from {entry['directory']}:",
+                                            pdb_names,
+                                            index=st.session_state[idx_key],
+                                        )
+                                    ## Keep index in sync when user picks from the selectbox directly
+                                    if selected_file:
+                                        st.session_state[idx_key] = pdb_names.index(selected_file)
 
                                 if selected_file:
                                     full_path = os.path.join(entry["path"], selected_file)
