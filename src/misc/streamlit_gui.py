@@ -2564,7 +2564,39 @@ elif page == "MolDock assays":
         
     else:
         with st.expander("Docking Assays Details", expanded=False):
-            st.dataframe(df)
+            ## 'notes' is the only editable column; edits are held in the widget's
+            ## own session state until "Save Notes" persists them to docking_assays.db.
+            _edited_assays_df = st.data_editor(
+                df,
+                column_config={
+                    "notes": st.column_config.TextColumn("notes", width="large"),
+                },
+                disabled=[c for c in df.columns if c != "notes"],
+                hide_index=True,
+                use_container_width=True,
+                key="data_editor_docking_assays",
+            )
+            if st.button("💾 Save Notes", key="btn_save_docking_assay_notes"):
+                _changed_assays = [
+                    (assay_name, new_notes)
+                    for assay_name, old_notes, new_notes in zip(
+                        df["assay_name"], df["notes"].fillna(""), _edited_assays_df["notes"].fillna("")
+                    )
+                    if old_notes != new_notes
+                ]
+                if not _changed_assays:
+                    st.info("No changes to save.")
+                else:
+                    _failed_assays = [
+                        assay_name
+                        for assay_name, new_notes in _changed_assays
+                        if not st_funcs.update_docking_assay_notes(docking_registries_db_path, assay_name, new_notes)
+                    ]
+                    if _failed_assays:
+                        st.error(f"Failed to save notes for: {', '.join(_failed_assays)}")
+                    else:
+                        st.success(f"Saved notes for {len(_changed_assays)} assay(s).")
+                        st.rerun()
 
             # Selection box for assay_name
             if "assay_name" in df.columns:

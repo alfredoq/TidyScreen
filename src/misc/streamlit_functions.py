@@ -342,7 +342,31 @@ def get_docking_assay_registers(db_path):
         return df
     except Exception as e:
         return None
-    
+
+def update_docking_assay_notes(db_path, assay_name, notes):
+    """
+    Persist an edited 'notes' value for a docking assay row in docking_assays.db.
+
+    Args:
+        db_path (str): Path to docking_assays.db.
+        assay_name (str): assay_name of the row to update (unique per assay).
+        notes (str): New notes text.
+
+    Returns:
+        bool: True on success, False otherwise.
+    """
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "UPDATE docking_assays SET notes = ? WHERE assay_name = ?",
+            (notes, assay_name),
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception:
+        return False
+
 def get_docking_results(db_path):
     """
     Retrieve columns 'LigName', 'pose_rank', 'run_number', 'docking_score', and 'cluster_size'
