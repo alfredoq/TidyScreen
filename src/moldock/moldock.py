@@ -9992,7 +9992,7 @@ class MolDock:
             return None
         pass
     
-    def extract_docked_poses(self, assay=None, selection=None, score_column=None):
+    def extract_docked_poses(self, assay=None, selection=None, score_column=None, overwrite=False):
         """
         Extract docked poses from a docking assay and save them as PDB files based on user-selected criteria.
         This method allows users to select a docking assay from the registry and extract poses based on three
@@ -10005,6 +10005,9 @@ class MolDock:
             - None (default): User is prompted to select from available assays
             - int: Assay ID to match against the registry
             - str: Assay name to match against the registry
+        overwrite : bool, optional
+            When the target output directory already contains a previous extraction,
+            delete and recreate it without prompting. Defaults to False.
         Returns
         -------
         None
@@ -10012,8 +10015,11 @@ class MolDock:
             output directory based on the selection criteria.
         Raises
         ------
-        None
-            Errors are caught internally and reported via print statements. Returns None on failure.
+        FileExistsError
+            If the output directory already contains files, overwrite=False, and the call
+            is running without an attached terminal (e.g. from the Streamlit GUI), so there
+            is no safe way to prompt for confirmation.
+        Other errors are caught internally and reported via print statements; returns None on failure.
         Notes
         -----
         - Requires a valid docking assay registry at 'docking/docking_registers/docking_assays.db'
@@ -10109,12 +10115,12 @@ class MolDock:
 
         ## Evaluate the docking engine in order to use the corresponding pose extraction method
         if docking_engine == "AutoDockGPU":
-            return self._extract_docked_poses_autodockgpu(db_path, selection=selection, score_column=score_column)
+            return self._extract_docked_poses_autodockgpu(db_path, selection=selection, score_column=score_column, overwrite=overwrite)
 
         else:
-            return self._extract_docked_poses_autodockvina(db_path, selection=selection, score_column=score_column)
+            return self._extract_docked_poses_autodockvina(db_path, selection=selection, score_column=score_column, overwrite=overwrite)
 
-    def _extract_docked_poses_autodockgpu(self, db_path, selection=None, score_column=None):
+    def _extract_docked_poses_autodockgpu(self, db_path, selection=None, score_column=None, overwrite=False):
         ## Start the analysis
         print("Starting poses extraction for engine AutoDockGPU")
         print("")
@@ -10140,28 +10146,28 @@ class MolDock:
         if selection == "1":
             print("You selected: lowest energy poses")
             output_dir = os.path.join(os.path.dirname(os.path.abspath(db_path)), "most_stable_poses")
-            if not self._prepare_output_dir(output_dir):
+            if not self._prepare_output_dir(output_dir, overwrite=overwrite):
                 return None
             df = self._select_most_stable_poses(db_path, score_column=score_column)
 
         elif selection == "2":
             print("You selected: most populated poses")
             output_dir = os.path.join(os.path.dirname(os.path.abspath(db_path)), "most_populated_poses")
-            if not self._prepare_output_dir(output_dir):
+            if not self._prepare_output_dir(output_dir, overwrite=overwrite):
                 return None
             df = self._select_most_populated_poses(db_path)
 
         elif selection == "3":
             print("You selected: most populated AND lowest energy poses")
             output_dir = os.path.join(os.path.dirname(os.path.abspath(db_path)), "most_populated_and_stable_poses")
-            if not self._prepare_output_dir(output_dir):
+            if not self._prepare_output_dir(output_dir, overwrite=overwrite):
                 return None
             df = self._select_most_populated_and_stable_poses(db_path, score_column=score_column)
 
         elif selection == "4":
             print("You selected: ALL poses")
             output_dir = os.path.join(os.path.dirname(os.path.abspath(db_path)), "all_poses")
-            if not self._prepare_output_dir(output_dir):
+            if not self._prepare_output_dir(output_dir, overwrite=overwrite):
                 return None
             df = self._select_all_poses(db_path)
 
@@ -10186,7 +10192,7 @@ class MolDock:
 
         return output_dir
 
-    def _extract_docked_poses_autodockvina(self, db_path, selection=None, score_column=None):
+    def _extract_docked_poses_autodockvina(self, db_path, selection=None, score_column=None, overwrite=False):
 
         ## Start the analysis
         print("Starting poses extraction for engine Vina")
@@ -10211,14 +10217,14 @@ class MolDock:
         if selection == "1":
             print("You selected: lowest energy poses")
             output_dir = os.path.join(os.path.dirname(os.path.abspath(db_path)), "most_stable_poses")
-            if not self._prepare_output_dir(output_dir):
+            if not self._prepare_output_dir(output_dir, overwrite=overwrite):
                 return None
             df = self._select_most_stable_poses(db_path, score_column=score_column)
 
         elif selection == "2":
             print("You selected: all poses")
             output_dir = os.path.join(os.path.dirname(os.path.abspath(db_path)), "all_poses")
-            if not self._prepare_output_dir(output_dir):
+            if not self._prepare_output_dir(output_dir, overwrite=overwrite):
                 return None
             df = self._select_all_poses(db_path)
 
@@ -10235,15 +10241,26 @@ class MolDock:
         print(f"Docked poses extracted to {output_dir}")
         return output_dir
 
-    def _prepare_output_dir(self, output_dir):
+    def _prepare_output_dir(self, output_dir, overwrite=False):
         """
         Ensure output_dir is an empty, ready-to-use directory.
 
         - If the directory does not exist it is created and True is returned.
-        - If it already exists the user is asked whether to delete it:
+        - If it already exists and overwrite=True, it is removed and recreated
+          without prompting; True is returned.
+        - Otherwise the user is asked whether to delete it:
             - 'y' / Enter  → directory is removed and recreated; True is returned.
             - 'n' / Ctrl-C → operation is cancelled; False is returned (caller
                              should abort and return None).
+
+        Raises
+        ------
+        FileExistsError
+            If the directory already contains files, overwrite=False, and no
+            terminal is attached to confirm interactively (e.g. when called
+            from the Streamlit GUI process) — there is no safe way to ask, so
+            the caller must explicitly opt in via overwrite=True instead of
+            data being silently deleted or the failure being silently swallowed.
         """
         import os
         import shutil
@@ -10258,14 +10275,25 @@ class MolDock:
         if not os.listdir(output_dir):
             return True
 
+        if overwrite:
+            shutil.rmtree(output_dir)
+            os.makedirs(output_dir)
+            print(f"Directory cleared (overwrite requested): {output_dir}")
+            return True
+
         print(f"\n⚠️  Output directory already exists:\n   {output_dir}")
 
         ## input() has no source when this runs non-interactively (e.g. from the
-        ## Streamlit GUI subprocess), which raises EOFError. Default to the safe
-        ## choice (cancel, do not delete) in that case.
+        ## Streamlit GUI process), which raises EOFError. There is no safe
+        ## default choice in that case, so surface the reason explicitly
+        ## rather than silently cancelling.
         if not sys.stdin.isatty():
-            print("❌ Non-interactive session — refusing to overwrite without confirmation. Operation cancelled.")
-            return False
+            message = (
+                f"Output directory already contains extracted poses: {output_dir}. "
+                "Re-run with the 'overwrite' option enabled to replace them."
+            )
+            print(f"❌ Non-interactive session — {message}")
+            raise FileExistsError(message)
 
         try:
             answer = input("Delete it and proceed? [y/N]: ").strip().lower()

@@ -403,7 +403,7 @@ def _load_moldock_class():
     return mod.MolDock
 
 
-def extract_poses_for_assay(project_name, project_path, assay_name, selection, score_column=None):
+def extract_poses_for_assay(project_name, project_path, assay_name, selection, score_column=None, overwrite=False):
     """
     Extract docked poses for *assay_name* using the native MolDock method.
 
@@ -413,14 +413,22 @@ def extract_poses_for_assay(project_name, project_path, assay_name, selection, s
 
     *score_column*, when given, is used as the "lowest energy" criterion for
     selections "1" and "3" instead of prompting interactively (which cannot
-    happen from this non-interactive GUI subprocess).
+    happen from this non-interactive GUI process).
+
+    *overwrite*, when True, replaces a previous extraction's output directory
+    without prompting. When False and a previous extraction's output directory
+    already contains files, MolDock.extract_docked_poses() raises FileExistsError
+    (there is no terminal here to confirm interactively) — that message is
+    returned to the caller as-is so the GUI can offer to retry with overwrite.
 
     Returns (success: bool, message: str).
     """
     try:
         MolDock = _load_moldock_class()
         moldock = MolDock.from_path(project_name, project_path)
-        output_dir = moldock.extract_docked_poses(assay=assay_name, selection=selection, score_column=score_column)
+        output_dir = moldock.extract_docked_poses(
+            assay=assay_name, selection=selection, score_column=score_column, overwrite=overwrite
+        )
         if output_dir:
             return (True, f"Poses extracted to: {output_dir}")
         return (False, "Extraction returned no output directory — check console for details.")

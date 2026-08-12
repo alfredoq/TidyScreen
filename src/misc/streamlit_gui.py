@@ -3810,12 +3810,24 @@ elif page == "Docking analysis":
                                     st.session_state["selected_assay_name"],
                                     _selection,
                                     score_column=_selected_score_col,
+                                    overwrite=st.session_state.get("extract_poses_overwrite", False),
                                 )
                             if _ok:
                                 st.success(_msg)
                                 st.rerun()
                             else:
                                 st.error(_msg)
+
+                    ## A previous extraction for this criterion may already have populated the
+                    ## output directory; there is no terminal here to confirm interactively
+                    ## (see MolDock._prepare_output_dir), so the GUI must ask explicitly.
+                    st.checkbox(
+                        "Overwrite existing extracted poses for this criterion, if present",
+                        key="extract_poses_overwrite",
+                        help="If a previous extraction already wrote poses for this criterion, "
+                             "this replaces them. Leave unchecked to keep existing poses and "
+                             "fail instead of overwriting.",
+                    )
 
                 if any_active:
                     st.divider()
@@ -3985,11 +3997,57 @@ elif page == "Docking analysis":
                                                 else:
                                                     st.error(result)
 
+                                    ## Keyboard shortcuts for the buttons above: Left/Right arrows
+                                    ## navigate prev/next, Y flags positive, N flags negative.
+                                    ## Streamlit has no native keybinding API, so this injects a
+                                    ## hidden component whose JS reaches into the parent document
+                                    ## (components render in a same-origin iframe) and clicks the
+                                    ## matching button by its visible label. Ignored while a text
+                                    ## field/select is focused, or a modifier key is held, so it
+                                    ## doesn't hijack normal typing or browser shortcuts.
+                                    st.components.v1.html(
+                                        """
+                                        <script>
+                                        (function() {
+                                            const doc = window.parent.document;
+                                            if (window.parent.__tsPoseKeyHandler) {
+                                                doc.removeEventListener('keydown', window.parent.__tsPoseKeyHandler);
+                                            }
+                                            function clickButtonByText(text) {
+                                                const buttons = doc.querySelectorAll('button');
+                                                for (const btn of buttons) {
+                                                    if (btn.textContent.trim() === text && !btn.disabled) {
+                                                        btn.click();
+                                                        return true;
+                                                    }
+                                                }
+                                                return false;
+                                            }
+                                            function handler(e) {
+                                                const active = doc.activeElement;
+                                                const tag = active ? active.tagName : '';
+                                                if (tag === 'INPUT' || tag === 'TEXTAREA' || (active && active.isContentEditable)) return;
+                                                if (e.ctrlKey || e.metaKey || e.altKey) return;
+                                                if (e.key === 'ArrowLeft') { clickButtonByText('◀'); }
+                                                else if (e.key === 'ArrowRight') { clickButtonByText('▶'); }
+                                                else if (e.key === 'y' || e.key === 'Y') { clickButtonByText('✅ Flag positive binding pose'); }
+                                                else if (e.key === 'n' || e.key === 'N') { clickButtonByText('❌ Flag negative binding pose'); }
+                                            }
+                                            window.parent.__tsPoseKeyHandler = handler;
+                                            doc.addEventListener('keydown', handler);
+                                        })();
+                                        </script>
+                                        """,
+                                        height=0,
+                                    )
+
                                     ## pose counter label
                                     pose_info = filename_to_pose_id.get(selected_file, {})
                                     pose_id_label = pose_info.get("pose_id", "?")
                                     lig_label = pose_info["ligname"] if pose_info else "?"
                                     st.caption(f"Pose ID: {pose_id_label}  |  {lig_label}  ({current_idx + 1} of {len(pdb_names)})")
+                                    if has_ref:
+                                        st.caption("Shortcuts: ← prev · → next · Y flag positive · N flag negative")
 
                                     ## VMD script creation
                                     with st.expander("🎬 Create VMD Script", expanded=False):
