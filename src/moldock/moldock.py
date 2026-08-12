@@ -11946,10 +11946,10 @@ class MolDock:
         """
         Will compute the ProLIF fingerprints for all docked ligands in a given assay.
 
-        max_workers: number of parallel worker processes to use for the "MMGBSA only"
-        mode (choice 2 below). Defaults to min(cpu_count(), 8) when None. Only applies
-        to the MMGBSA-only path; ProLIF-only and combined ProLIF+MMGBSA modes always
-        run sequentially.
+        max_workers: number of parallel worker processes to use. Defaults to
+        min(cpu_count(), 8) when None. Applies to all three modes (ProLIF-only,
+        MMGBSA-only, and combined ProLIF+MMGBSA) — every mode runs through the
+        same parallel per-pose pipeline.
         """
 
         import os
@@ -12070,29 +12070,14 @@ class MolDock:
                 computation_mode = "Lowest energy cluster AND Most populated"
                 break
         
-        # If ProLIF requested, check if the final table already exists
+        # Table existence / resume-vs-overwrite prompts for whichever table(s) this
+        # run needs are handled inside _compute_fingerprints_parallel(), once it
+        # knows exactly which tables (ProLIF condition table and/or MMGBSA table)
+        # are relevant.
         if prolif:
             print("I will compute ProLIF FPS")
-            # Check already existing fingerprints tables in the database
-            #self._check_table_in_db(results_db, "processed_prolif_fps_json") # Deprecated since the existence is checked at the moment of storing the results in the database.
         if mmbgsa:
             print("I will compute MMGBSA FPS")
-            if not prolif:
-                # MMGBSA-only mode runs through the parallel path (_compute_mmgbsa_parallel),
-                # which is the long-running job most exposed to an unexpected shutdown.
-                # Offer to resume instead of forcing a full overwrite or a cancel.
-                mmgbsa_resume = self._check_mmgbsa_table_for_resume(results_db, "processed_mmgbsa_decomposition_json")
-                if mmgbsa_resume == 'resume':
-                    computed_pose_ids = self._get_computed_mmgbsa_pose_ids(results_db)
-                    n_before = len(df)
-                    df = df[~df['Pose_ID'].isin(computed_pose_ids)].reset_index(drop=True)
-                    print(f"   ℹ️  {n_before - len(df)} pose(s) already have MMGBSA results; {len(df)} pose(s) remain to be computed.")
-            else:
-                # Check already existing fingerprints tables in the database
-                self._check_table_in_db(results_db, "processed_mmgbsa_decomposition_json")
-
-        ## Loop over dataframe to process each docked pose
-        processed_ligands = []
 
         pdbs_db_path = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
 
@@ -12120,10 +12105,13 @@ class MolDock:
                 print("❌ No tleap template available for this stub receptor. Cannot proceed.")
                 return None
 
-        ## If ProLIF fingerprints are requested, retrieve the computation parameters
+        ## If ProLIF fingerprints are requested, retrieve the computation parameters.
+        # The condition table's existence/resume-vs-overwrite check happens inside
+        # _compute_fingerprints_parallel(), since that's where the per-table
+        # "already computed" pose sets are needed.
+        prolif_params_dict, condition_selection = None, None
         if prolif == True:
             prolif_params_dict, condition_selection = self._get_prolif_params()
-            self._check_table_in_db(results_db, f'processed_prolif_fps_json_condition_{condition_selection}')
 
         # Retrieve renumbering_dict once for the whole assay (template_name is constant
         # across all poses in this run, so there is no need to re-query it per pose).
@@ -12144,177 +12132,96 @@ class MolDock:
             except Exception as e:
                 print(f"Error retrieving renumbering_dict for template '{template_name}': {e}")
 
-        # MMGBSA-only mode gets a dedicated parallel execution path; ProLIF-only and
-        # combined ProLIF+MMGBSA modes keep the sequential loop below unchanged.
-        if mmbgsa and not prolif:
-            self._compute_mmgbsa_parallel(
-                df, results_db, assay_info, computation_mode, minimize,
-                is_stub_receptor, fps_tleap_config, renumbering_dict,
-                max_workers, clean_files, write_mmgbsa
-            )
-            return
+        # All three modes (ProLIF-only, MMGBSA-only, combined) run through the same
+        # parallel per-pose pipeline.
+        self._compute_fingerprints_parallel(
+            df, results_db, assay_info, computation_mode, minimize,
+            is_stub_receptor, fps_tleap_config, renumbering_dict, max_workers, clean_files,
+            prolif, mmbgsa, prolif_params_dict, condition_selection,
+            receptor_file, write_prolif, write_mmgbsa,
+        )
 
-        for idx, row in df.iterrows():
-            pose_id = row['Pose_ID']
-            run_number = row['run_number']
-            ligname = row['LigName']
-            print(f"Processing Pose_ID: {pose_id}, LigName: {ligname}")
-        
-            # Restore every docked pose using (ligname, run_number) which matches the
-            # per-ligand sequential number used when PDB filenames are constructed.
-            output_dir, output_file = self._restore_single_docked_pose(results_db, ligname, run_number)
-        
-            # Create ligand parameter files.
-            # Stub receptors use mol2 format so {{MOL2_FILE}} in the tleap template
-            # is substituted correctly; standard receptors keep prepin format.
-            if ligname not in processed_ligands:
-                if is_stub_receptor:
-                    ligand_params_file, frcmod_file = self._prepare_ligand_mol2_files(ligname, assay_info, output_dir)
-                else:
-                    ligand_params_file, frcmod_file = self._prepare_ligand_tleap_files(ligname, assay_info, output_dir)
-
-            # Create complex .prmtop and .inpcrd files
-            if is_stub_receptor:
-                _receptor_pdb = os.path.join(
-                    os.path.dirname(self._remap_project_path(
-                        assay_info.get('receptor_info', {}).get('pdbqt_file', '')
-                    )),
-                    'receptor_checked.pdb'
-                )
-                prmtop_file, inpcrd_file, output_pdb_file = self._prepare_complex_prmtop_inpcrd_from_template_fps(
-                    output_file, output_dir, fps_tleap_config, ligand_params_file, frcmod_file, _receptor_pdb
-                )
-            else:
-                prmtop_file, inpcrd_file, output_pdb_file = self._prepare_complex_prmtop_inpcrd(
-                    ligand_params_file, frcmod_file, assay_info, output_dir, output_file, pose_id, ligname=ligname
-                )
-            
-            if minimize:
-                # Minimize complex
-                try: 
-                    print("MINIMIZING COMPLEX...")
-                    
-                    min_rst_cpptraj_file, output_pdb_file = self._minimize_complex(prmtop_file, inpcrd_file, output_dir, ligname, pose_id, output_pdb_file)
-                    
-                    rst_cpptraj_file = min_rst_cpptraj_file # Set the file to the minimized one for further processing
-                    
-                    #rst_cpptraj_file = min_rst_cpptraj_file
-                    #inpcrd_file = min_rst_cpptraj_file # Set the file to the minimized one for further processing
-                    
-                except Exception as e:
-                    print(f"Error occurred while minimizing complex for Pose_ID: {pose_id}, LigName: {ligname}: {e} \n Skipping minimization for this pose and proceeding with original inpcrd file.")
-                    
-                    rst_cpptraj_file = inpcrd_file    
-                    
-            else:
-                rst_cpptraj_file = inpcrd_file # No minimization, use the original inpcrd file for further processing
-
-            # Generate a full size dataframe based on all crystal residues and requested interactions
-            if prolif:
-                full_size_df = self._create_full_size_interactions_df(prolif_params_dict, renumbering_dict)
-
-                # Store the full_size_df in the assay database for posterior processing
-                self._store_full_size_interactions_df_in_db(full_size_df, results_db)
-
-            # Compute the requested fingerprints
-            if prolif == True:
-                
-                try: 
-                    ## Will compute and process the structure of the resulting ProLIF dataframe
-                    #fps_df = self._compute_prolif_fingerprints(prmtop_file, inpcrd_file, pose_id, results_db, prolif_params_dict)
-                    #fps_df = self._compute_prolif_fingerprints2(prolif_params_dict, output_pdb_file, receptor_file)
-                    
-                    ## This fingerprint computation mode is based on generating the .pdb file containing records from the .prmtop and .inpcrd files
-                    fps_df = self._compute_prolif_fingerprints3(prolif_params_dict, output_pdb_file, receptor_file, prmtop_file, inpcrd_file, ligname, pose_id)
-                    
-                except Exception as e:
-                    print(f"Error occurred while computing ProLIF fingerprints for Pose_ID: {pose_id}, LigName: {ligname}: {e} \n Skipping ProLIF computation for this pose.")
-                    continue
-                
-                # Flatten the MultiIndex columns by removing the first level
-                fps_df.columns = fps_df.columns.droplevel(0)
-                
-                # Rename the column header to match crystal
-                fps_df = fps_df.rename(columns=renumbering_dict, level=0)
-                
-                # Flatten the MultiIndex columns by mapping the original second level to the original third level
-                fps_df.columns = [f"{first}_{second}" for first, second in fps_df.columns]
-
-                # Store the processed fps_df in the assay database for posterior processing
-                self._store_processed_fps_df_in_db(fps_df, pose_id, results_db, computation_mode, condition_selection)
-                
-            if mmbgsa == True:
-
-                try:
-                    ## Compute MMGBSA binding energy
-                    complex_prmtop, receptor_prmtop, ligand_prmtop = self._prepare_mmgbsa_files(ligname, pose_id, prmtop_file, output_dir)
-
-                    self._compute_mmgbsa_fingerprint(ligname, pose_id, complex_prmtop, receptor_prmtop, ligand_prmtop, rst_cpptraj_file, output_dir)
-
-                    # Parse MMGBSA decomposition original output
-                    mmgbsa_df = self._parse_mmgbsa_decomposition_output(ligname, pose_id, output_dir)
-
-                    # Renumber the residue numbers to match the crystal numbering
-                    if not mmgbsa_df.empty:
-                        mmgbsa_df['residue'] = mmgbsa_df['residue'].apply(lambda x: renumbering_dict.get(x, x))
-
-                    # Store the processed mmgbsa df in the assay database for posterior processing
-                    self._store_processed_mmgbsa_df_in_db(mmgbsa_df, pose_id, results_db, computation_mode)
-
-                    # Extract summary energies to write back to the Results table
-                    if not mmgbsa_df.empty:
-                        total_energy = round(mmgbsa_df['total'].sum(), 3)
-                        gas_energy = round(mmgbsa_df['gas'].sum(), 3)
-                    else:
-                        total_energy, gas_energy = -1, -1
-
-                except Exception as e:
-                    print(f"Error occurred while computing MMGBSA for Pose_ID: {pose_id}, LigName: {ligname}: {e}")
-                    total_energy, gas_energy = -1, -1
-
-                self._update_results_mmgbsa_energies(results_db, pose_id, total_energy, gas_energy)
-                
-            # Add processed ligand to list
-            processed_ligands.append(ligname)
-    
-        # After iterating through all ligands, reconstruct the corresponding ProLIF dataframes and output a .csv file
-        
-        if write_prolif:
-            self._write_prolif_fps(results_db, assay_info)
-        
-        if write_mmgbsa:
-            self._write_mmgbsa_fps(results_db, assay_info)
-
-        if clean_files:
-            # Finally delte output_dir containing all temporary files
-            import shutil
-            shutil.rmtree(output_dir, ignore_errors=True)
-            print("✅ Temporary files cleaned up.")
-
-    def _compute_mmgbsa_parallel(self, df, results_db, assay_info, computation_mode,
-                                  minimize, is_stub_receptor, fps_tleap_config,
-                                  renumbering_dict, max_workers, clean_files, write_mmgbsa):
+    def _compute_fingerprints_parallel(self, df, results_db, assay_info, computation_mode,
+                                        minimize, is_stub_receptor, fps_tleap_config,
+                                        renumbering_dict, max_workers, clean_files,
+                                        prolif, mmgbsa, prolif_params_dict, condition_selection,
+                                        receptor_file, write_prolif, write_mmgbsa):
         """
-        Parallel MMGBSA-only execution path for compute_fingerprints(). Each docked
-        pose's full pipeline (restore -> build complex -> minimize -> MMGBSA) runs in
-        its own worker process, isolated in its own subdirectory under
-        temp_restored_poses/, so concurrent poses never collide on the fixed-name
-        scratch files written by tleap/sander/MMPBSA.py (complex.in, min.in/out/rst,
-        cpptraj.in, MMPBSA.py's own _MMPBSA_* files). GPU minimization is serialized
-        across workers via a shared lock so only one worker uses pmemd.cuda at a time.
-        All SQLite writes to results_db happen back in this (parent) process as
-        results are collected, so workers never touch the database.
+        Parallel execution path for compute_fingerprints(), covering all three modes
+        (ProLIF-only, MMGBSA-only, combined ProLIF+MMGBSA). Each docked pose's shared
+        pipeline (restore -> build complex -> minimize) runs once per pose in its own
+        worker process, isolated in its own subdirectory under temp_restored_poses/,
+        so concurrent poses never collide on the fixed-name scratch files written by
+        tleap/sander/ambpdb/MMPBSA.py (complex.in, min.in/out/rst, cpptraj.in,
+        MMPBSA.py's own _MMPBSA_* files). ProLIF and MMGBSA computation then branch
+        off that shared result within the same worker call, so combined mode never
+        restores/builds/minimizes a pose twice. GPU minimization is serialized across
+        workers via a shared lock so only one worker uses pmemd.cuda at a time. All
+        SQLite writes to results_db happen back in this (parent) process as results
+        are collected, so workers never touch the database.
+
+        Resume support (skip poses already computed) is evaluated independently per
+        requested fingerprint type: a pose done for only one of the two requested
+        types in combined mode still gets a task, and that task recomputes only the
+        missing piece.
         """
         import contextlib
         import shutil
         from concurrent.futures import ProcessPoolExecutor, as_completed
         from multiprocessing import Manager, cpu_count
 
-        n_poses = len(df)
-        print(f"📊 {n_poses} docked pose(s) will be processed for MMGBSA computation.")
+        total_poses = len(df)
+        if total_poses == 0:
+            print("Nothing to do.")
+            return
+
+        if prolif and mmgbsa:
+            mode_label = "ProLIF+MMGBSA"
+        elif prolif:
+            mode_label = "ProLIF"
+        else:
+            mode_label = "MMGBSA"
+
+        # Per-table resume/overwrite prompts, only for the table(s) this run needs.
+        done_prolif_ids = set()
+        done_mmgbsa_ids = set()
+        prolif_table_name = f'processed_prolif_fps_json_condition_{condition_selection}' if prolif else None
+        mmgbsa_table_name = 'processed_mmgbsa_decomposition_json'
+
+        if prolif:
+            resume_choice = self._check_table_for_resume(results_db, prolif_table_name, item_label="ProLIF results")
+            if resume_choice == 'resume':
+                done_prolif_ids = self._get_computed_pose_ids(results_db, prolif_table_name)
+        if mmgbsa:
+            resume_choice = self._check_table_for_resume(results_db, mmgbsa_table_name, item_label="MMGBSA results")
+            if resume_choice == 'resume':
+                done_mmgbsa_ids = self._get_computed_pose_ids(results_db, mmgbsa_table_name)
+
+        # Determine, per pose, which of the requested fingerprint types still need
+        # computing; drop poses where nothing is left to do.
+        pending = []
+        for _, row in df.iterrows():
+            do_prolif = prolif and row['Pose_ID'] not in done_prolif_ids
+            do_mmgbsa = mmgbsa and row['Pose_ID'] not in done_mmgbsa_ids
+            if do_prolif or do_mmgbsa:
+                pending.append((row, do_prolif, do_mmgbsa))
+
+        n_poses = len(pending)
+        print(f"📊 {n_poses} of {total_poses} docked pose(s) require {mode_label} computation.")
+
+        # Full-size interactions df doesn't depend on the pose; store it once up
+        # front rather than once per pose. _write_prolif_fps() only ever reads this
+        # table with LIMIT 1, so a single row is sufficient.
+        if prolif:
+            full_size_df = self._create_full_size_interactions_df(prolif_params_dict, renumbering_dict)
+            self._store_full_size_interactions_df_in_db(full_size_df, results_db)
 
         if n_poses == 0:
             print("Nothing to do.")
+            if write_prolif:
+                self._write_prolif_fps(results_db, assay_info)
+            if write_mmgbsa:
+                self._write_mmgbsa_fps(results_db, assay_info)
             return
 
         if max_workers is None:
@@ -12322,7 +12229,7 @@ class MolDock:
             default_workers = min(available_cores, 8, n_poses)
             while True:
                 raw = input(
-                    f"How many CPU cores should be used for parallel MMGBSA computation? "
+                    f"How many CPU cores should be used for parallel {mode_label} computation? "
                     f"[{default_workers}] (1-{available_cores} available): "
                 ).strip()
                 if raw == "":
@@ -12348,14 +12255,14 @@ class MolDock:
         temp_poses_root = os.path.join(assay_dir, "temp_restored_poses")
         os.makedirs(temp_poses_root, exist_ok=True)
 
-        # Precompute ligand parameter files once per unique ligand, sequentially,
-        # before fanning out. antechamber/parmchk2 don't set cwd=, so they litter
-        # fixed-name files into the caller's CWD; keeping this pre-pass sequential
-        # avoids a race there and lets every worker use already-materialized files.
-        # Every helper called below prints its own status/error lines; those are
-        # silenced here (with failures still surfaced through ligand_errors) so the
-        # only visible output is the progress bar itself.
-        unique_lignames = df['LigName'].unique().tolist()
+        # Precompute ligand parameter files once per unique ligand (among poses that
+        # still need work), sequentially, before fanning out. antechamber/parmchk2
+        # don't set cwd=, so they litter fixed-name files into the caller's CWD;
+        # keeping this pre-pass sequential avoids a race there and lets every worker
+        # use already-materialized files. Every helper called below prints its own
+        # status/error lines; those are silenced here (with failures still surfaced
+        # through ligand_errors) so the only visible output is the progress bar.
+        unique_lignames = sorted({row['LigName'] for row, _, _ in pending})
         ligand_iterator = tqdm(unique_lignames, desc="Preparing ligands", unit="ligand") if TQDM_AVAILABLE else unique_lignames
         ligand_files = {}
         ligand_errors = []
@@ -12387,7 +12294,7 @@ class MolDock:
             print(f"⚠️  Failed to prepare ligand parameter files for: {shown}{more} (their poses will fail).")
 
         tasks = []
-        for _, row in df.iterrows():
+        for row, do_prolif, do_mmgbsa in pending:
             pose_id = row['Pose_ID']
             ligname = row['LigName']
             ligand_params_file, frcmod_file = ligand_files[ligname]
@@ -12407,56 +12314,88 @@ class MolDock:
                 'renumbering_dict': renumbering_dict,
                 'work_subdir': f"{ligname}_{pose_id}",
                 'clean_files': clean_files,
+                'do_prolif': do_prolif,
+                'do_mmgbsa': do_mmgbsa,
+                'prolif_params_dict': prolif_params_dict,
+                'receptor_file': receptor_file,
             })
 
         gpu_lock = Manager().Lock()
-        succeeded = 0
-        failed = 0
+        prolif_ok = prolif_failed = 0
+        mmgbsa_ok = mmgbsa_failed = 0
         failed_poses = []
 
-        progress_bar = tqdm(total=len(tasks), desc="Computing MMGBSA", unit="pose") if TQDM_AVAILABLE else None
+        progress_bar = tqdm(total=len(tasks), desc=f"Computing {mode_label}", unit="pose") if TQDM_AVAILABLE else None
 
-        with ProcessPoolExecutor(max_workers=max_workers, initializer=_init_mmgbsa_worker, initargs=(gpu_lock,)) as executor:
-            future_to_task = {executor.submit(_compute_mmgbsa_pose_worker, task): task for task in tasks}
+        with ProcessPoolExecutor(max_workers=max_workers, initializer=_init_fps_worker, initargs=(gpu_lock,)) as executor:
+            future_to_task = {executor.submit(_compute_fingerprints_pose_worker, task): task for task in tasks}
 
             for future in as_completed(future_to_task):
                 task = future_to_task[future]
+                pose_id = task['pose_id']
+                ligname = task['ligname']
                 try:
                     result = future.result()
                 except Exception as e:
                     result = {
-                        "success": False, "pose_id": task['pose_id'], "ligname": task['ligname'],
-                        "mmgbsa_df": None, "total_energy": -1, "gas_energy": -1, "error": str(e),
+                        "pose_id": pose_id, "ligname": ligname, "fps_df": None, "prolif_error": None,
+                        "mmgbsa_df": None, "total_energy": -1, "gas_energy": -1, "mmgbsa_error": None,
+                        "error": str(e),
                     }
 
-                pose_id = result['pose_id']
-                ligname = result['ligname']
+                shared_failed = result['error'] is not None
+                pose_had_failure = False
 
-                if result['success']:
-                    self._store_processed_mmgbsa_df_in_db(result['mmgbsa_df'], pose_id, results_db, computation_mode)
-                    succeeded += 1
-                else:
-                    failed += 1
+                if task['do_prolif']:
+                    if not shared_failed and result['prolif_error'] is None:
+                        self._store_processed_fps_df_in_db(result['fps_df'], pose_id, results_db, computation_mode, condition_selection)
+                        prolif_ok += 1
+                    else:
+                        prolif_failed += 1
+                        pose_had_failure = True
+
+                if task['do_mmgbsa']:
+                    if not shared_failed and result['mmgbsa_error'] is None:
+                        self._store_processed_mmgbsa_df_in_db(result['mmgbsa_df'], pose_id, results_db, computation_mode)
+                        mmgbsa_ok += 1
+                    else:
+                        mmgbsa_failed += 1
+                        pose_had_failure = True
+                    self._update_results_mmgbsa_energies(results_db, pose_id, result['total_energy'], result['gas_energy'])
+
+                if pose_had_failure:
                     failed_poses.append((pose_id, ligname))
 
-                self._update_results_mmgbsa_energies(results_db, pose_id, result['total_energy'], result['gas_energy'])
-
                 if progress_bar:
-                    progress_bar.set_postfix(ok=succeeded, failed=failed)
+                    postfix = {}
+                    if prolif:
+                        postfix.update(prolif_ok=prolif_ok, prolif_failed=prolif_failed)
+                    if mmgbsa:
+                        postfix.update(mmgbsa_ok=mmgbsa_ok, mmgbsa_failed=mmgbsa_failed)
+                    progress_bar.set_postfix(**postfix)
                     progress_bar.update(1)
                 else:
-                    print(f"\rComputing MMGBSA: {succeeded + failed}/{len(tasks)} poses (ok={succeeded}, failed={failed})", end="", flush=True)
+                    print(f"\rComputing {mode_label}: {prolif_ok + prolif_failed + mmgbsa_ok + mmgbsa_failed}/"
+                          f"{len(tasks) * ((1 if prolif else 0) + (1 if mmgbsa else 0))} pieces done", end="", flush=True)
 
         if progress_bar:
             progress_bar.close()
         else:
             print()
 
-        print(f"✅ MMGBSA computation complete: {succeeded} succeeded, {failed} failed.")
+        summary_parts = []
+        if prolif:
+            summary_parts.append(f"ProLIF {prolif_ok} succeeded, {prolif_failed} failed")
+        if mmgbsa:
+            summary_parts.append(f"MMGBSA {mmgbsa_ok} succeeded, {mmgbsa_failed} failed")
+        print(f"✅ {mode_label} computation complete: " + "; ".join(summary_parts) + ".")
         if failed_poses:
             shown = ", ".join(f"{lig}#{pid}" for pid, lig in failed_poses[:20])
             more = f" (+{len(failed_poses) - 20} more)" if len(failed_poses) > 20 else ""
             print(f"   Failed poses: {shown}{more}")
+
+        if write_prolif:
+            self._write_prolif_fps(results_db, assay_info)
 
         if write_mmgbsa:
             self._write_mmgbsa_fps(results_db, assay_info)
@@ -13020,8 +12959,12 @@ class MolDock:
         cpptraj_in_file = os.path.join(output_dir, "cpptraj.in")
         min_rst_cpptraj_file = os.path.join(output_dir, "min_cpptraj.rst")
 
-        # Create a tleap input file in the same directory as tleap_processed_file
-        tleap_in_file = os.path.join(os.path.dirname(output_dir), "minimize.in")
+        # Create a tleap input file in the same directory as tleap_processed_file.
+        # Must live inside output_dir (the per-pose work_subdir), not its parent,
+        # since the parent is shared across all concurrent workers in the parallel
+        # fingerprint computation path (_compute_fingerprints_parallel) and a
+        # dirname(output_dir) path would race on this fixed filename.
+        tleap_in_file = os.path.join(output_dir, "minimize.in")
 
         # Check if a GPU is available to decide how to run the minimizatin
         gpu_available = self._check_gpu_available()
@@ -15103,11 +15046,12 @@ class MolDock:
                             print("\n   ❌ Operation cancelled by user.")
                             return False
 
-    def _check_mmgbsa_table_for_resume(self, results_db, table_name):
+    def _check_table_for_resume(self, results_db, table_name, item_label="results"):
         """
-        Like _check_table_in_db(), but for the MMGBSA-only path: offers to resume
-        an interrupted run (keep existing rows, compute only the poses still
-        missing) in addition to overwriting everything or cancelling.
+        Like _check_table_in_db(), but offers to resume an interrupted run (keep
+        existing rows, compute only the poses still missing) in addition to
+        overwriting everything or cancelling. Used for both the ProLIF condition
+        table and the MMGBSA table by _compute_fingerprints_parallel().
 
         Returns:
             None      - table does not exist yet, nothing to resume/overwrite.
@@ -15133,14 +15077,14 @@ class MolDock:
         while True:
             try:
                 response = input(
-                    "   Existing MMGBSA results found. "
+                    f"   Existing {item_label} found. "
                     "(r)esume unfinished poses, (o)verwrite all, (c)ancel? [r/o/c]: "
                 ).strip().lower()
             except KeyboardInterrupt:
                 raise SystemExit("\n   ❌ Operation cancelled by user.")
 
             if response in ('r', 'resume'):
-                print("   ℹ️  Resuming: only poses without existing MMGBSA results will be computed.")
+                print(f"   ℹ️  Resuming: only poses without existing {item_label} will be computed.")
                 return 'resume'
             elif response in ('o', 'overwrite'):
                 conn = sqlite3.connect(results_db)
@@ -15155,12 +15099,12 @@ class MolDock:
             else:
                 print("   ❌ Please answer 'r', 'o', or 'c'")
 
-    def _get_computed_mmgbsa_pose_ids(self, results_db):
+    def _get_computed_pose_ids(self, results_db, table_name):
         """
-        Return the set of Pose_ID values already present in
-        processed_mmgbsa_decomposition_json, i.e. poses that have already had
-        an MMGBSA computation attempt stored (successful or not). Used to skip
-        already-processed poses when resuming an interrupted run.
+        Return the set of Pose_ID values already present in table_name, i.e. poses
+        that have already had a computation attempt stored (successful or not) for
+        that fingerprint type. Used to skip already-processed poses when resuming
+        an interrupted run.
         """
         import sqlite3
 
@@ -15168,18 +15112,18 @@ class MolDock:
             conn = sqlite3.connect(results_db)
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='processed_mmgbsa_decomposition_json'"
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table_name,)
             )
             if cursor.fetchone() is None:
                 conn.close()
                 return set()
 
-            cursor.execute("SELECT pose_id FROM processed_mmgbsa_decomposition_json")
+            cursor.execute(f"SELECT pose_id FROM {table_name}")
             pose_ids = {row[0] for row in cursor.fetchall()}
             conn.close()
             return pose_ids
         except Exception as e:
-            print(f"❌ Error retrieving already-computed MMGBSA pose IDs: {e}")
+            print(f"❌ Error retrieving already-computed pose IDs from {table_name}: {e}")
             return set()
 
     def _clean_ligand_names_in_results_db(self, results_db_file):
@@ -16833,7 +16777,7 @@ Example — cyclodextrin receptor:
             return None
 
 
-# --- Module-level worker functions for MolDock._compute_mmgbsa_parallel() ---
+# --- Module-level worker functions for MolDock._compute_fingerprints_parallel() ---
 #
 # These must live at module level (rather than as MolDock methods) so they are
 # picklable for concurrent.futures.ProcessPoolExecutor, per the project's
@@ -16842,14 +16786,15 @@ Example — cyclodextrin receptor:
 _gpu_lock = None
 
 
-def _init_mmgbsa_worker(lock):
+def _init_fps_worker(lock):
     """
     ProcessPoolExecutor initializer: stashes the shared GPU lock in each worker
     process and silences stdout/stderr for the worker's whole lifetime. The helper
-    methods invoked by _compute_mmgbsa_pose_worker() (tleap/sander/MMPBSA.py wrapper
-    calls) print their own status/error lines; with many workers running
-    concurrently these interleave into unreadable output, so each worker is muted
-    and progress is reported solely through the parent process's progress bar.
+    methods invoked by _compute_fingerprints_pose_worker() (tleap/sander/ambpdb/
+    ProLIF/MMPBSA.py wrapper calls) print their own status/error lines; with many
+    workers running concurrently these interleave into unreadable output, so each
+    worker is muted and progress is reported solely through the parent process's
+    progress bar.
     """
     global _gpu_lock
     _gpu_lock = lock
@@ -16859,22 +16804,42 @@ def _init_mmgbsa_worker(lock):
     sys.stderr = devnull
 
 
-def _compute_mmgbsa_pose_worker(task):
+def _compute_fingerprints_pose_worker(task):
     """
-    Runs the full per-pose MMGBSA pipeline (restore pose -> build complex -> minimize
-    -> MMGBSA) inside a worker process for a single docked pose. Every filesystem path
-    used here is scoped to this pose's own subdirectory (task['work_subdir']) so
-    concurrent workers never collide on the fixed-name scratch files written by
-    tleap/sander/MMPBSA.py. GPU minimization (if used) is serialized via the shared
-    lock stashed by _init_mmgbsa_worker().
+    Runs the per-pose fingerprint pipeline inside a worker process for a single
+    docked pose: restore pose -> build complex -> optionally minimize (steps shared
+    by both fingerprint types, run once regardless of which ones are requested) ->
+    ProLIF (if task['do_prolif']) -> MMGBSA (if task['do_mmgbsa']). Every filesystem
+    path used here is scoped to this pose's own subdirectory (task['work_subdir'])
+    so concurrent workers never collide on the fixed-name scratch files written by
+    tleap/sander/ambpdb/MMPBSA.py. GPU minimization (if used) is serialized via the
+    shared lock stashed by _init_fps_worker().
 
-    Returns a dict: {"success", "pose_id", "ligname", "mmgbsa_df", "total_energy",
-    "gas_energy", "error"}. On any exception the same fallback semantics as the
-    original sequential loop are used (total_energy = gas_energy = -1).
+    ProLIF and MMGBSA each have their own try/except so one can fail without
+    aborting the other; a failure in the shared restore/build/minimize step fails
+    both.
+
+    Returns a dict: {"pose_id", "ligname", "fps_df", "prolif_error",
+    "mmgbsa_df", "total_energy", "gas_energy", "mmgbsa_error", "error"}.
+    "error" is set (and every other field left at its default) only when the
+    shared setup itself fails, mirroring the original sequential loop's fallback
+    semantics (total_energy = gas_energy = -1 on any MMGBSA failure).
     """
     pose_id = task['pose_id']
     ligname = task['ligname']
     pose_output_dir = None
+
+    result = {
+        "pose_id": pose_id,
+        "ligname": ligname,
+        "fps_df": None,
+        "prolif_error": None,
+        "mmgbsa_df": None,
+        "total_energy": -1,
+        "gas_energy": -1,
+        "mmgbsa_error": None,
+        "error": None,
+    }
 
     try:
         moldock = MolDock.from_path(task['project_name'], task['project_path'])
@@ -16913,41 +16878,42 @@ def _compute_mmgbsa_pose_worker(task):
 
         renumbering_dict = task['renumbering_dict']
 
-        complex_prmtop, receptor_prmtop, ligand_prmtop = moldock._prepare_mmgbsa_files(
-            ligname, pose_id, prmtop_file, output_dir
-        )
-        moldock._compute_mmgbsa_fingerprint(
-            ligname, pose_id, complex_prmtop, receptor_prmtop, ligand_prmtop, rst_cpptraj_file, output_dir
-        )
-        mmgbsa_df = moldock._parse_mmgbsa_decomposition_output(ligname, pose_id, output_dir)
+        if task['do_prolif']:
+            try:
+                fps_df = moldock._compute_prolif_fingerprints3(
+                    task['prolif_params_dict'], output_pdb_file, task['receptor_file'],
+                    prmtop_file, inpcrd_file, ligname, pose_id
+                )
+                fps_df.columns = fps_df.columns.droplevel(0)
+                fps_df = fps_df.rename(columns=renumbering_dict, level=0)
+                fps_df.columns = [f"{first}_{second}" for first, second in fps_df.columns]
+                result["fps_df"] = fps_df
+            except Exception as e:
+                result["prolif_error"] = str(e)
 
-        if not mmgbsa_df.empty:
-            mmgbsa_df['residue'] = mmgbsa_df['residue'].apply(lambda x: renumbering_dict.get(x, x))
-            total_energy = round(mmgbsa_df['total'].sum(), 3)
-            gas_energy = round(mmgbsa_df['gas'].sum(), 3)
-        else:
-            total_energy, gas_energy = -1, -1
+        if task['do_mmgbsa']:
+            try:
+                complex_prmtop, receptor_prmtop, ligand_prmtop = moldock._prepare_mmgbsa_files(
+                    ligname, pose_id, prmtop_file, output_dir
+                )
+                moldock._compute_mmgbsa_fingerprint(
+                    ligname, pose_id, complex_prmtop, receptor_prmtop, ligand_prmtop, rst_cpptraj_file, output_dir
+                )
+                mmgbsa_df = moldock._parse_mmgbsa_decomposition_output(ligname, pose_id, output_dir)
 
-        return {
-            "success": True,
-            "pose_id": pose_id,
-            "ligname": ligname,
-            "mmgbsa_df": mmgbsa_df,
-            "total_energy": total_energy,
-            "gas_energy": gas_energy,
-            "error": None,
-        }
+                if not mmgbsa_df.empty:
+                    mmgbsa_df['residue'] = mmgbsa_df['residue'].apply(lambda x: renumbering_dict.get(x, x))
+                    result["total_energy"] = round(mmgbsa_df['total'].sum(), 3)
+                    result["gas_energy"] = round(mmgbsa_df['gas'].sum(), 3)
+                result["mmgbsa_df"] = mmgbsa_df
+            except Exception as e:
+                result["mmgbsa_error"] = str(e)
+
+        return result
 
     except Exception as e:
-        return {
-            "success": False,
-            "pose_id": pose_id,
-            "ligname": ligname,
-            "mmgbsa_df": None,
-            "total_energy": -1,
-            "gas_energy": -1,
-            "error": str(e),
-        }
+        result["error"] = str(e)
+        return result
 
     finally:
         if task.get('clean_files') and pose_output_dir:
