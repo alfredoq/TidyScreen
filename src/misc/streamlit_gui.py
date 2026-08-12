@@ -3748,73 +3748,77 @@ elif page == "Docking analysis":
             any_active = any(e["active"] for e in extracted_poses)
 
             with st.expander("🔍 View Poses", expanded=False):
-                if not any_active:
-                    _sp, _ep_col = st.columns([1, 9])
-                    with _ep_col:
-                        _engine = st_funcs.get_assay_engine(
-                            st.session_state["active_project_path"],
-                            st.session_state["selected_assay_name"]
+                ## Extraction controls — always shown, so additional pose sets (e.g. "most
+                ## stable") can still be extracted even after another set (e.g. "all poses")
+                ## already exists.
+                _sp, _ep_col = st.columns([1, 9])
+                with _ep_col:
+                    _engine = st_funcs.get_assay_engine(
+                        st.session_state["active_project_path"],
+                        st.session_state["selected_assay_name"]
+                    )
+                    if _engine == "AutoDockGPU":
+                        _criteria_labels = [
+                            "1 - Most stable poses",
+                            "2 - Most populated poses",
+                            "3 - Most stable + most populated",
+                            "4 - All poses",
+                        ]
+                    else:
+                        _criteria_labels = [
+                            "1 - Most stable poses",
+                            "2 - All poses",
+                        ]
+                    _ep_inner_left, _ep_inner_mid, _ep_inner_right = st.columns([3, 3, 2])
+                    with _ep_inner_left:
+                        _criteria = st.selectbox(
+                            "Extraction criteria:",
+                            _criteria_labels,
+                            key="extract_poses_criteria",
                         )
-                        if _engine == "AutoDockGPU":
-                            _criteria_labels = [
-                                "1 - Most stable poses",
-                                "2 - Most populated poses",
-                                "3 - Most stable + most populated",
-                                "4 - All poses",
-                            ]
-                        else:
-                            _criteria_labels = [
-                                "1 - Most stable poses",
-                                "2 - All poses",
-                            ]
-                        _ep_inner_left, _ep_inner_mid, _ep_inner_right = st.columns([3, 3, 2])
-                        with _ep_inner_left:
-                            _criteria = st.selectbox(
-                                "Extraction criteria:",
-                                _criteria_labels,
-                                key="extract_poses_criteria",
-                            )
 
-                        ## "Most stable" (1) and "Most stable + most populated" (3) rank by a
-                        ## numeric score column; offer a choice when more than one is available,
-                        ## mirroring MolDock._prompt_score_column() from the interactive CLI.
-                        _needs_score_col = _criteria.startswith("1") or _criteria.startswith("3")
-                        _score_col_labels = {
-                            'docking_score': 'Docking score',
-                            'mmgbsa_total_energy': 'MMGBSA total energy',
-                            'mmgbsa_gas_energy': 'MMGBSA gas energy',
-                        }
-                        _selected_score_col = None
-                        with _ep_inner_mid:
-                            if _needs_score_col:
-                                _score_col_candidates = st_funcs.get_available_score_columns(results_db_path)
-                                if len(_score_col_candidates) > 1:
-                                    _selected_score_col = st.selectbox(
-                                        "Scoring column:",
-                                        _score_col_candidates,
-                                        format_func=lambda c: _score_col_labels.get(c, c),
-                                        key="extract_poses_score_column",
-                                    )
+                    ## "Most stable" (1) and "Most stable + most populated" (3) rank by a
+                    ## numeric score column; offer a choice when more than one is available,
+                    ## mirroring MolDock._prompt_score_column() from the interactive CLI.
+                    _needs_score_col = _criteria.startswith("1") or _criteria.startswith("3")
+                    _score_col_labels = {
+                        'docking_score': 'Docking score',
+                        'mmgbsa_total_energy': 'MMGBSA total energy',
+                        'mmgbsa_gas_energy': 'MMGBSA gas energy',
+                    }
+                    _selected_score_col = None
+                    with _ep_inner_mid:
+                        if _needs_score_col:
+                            _score_col_candidates = st_funcs.get_available_score_columns(results_db_path)
+                            if len(_score_col_candidates) > 1:
+                                _selected_score_col = st.selectbox(
+                                    "Scoring column:",
+                                    _score_col_candidates,
+                                    format_func=lambda c: _score_col_labels.get(c, c),
+                                    key="extract_poses_score_column",
+                                )
 
-                        with _ep_inner_right:
-                            st.write("")
-                            st.write("")
-                            if st.button("Extract Poses", key="btn_extract_poses"):
-                                _selection = _criteria[0]  # leading digit "1", "2", "3", or "4"
-                                with st.spinner("Extracting poses..."):
-                                    _ok, _msg = st_funcs.extract_poses_for_assay(
-                                        st.session_state["selected_project"],
-                                        st.session_state["active_project_path"],
-                                        st.session_state["selected_assay_name"],
-                                        _selection,
-                                        score_column=_selected_score_col,
-                                    )
-                                if _ok:
-                                    st.success(_msg)
-                                    st.rerun()
-                                else:
-                                    st.error(_msg)
-                else:
+                    with _ep_inner_right:
+                        st.write("")
+                        st.write("")
+                        if st.button("Extract Poses", key="btn_extract_poses"):
+                            _selection = _criteria[0]  # leading digit "1", "2", "3", or "4"
+                            with st.spinner("Extracting poses..."):
+                                _ok, _msg = st_funcs.extract_poses_for_assay(
+                                    st.session_state["selected_project"],
+                                    st.session_state["active_project_path"],
+                                    st.session_state["selected_assay_name"],
+                                    _selection,
+                                    score_column=_selected_score_col,
+                                )
+                            if _ok:
+                                st.success(_msg)
+                                st.rerun()
+                            else:
+                                st.error(_msg)
+
+                if any_active:
+                    st.divider()
                     ## Reference PDB uploader (shared across all pose folders)
                     _sp, _col = st.columns([1, 9])
                     with _col:
