@@ -3948,7 +3948,7 @@ elif page == "Docking analysis":
                                         st.write("")  ## vertical alignment spacer
                                         st.write("")
                                         st.write("")
-                                        if st.button("◀", key=f"prev_pose_{entry['directory']}", disabled=(current_idx == 0)):
+                                        if st.button("◀ (←)", key=f"prev_pose_{entry['directory']}", disabled=(current_idx == 0)):
                                             st.session_state[idx_key] = current_idx - 1
                                             st.rerun()
                                     with viewer_col:
@@ -3957,13 +3957,13 @@ elif page == "Docking analysis":
                                         st.write("")
                                         st.write("")
                                         st.write("")
-                                        if st.button("▶", key=f"next_pose_{entry['directory']}", disabled=(current_idx >= len(pdb_names) - 1)):
+                                        if st.button("▶ (→)", key=f"next_pose_{entry['directory']}", disabled=(current_idx >= len(pdb_names) - 1)):
                                             st.session_state[idx_key] = current_idx + 1
                                             st.rerun()
                                         if has_ref:
                                             st.write("")
                                             flag_pos_key = f"flag_pos_{entry['directory']}_{selected_file}"
-                                            if st.button("✅ Flag positive binding pose", key=flag_pos_key):
+                                            if st.button("✅ Flag positive binding pose (Y)", key=flag_pos_key):
                                                 result = st_funcs.save_positive_binder(
                                                     project_path=st.session_state["active_project_path"],
                                                     assay_name=st.session_state.get("selected_assay_name", "unknown"),
@@ -3980,7 +3980,7 @@ elif page == "Docking analysis":
                                                 else:
                                                     st.error(result)
                                             flag_neg_key = f"flag_neg_{entry['directory']}_{selected_file}"
-                                            if st.button("❌ Flag negative binding pose", key=flag_neg_key):
+                                            if st.button("❌ Flag negative binding pose (N)", key=flag_neg_key):
                                                 result = st_funcs.save_negative_binder(
                                                     project_path=st.session_state["active_project_path"],
                                                     assay_name=st.session_state.get("selected_assay_name", "unknown"),
@@ -4013,10 +4013,10 @@ elif page == "Docking analysis":
                                             if (window.parent.__tsPoseKeyHandler) {
                                                 doc.removeEventListener('keydown', window.parent.__tsPoseKeyHandler);
                                             }
-                                            function clickButtonByText(text) {
+                                            function clickButtonByPrefix(prefix) {
                                                 const buttons = doc.querySelectorAll('button');
                                                 for (const btn of buttons) {
-                                                    if (btn.textContent.trim() === text && !btn.disabled) {
+                                                    if (btn.textContent.trim().startsWith(prefix) && !btn.disabled) {
                                                         btn.click();
                                                         return true;
                                                     }
@@ -4028,10 +4028,10 @@ elif page == "Docking analysis":
                                                 const tag = active ? active.tagName : '';
                                                 if (tag === 'INPUT' || tag === 'TEXTAREA' || (active && active.isContentEditable)) return;
                                                 if (e.ctrlKey || e.metaKey || e.altKey) return;
-                                                if (e.key === 'ArrowLeft') { clickButtonByText('◀'); }
-                                                else if (e.key === 'ArrowRight') { clickButtonByText('▶'); }
-                                                else if (e.key === 'y' || e.key === 'Y') { clickButtonByText('✅ Flag positive binding pose'); }
-                                                else if (e.key === 'n' || e.key === 'N') { clickButtonByText('❌ Flag negative binding pose'); }
+                                                if (e.key === 'ArrowLeft') { clickButtonByPrefix('◀'); }
+                                                else if (e.key === 'ArrowRight') { clickButtonByPrefix('▶'); }
+                                                else if (e.key === 'y' || e.key === 'Y') { clickButtonByPrefix('✅ Flag positive binding pose'); }
+                                                else if (e.key === 'n' || e.key === 'N') { clickButtonByPrefix('❌ Flag negative binding pose'); }
                                             }
                                             window.parent.__tsPoseKeyHandler = handler;
                                             doc.addEventListener('keydown', handler);
@@ -4046,8 +4046,6 @@ elif page == "Docking analysis":
                                     pose_id_label = pose_info.get("pose_id", "?")
                                     lig_label = pose_info["ligname"] if pose_info else "?"
                                     st.caption(f"Pose ID: {pose_id_label}  |  {lig_label}  ({current_idx + 1} of {len(pdb_names)})")
-                                    if has_ref:
-                                        st.caption("Shortcuts: ← prev · → next · Y flag positive · N flag negative")
 
                                     ## VMD script creation
                                     with st.expander("🎬 Create VMD Script", expanded=False):
