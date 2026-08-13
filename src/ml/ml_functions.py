@@ -108,6 +108,106 @@ def _predict_pose_worker(task: dict) -> dict:
             shutil.rmtree(pose_dir, ignore_errors=True)
 
 
+def _compute_training_fp_worker(task: dict) -> dict:
+    """
+    Module-level worker (required for ProcessPoolExecutor pickling) that restores
+    a single training-set pose, builds its AMBER complex, optionally minimizes it,
+    and computes its ProLIF fingerprint.
+
+    Same restore/build/minimize/fingerprint pipeline as _predict_pose_worker(),
+    adapted for MachineLearning._compute_training_fps_parallel(): a training set
+    snapshot can mix poses from any number of docking assays (rather than the
+    single assay _predict_pose_worker() operates within), and the result carries
+    the training_set_fingerprints identifying columns (assay_name, pose_file,
+    directory, binder_type, label) instead of a docking_score.
+
+    Ligand-specific tleap files (prepin/frcmod) must already be prepared (see
+    MachineLearning._compute_training_fps_parallel) and are passed in read-only,
+    since concurrent workers preparing the same ligand would race on its files.
+    """
+    import os
+    import sys
+    import shutil
+    from moldock.moldock import MolDock
+
+    pose_file = task['pose_file']
+    ligname = task['ligname']
+    run_number = task['run_number']
+    verbose = task['verbose']
+
+    devnull_fd = saved_out_fd = saved_err_fd = None
+    if not verbose:
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        saved_out_fd = os.dup(1)
+        saved_err_fd = os.dup(2)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.dup2(devnull_fd, 1)
+        os.dup2(devnull_fd, 2)
+
+    pose_dir = None
+    try:
+        moldock = MolDock.from_path(task['project_name'], task['project_path'])
+
+        shared_dir, restored_pdb = moldock._restore_single_docked_pose(
+            task['results_db'], ligname, run_number
+        )
+        pose_dir = os.path.join(shared_dir, f"pose_{ligname}_{run_number}")
+        work_dir = os.path.join(pose_dir, "work")
+        os.makedirs(work_dir, exist_ok=True)
+
+        prmtop_file, inpcrd_file, output_pdb_file = moldock._prepare_complex_prmtop_inpcrd(
+            task['prepin_file'], task['frcmod_file'], task['assay_info'],
+            work_dir, restored_pdb, run_number, ligname=ligname
+        )
+
+        if task['minimize']:
+            _, output_pdb_file = moldock._minimize_complex(
+                prmtop_file, inpcrd_file, work_dir, ligname, run_number, output_pdb_file
+            )
+
+        fps_df = moldock._compute_prolif_fingerprints3(
+            task['prolif_params_dict'], output_pdb_file, task['receptor_file'],
+            prmtop_file, inpcrd_file, ligname, run_number
+        )
+        fps_df.columns = fps_df.columns.droplevel(0)
+        if task['renumbering_dict']:
+            fps_df = fps_df.rename(columns=task['renumbering_dict'], level=0)
+        fps_df.columns = [f"{a}_{b}" for a, b in fps_df.columns]
+
+        fp_row = fps_df.iloc[0].to_dict()
+        fp_json = json.dumps({k: bool(v) for k, v in fp_row.items()})
+
+        return {
+            'ok': True,
+            'assay_name': task['assay_name'],
+            'pose_file': pose_file,
+            'directory': task['directory'],
+            'binder_type': task['binder_type'],
+            'label': task['label'],
+            'fingerprint_json': fp_json,
+        }
+    except Exception as e:
+        return {
+            'ok': False,
+            'assay_name': task['assay_name'],
+            'pose_file': pose_file,
+            'directory': task['directory'],
+            'error': str(e),
+        }
+    finally:
+        if not verbose:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os.dup2(saved_out_fd, 1)
+            os.dup2(saved_err_fd, 2)
+            os.close(saved_out_fd)
+            os.close(saved_err_fd)
+            os.close(devnull_fd)
+        if task.get('clean_files', True) and pose_dir and os.path.isdir(pose_dir):
+            shutil.rmtree(pose_dir, ignore_errors=True)
+
+
 def _run_background_rf_predictions(job_file: str) -> None:
     """
     Entry point for the detached background process launched by
@@ -381,12 +481,16 @@ class MachineLearning:
         """
         Compute ProLIF fingerprints for all poses in a consolidated training set
         snapshot, following the same AMBER + ProLIF pipeline as
-        MolDock.compute_fingerprints().
+        MolDock.compute_fingerprints() — including its parallel dispatch: poses
+        are processed by a pool of worker processes (see
+        _compute_training_fps_parallel() / _compute_training_fp_worker()) rather
+        than one at a time.
 
         The user is prompted to:
           1. Select a training set snapshot.
           2. Select a ProLIF conditions record.
           3. Confirm whether complex minimization should be performed.
+          4. Choose how many CPU cores to use for the parallel computation.
 
         Results are stored in the 'training_set_fingerprints' table of
         training_sets_snapshots.db, keyed on
@@ -406,9 +510,6 @@ class MachineLearning:
                 output is suppressed and a tqdm progress counter is shown instead
                 (same behaviour as make_rf_predictions_on_docking_assay()).
         """
-
-        import shutil
-        from datetime import datetime
 
         from moldock.moldock import MolDock
 
@@ -493,186 +594,296 @@ class MachineLearning:
         # ── 8. Instantiate MolDock to access the AMBER + ProLIF pipeline ─────
         moldock = MolDock(self.project)
 
-        output_dirs = []
-        processed_ligands_by_assay = {}  # {assay_name: {ligname: (prepin_file, frcmod_file)}}
-        n_computed = 0
-        n_skipped = 0
-        n_failed = 0
+        # ── 9. Build the pending work list: resolve each entry's ligand/pose/
+        # assay metadata and drop entries that are already computed for this
+        # conditions set or that fail to resolve — a fast, sequential pass with
+        # no AMBER/ProLIF work, mirroring _prepare_fingerprints_execution() in
+        # MolDock.compute_fingerprints().
+        conn = sqlite3.connect(self.__training_sets_db)
+        done_keys = {
+            (a, p, d) for a, p, d in conn.execute(
+                """SELECT assay_name, pose_file, directory FROM training_set_fingerprints
+                   WHERE training_set_id=? AND prolif_conditions_id=?""",
+                (training_set_id, condition_selection)
+            ).fetchall()
+        }
+        conn.close()
 
-        # When quiet, tqdm writes through a duplicated stdout fd so the progress
-        # counter keeps displaying even while fd 1/2 are redirected to devnull
-        # below (needed to silence subprocess-inherited tleap/sander/ambpdb output).
-        original_stdout = os.fdopen(os.dup(1), 'w') if not verbose else sys.stdout
+        pending = []
+        n_skipped = 0
+        for _, row in entries_df.iterrows():
+            assay_name = row['assay_name']
+            pose_file = row['pose_file']
+            directory = row['directory']
+            binder_type = row['binder_type']
+            label = 1 if binder_type == 'positive' else 0
+
+            if (assay_name, pose_file, directory) in done_keys:
+                n_skipped += 1
+                if verbose:
+                    print(f"  ⏭️  Already computed, skipping: {pose_file}")
+                continue
+
+            assay_info = assay_info_by_name.get(assay_name)
+            if not assay_info:
+                n_skipped += 1
+                if verbose:
+                    print(f"  ❌ Assay '{assay_name}' not found in registry — skipping {pose_file}")
+                continue
+
+            # Parse LigName and run_number from pose_file ({LigName}_{run_number}.pdb).
+            # The suffix is the per-ligand run_number used during pose extraction,
+            # NOT the global Pose_ID from the Ringtail Results table.
+            stem = os.path.splitext(pose_file)[0]
+            parts = stem.rsplit('_', 1)
+            if len(parts) != 2:
+                n_skipped += 1
+                if verbose:
+                    print(f"  ❌ Cannot parse pose_file '{pose_file}' — skipping")
+                continue
+            ligname, run_number_str = parts
+            try:
+                run_number = int(run_number_str)
+            except ValueError:
+                n_skipped += 1
+                if verbose:
+                    print(f"  ❌ Cannot parse run_number from '{run_number_str}' — skipping {pose_file}")
+                continue
+
+            # Derive receptor_checked.pdb path from the pdbqt_file stored in assay info
+            receptor_pdbqt = assay_info.get('receptor_info', {}).get('pdbqt_file')
+            if not receptor_pdbqt:
+                n_skipped += 1
+                if verbose:
+                    print(f"  ❌ No receptor pdbqt_file for assay '{assay_name}' — skipping {pose_file}")
+                continue
+            receptor_pdbqt = self._remap_project_path(receptor_pdbqt)
+            receptor_file = os.path.join(os.path.dirname(receptor_pdbqt), 'receptor_checked.pdb')
+
+            assay_folder_path = assay_info['assay_folder_path']
+            assay_id = assay_info['assay_id']
+            results_db = os.path.join(assay_folder_path, 'results', f'assay_{assay_id}.db')
+
+            pending.append({
+                'assay_name': assay_name,
+                'pose_file': pose_file,
+                'directory': directory,
+                'binder_type': binder_type,
+                'label': label,
+                'LigName': ligname,
+                'run_number': run_number,
+                'assay_info': assay_info,
+                'renumbering_dict': renumbering_dict_by_name.get(assay_name, {}),
+                'results_db': results_db,
+                'receptor_file': receptor_file,
+            })
+
+        n_pending = len(pending)
+        print(f"\n📊 {n_pending} of {len(entries_df)} entries require fingerprint computation "
+              f"({n_skipped} already computed or skipped).")
+
+        if n_pending == 0:
+            print("\n✅ Nothing to compute.")
+            return
+
+        # ── 10. Prompt for worker count, same convention as
+        # MolDock._prepare_fingerprints_execution() ────────────────────────────
+        from multiprocessing import cpu_count
+        available_cores = cpu_count()
+        default_workers = min(available_cores, 8, n_pending)
+        while True:
+            raw = input(
+                f"How many CPU cores should be used for parallel fingerprint computation? "
+                f"[{default_workers}] (1-{available_cores} available): "
+            ).strip()
+            if raw == "":
+                max_workers = default_workers
+                break
+            try:
+                max_workers = int(raw)
+            except ValueError:
+                print("Please enter a valid integer.")
+                continue
+            if max_workers < 1:
+                print("Please enter a positive integer.")
+                continue
+            if max_workers > available_cores:
+                print(f"⚠️  Only {available_cores} core(s) available; using {available_cores}.")
+                max_workers = available_cores
+            break
+        max_workers = min(max_workers, n_pending)
+
+        # ── 11. Dispatch to the parallel pipeline ──────────────────────────────
+        n_computed, n_failed = self._compute_training_fps_parallel(
+            moldock, pending, training_set_id, condition_selection,
+            prolif_params_dict, minimize, max_workers, verbose, clean_files,
+        )
+
+        print(f"\n🎉 Fingerprint computation complete for training set '{training_set_id}' "
+              f"({n_computed} computed, {n_skipped} skipped, {n_failed} failed)")
+
+    def _compute_training_fps_parallel(self, moldock, pending, training_set_id, condition_selection,
+                                        prolif_params_dict, minimize, max_workers, verbose,
+                                        clean_files, chunk_size=None) -> tuple:
+        """
+        Parallel pipeline for compute_training_set_fingerprints(): restores,
+        builds, optionally minimizes, and computes the ProLIF fingerprint for
+        each pending training-set pose using a shared ProcessPoolExecutor.
+
+        Follows the same chunked-dispatch approach as
+        MachineLearning._classify_poses_parallel() / _predict_pose_worker()
+        (itself modeled on MolDock.compute_fingerprints()'s parallel pipeline),
+        adapted for a training set snapshot that can mix poses from any number
+        of docking assays: entries are grouped by assay_name first — each assay
+        has its own temp_restored_poses/ scratch directory and receptor/tleap
+        metadata — and then chunked by ligand within that assay (never
+        splitting one ligand's poses across chunks), so tleap ligand-prep files
+        are shared across a chunk's poses instead of being rebuilt per pose.
+
+        Each successfully computed fingerprint is written to
+        training_set_fingerprints as its future completes, so results land in
+        the database incrementally rather than only at the very end. Per-assay
+        scratch directories are removed at the end only if clean_files is True,
+        matching the sequential path's behaviour.
+
+        Returns (n_computed, n_failed).
+        """
+        import shutil
+        from datetime import datetime
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+
+        if chunk_size is None:
+            chunk_size = max(max_workers * 4, 1)
+
+        entries_df = pd.DataFrame(pending)
+        chunks = []
+        for _, assay_group in entries_df.groupby('assay_name', sort=False):
+            chunks.extend(self._chunk_poses_by_ligand(assay_group, chunk_size))
+
+        n_computed = 0
+        n_failed = 0
+        n_chunks = len(chunks)
+        chunks_done = 0
+        shared_dirs_used = set()
+
+        pbar = tqdm(total=len(entries_df), desc="Computing fingerprints (parallel)", disable=verbose)
+        pbar.set_postfix(computed=n_computed, failed=n_failed, chunks=f"{chunks_done}/{n_chunks}")
 
         try:
-            pbar = tqdm(
-                entries_df.iterrows(), total=len(entries_df),
-                desc="Computing fingerprints", file=original_stdout,
-                dynamic_ncols=True, disable=verbose,
-            )
-            for _, row in pbar:
-                assay_name = row['assay_name']
-                pose_file  = row['pose_file']
-                directory  = row['directory']
-                binder_type = row['binder_type']
-                label = 1 if binder_type == 'positive' else 0
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                for chunk_df in chunks:
+                    assay_name = chunk_df.iloc[0]['assay_name']
+                    assay_info = chunk_df.iloc[0]['assay_info']
+                    results_db = chunk_df.iloc[0]['results_db']
+                    shared_output_dir = os.path.join(os.path.dirname(results_db), 'temp_restored_poses')
+                    shared_dirs_used.add(shared_output_dir)
+                    os.makedirs(shared_output_dir, exist_ok=True)
 
-                try:
-                    # Skip if already computed for this conditions set
-                    conn = sqlite3.connect(self.__training_sets_db)
-                    existing = conn.execute(
-                        """SELECT id FROM training_set_fingerprints
-                           WHERE training_set_id=? AND assay_name=? AND pose_file=?
-                             AND directory=? AND prolif_conditions_id=?""",
-                        (training_set_id, assay_name, pose_file, directory, condition_selection)
-                    ).fetchone()
-                    conn.close()
-                    if existing:
-                        n_skipped += 1
-                        if verbose:
-                            print(f"  ⏭️  Already computed, skipping: {pose_file}")
-                        continue
-
-                    assay_info = assay_info_by_name.get(assay_name)
-                    if not assay_info:
-                        n_skipped += 1
-                        if verbose:
-                            print(f"  ❌ Assay '{assay_name}' not found in registry — skipping {pose_file}")
-                        continue
-
-                    # Parse LigName and run_number from pose_file ({LigName}_{run_number}.pdb).
-                    # The suffix is the per-ligand run_number used during pose extraction,
-                    # NOT the global Pose_ID from the Ringtail Results table.
-                    stem = os.path.splitext(pose_file)[0]
-                    parts = stem.rsplit('_', 1)
-                    if len(parts) != 2:
-                        n_skipped += 1
-                        if verbose:
-                            print(f"  ❌ Cannot parse pose_file '{pose_file}' — skipping")
-                        continue
-                    ligname, pose_id_str = parts
-                    try:
-                        pose_id = int(pose_id_str)  # this is the run_number
-                    except ValueError:
-                        n_skipped += 1
-                        if verbose:
-                            print(f"  ❌ Cannot parse run_number from '{pose_id_str}' — skipping {pose_file}")
-                        continue
-
-                    # Derive receptor_checked.pdb path from the pdbqt_file stored in assay info
-                    receptor_pdbqt = assay_info.get('receptor_info', {}).get('pdbqt_file')
-                    if not receptor_pdbqt:
-                        n_skipped += 1
-                        if verbose:
-                            print(f"  ❌ No receptor pdbqt_file for assay '{assay_name}' — skipping {pose_file}")
-                        continue
-                    receptor_pdbqt = self._remap_project_path(receptor_pdbqt)
-                    receptor_file = os.path.join(os.path.dirname(receptor_pdbqt), 'receptor_checked.pdb')
-
-                    assay_folder_path = assay_info['assay_folder_path']
-                    assay_id = assay_info['assay_id']
-                    results_db = os.path.join(assay_folder_path, 'results', f'assay_{assay_id}.db')
-
-                    renumbering_dict = renumbering_dict_by_name.get(assay_name, {})
+                    unique_lignames = chunk_df['LigName'].unique().tolist()
+                    ligand_files = {}
+                    failed_ligands = []
 
                     if verbose:
-                        print(f"\n  🔬 Processing {pose_file} ({binder_type}) — assay: {assay_name}")
+                        print(f"\n🧪 Chunk {chunks_done + 1}/{n_chunks} ({assay_name}): preparing tleap "
+                              f"files for {len(unique_lignames)} ligand(s), {len(chunk_df)} pose(s)...")
 
-                    suppress = contextlib.nullcontext() if verbose else self._suppress_output()
-                    with suppress:
-                        # Step A: Restore docked pose PDB from the assay results DB
-                        output_dir, output_file = moldock._restore_single_docked_pose(results_db, ligname, pose_id)
-
-                        if output_dir not in output_dirs:
-                            output_dirs.append(output_dir)
-
-                        # Step B: Prepare ligand AMBER files (once per unique ligname per assay)
-                        processed_ligands_by_assay.setdefault(assay_name, {})
-                        if ligname not in processed_ligands_by_assay[assay_name]:
-                            prepin_file, frcmod_file = moldock._prepare_ligand_tleap_files(
-                                ligname, assay_info, output_dir
-                            )
-                            processed_ligands_by_assay[assay_name][ligname] = (prepin_file, frcmod_file)
-                        else:
-                            prepin_file, frcmod_file = processed_ligands_by_assay[assay_name][ligname]
-
-                        # Step C: Prepare complex prmtop and inpcrd files using tleap
-                        prmtop_file, inpcrd_file, output_pdb_file = moldock._prepare_complex_prmtop_inpcrd(
-                            prepin_file, frcmod_file, assay_info, output_dir, output_file, pose_id, ligname=ligname
-                        )
-
-                        # Step D: Optionally minimize complex (mirrors compute_fingerprints behaviour)
-                        if minimize:
-                            try:
-                                if verbose:
-                                    print("    MINIMIZING COMPLEX...")
-                                min_rst_cpptraj_file, output_pdb_file = moldock._minimize_complex(
-                                    prmtop_file, inpcrd_file, output_dir, ligname, pose_id, output_pdb_file
+                    for ligname in unique_lignames:
+                        suppress = contextlib.nullcontext() if verbose else self._suppress_output()
+                        try:
+                            with suppress:
+                                result = moldock._prepare_ligand_tleap_files(
+                                    ligname, assay_info, shared_output_dir
                                 )
-                                rst_cpptraj_file = min_rst_cpptraj_file
-                            except Exception as e:
-                                if verbose:
-                                    print(f"    ⚠️  Minimization failed: {e}. Using original inpcrd.")
-                                rst_cpptraj_file = inpcrd_file
+                        except SystemExit:
+                            # _prepare_ligand_tleap_files calls sys.exit(1) if the ligand's
+                            # SDF cannot be converted to PDB — treat as a per-ligand failure
+                            # instead of killing the run.
+                            result = None
+                        if not result or result[0] is None or result[1] is None:
+                            failed_ligands.append(ligname)
+                            continue
+                        ligand_files[ligname] = result
+
+                    if failed_ligands:
+                        print(f"\n⚠️  Failed to prepare tleap files for {len(failed_ligands)} "
+                              f"ligand(s) in chunk {chunks_done + 1}/{n_chunks} ({assay_name}): "
+                              f"{', '.join(failed_ligands)}")
+                        print("   Poses for these ligands will be skipped.")
+
+                    tasks = []
+                    for _, row in chunk_df.iterrows():
+                        ligname = row['LigName']
+                        if ligname not in ligand_files:
+                            n_failed += 1
+                            pbar.update(1)
+                            pbar.set_postfix(computed=n_computed, failed=n_failed,
+                                              chunks=f"{chunks_done}/{n_chunks}")
+                            continue
+                        prepin_file, frcmod_file = ligand_files[ligname]
+                        tasks.append({
+                            'project_path': self.path,
+                            'project_name': self.name,
+                            'results_db': row['results_db'],
+                            'assay_name': row['assay_name'],
+                            'assay_info': row['assay_info'],
+                            'ligname': ligname,
+                            'run_number': row['run_number'],
+                            'pose_file': row['pose_file'],
+                            'directory': row['directory'],
+                            'binder_type': row['binder_type'],
+                            'label': row['label'],
+                            'prolif_params_dict': prolif_params_dict,
+                            'receptor_file': row['receptor_file'],
+                            'renumbering_dict': row['renumbering_dict'],
+                            'minimize': minimize,
+                            'prepin_file': prepin_file,
+                            'frcmod_file': frcmod_file,
+                            'verbose': verbose,
+                            'clean_files': clean_files,
+                        })
+
+                    futures = [executor.submit(_compute_training_fp_worker, task) for task in tasks]
+                    for future in as_completed(futures):
+                        result = future.result()
+                        if result.get('ok'):
+                            conn = sqlite3.connect(self.__training_sets_db)
+                            conn.execute(
+                                """INSERT OR REPLACE INTO training_set_fingerprints
+                                   (training_set_id, assay_name, pose_file, directory,
+                                    binder_type, label, prolif_conditions_id, minimized,
+                                    fingerprint_json, computed_at)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                (training_set_id, result['assay_name'], result['pose_file'],
+                                 result['directory'], result['binder_type'], result['label'],
+                                 condition_selection, int(minimize), result['fingerprint_json'],
+                                 datetime.now().isoformat())
+                            )
+                            conn.commit()
+                            conn.close()
+                            n_computed += 1
+                            if verbose:
+                                print(f"    ✅ Fingerprint stored for {result['pose_file']}")
                         else:
-                            rst_cpptraj_file = inpcrd_file
+                            n_failed += 1
+                            if verbose:
+                                print(f"    ❌ Error processing {result['pose_file']} "
+                                      f"({result['assay_name']}): {result.get('error')} — skipping")
+                        pbar.update(1)
+                        pbar.set_postfix(computed=n_computed, failed=n_failed,
+                                          chunks=f"{chunks_done}/{n_chunks}")
 
-                        # Step E: Compute ProLIF fingerprints via ambpdb + MDAnalysis + ProLIF
-                        fps_df = moldock._compute_prolif_fingerprints3(
-                            prolif_params_dict, output_pdb_file, receptor_file,
-                            prmtop_file, inpcrd_file, ligname, pose_id
-                        )
-
-                        # Step F: Flatten MultiIndex columns and apply residue renumbering
-                        fps_df.columns = fps_df.columns.droplevel(0)
-                        if renumbering_dict:
-                            fps_df = fps_df.rename(columns=renumbering_dict, level=0)
-                        fps_df.columns = [f"{a}_{b}" for a, b in fps_df.columns]
-
-                        # Step G: Serialise the single fingerprint row to JSON
-                        fp_row = fps_df.iloc[0].to_dict()
-                        fp_json = json.dumps({k: bool(v) for k, v in fp_row.items()})
-
-                        # Step H: Store in training_set_fingerprints table
-                        conn = sqlite3.connect(self.__training_sets_db)
-                        conn.execute(
-                            """INSERT OR REPLACE INTO training_set_fingerprints
-                               (training_set_id, assay_name, pose_file, directory,
-                                binder_type, label, prolif_conditions_id, minimized,
-                                fingerprint_json, computed_at)
-                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                            (training_set_id, assay_name, pose_file, directory,
-                             binder_type, label, condition_selection, int(minimize),
-                             fp_json, datetime.now().isoformat())
-                        )
-                        conn.commit()
-                        conn.close()
-
-                    n_computed += 1
-                    if verbose:
-                        print(f"    ✅ Fingerprint stored for {pose_file}")
-
-                except Exception as e:
-                    n_failed += 1
-                    if verbose:
-                        print(f"    ❌ Error processing {pose_file}: {e} — skipping")
-                    continue
-                finally:
-                    if not verbose:
-                        pbar.set_postfix(computed=n_computed, skipped=n_skipped, failed=n_failed)
-
+                    chunks_done += 1
+                    pbar.set_postfix(computed=n_computed, failed=n_failed,
+                                      chunks=f"{chunks_done}/{n_chunks}")
         finally:
             pbar.close()
-            if not verbose:
-                original_stdout.close()
             if clean_files:
-                for d in output_dirs:
+                for d in shared_dirs_used:
                     shutil.rmtree(d, ignore_errors=True)
                 if verbose:
                     print("\n✅ Temporary files cleaned up.")
 
-        print(f"\n🎉 Fingerprint computation complete for training set '{training_set_id}' "
-              f"({n_computed} computed, {n_skipped} skipped, {n_failed} failed)")
+        return n_computed, n_failed
 
     def load_training_set_features(self) -> tuple:
         """
