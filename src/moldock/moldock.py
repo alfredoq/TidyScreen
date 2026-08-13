@@ -11978,6 +11978,12 @@ class MolDock:
         min(cpu_count(), 8) when None. Applies to all three modes (ProLIF-only,
         MMGBSA-only, and combined ProLIF+MMGBSA) — every mode runs through the
         same parallel per-pose pipeline.
+
+        After all interactive setup (assay/ligand/pose selection, resume choices,
+        worker count), prompts whether to run the computation in the foreground
+        (blocks until done) or background (detached process; progress/errors go to
+        a log file under the assay's logs/ folder, and this call returns immediately).
+        Defaults to foreground.
         """
 
         import os
@@ -12099,7 +12105,7 @@ class MolDock:
                 break
         
         # Table existence / resume-vs-overwrite prompts for whichever table(s) this
-        # run needs are handled inside _compute_fingerprints_parallel(), once it
+        # run needs are handled inside _prepare_fingerprints_execution(), once it
         # knows exactly which tables (ProLIF condition table and/or MMGBSA table)
         # are relevant.
         if prolif:
@@ -12135,7 +12141,7 @@ class MolDock:
 
         ## If ProLIF fingerprints are requested, retrieve the computation parameters.
         # The condition table's existence/resume-vs-overwrite check happens inside
-        # _compute_fingerprints_parallel(), since that's where the per-table
+        # _prepare_fingerprints_execution(), since that's where the per-table
         # "already computed" pose sets are needed.
         prolif_params_dict, condition_selection = None, None
         if prolif == True:
@@ -12161,47 +12167,69 @@ class MolDock:
                 print(f"Error retrieving renumbering_dict for template '{template_name}': {e}")
 
         # All three modes (ProLIF-only, MMGBSA-only, combined) run through the same
-        # parallel per-pose pipeline.
-        self._compute_fingerprints_parallel(
+        # parallel per-pose pipeline. Interactive setup (resume/overwrite prompts,
+        # worker-count prompt, ligand preparation) always happens here in the
+        # foreground; only the actual computation that follows can be backgrounded.
+        prep = self._prepare_fingerprints_execution(
             df, results_db, assay_info, computation_mode, minimize,
             is_stub_receptor, fps_tleap_config, renumbering_dict, max_workers, clean_files,
             prolif, mmbgsa, prolif_params_dict, condition_selection,
             receptor_file, write_prolif, write_mmgbsa,
         )
+        if prep is None:
+            return None
 
-    def _compute_fingerprints_parallel(self, df, results_db, assay_info, computation_mode,
+        tasks, mode_label, temp_poses_root, resolved_max_workers = prep
+
+        exec_kwargs = dict(
+            tasks=tasks, mode_label=mode_label, prolif=prolif, mmgbsa=mmbgsa,
+            results_db=results_db, condition_selection=condition_selection,
+            clean_files=clean_files, temp_poses_root=temp_poses_root,
+            write_prolif=write_prolif, write_mmgbsa=write_mmgbsa, assay_info=assay_info,
+            max_workers=resolved_max_workers, computation_mode=computation_mode,
+        )
+
+        run_mode = input(
+            "\n⚙️  Run the fingerprint computation in the foreground or background? (fg/bg) [default: fg]: "
+        ).strip().lower() or 'fg'
+
+        if run_mode in ('fg', 'foreground'):
+            print(f"\n▶️  Starting {mode_label} computation in the foreground...")
+            self._execute_fingerprints_tasks(**exec_kwargs)
+        elif run_mode in ('bg', 'background'):
+            self._launch_fingerprints_background(**exec_kwargs)
+        else:
+            print("❌ Invalid option. Please choose 'fg' or 'bg'. No computation was started.")
+
+    def _prepare_fingerprints_execution(self, df, results_db, assay_info, computation_mode,
                                         minimize, is_stub_receptor, fps_tleap_config,
                                         renumbering_dict, max_workers, clean_files,
                                         prolif, mmgbsa, prolif_params_dict, condition_selection,
                                         receptor_file, write_prolif, write_mmgbsa):
         """
-        Parallel execution path for compute_fingerprints(), covering all three modes
-        (ProLIF-only, MMGBSA-only, combined ProLIF+MMGBSA). Each docked pose's shared
-        pipeline (restore -> build complex -> minimize) runs once per pose in its own
-        worker process, isolated in its own subdirectory under temp_restored_poses/,
-        so concurrent poses never collide on the fixed-name scratch files written by
-        tleap/sander/ambpdb/MMPBSA.py (complex.in, min.in/out/rst, cpptraj.in,
-        MMPBSA.py's own _MMPBSA_* files). ProLIF and MMGBSA computation then branch
-        off that shared result within the same worker call, so combined mode never
-        restores/builds/minimizes a pose twice. GPU minimization is serialized across
-        workers via a shared lock so only one worker uses pmemd.cuda at a time. All
-        SQLite writes to results_db happen back in this (parent) process as results
-        are collected, so workers never touch the database.
+        Interactive setup phase for compute_fingerprints(): resolves resume/overwrite
+        choices, the worker-count prompt, and per-ligand parameter file preparation
+        (all of which need input() and/or must not race across concurrent poses).
+        This phase always runs synchronously in the foreground, even when the actual
+        computation that follows (_execute_fingerprints_tasks()) is later backgrounded,
+        since it is the only phase that prompts the user.
 
         Resume support (skip poses already computed) is evaluated independently per
         requested fingerprint type: a pose done for only one of the two requested
         types in combined mode still gets a task, and that task recomputes only the
         missing piece.
+
+        Returns (tasks, mode_label, temp_poses_root, max_workers) ready to hand to
+        _execute_fingerprints_tasks(), or None if there is nothing to compute (in
+        which case any requested write_prolif/write_mmgbsa export has already run).
         """
         import contextlib
-        import shutil
-        from concurrent.futures import ProcessPoolExecutor, as_completed
-        from multiprocessing import Manager, cpu_count
+        from multiprocessing import cpu_count
 
         total_poses = len(df)
         if total_poses == 0:
             print("Nothing to do.")
-            return
+            return None
 
         if prolif and mmgbsa:
             mode_label = "ProLIF+MMGBSA"
@@ -12250,7 +12278,7 @@ class MolDock:
                 self._write_prolif_fps(results_db, assay_info)
             if write_mmgbsa:
                 self._write_mmgbsa_fps(results_db, assay_info)
-            return
+            return None
 
         if max_workers is None:
             available_cores = cpu_count()
@@ -12348,6 +12376,35 @@ class MolDock:
                 'receptor_file': receptor_file,
             })
 
+        return tasks, mode_label, temp_poses_root, max_workers
+
+    def _execute_fingerprints_tasks(self, tasks, mode_label, prolif, mmgbsa, results_db,
+                                     condition_selection, clean_files, temp_poses_root,
+                                     write_prolif, write_mmgbsa, assay_info, max_workers,
+                                     computation_mode):
+        """
+        Non-interactive execution phase for compute_fingerprints(): dispatches the
+        prepared per-pose tasks to a ProcessPoolExecutor, collects and stores
+        results, then runs the requested exports and cleanup. Each docked pose's
+        shared pipeline (restore -> build complex -> minimize) runs once per pose in
+        its own worker process, isolated in its own subdirectory under
+        temp_restored_poses/, so concurrent poses never collide on the fixed-name
+        scratch files written by tleap/sander/ambpdb/MMPBSA.py (complex.in,
+        min.in/out/rst, cpptraj.in, MMPBSA.py's own _MMPBSA_* files). ProLIF and
+        MMGBSA computation then branch off that shared result within the same worker
+        call, so combined mode never restores/builds/minimizes a pose twice. GPU
+        minimization is serialized across workers via a shared lock so only one
+        worker uses pmemd.cuda at a time. All SQLite writes to results_db happen
+        back in this process as results are collected, so workers never touch the
+        database.
+
+        Contains no input() calls, so it is safe to run either inline (foreground)
+        or inside a detached background process — see _launch_fingerprints_background().
+        """
+        import shutil
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        from multiprocessing import Manager
+
         gpu_lock = Manager().Lock()
         prolif_ok = prolif_failed = 0
         mmgbsa_ok = mmgbsa_failed = 0
@@ -12434,6 +12491,87 @@ class MolDock:
             # now-empty top-level directory.
             shutil.rmtree(temp_poses_root, ignore_errors=True)
             print("✅ Temporary files cleaned up.")
+
+    def _launch_fingerprints_background(self, **exec_kwargs):
+        """
+        Launch _execute_fingerprints_tasks() as a fully detached background process
+        (survives terminal/SSH disconnect), mirroring the nohup-style launch used by
+        _run_docking_background(). Unlike that method, the prepared tasks are pickled
+        to disk rather than embedded as literal Python source in the generated
+        script: tasks is a list of per-pose dicts (one per docked pose) that can
+        carry pandas/numpy scalar values not safely representable via repr().
+        """
+        import pickle
+        import subprocess
+        import sys
+        import textwrap
+        from datetime import datetime
+
+        results_db = exec_kwargs['results_db']
+        mode_label = exec_kwargs['mode_label']
+        results_dir = os.path.dirname(os.path.abspath(results_db))
+        assay_folder = os.path.dirname(results_dir)
+        logs_dir = os.path.join(assay_folder, 'logs')
+        os.makedirs(logs_dir, exist_ok=True)
+
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        params_file = os.path.join(logs_dir, f'fingerprints_bg_{timestamp}.pkl')
+        log_file = os.path.join(logs_dir, f'fingerprints_bg_{timestamp}.log')
+        script_file = os.path.join(logs_dir, f'fingerprints_bg_{timestamp}.py')
+
+        payload = {'project_name': self.name, 'project_path': self.path, 'exec_kwargs': exec_kwargs}
+        try:
+            with open(params_file, 'wb') as f:
+                pickle.dump(payload, f)
+        except Exception as e:
+            print(f"❌ Error preparing background fingerprint computation: {e}")
+            return
+
+        python_script = textwrap.dedent(f"""
+            import pickle
+            import sys
+
+            from tidyscreen.moldock.moldock import MolDock
+
+            with open({params_file!r}, 'rb') as f:
+                payload = pickle.load(f)
+
+            mdock = MolDock.from_path(payload['project_name'], payload['project_path'])
+            try:
+                mdock._execute_fingerprints_tasks(**payload['exec_kwargs'])
+                print('✅ Background fingerprint computation completed successfully')
+            except Exception as e:
+                print(f'❌ Error in background fingerprint computation: {{e}}')
+                import traceback
+                traceback.print_exc()
+                sys.exit(1)
+            """)
+
+        try:
+            with open(script_file, 'w') as f:
+                f.write(python_script)
+        except Exception as e:
+            print(f"❌ Error writing background fingerprint script: {e}")
+            return
+
+        try:
+            with open(log_file, 'w') as logf:
+                process = subprocess.Popen(
+                    [sys.executable, script_file],
+                    stdout=logf,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+        except Exception as e:
+            print(f"❌ Error launching background fingerprint computation: {e}")
+            return
+
+        print(f"\n✅ {mode_label} computation launched in the background!")
+        print(f"   🆔 Process ID: {process.pid}")
+        print(f"   📝 Log file: {log_file}")
+        print(f"   📂 Results will be written to: {results_db}")
+        print(f"   ℹ️  Re-run compute_fingerprints() later to check status/resume.")
 
     def _remap_project_path(self, stored_path: str) -> str:
         """
@@ -12990,7 +13128,7 @@ class MolDock:
         # Create a tleap input file in the same directory as tleap_processed_file.
         # Must live inside output_dir (the per-pose work_subdir), not its parent,
         # since the parent is shared across all concurrent workers in the parallel
-        # fingerprint computation path (_compute_fingerprints_parallel) and a
+        # fingerprint computation path (_execute_fingerprints_tasks) and a
         # dirname(output_dir) path would race on this fixed filename.
         tleap_in_file = os.path.join(output_dir, "minimize.in")
 
@@ -15079,7 +15217,7 @@ class MolDock:
         Like _check_table_in_db(), but offers to resume an interrupted run (keep
         existing rows, compute only the poses still missing) in addition to
         overwriting everything or cancelling. Used for both the ProLIF condition
-        table and the MMGBSA table by _compute_fingerprints_parallel().
+        table and the MMGBSA table by _prepare_fingerprints_execution().
 
         Returns:
             None      - table does not exist yet, nothing to resume/overwrite.
@@ -16805,7 +16943,7 @@ Example — cyclodextrin receptor:
             return None
 
 
-# --- Module-level worker functions for MolDock._compute_fingerprints_parallel() ---
+# --- Module-level worker functions for MolDock._execute_fingerprints_tasks() ---
 #
 # These must live at module level (rather than as MolDock methods) so they are
 # picklable for concurrent.futures.ProcessPoolExecutor, per the project's
