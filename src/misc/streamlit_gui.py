@@ -342,6 +342,28 @@ st.sidebar.info(active_project if active_project else "None selected")
 st.sidebar.markdown("**Active docking assay:**")
 st.sidebar.info(active_assay if active_assay else "None selected")
 
+## Persistent sidebar info: running-actions badge for the active project
+if "active_project_path" in st.session_state:
+    try:
+        from tidyscreen.actionlog.action_logger import refresh_action_log_statuses, ACTION_LOG_DB_FILENAME
+        _al_project_path = st.session_state["active_project_path"]
+        _al_db = os.path.join(_al_project_path, ACTION_LOG_DB_FILENAME)
+        if os.path.exists(_al_db):
+            refresh_action_log_statuses(_al_project_path)
+            _al_conn = sqlite3.connect(_al_db)
+            try:
+                _n_running = _al_conn.execute(
+                    "SELECT COUNT(*) FROM action_log WHERE status = 'running'"
+                ).fetchone()[0]
+            finally:
+                _al_conn.close()
+            if _n_running:
+                st.sidebar.warning(f"🔄 {_n_running} action(s) running")
+            else:
+                st.sidebar.caption("✅ No active jobs")
+    except Exception:
+        pass
+
 if page == "Project selection":
     st.title("Project selection")
     st.write("Welcome to the TidyScreen main page.")
@@ -509,6 +531,89 @@ if page == "Project selection":
                     with _dc2:
                         if st.button("Cancel", key=f"btn_cancel_del_note_{_sel_id}"):
                             st.session_state[_del_key] = False
+                            st.rerun()
+
+    ## --- Activity Log ---
+    st.divider()
+    st.subheader(f"Activity Log — {_notes_project}" if _notes_project else "Activity Log")
+
+    if "active_project_path" not in st.session_state:
+        st.info("Activate a project above to view its activity log.")
+    else:
+        from tidyscreen.actionlog.action_logger import get_action_log, clear_action_log
+
+        _al_project_path = st.session_state["active_project_path"]
+
+        _al_col1, _al_col2 = st.columns([1, 5])
+        with _al_col1:
+            if st.button("🔄 Refresh", key="btn_refresh_action_log"):
+                st.rerun()
+
+        _al_rows = get_action_log(_al_project_path, limit=200)
+
+        if not _al_rows:
+            st.info("No logged actions yet for this project.")
+        else:
+            _al_status_icons = {
+                'running': '🔄 running',
+                'success': '✅ success',
+                'error': '❌ error',
+                'interrupted': '⚠️ interrupted',
+                'completed (unconfirmed)': '❔ completed (unconfirmed)',
+            }
+            _al_display = [
+                {
+                    "ID": r["id"],
+                    "Started": r["started_at"],
+                    "Ended": r["ended_at"] or "",
+                    "Class": r["class_name"],
+                    "Method": r["method_name"],
+                    "Description": r["description"] or "",
+                    "Source": r["source"],
+                    "Status": _al_status_icons.get(r["status"], r["status"]),
+                    "Background": "yes" if r["background"] else "",
+                    "PID": r["child_pid"] or r["process_pid"],
+                    "Error": (r["error_message"] or "")[:200],
+                }
+                for r in _al_rows
+            ]
+            st.dataframe(
+                _al_display,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Status": st.column_config.TextColumn("Status", width="small"),
+                },
+            )
+            st.caption(f"Showing {len(_al_rows)} most recent action(s).")
+
+            with st.expander("Manage log", expanded=False):
+                st.caption(
+                    "Deletes finished (non-running) rows. Actions currently 'running', "
+                    "including active background jobs, are never deleted."
+                )
+                _al_older_than = st.number_input(
+                    "Clear rows older than (days, 0 = clear all finished rows)",
+                    min_value=0, value=0, step=1, key="al_clear_older_than_days",
+                )
+                _al_confirm_key = "confirm_clear_action_log"
+                if not st.session_state.get(_al_confirm_key):
+                    if st.button("Clear log", key="btn_clear_action_log"):
+                        st.session_state[_al_confirm_key] = True
+                        st.rerun()
+                else:
+                    _al_days = None if _al_older_than == 0 else float(_al_older_than)
+                    _al_pending = clear_action_log(_al_project_path, older_than_days=_al_days, dry_run=True)
+                    st.warning(f"This will permanently delete {_al_pending} finished action-log row(s).")
+                    _al_dc1, _al_dc2 = st.columns(2)
+                    with _al_dc1:
+                        if st.button("Yes, clear", key="btn_confirm_clear_action_log"):
+                            clear_action_log(_al_project_path, older_than_days=_al_days)
+                            st.session_state[_al_confirm_key] = False
+                            st.rerun()
+                    with _al_dc2:
+                        if st.button("Cancel", key="btn_cancel_clear_action_log"):
+                            st.session_state[_al_confirm_key] = False
                             st.rerun()
 
 elif page == "ChemSpace Inspection":

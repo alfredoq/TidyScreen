@@ -818,6 +818,96 @@ def import_existing_project():
         print(f"❌ Failed to import project: {result['message']}")
 
 
+def list_project_actions(project_name=None, limit=50, print_output=True):
+    """
+    Show recent logged actions (API + GUI calls) for a project's MolDock, MolDyn,
+    ChemSpace and MachineLearning methods, including background job status.
+
+    Args:
+        project_name (str, optional): project to inspect; prompted if omitted.
+        limit (int): maximum number of most-recent rows to return.
+        print_output (bool): pretty-print a table to the console (default True).
+    """
+    if not project_name:
+        print("Available projects:")
+        projects()
+        project_name = input("Enter the project name to inspect: ").strip()
+
+    project = ActivateProject(project_name)
+    if not project.project_exists():
+        print(f"❌ Project '{project_name}' not found.")
+        return []
+
+    from tidyscreen.actionlog.action_logger import get_action_log
+    rows = get_action_log(project.path, limit=limit)
+
+    if print_output:
+        if not rows:
+            print(f"No logged actions found for project '{project_name}'.")
+        else:
+            print("\n" + "=" * 100)
+            print(f"ACTION LOG — {project_name}")
+            print("=" * 130)
+            print(
+                f"{'ID':<5} {'Started':<20} {'Class':<16} {'Method':<28} {'Src':<4} "
+                f"{'Status':<24} {'Description':<30}"
+            )
+            print("-" * 130)
+            for row in rows:
+                description = (row.get('description') or '')[:30]
+                print(
+                    f"{row['id']:<5} {row['started_at']:<20} {row['class_name']:<16} "
+                    f"{row['method_name']:<28} {row['source']:<4} {row['status']:<24} {description:<30}"
+                )
+            print("=" * 130)
+            print(f"Total: {len(rows)}")
+
+    return rows
+
+
+def clear_project_actions(project_name=None, older_than_days=None, confirm=True):
+    """
+    Delete finished action-log rows for a project. Rows still 'running' (including
+    active background jobs) are never deleted, regardless of age.
+
+    Args:
+        project_name (str, optional): project to clear; prompted if omitted.
+        older_than_days (float, optional): only remove rows older than this many
+            days (None = remove all finished rows regardless of age).
+        confirm (bool): interactively confirm before deleting (default True).
+    """
+    if not project_name:
+        print("Available projects:")
+        projects()
+        project_name = input("Enter the project name to clear the action log for: ").strip()
+
+    project = ActivateProject(project_name)
+    if not project.project_exists():
+        print(f"❌ Project '{project_name}' not found.")
+        return 0
+
+    from tidyscreen.actionlog.action_logger import clear_action_log
+
+    pending = clear_action_log(project.path, older_than_days=older_than_days, dry_run=True)
+    if pending == 0:
+        print(f"No finished action-log rows to clear for project '{project_name}'.")
+        return 0
+
+    if confirm:
+        age_note = f" older than {older_than_days} day(s)" if older_than_days is not None else ""
+        print(f"\nThis will permanently delete {pending} finished action-log row(s) "
+              f"for project '{project_name}'{age_note}.")
+        print("Rows currently 'running' (including active background jobs) are never deleted.")
+        confirmation = input("Continue? (yes/no): ").strip().lower()
+        if confirmation not in ['yes', 'y']:
+            print("❌ Action log clear cancelled.")
+            return 0
+
+    removed = clear_action_log(project.path, older_than_days=older_than_days)
+    print(f"✅ Removed {removed} action-log row(s) for project '{project_name}'.")
+    return removed
+
+
 class ActivateProject:
     
     def __init__(self, name):

@@ -29,7 +29,9 @@ sys.path.insert(0, parent_dir)
 # Import from our local tidyscreen module
 from tidyscreen import tidyscreen
 ActivateProject = tidyscreen.ActivateProject
+from tidyscreen.actionlog.action_logger import log_all_public_methods
 
+@log_all_public_methods
 class MolDock:
     """
     MolDock class for managing molecular docking assays within a project.

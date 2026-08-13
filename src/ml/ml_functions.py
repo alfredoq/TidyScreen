@@ -15,6 +15,7 @@ sys.path.insert(0, parent_dir)
 # Import from our local tidyscreen module
 from tidyscreen import tidyscreen
 ActivateProject = tidyscreen.ActivateProject
+from tidyscreen.actionlog.action_logger import log_all_public_methods
 
 
 def _predict_pose_worker(task: dict) -> dict:
@@ -157,6 +158,7 @@ def _run_background_rf_predictions(job_file: str) -> None:
     ml._align_and_store_rf_predictions(model, fp_records, job['results_db'], job['predictions_table'])
 
 
+@log_all_public_methods
 class MachineLearning:
     """
     MachineLearning class for managing machine learning workflows within a project.

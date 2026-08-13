@@ -1,8 +1,8 @@
 from tidyscreen import tidyscreen
 import sys
 import os
-from databases import DatabaseManager as dbm
-from molecule_management import ligand_management as lm
+from tidyscreen.databases import DatabaseManager as dbm
+from tidyscreen.molecule_management import ligand_management as lm
 
 
 # Add the parent directory to path to import our local tidyscreen module
@@ -12,7 +12,9 @@ sys.path.insert(0, parent_dir)
 # Import from our local tidyscreen module
 from tidyscreen import tidyscreen
 ActivateProject = tidyscreen.ActivateProject
+from tidyscreen.actionlog.action_logger import log_all_public_methods
 
+@log_all_public_methods
 class MolDyn:
     """
     MolDyn class for managing molecular dynamics assays within a project.
@@ -1070,10 +1072,13 @@ class MolDyn:
 
             # Query if the user want to start the MD simulation now
             start_now = input("\n▶️  Do you want to start the MD simulation now? (yes/no) [default: no]: ").strip().lower() or 'no'
+            bg_info = None
             if start_now in ['yes', 'y']:
-                self._start_md_simulation(md_assay_folder)
+                bg_info = self._start_md_simulation(md_assay_folder)
             else:
                 print("ℹ️  MD simulation not started. Run the execution script in the assay folder when ready.")
+
+            return bg_info
 
         except Exception as e:
             print(f"\n❌ Error performing MD assay: {e}")
@@ -2120,7 +2125,7 @@ class MolDyn:
             raise RuntimeError(f"Failed to write execution script '{execution_script_path}': {e}") from e
     
     def _start_md_simulation(self, md_assay_folder):
-        
+
         # Query if the user wants to run in the foreground or background
         run_mode = input("\n⚙️  Do you want to run the MD simulation in the foreground or background? (fg/bg) [default: fg]: ").strip().lower() or 'fg'
         execution_script_path = os.path.join(md_assay_folder, "run_md.sh")
@@ -2130,16 +2135,23 @@ class MolDyn:
             if run_mode in ['fg', 'foreground']:
                 print("\n▶️  Starting MD simulation in the foreground...")
                 subprocess.run([execution_script_path], check=True, cwd=md_assay_folder)
+                return None
 
             elif run_mode in ['bg', 'background']:
                 print("\n▶️  Starting MD simulation in the background...")
-                subprocess.Popen([execution_script_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=md_assay_folder)
+                process = subprocess.Popen([execution_script_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=md_assay_folder)
+                print(f"   🆔 Process ID: {process.pid}")
+                # No dedicated subprocess log file (output goes to per-stage
+                # min/heating/equilibration/production .out files instead);
+                # completion is judged from those via get_md_assay_status-style checks.
+                return {'background': True, 'pid': process.pid, 'log_file': None}
 
             else:
                 print("❌ Invalid option. Please choose 'fg' or 'bg'.")
-                return
+                return None
         except Exception as e:
             print(f"❌ Error starting MD simulation: {e}")
+            return None
             
     def perform_md_assay_on_receptor(self):
         """
@@ -2189,6 +2201,7 @@ class MolDyn:
 
             print(f"\n🔁 Creating {n_replicas} replica(s) for template '{template_dict['pdb_template_name']}'...")
 
+            bg_info = None
             for replica_idx in range(1, n_replicas + 1):
                 md_assay_folder = None
                 md_assay_id = None
@@ -2246,7 +2259,7 @@ class MolDyn:
 
                     # Auto-start only for the first replica if the user requested it
                     if replica_idx == 1 and start_first in ['yes', 'y']:
-                        self._start_md_simulation(md_assay_folder)
+                        bg_info = self._start_md_simulation(md_assay_folder)
                     else:
                         if replica_idx == 1:
                             print(f"ℹ️  Replica 1 not started. Run the execution script manually when ready.")
@@ -2262,6 +2275,8 @@ class MolDyn:
             print(f"\n{'═' * 60}")
             print(f"✅ Done — {n_replicas} replica(s) registered for template '{template_dict['pdb_template_name']}'.")
             print(f"{'═' * 60}")
+
+            return bg_info
 
         except Exception as e:
             print(f"\n❌ Error performing receptor MD assay: {e}")

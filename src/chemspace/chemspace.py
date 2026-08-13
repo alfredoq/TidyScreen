@@ -12,6 +12,7 @@ import numpy as np
 import time
 import json
 from tidyscreen import tidyscreen
+from tidyscreen.actionlog.action_logger import log_all_public_methods
 
 
 # Try to import tqdm for progress bars
@@ -941,6 +942,7 @@ def _process_unimolecular_chunk_to_file_worker(chunk_data: List[Dict], reaction_
     except Exception:
         return 0, []
 
+@log_all_public_methods
 class ChemSpace:
     """
     ChemSpace class for managing chemical compound data within a project.

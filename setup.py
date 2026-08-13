@@ -43,7 +43,7 @@ setup(name='tidyscreen',
 	'umap-learn',
 	'seaborn'
       ],
-      packages=['tidyscreen', 'tidyscreen.chemspace', 'tidyscreen.config', 'tidyscreen.databases', 'tidyscreen.projects', 'tidyscreen.moldock', 'tidyscreen.misc', 'tidyscreen.moldyn', 'tidyscreen.molecule_management', 'tidyscreen.config', 'tidyscreen.ml', 'tidyscreen.images'],
+      packages=['tidyscreen', 'tidyscreen.chemspace', 'tidyscreen.config', 'tidyscreen.databases', 'tidyscreen.projects', 'tidyscreen.moldock', 'tidyscreen.misc', 'tidyscreen.moldyn', 'tidyscreen.molecule_management', 'tidyscreen.config', 'tidyscreen.ml', 'tidyscreen.images', 'tidyscreen.actionlog'],
       keywords='drug-discovery',
       classifiers=[
           "Programming Language :: Python :: 3.10",
