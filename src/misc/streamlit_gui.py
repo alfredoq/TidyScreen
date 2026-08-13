@@ -5382,6 +5382,39 @@ elif page == "ML features management":
                                 if st.button("▶", key="ml_pos_next", disabled=(cur_pos >= len(pose_labels_pos) - 1)):
                                     st.session_state[idx_key_pos] = cur_pos + 1
                                     st.rerun()
+
+                            ## Keyboard shortcuts: Left/Right arrows navigate prev/next.
+                            ## Buttons are targeted by their key-derived CSS class (st-key-<key>)
+                            ## rather than text, since the negative-pose viewer below can be open
+                            ## at the same time and uses identical ◀/▶ labels.
+                            st.components.v1.html(
+                                """
+                                <script>
+                                (function() {
+                                    const doc = window.parent.document;
+                                    if (window.parent.__tsMlPosKeyHandler) {
+                                        doc.removeEventListener('keydown', window.parent.__tsMlPosKeyHandler);
+                                    }
+                                    function clickByKey(key) {
+                                        const btn = doc.querySelector('.st-key-' + key + ' button');
+                                        if (btn && !btn.disabled) { btn.click(); return true; }
+                                        return false;
+                                    }
+                                    function handler(e) {
+                                        const active = doc.activeElement;
+                                        const tag = active ? active.tagName : '';
+                                        if (tag === 'INPUT' || tag === 'TEXTAREA' || (active && active.isContentEditable)) return;
+                                        if (e.ctrlKey || e.metaKey || e.altKey) return;
+                                        if (e.key === 'ArrowLeft') { clickByKey('ml_pos_prev'); }
+                                        else if (e.key === 'ArrowRight') { clickByKey('ml_pos_next'); }
+                                    }
+                                    window.parent.__tsMlPosKeyHandler = handler;
+                                    doc.addEventListener('keydown', handler);
+                                })();
+                                </script>
+                                """,
+                                height=0,
+                            )
                             st.caption(f"Pose {cur_pos + 1} of {len(pose_labels_pos)}")
 
                             ## VMD script creation
@@ -5627,6 +5660,39 @@ elif page == "ML features management":
                                 if st.button("▶", key="ml_neg_next", disabled=(cur_neg >= len(pose_labels_neg) - 1)):
                                     st.session_state[idx_key_neg] = cur_neg + 1
                                     st.rerun()
+
+                            ## Keyboard shortcuts: Left/Right arrows navigate prev/next.
+                            ## Buttons are targeted by their key-derived CSS class (st-key-<key>)
+                            ## rather than text, since the positive-pose viewer above can be open
+                            ## at the same time and uses identical ◀/▶ labels.
+                            st.components.v1.html(
+                                """
+                                <script>
+                                (function() {
+                                    const doc = window.parent.document;
+                                    if (window.parent.__tsMlNegKeyHandler) {
+                                        doc.removeEventListener('keydown', window.parent.__tsMlNegKeyHandler);
+                                    }
+                                    function clickByKey(key) {
+                                        const btn = doc.querySelector('.st-key-' + key + ' button');
+                                        if (btn && !btn.disabled) { btn.click(); return true; }
+                                        return false;
+                                    }
+                                    function handler(e) {
+                                        const active = doc.activeElement;
+                                        const tag = active ? active.tagName : '';
+                                        if (tag === 'INPUT' || tag === 'TEXTAREA' || (active && active.isContentEditable)) return;
+                                        if (e.ctrlKey || e.metaKey || e.altKey) return;
+                                        if (e.key === 'ArrowLeft') { clickByKey('ml_neg_prev'); }
+                                        else if (e.key === 'ArrowRight') { clickByKey('ml_neg_next'); }
+                                    }
+                                    window.parent.__tsMlNegKeyHandler = handler;
+                                    doc.addEventListener('keydown', handler);
+                                })();
+                                </script>
+                                """,
+                                height=0,
+                            )
                             st.caption(f"Pose {cur_neg + 1} of {len(pose_labels_neg)}")
 
                             ## VMD script creation
