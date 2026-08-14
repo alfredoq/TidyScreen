@@ -397,6 +397,45 @@ def _compute_morgan_fingerprints_worker(chunk_data: List[Tuple[int, str, str]], 
 
     return results
 
+
+# Module-global holding the reducer loaded once per worker process by
+# _init_projection_transform_worker(), reused across every chunk that worker handles.
+_projection_worker_reducer = None
+
+
+def _init_projection_transform_worker(model_path: str) -> None:
+    """
+    ProcessPoolExecutor initializer for project_dimensionality_on_table()'s parallel chunk
+    transform. Loads the fitted reducer (joblib pickle, e.g. UMAP with its embedded
+    pynndescent index) once per worker process instead of once per chunk task, since
+    re-pickling/re-loading a UMAP model on every task would dwarf the actual transform cost.
+    """
+    global _projection_worker_reducer
+    import joblib
+    _projection_worker_reducer = joblib.load(model_path)
+
+
+def _transform_fp_chunk_worker(fp_blobs: List[bytes]) -> np.ndarray:
+    """
+    Worker function for project_dimensionality_on_table()'s parallel chunk transform. Unpacks
+    a chunk of packed Morgan fingerprint blobs to a float32 bit matrix and runs it through the
+    reducer loaded by _init_projection_transform_worker() in this same process. Must be at
+    module level to be pickleable for multiprocessing.
+
+    Reproducibility note: transform() on a fixed fitted reducer is deterministic given fixed
+    input data and boundaries, and independent across chunks (UMAP's random_state forces
+    single-threaded, seeded execution *within* each transform() call, but running separate
+    chunks concurrently in separate processes doesn't change what points go into which call
+    or their order within it, so results are bit-identical to running the same chunks
+    sequentially).
+    """
+    X_chunk = np.array(
+        [np.unpackbits(np.frombuffer(b, dtype=np.uint8)) for b in fp_blobs],
+        dtype=np.float32
+    )
+    return _projection_worker_reducer.transform(X_chunk)
+
+
 def _filter_chunk_worker_by_instances(chunk_data: List[Tuple], filters_list: List[Tuple]) -> Tuple[List[Dict], Dict[int, int]]:
     """
     Memory-optimized version that only returns essential data.
@@ -4717,8 +4756,8 @@ finally:
                 method saved for that table
 
         Returns:
-            Dict[str, Dict[str, Any]]: {method: {'reducer': obj, 'fp_column': str, 'n_components': int}},
-                empty dict if none found or on error
+            Dict[str, Dict[str, Any]]: {method: {'reducer': obj, 'fp_column': str, 'n_components': int,
+                'model_path': str}}, empty dict if none found or on error
         """
         try:
             import joblib
@@ -4754,7 +4793,8 @@ finally:
                 models[saved_method] = {
                     'reducer': joblib.load(model_path),
                     'fp_column': fp_col,
-                    'n_components': n_comp
+                    'n_components': n_comp,
+                    'model_path': model_path
                 }
             return models
 
@@ -4766,7 +4806,8 @@ finally:
                                         reference_table: Optional[str] = None,
                                         method: Optional[str] = None,
                                         update_database: bool = True,
-                                        run_in_background: Optional[bool] = None) -> pd.DataFrame:
+                                        run_in_background: Optional[bool] = None,
+                                        max_workers: Optional[int] = None) -> pd.DataFrame:
         """
         Project a table's already-computed Morgan fingerprints into a dimensionality-reduction
         embedding previously fit (and auto-saved by reduce_dimensionality()) on another table.
@@ -4787,6 +4828,18 @@ finally:
                 in a separate background process, returning immediately (progress and results are
                 written to a log file instead of stdout). If False, run in the foreground as usual.
                 If None, prompts an interactive fg/bg selection.
+            max_workers (Optional[int]): Number of worker processes used to transform chunks in
+                parallel (each chunk's transform() is single-threaded internally, e.g. UMAP always
+                forces n_jobs=1 when random_state is set, so this is what lets the projection use
+                more than one core while staying fully reproducible -- chunk boundaries and their
+                point order are unchanged, so results are bit-identical to a sequential run).
+                Each worker holds its own copy of the fitted reducer (for UMAP, this includes the
+                training data and its pynndescent index), so memory use scales with max_workers --
+                e.g. a reducer with a 4 GB on-disk pickle means roughly 4 * max_workers GB just for
+                the replicated models, before any chunk data. If None, prompts an interactive
+                selection, pre-filled with a suggested value that keeps replicated model memory
+                under ~4 GB for the largest saved model among methods_to_run. Pass 1 to disable
+                parallelism.
 
         Returns:
             pd.DataFrame: DataFrame with added '<method>_from_<reference_table>_1'..'_<n>' columns.
@@ -4869,22 +4922,113 @@ finally:
                 ).strip().lower() or 'fg'
                 run_in_background = run_mode in ['bg', 'background']
 
+            if max_workers is None:
+                model_paths = [
+                    available_models[m]['model_path'] for m in methods_to_run
+                    if m in available_models and available_models[m].get('model_path')
+                ]
+                suggested_workers = self._suggest_projection_worker_count(model_paths)
+                model_sizes_gb = [os.path.getsize(p) / (1024 ** 3) for p in model_paths if p and os.path.exists(p)]
+                available_gb = self._get_available_memory_gb()
+                if model_sizes_gb:
+                    basis = f"largest reference model: {max(model_sizes_gb):.2f} GB on disk"
+                    basis += (f"; available memory: {available_gb:.1f} GB" if available_gb is not None
+                              else "; available memory: unknown, using a fixed budget")
+                    print(f"   📐 {basis}")
+                worker_input = input(
+                    f"\n⚙️  How many worker processes should transform chunks in parallel? "
+                    f"[default: {suggested_workers}]: "
+                ).strip()
+                if worker_input:
+                    try:
+                        max_workers = max(1, int(worker_input))
+                    except ValueError:
+                        print(f"⚠️  Invalid number '{worker_input}', using suggested default "
+                              f"({suggested_workers}).")
+                        max_workers = suggested_workers
+                else:
+                    max_workers = suggested_workers
+
             if run_in_background:
                 return self._project_dimensionality_in_background(
-                    table_name, reference_table, methods_to_run, available_models, update_database
+                    table_name, reference_table, methods_to_run, available_models, update_database,
+                    max_workers
                 )
 
             return self._run_dimensionality_projection(
-                table_name, reference_table, methods_to_run, available_models, update_database
+                table_name, reference_table, methods_to_run, available_models, update_database,
+                max_workers
             )
 
         except Exception as e:
             print(f"❌ Error projecting dimensionality for table '{table_name}': {e}")
             return pd.DataFrame()
 
+    @staticmethod
+    def _get_available_memory_gb() -> Optional[float]:
+        """
+        Best-effort currently-available system memory in GiB (RAM immediately reclaimable/free
+        for new allocations, i.e. free + reclaimable caches/buffers -- not raw MemFree, which
+        undercounts memory the OS would happily hand back). Tries psutil first (not a hard
+        TidyScreen dependency, but often present transitively); falls back to reading
+        'MemAvailable' from /proc/meminfo on Linux. Returns None if neither is available (e.g.
+        non-Linux without psutil), so callers can fall back to a fixed budget instead.
+        """
+        try:
+            import psutil
+            return psutil.virtual_memory().available / (1024 ** 3)
+        except ImportError:
+            pass
+
+        try:
+            with open('/proc/meminfo') as f:
+                for line in f:
+                    if line.startswith('MemAvailable:'):
+                        kb = int(line.split()[1])
+                        return kb / (1024 ** 2)
+        except (OSError, ValueError, IndexError):
+            pass
+
+        return None
+
+    def _suggest_projection_worker_count(self, model_paths: List[str]) -> int:
+        """
+        Suggests a default worker count for project_dimensionality_on_table()'s parallel chunk
+        transform. Each worker holds a full independent copy of the fitted reducer (for UMAP,
+        including its training data and pynndescent index), so blindly using every CPU core
+        can multiply a multi-GB reference model across several worker processes. This caps
+        replicated model memory to a budget sized off currently available system memory (falling
+        back to a fixed 4 GB budget if that can't be determined) and the largest model among the
+        ones about to be used (the worst case, since one worker_count applies to every method in
+        the run), and only offers extra workers when the model is small enough to afford them.
+        """
+        cpu_cap = min(cpu_count(), 4)
+        sizes_gb = [os.path.getsize(p) / (1024 ** 3) for p in model_paths if p and os.path.exists(p)]
+        if not sizes_gb:
+            return cpu_cap
+        largest_gb = max(sizes_gb)
+
+        available_gb = self._get_available_memory_gb()
+        if available_gb is not None:
+            # Only half of currently-available memory is budgeted for replicated models: the
+            # main process still holds the retrieved table plus, per chunk, an unpacked float32
+            # matrix, and other processes/the OS need headroom too.
+            worker_budget_gb = available_gb * 0.5
+        else:
+            worker_budget_gb = 4.0
+
+        # A worker's resident footprint runs somewhat above the model's pickled size (numpy
+        # array overhead from unpickling, plus its own chunk transform working memory), so a
+        # margin is added rather than budgeting off the raw on-disk size.
+        per_worker_gb = largest_gb * 1.3
+
+        size_cap = max(1, int(worker_budget_gb / per_worker_gb)) if per_worker_gb > 0 else cpu_cap
+        return max(1, min(cpu_cap, size_cap))
+
     def _run_dimensionality_projection(self, table_name: str, reference_table: str,
                                        methods_to_run: List[str], available_models: Dict[str, Dict],
-                                       update_database: bool) -> pd.DataFrame:
+                                       update_database: bool,
+                                       max_workers: Optional[int] = None) -> pd.DataFrame:
         """
         Performs the actual retrieval, projection, and (optional) database update for
         project_dimensionality_on_table(), once table/reference/method(s) have already been
@@ -4896,8 +5040,28 @@ finally:
         """
         conn = None
         try:
-            print(f"📊 Retrieving table '{table_name}' for dimensionality projection...")
-            df = self._get_table_as_dataframe(table_name)
+            # Only 'id' and the fingerprint column(s) the requested method(s) were fit on are
+            # ever read here, instead of the whole table (SELECT *): projection tables can carry
+            # plenty of columns that are irrelevant to it (smiles, name, inchi_key, workflow
+            # metadata, previously-projected coordinate columns, ...) and, at whole-chemspace
+            # row counts, loading all of them can dwarf the fingerprint data actually needed.
+            table_columns = set(self._get_table_columns(table_name))
+            fp_columns_needed = sorted({
+                available_models[m]['fp_column'] for m in methods_to_run
+                if m in available_models and available_models[m]['fp_column'] in table_columns
+            })
+            if not fp_columns_needed or 'id' not in table_columns:
+                print(f"⚠️  No data retrieved from table '{table_name}'")
+                return pd.DataFrame()
+
+            print(f"📊 Retrieving 'id' + {fp_columns_needed} from table '{table_name}' "
+                  f"for dimensionality projection...")
+            select_columns = ['id'] + fp_columns_needed
+            read_conn = sqlite3.connect(self.__chemspace_db)
+            read_conn.execute("PRAGMA journal_mode=WAL")
+            read_conn.execute("PRAGMA synchronous=NORMAL")
+            df = pd.read_sql_query(f"SELECT {', '.join(select_columns)} FROM {table_name}", read_conn)
+            read_conn.close()
 
             if df.empty:
                 print(f"⚠️  No data retrieved from table '{table_name}'")
@@ -4958,15 +5122,76 @@ finally:
                 total_chunks = (num_valid + self._PROJECTION_CHUNK_SIZE - 1) // self._PROJECTION_CHUNK_SIZE
                 db_write_failed = False
                 rows_written = 0
-                for chunk_start in range(0, num_valid, self._PROJECTION_CHUNK_SIZE):
-                    chunk_idx = valid_indices[chunk_start:chunk_start + self._PROJECTION_CHUNK_SIZE]
-                    fp_blobs = df.loc[chunk_idx, fp_column].tolist()
-                    X_chunk = np.array(
-                        [np.unpackbits(np.frombuffer(b, dtype=np.uint8)) for b in fp_blobs],
-                        dtype=np.float32
-                    )
-                    embedding_chunk = reducer.transform(X_chunk)
 
+                chunk_id_ranges = [
+                    valid_indices[cs:cs + self._PROJECTION_CHUNK_SIZE]
+                    for cs in range(0, num_valid, self._PROJECTION_CHUNK_SIZE)
+                ]
+
+                # transform() on a fitted reducer is single-threaded per call (UMAP forces
+                # n_jobs=1 internally whenever random_state is set, which is always, since
+                # reproducible projections matter more here than raw fit/transform speed).
+                # Chunks are independent of each other though, so they're farmed out across
+                # worker processes instead -- each chunk's boundaries and point order are
+                # unchanged, so results are bit-identical to running them sequentially. Each
+                # worker loads its own copy of the reducer once (see
+                # _init_projection_transform_worker), so this trades memory (the model, plus
+                # for UMAP its pynndescent index, replicated per worker) for wall-clock time.
+                model_path = model_info.get('model_path')
+                # max_workers is normally already resolved to a concrete int by
+                # project_dimensionality_on_table() (interactively or otherwise) before this
+                # method is ever called; the memory-aware suggestion is repeated here only as a
+                # fallback for direct/background-script calls that pass max_workers=None.
+                worker_count = (max_workers if max_workers is not None
+                                else self._suggest_projection_worker_count([model_path] if model_path else []))
+                use_pool = bool(model_path) and total_chunks > 1 and worker_count > 1
+
+                def _sequential_chunk_results():
+                    for i, idx in enumerate(chunk_id_ranges):
+                        blobs = df.loc[idx, fp_column].tolist()
+                        X_chunk = np.array(
+                            [np.unpackbits(np.frombuffer(b, dtype=np.uint8)) for b in blobs],
+                            dtype=np.float32
+                        )
+                        yield idx, reducer.transform(X_chunk), i + 1
+
+                def _parallel_chunk_results():
+                    # Keeps only a small multiple of worker_count chunks in flight at once
+                    # (submitting all chunks upfront would queue every chunk's packed
+                    # fingerprint bytes for the whole method at once, reintroducing the kind
+                    # of unbounded memory growth chunking was meant to avoid in the first
+                    # place -- just at the packed-bytes scale instead of the unpacked one).
+                    from concurrent.futures import FIRST_COMPLETED, wait
+                    max_in_flight = worker_count * 2
+                    remaining = iter(enumerate(chunk_id_ranges))
+                    with ProcessPoolExecutor(max_workers=worker_count,
+                                             initializer=_init_projection_transform_worker,
+                                             initargs=(model_path,)) as executor:
+                        def _submit_next(pending):
+                            item = next(remaining, None)
+                            if item is not None:
+                                i, idx = item
+                                future = executor.submit(_transform_fp_chunk_worker,
+                                                          df.loc[idx, fp_column].tolist())
+                                pending[future] = (i, idx)
+
+                        pending = {}
+                        for _ in range(max_in_flight):
+                            _submit_next(pending)
+
+                        while pending:
+                            done, _ = wait(pending.keys(), return_when=FIRST_COMPLETED)
+                            for future in done:
+                                i, idx = pending.pop(future)
+                                yield idx, future.result(), i + 1
+                                _submit_next(pending)
+
+                if use_pool:
+                    print(f"   🧵 Transforming {total_chunks} chunk(s) across {worker_count} worker "
+                          f"process(es) (chunk order/boundaries unchanged, so results stay reproducible)...")
+                chunk_results = _parallel_chunk_results() if use_pool else _sequential_chunk_results()
+
+                for chunk_idx, embedding_chunk, chunk_num in chunk_results:
                     if output_columns is None:
                         # Column names reference the reference table the loaded model was fit on;
                         # component count taken from the actual embedding, in case it ever
@@ -4982,7 +5207,6 @@ finally:
 
                     df.loc[chunk_idx, output_columns] = embedding_chunk
 
-                    chunk_num = chunk_start // self._PROJECTION_CHUNK_SIZE + 1
                     if update_database and not db_write_failed:
                         try:
                             chunk_ids = df.loc[chunk_idx, 'id'].tolist()
@@ -5025,7 +5249,8 @@ finally:
 
     def _project_dimensionality_in_background(self, table_name: str, reference_table: str,
                                                methods_to_run: List[str], available_models: Dict[str, Dict],
-                                               update_database: bool) -> pd.DataFrame:
+                                               update_database: bool,
+                                               max_workers: Optional[int] = None) -> pd.DataFrame:
         """
         Launches the projection as a fully independent OS process via subprocess.Popen (the
         same fg/bg pattern used by MolDyn's MD/MM-GBSA runs) and returns immediately, so long
@@ -5069,6 +5294,7 @@ for method in {methods_to_run!r}:
         method=method,
         update_database={update_database!r},
         run_in_background=False,
+        max_workers={max_workers!r},
     )
 """
         with open(script_path, 'w') as f:
