@@ -6701,7 +6701,28 @@ elif page == "RF model training":
                     ax.set_ylabel("True label")
                     fig.tight_layout()
                     st.pyplot(fig)
+
+                    _cm_png_buf = io.BytesIO()
+                    fig.savefig(_cm_png_buf, format="png", dpi=300, bbox_inches="tight")
                     plt.close(fig)
+
+                    _cm_dl1, _cm_dl2 = st.columns(2)
+                    with _cm_dl1:
+                        st.download_button(
+                            "🖼️ Download image (.png)",
+                            data=_cm_png_buf.getvalue(),
+                            file_name="confusion_matrix.png",
+                            mime="image/png",
+                            key="rf_dl_cm_png",
+                        )
+                    with _cm_dl2:
+                        st.download_button(
+                            "🐍 Download script (.py)",
+                            data=st_funcs.build_confusion_matrix_script(cm),
+                            file_name="plot_confusion_matrix.py",
+                            mime="text/x-python",
+                            key="rf_dl_cm_script",
+                        )
             with col_fi:
                 if fi is None or fi.empty:
                     st.subheader("Feature Importances")
@@ -6715,7 +6736,28 @@ elif page == "RF model training":
                     ax.spines[["top", "right"]].set_visible(False)
                     fig.tight_layout()
                     st.pyplot(fig)
+
+                    _fi_png_buf = io.BytesIO()
+                    fig.savefig(_fi_png_buf, format="png", dpi=300, bbox_inches="tight")
                     plt.close(fig)
+
+                    _fi_dl1, _fi_dl2 = st.columns(2)
+                    with _fi_dl1:
+                        st.download_button(
+                            "🖼️ Download image (.png)",
+                            data=_fi_png_buf.getvalue(),
+                            file_name="feature_importances.png",
+                            mime="image/png",
+                            key="rf_dl_fi_png",
+                        )
+                    with _fi_dl2:
+                        st.download_button(
+                            "🐍 Download script (.py)",
+                            data=st_funcs.build_feature_importances_script(fi),
+                            file_name="plot_feature_importances.py",
+                            mime="text/x-python",
+                            key="rf_dl_fi_script",
+                        )
 
             with st.expander("🔍 Poses by Confusion Matrix Quadrant", expanded=False):
                 _tp_df = st.session_state.get("rf_test_predictions")

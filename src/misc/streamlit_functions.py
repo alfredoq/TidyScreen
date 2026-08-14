@@ -2,6 +2,7 @@ from io import StringIO, BytesIO
 import sqlite3
 import os
 import json
+import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
@@ -2844,3 +2845,60 @@ def ensure_rf_trained_models_schema(db_path):
             conn.execute(f"ALTER TABLE rf_trained_models ADD COLUMN {col} {col_type}")
     conn.commit()
     conn.close()
+
+
+def build_confusion_matrix_script(cm):
+    """Return a standalone Python script (as a string) that reproduces the
+    RF Results confusion matrix plot from embedded data, for the user to
+    customize outside of the Streamlit app."""
+    cm_literal = json.dumps(np.asarray(cm).tolist())
+    return f'''"""
+Reproduces the confusion matrix plot from the TidyScreen RF model training
+"Results" tab. Data below was embedded at export time; edit the styling
+below (or the `confusion_matrix` array itself) to customize the figure.
+"""
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+confusion_matrix = np.array({cm_literal})
+
+fig, ax = plt.subplots(figsize=(4, 3))
+sns.heatmap(confusion_matrix, annot=True, fmt="d", cmap="Blues", cbar=False,
+            linewidths=0.5, ax=ax)
+ax.set_xlabel("Predicted label")
+ax.set_ylabel("True label")
+fig.tight_layout()
+
+fig.savefig("confusion_matrix.png", dpi=300, bbox_inches="tight")
+plt.show()
+'''
+
+
+def build_feature_importances_script(fi):
+    """Return a standalone Python script (as a string) that reproduces the
+    RF Results feature importance bar plot from embedded data, for the user
+    to customize outside of the Streamlit app."""
+    features_literal = json.dumps(list(fi.index))
+    importances_literal = json.dumps([float(v) for v in fi.values])
+    return f'''"""
+Reproduces the feature importance plot from the TidyScreen RF model training
+"Results" tab. Data below was embedded at export time; edit the styling
+below (or the `features` / `importances` lists) to customize the figure.
+"""
+import numpy as np
+import matplotlib.pyplot as plt
+
+features = {features_literal}
+importances = {importances_literal}
+
+fig, ax = plt.subplots(figsize=(5, max(3, len(features) * 0.28)))
+colors = plt.cm.viridis_r(np.linspace(0.2, 0.85, len(features)))
+ax.barh(features[::-1], importances[::-1], color=colors[::-1])
+ax.set_xlabel("Mean decrease in impurity")
+ax.spines[["top", "right"]].set_visible(False)
+fig.tight_layout()
+
+fig.savefig("feature_importances.png", dpi=300, bbox_inches="tight")
+plt.show()
+'''
