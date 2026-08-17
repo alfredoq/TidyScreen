@@ -6727,6 +6727,7 @@ plt.show()
             ax.set_title(plot_title)
             ax.grid(True, alpha=0.3)
             ax.legend(loc='best', fontsize=8)
+            ax.set_aspect('equal', adjustable='box')
 
             if output_path is None:
                 output_dir = os.path.join(self.path, 'chemspace', 'misc', 'dim_reduction')
@@ -8087,6 +8088,7 @@ ax.set_ylabel(PROJ_Y_COL)
 ax.set_title({title!r})
 ax.grid(True, alpha=0.3)
 ax.legend(loc='best', fontsize=8)
+ax.set_aspect('equal', adjustable='box')
 
 fig.savefig(OUTPUT_PATH, dpi=300, bbox_inches='tight')
 plt.show()
