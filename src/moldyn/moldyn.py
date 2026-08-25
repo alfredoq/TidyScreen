@@ -68,6 +68,26 @@ class MolDyn:
         # Set up molecular dynamics params folder path within the project directory
         self.__md_params_folder = os.path.join(self.path, 'dynamics/md_params')
 
+    def _remap_project_path(self, stored_path):
+        """
+        Remap a stored absolute path to the current project location.
+
+        When a project is imported (ActivateProject via import_existing_project())
+        the paths stored inside SQLite blobs/columns still reference the directory
+        the project lived in when those rows were written. This detects the first
+        occurrence of a known top-level project subdirectory inside *stored_path*
+        and replaces everything before it with self.path, leaving the relative
+        suffix intact. Mirrors MolDock._remap_project_path().
+        """
+        if not stored_path or os.path.exists(stored_path):
+            return stored_path
+        for marker in ('/docking/', '/chemspace/', '/ml/', '/dynamics/'):
+            pos = stored_path.find(marker)
+            if pos != -1:
+                relative = stored_path[pos + 1:]  # strip the leading '/'
+                return os.path.join(self.path, relative)
+        return stored_path
+
     @staticmethod
     def _prompt(message):
         """
@@ -975,9 +995,7 @@ class MolDyn:
                     _receptor_info = {}
 
             # Derive receptor PDB path (needed by both template branches)
-            _pdbqt = _receptor_info.get('pdbqt_file', '')
-            if _pdbqt and 'docking/receptors' in _pdbqt:
-                _pdbqt = os.path.join(self.path, _pdbqt[_pdbqt.index('docking/receptors'):])
+            _pdbqt = self._remap_project_path(_receptor_info.get('pdbqt_file', ''))
             _receptor_pdb = os.path.join(os.path.dirname(_pdbqt), 'receptor_checked.pdb') if _pdbqt else None
 
             if md_parameters_dict.get('method_type') == 'tleap_template':
@@ -1143,7 +1161,8 @@ class MolDyn:
             import sqlite3
 
             # Get required parameters from docking_assay_params_dict
-            assay_folder_path = docking_assay_params_dict.get('assay_folder_path')
+            assay_folder_path = self._remap_project_path(docking_assay_params_dict.get('assay_folder_path'))
+            docking_assay_params_dict['assay_folder_path'] = assay_folder_path
             assay_name = docking_assay_params_dict.get('assay_name')
             # Connect to docking results database within the assay folder
             docking_results_db = os.path.join(assay_folder_path, 'results', f'{assay_name}.db')
@@ -1493,16 +1512,9 @@ class MolDyn:
         else:
             receptor_details = {}
 
-        # get the .pdbqt used for docking
-        receptor_pdb = receptor_details.get('pdbqt_file', None)
-
-        # Remap stored absolute path to the current project location so that
-        # imported projects (whose original path differs) work correctly.
-        if receptor_pdb:
-            anchor = 'docking/receptors'
-            if anchor in receptor_pdb:
-                rel_part = receptor_pdb[receptor_pdb.index(anchor):]
-                receptor_pdb = os.path.join(self.path, rel_part)
+        # get the .pdbqt used for docking, remapped to the current project location
+        # so that imported projects (whose original path differs) work correctly.
+        receptor_pdb = self._remap_project_path(receptor_details.get('pdbqt_file', None))
 
         # Define the raw .pdb file of the receptor
         receptor_pdb_path = os.path.join(os.path.dirname(receptor_pdb), 'receptor_checked.pdb')
@@ -2338,8 +2350,8 @@ class MolDyn:
                     return {
                         'pdb_id': row[0],
                         'pdb_template_name': row[1],
-                        'checked_pdb_path': row[2],
-                        'template_folder_path': row[3],
+                        'checked_pdb_path': self._remap_project_path(row[2]),
+                        'template_folder_path': self._remap_project_path(row[3]),
                         'chains': row[4],
                         'notes': row[5],
                     }
@@ -2564,6 +2576,7 @@ class MolDyn:
 
             completed = []
             for assay_id, md_assay, description, folder, ligname, pose_id in rows:
+                folder = self._remap_project_path(folder)
                 if not folder or not os.path.exists(folder):
                     continue
                 prod_out = os.path.join(folder, 'production.out')
