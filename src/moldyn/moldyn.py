@@ -3194,7 +3194,10 @@ class MolDyn:
 
             # Fetch all MD assays
             cursor.execute("SELECT assay_id, md_assay, description, assay_folder_path FROM md_assays;")
-            assays = cursor.fetchall()
+            assays = [
+                (assay_id, md_assay, description, self._remap_project_path(assay_folder_path))
+                for assay_id, md_assay, description, assay_folder_path in cursor.fetchall()
+            ]
 
             if not assays:
                 print("❌ No MD assays found.")
