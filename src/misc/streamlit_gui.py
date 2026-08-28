@@ -3864,7 +3864,49 @@ elif page == "Docking analysis":
             st.warning("No docking results")
         else:
             with st.expander(f"📊 {st.session_state['selected_assay_name']} Docking Results", expanded=False):
-                st.write(df_results)
+                ## Pose filtering — mirrors the "Classified Poses Viewer" section:
+                ## a LigName substring filter plus a per-column, case-insensitive
+                ## substring filter for every column in the results table.
+                _dr_df = df_results.copy()
+
+                if "LigName" in _dr_df.columns:
+                    _dr_ligname_filter = st.text_input(
+                        "Filter by LigName (substring):", key="dr_ligname_filter"
+                    ).strip()
+                    if _dr_ligname_filter:
+                        _dr_df = _dr_df[
+                            _dr_df["LigName"].astype(str).str.contains(
+                                _dr_ligname_filter, case=False, na=False
+                            )
+                        ].reset_index(drop=True)
+
+                _dr_filter_cols = list(_dr_df.columns)
+                if _dr_filter_cols:
+                    st.caption("Filter results by column (case-insensitive substring match):")
+                    _dr_filter_boxes = st.columns(len(_dr_filter_cols))
+                    _dr_filter_values = {}
+                    for _dr_fbox, _dr_fcol in zip(_dr_filter_boxes, _dr_filter_cols):
+                        with _dr_fbox:
+                            _dr_filter_values[_dr_fcol] = st.text_input(
+                                str(_dr_fcol), key=f"dr_colfilter_{_dr_fcol}"
+                            )
+                    for _dr_fcol, _dr_fval in _dr_filter_values.items():
+                        if _dr_fval:
+                            _dr_df = _dr_df[
+                                _dr_df[_dr_fcol].astype(str).str.contains(
+                                    _dr_fval, case=False, na=False
+                                )
+                            ].reset_index(drop=True)
+
+                st.caption(f"Showing {len(_dr_df)} of {len(df_results)} pose(s)")
+                st.dataframe(_dr_df, use_container_width=True)
+                st.download_button(
+                    "📥 Export filtered results as CSV",
+                    data=_dr_df.to_csv(index=False),
+                    file_name=f"{st.session_state['selected_assay_name']}_docking_results_filtered.csv",
+                    mime="text/csv",
+                    key="dr_export_filtered",
+                )
 
                 if df_mmpbsa_poses_results is not None and not df_mmpbsa_poses_results.empty:
                     _sp, _col = st.columns([1, 9])
