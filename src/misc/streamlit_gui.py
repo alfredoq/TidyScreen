@@ -4069,19 +4069,31 @@ elif page == "Docking analysis":
                                 pdb_names_all = [os.path.basename(f) for f in pdb_files]
 
                                 ## Filter poses by InChIKey (LigName) substring, case-insensitive
-                                _sp, _col = st.columns([2, 8])
-                                with _col:
+                                _sp, _col_ik, _col_pid = st.columns([1, 5, 4])
+                                with _col_ik:
                                     _filter_text = st.text_input(
                                         f"Filter poses by InChIKey ({entry['directory']}):",
                                         key=f"pose_filter_{entry['directory']}",
                                     ).strip()
+                                with _col_pid:
+                                    _pose_id_text = st.text_input(
+                                        f"Filter poses by pose ID ({entry['directory']}):",
+                                        key=f"pose_id_filter_{entry['directory']}",
+                                        help="Comma-separated pose IDs (e.g. 3, 7, 12).",
+                                    ).strip()
+
+                                pdb_names = pdb_names_all
                                 if _filter_text:
                                     pdb_names = [
-                                        name for name in pdb_names_all
+                                        name for name in pdb_names
                                         if _filter_text.lower() in filename_to_pose_id.get(name, {}).get("ligname", name).lower()
                                     ]
-                                else:
-                                    pdb_names = pdb_names_all
+                                if _pose_id_text:
+                                    _wanted_pose_ids = {t.strip() for t in _pose_id_text.split(",") if t.strip()}
+                                    pdb_names = [
+                                        name for name in pdb_names
+                                        if str(filename_to_pose_id.get(name, {}).get("pose_id", "")) in _wanted_pose_ids
+                                    ]
 
                                 idx_key = f"pose_idx_{entry['directory']}"
                                 if idx_key not in st.session_state:
@@ -4259,6 +4271,27 @@ elif page == "Docking analysis":
                                                     st.info(f"Reference PDB saved alongside: {_ref_pdb_path}")
                                             except Exception as _e:
                                                 st.error(f"Could not save VMD script: {_e}")
+
+                                    ## Export the currently visualized pose to a .pdb file
+                                    with st.expander("📄 Export pose PDB", expanded=False):
+                                        _default_pdb_path = os.path.join(
+                                            os.path.expanduser("~"), "Desktop",
+                                            os.path.splitext(selected_file)[0] + ".pdb"
+                                        )
+                                        _export_pdb_path = st.text_input(
+                                            "Save pose PDB to:",
+                                            value=_default_pdb_path,
+                                            key=f"export_pdb_path_{entry['directory']}_{selected_file}",
+                                        )
+                                        if st.button("💾 Save pose PDB", key=f"btn_export_pdb_{entry['directory']}_{selected_file}"):
+                                            try:
+                                                _pdb_out = _export_pdb_path.strip()
+                                                os.makedirs(os.path.dirname(os.path.abspath(_pdb_out)), exist_ok=True)
+                                                with open(_pdb_out, "w") as _pf:
+                                                    _pf.write(pdb_data)
+                                                st.success(f"Pose PDB saved to: {_pdb_out}")
+                                            except Exception as _e:
+                                                st.error(f"Could not save pose PDB: {_e}")
 
                                 ## ProLIF Fingerprints for this pose directory — always follows
                                 ## the pose currently selected above (no separate pose picker),
