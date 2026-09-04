@@ -1083,8 +1083,17 @@ class MolDyn:
             print(f"⚙️  Writing execution script...")
             self._prepare_md_execution_script(md_assay_folder, md_parameters_dict)
 
-            # Create MD register entry in the md_assays table
-            self._create_md_assay_register_entry(md_assay_id, md_assay_folder, assay_description, docking_assay_params_dict.get('assay_id'), docking_assay_params_dict.get('selected_ligand_name'), docking_assay_params_dict.get('selected_pose_id'), md_parameters_dict)
+            # Create MD register entry in the md_assays table. receptor_template_name
+            # is recorded so per-residue MM-GBSA decomposition can later be renumbered
+            # back to the original receptor numbering (see compute_mmgbsa_on_trajectory).
+            self._create_md_assay_register_entry(
+                md_assay_id, md_assay_folder, assay_description,
+                docking_assay_params_dict.get('assay_id'),
+                docking_assay_params_dict.get('selected_ligand_name'),
+                docking_assay_params_dict.get('selected_pose_id'),
+                md_parameters_dict,
+                receptor_template_name=_receptor_info.get('template_name'),
+            )
 
             print(f"\n✅ MD assay prepared successfully in: {md_assay_folder}")
 
@@ -2491,11 +2500,24 @@ class MolDyn:
                     print(f"❌ Required file not found: {req_file}")
                     return
 
+            mmgbsa_folder = os.path.join(assay_folder, 'mmgbsa')
+
+            # If a previous run already produced results (e.g. it was launched in the
+            # background), offer to parse and store them instead of recomputing.
+            existing_results_dat = os.path.join(mmgbsa_folder, 'mmgbsa_results.dat')
+            if os.path.exists(existing_results_dat):
+                print(f"\n📄 Found existing MM-GBSA results: {existing_results_dat}")
+                parse_existing = input(
+                    "🔎 Parse and store these existing results (instead of recomputing)? (yes/no) [default: yes]: "
+                ).strip().lower() or 'yes'
+                if parse_existing in ['yes', 'y']:
+                    self._collect_and_store_existing_mmgbsa(assay_id, mmgbsa_folder, assay_info)
+                    return
+
             mmgbsa_params = self._collect_mmgbsa_parameters(ligand_name)
             if mmgbsa_params is None:
                 return
 
-            mmgbsa_folder = os.path.join(assay_folder, 'mmgbsa')
             if os.path.exists(mmgbsa_folder):
                 print(f"\n⚠️  MM-GBSA folder already exists: {mmgbsa_folder}")
                 confirm = input("🗑️  Delete existing folder and continue? (yes/no) [default: no]: ").strip().lower() or 'no'
@@ -2560,9 +2582,21 @@ class MolDyn:
                 conn.close()
                 return None
 
-            cursor.execute("""
+            # receptor_template_name is added lazily by _create_md_assay_register_entry();
+            # older assay rows predate it, so only select it when the column exists.
+            cursor.execute("PRAGMA table_info(md_assays)")
+            md_cols = {row[1] for row in cursor.fetchall()}
+            has_template_col = 'receptor_template_name' in md_cols
+            has_docking_col = 'docking_assay_id' in md_cols
+            extra_select = ""
+            if has_template_col:
+                extra_select += ", receptor_template_name"
+            if has_docking_col:
+                extra_select += ", docking_assay_id"
+
+            cursor.execute(f"""
                 SELECT assay_id, md_assay, description, assay_folder_path,
-                       ligand_name, pose_id
+                       ligand_name, pose_id{extra_select}
                 FROM md_assays
                 WHERE ligand_name IS NOT NULL
                 ORDER BY assay_id ASC
@@ -2575,7 +2609,22 @@ class MolDyn:
                 return None
 
             completed = []
-            for assay_id, md_assay, description, folder, ligname, pose_id in rows:
+            for row in rows:
+                assay_id, md_assay, description, folder, ligname, pose_id = row[:6]
+                _idx = 6
+                receptor_template_name = None
+                docking_assay_id = None
+                if has_template_col:
+                    receptor_template_name = row[_idx]
+                    _idx += 1
+                if has_docking_col:
+                    docking_assay_id = row[_idx]
+
+                # Older ligand-receptor assays did not record receptor_template_name;
+                # recover it from the linked docking assay's receptor_info.
+                if not receptor_template_name and docking_assay_id:
+                    receptor_template_name = self._resolve_template_from_docking_assay(docking_assay_id)
+
                 folder = self._remap_project_path(folder)
                 if not folder or not os.path.exists(folder):
                     continue
@@ -2596,6 +2645,7 @@ class MolDyn:
                     'assay_folder_path': folder,
                     'ligand_name': ligname,
                     'pose_id': pose_id,
+                    'receptor_template_name': receptor_template_name,
                 })
 
             if not completed:
@@ -2694,6 +2744,15 @@ class MolDyn:
                 params['endframe'] = 9999
                 params['interval'] = 1
 
+            # Per-residue energy decomposition (idecomp=2, mirrors the docking
+            # MMGBSA fingerprint pipeline in MolDock.compute_fingerprints()).
+            # The resulting per-residue table is renumbered back to the original
+            # receptor numbering before being stored.
+            perres_str = input(
+                "\nCompute per-residue energy decomposition? (yes/no) [default: yes]: "
+            ).strip().lower() or 'yes'
+            params['per_residue'] = perres_str in ['yes', 'y']
+
             # Whether to keep MMPBSA.py temporary files
             keep_str = input(
                 "\nKeep MMPBSA.py intermediate files? (yes/no) [default: no]: "
@@ -2706,6 +2765,7 @@ class MolDyn:
             print(f"   GB model    : igb={params['igb']}")
             print(f"   Salt conc.  : {params['saltcon']} M")
             print(f"   Frames      : {params['startframe']} to {params['endframe']}, every {params['interval']}")
+            print(f"   Per-residue : {'yes' if params['per_residue'] else 'no'}")
             return params
 
         except KeyboardInterrupt:
@@ -2844,6 +2904,14 @@ class MolDyn:
             f.write(f"  igb={mmgbsa_params['igb']},\n")
             f.write(f"  saltcon={mmgbsa_params['saltcon']},\n")
             f.write("/\n")
+            # Per-residue energy decomposition. idecomp=2 / csv_format=0 mirrors
+            # MolDock._compute_mmgbsa_fingerprint() so the resulting decomposition
+            # table can be parsed by the same logic and renumbered to the original
+            # receptor numbering.
+            if mmgbsa_params.get('per_residue', False):
+                f.write("&decomp\n")
+                f.write("  idecomp=2, csv_format=0,\n")
+                f.write("/\n")
         print(f"   ✓ MM-GBSA input file written: {os.path.basename(mmgbsa_in)}")
         return mmgbsa_in
 
@@ -2878,6 +2946,7 @@ class MolDyn:
         stripped_traj    = os.path.join(mmgbsa_folder, 'production_stripped.nc')
         results_dat      = os.path.join(mmgbsa_folder, 'mmgbsa_results.dat')
         energies_csv     = os.path.join(mmgbsa_folder, 'mmgbsa_energies.csv')
+        decomp_dat       = os.path.join(mmgbsa_folder, 'mmgbsa_decomp.dat')
         mmpbsa_log       = os.path.join(mmgbsa_folder, 'mmpbsa.log')
 
         try:
@@ -2930,6 +2999,10 @@ class MolDyn:
                 f.write(f"    -i  {mmgbsa_in} \\\n")
                 f.write(f"    -o  {results_dat} \\\n")
                 f.write(f"    -eo {energies_csv} \\\n")
+                if mmgbsa_params.get('per_residue', False):
+                    # -do writes the per-residue decomposition table parsed by
+                    # _parse_mmgbsa_decomposition_output() after the run finishes.
+                    f.write(f"    -do {decomp_dat} \\\n")
                 f.write(f"    -cp {com_prmtop} \\\n")
                 f.write(f"    -rp {rec_prmtop} \\\n")
                 f.write(f"    -lp {lig_prmtop} \\\n")
@@ -2962,6 +3035,7 @@ class MolDyn:
 
         results_dat  = os.path.join(mmgbsa_folder, 'mmgbsa_results.dat')
         energies_csv = os.path.join(mmgbsa_folder, 'mmgbsa_energies.csv')
+        decomp_dat   = os.path.join(mmgbsa_folder, 'mmgbsa_decomp.dat')
 
         if run_mode in ['fg', 'foreground']:
             print("\n▶️  Starting MM-GBSA computation in the foreground...")
@@ -2992,6 +3066,13 @@ class MolDyn:
             self._store_mmgbsa_results(assay_id, parsed, mmgbsa_params, mmgbsa_folder)
             self._display_mmgbsa_results(parsed, assay_info)
 
+            # Per-residue energy decomposition — parse, renumber to the original
+            # receptor numbering, and store (mirrors MolDock.compute_fingerprints()).
+            if mmgbsa_params.get('per_residue', False):
+                self._process_mmgbsa_decomposition(
+                    assay_id, decomp_dat, mmgbsa_folder, assay_info
+                )
+
         elif run_mode in ['bg', 'background']:
             print("\n▶️  Starting MM-GBSA computation in the background...")
             try:
@@ -3006,8 +3087,11 @@ class MolDyn:
                 return
             print(f"ℹ️  MM-GBSA running in background.")
             print(f"   Results will be written to: {results_dat}")
+            if mmgbsa_params.get('per_residue', False):
+                print(f"   Per-residue decomposition : {decomp_dat}")
             print(f"   Log: {os.path.join(mmgbsa_folder, 'mmpbsa.log')}")
-            print(f"   Re-run compute_mmgbsa_on_trajectory() after completion to parse and store results.")
+            print(f"   Re-run compute_mmgbsa_on_trajectory() after completion to parse and store results")
+            print(f"   (it will detect the finished output and offer to parse it without recomputing).")
 
         else:
             print("❌ Invalid option. Please choose 'fg' or 'bg'.")
@@ -3122,6 +3206,319 @@ class MolDyn:
         if energies_file:
             print(f"  Per-frame data : {energies_file}")
         print(f"{'=' * 60}")
+
+    def _collect_and_store_existing_mmgbsa(self, assay_id, mmgbsa_folder, assay_info):
+        """
+        Parse and store MM-GBSA results from a completed run whose output files are
+        already on disk (typically a background run). Handles both the overall
+        binding-energy summary (mmgbsa_results.dat) and, when present, the per-residue
+        decomposition (mmgbsa_decomp.dat).
+        """
+        results_dat  = os.path.join(mmgbsa_folder, 'mmgbsa_results.dat')
+        energies_csv = os.path.join(mmgbsa_folder, 'mmgbsa_energies.csv')
+        decomp_dat   = os.path.join(mmgbsa_folder, 'mmgbsa_decomp.dat')
+        mmgbsa_in    = os.path.join(mmgbsa_folder, 'mmgbsa.in')
+
+        parsed = self._parse_mmpbsa_output(results_dat)
+        if parsed is None:
+            print(f"⚠️  Could not parse MMPBSA.py output — raw results in: {results_dat}")
+            return
+
+        # Recover the parameter block from the input namelist if we can, so the stored
+        # payload keeps the same shape as a fresh fg run.
+        mmgbsa_params = self._read_mmgbsa_params_from_input(mmgbsa_in)
+
+        parsed['results_file'] = results_dat
+        parsed['energies_file'] = energies_csv if os.path.exists(energies_csv) else None
+        self._store_mmgbsa_results(assay_id, parsed, mmgbsa_params, mmgbsa_folder)
+        self._display_mmgbsa_results(parsed, assay_info)
+
+        if os.path.exists(decomp_dat):
+            self._process_mmgbsa_decomposition(assay_id, decomp_dat, mmgbsa_folder, assay_info)
+
+    def _read_mmgbsa_params_from_input(self, mmgbsa_in):
+        """
+        Best-effort reconstruction of the MM-GBSA parameter dict from an existing
+        mmgbsa.in namelist file. Returns a dict (possibly partial); never raises.
+        """
+        import re
+        params = {}
+        try:
+            with open(mmgbsa_in, 'r') as f:
+                content = f.read()
+            for key, cast in (
+                ('startframe', int), ('endframe', int), ('interval', int),
+                ('igb', int), ('saltcon', float),
+            ):
+                m = re.search(rf'{key}\s*=\s*([-\d.]+)', content)
+                if m:
+                    try:
+                        params[key] = cast(m.group(1))
+                    except ValueError:
+                        pass
+            params['per_residue'] = '&decomp' in content
+        except Exception:
+            pass
+        return params
+
+    def _process_mmgbsa_decomposition(self, assay_id, decomp_file, mmgbsa_folder, assay_info):
+        """
+        Parse the MMPBSA.py per-residue decomposition output (`-do` file), renumber
+        the receptor residues back to the original (crystallographic) numbering, and
+        store the resulting table.
+
+        This mirrors the per-residue MMGBSA fingerprint pipeline in
+        MolDock.compute_fingerprints() (see MolDock._parse_mmgbsa_decomposition_output
+        and the renumbering applied in _compute_fingerprints_pose_worker): the
+        decomposition table produced by tleap/MMPBSA.py uses sequential residue
+        numbering (1..N), which is mapped to the original receptor numbering via the
+        `renumbering_dict` stored in `pdb_templates` when the receptor template was
+        created.
+        """
+        try:
+            if not os.path.exists(decomp_file):
+                print(f"\n⚠️  Per-residue decomposition file not found: {decomp_file}")
+                print(f"    (check that '&decomp' was honoured — see {os.path.join(mmgbsa_folder, 'mmpbsa.log')})")
+                return
+
+            print(f"\n⚙️  Parsing per-residue energy decomposition...")
+            decomp_df = self._parse_mmgbsa_decomposition_output(decomp_file)
+            if decomp_df is None or decomp_df.empty:
+                print(f"⚠️  No per-residue decomposition data parsed from: {decomp_file}")
+                return
+
+            # Renumber receptor residues to the original receptor numbering.
+            renumbering_dict = self._get_receptor_renumbering_dict(
+                assay_info.get('receptor_template_name')
+            )
+            if renumbering_dict:
+                decomp_df['residue'] = decomp_df['residue'].apply(
+                    lambda x: renumbering_dict.get(x, x)
+                )
+            else:
+                print(f"⚠️  No renumbering_dict available for template "
+                      f"'{assay_info.get('receptor_template_name')}'; "
+                      f"per-residue table kept with sequential numbering.")
+
+            csv_path = self._store_mmgbsa_decomposition(
+                assay_id, decomp_df, mmgbsa_folder
+            )
+
+            print(f"\n📊 PER-RESIDUE MM-GBSA DECOMPOSITION (top contributors by |TOTAL|):")
+            print("-" * 60)
+            top = decomp_df.reindex(
+                decomp_df['total'].abs().sort_values(ascending=False).index
+            ).head(15)
+            for _, r in top.iterrows():
+                print(f"  {str(r['residue']):<14} : {r['total']:>9.3f} kcal/mol "
+                      f"(vdw {r['vdw']:>8.3f}, ele {r['ele']:>9.3f})")
+            if csv_path:
+                print(f"\n  Full table : {csv_path}")
+            print("-" * 60)
+
+        except Exception as e:
+            print(f"\n❌ Error processing per-residue MM-GBSA decomposition: {e}")
+
+    def _parse_mmgbsa_decomposition_output(self, decomp_file):
+        """
+        Parse an MMPBSA.py per-residue decomposition output file into a DataFrame with
+        columns: residue, vdw, ele, polar_solvation, nonpolar_solvation, gas, total.
+
+        Mirrors MolDock._parse_mmgbsa_decomposition_output(). The 'Total Energy
+        Decomposition' table has the same layout for single-frame (docking) and
+        multi-frame (trajectory) runs — every numeric cell is 'avg +/- std', so the
+        fixed token offsets below hold in both cases (std is 0.000 for a single frame).
+        """
+        import pandas as pd
+        import re
+
+        try:
+            with open(decomp_file, 'r') as f:
+                lines = f.readlines()
+
+            start_idx = None
+            end_idx = None
+            starting_pattern = (
+                r"Residue\s+\|\s+Location\s+\|\s+Internal\s+\|\s+van der Waals\s+\|\s+"
+                r"Electrostatic\s+\|\s+Polar Solvation\s+\|\s+Non-Polar Solv\.\s+\|\s+TOTAL"
+            )
+            for i, line in enumerate(lines):
+                if re.match(starting_pattern, line):
+                    start_idx = i + 2  # skip the header + separator line
+                elif start_idx is not None and line.strip() == '':
+                    end_idx = i
+                    break
+
+            if start_idx is None or end_idx is None:
+                print(f"\n❌ Could not find decomposition table in '{decomp_file}'")
+                return pd.DataFrame()
+
+            data = []
+            for line in lines[start_idx:end_idx]:
+                parts = line.split()
+                if len(parts) >= 8:
+                    resname = parts[4]
+                    resnumber = parts[5]
+                    vdw = float(parts[11])
+                    ele = float(parts[15])
+                    pol_solv = float(parts[19])
+                    nonpol_solv = float(parts[23])
+                    gas = vdw + ele
+                    total = float(parts[27])
+                    reskey = f"{resname}{resnumber}"
+
+                    # Normalise water residue name for consistency with the docking path
+                    if resname == 'WAT':
+                        reskey = f"HOH{resnumber}"
+
+                    data.append({
+                        'residue': reskey,
+                        'vdw': round(vdw, 3),
+                        'ele': round(ele, 3),
+                        'polar_solvation': round(pol_solv, 3),
+                        'nonpolar_solvation': round(nonpol_solv, 3),
+                        'gas': round(gas, 3),
+                        'total': round(total, 3),
+                    })
+
+            return pd.DataFrame(data)
+
+        except Exception as e:
+            print(f"\n❌ Error parsing MM-GBSA decomposition output: {e}")
+            return pd.DataFrame()
+
+    def _resolve_template_from_docking_assay(self, docking_assay_id):
+        """
+        Recover the receptor template name for an MD assay from its linked docking
+        assay's `receptor_info` JSON (docking_assays.db). `docking_assay_id` is stored
+        in md_assays either as a bare integer or as the string 'assay_<N>'.
+        Returns the template name or None.
+        """
+        import sqlite3
+        import json
+        import re
+
+        if docking_assay_id is None:
+            return None
+
+        m = re.search(r'(\d+)', str(docking_assay_id))
+        if not m:
+            return None
+        numeric_id = int(m.group(1))
+
+        if not os.path.exists(self.__docking_registers_db):
+            return None
+
+        try:
+            conn = sqlite3.connect(self.__docking_registers_db)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT receptor_info FROM docking_assays WHERE assay_id = ?",
+                (numeric_id,),
+            )
+            result = cursor.fetchone()
+            conn.close()
+            if result and result[0]:
+                info = result[0]
+                if isinstance(info, str):
+                    info = json.loads(info)
+                if isinstance(info, dict):
+                    return info.get('template_name')
+        except Exception as e:
+            print(f"⚠️  Could not resolve receptor template from docking assay "
+                  f"'{docking_assay_id}': {e}")
+        return None
+
+    def _get_receptor_renumbering_dict(self, receptor_template_name):
+        """
+        Retrieve the sequential→original residue renumbering dictionary stored in
+        `pdb_templates.renumbering_dict` (pdbs.db) for the given receptor template.
+
+        The MD complex topology is built by tleap loading the receptor first
+        (rec = loadpdb receptor_checked.pdb) and then the ligand, so receptor
+        residues keep the same sequential numbering as the docking template — the
+        same renumbering_dict therefore applies.
+
+        Returns an empty dict if the template / column / file is missing.
+        """
+        import sqlite3
+        import json
+
+        if not receptor_template_name:
+            return {}
+
+        pdbs_db_path = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
+        if not os.path.exists(pdbs_db_path):
+            return {}
+
+        try:
+            conn = sqlite3.connect(pdbs_db_path)
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA table_info(pdb_templates)")
+            if not any(row[1] == 'renumbering_dict' for row in cursor.fetchall()):
+                conn.close()
+                return {}
+            cursor.execute(
+                "SELECT renumbering_dict FROM pdb_templates WHERE pdb_template_name = ?",
+                (receptor_template_name,),
+            )
+            result = cursor.fetchone()
+            conn.close()
+            if result and result[0]:
+                return json.loads(result[0])
+        except Exception as e:
+            print(f"⚠️  Error retrieving renumbering_dict for template "
+                  f"'{receptor_template_name}': {e}")
+        return {}
+
+    def _store_mmgbsa_decomposition(self, assay_id, decomp_df, mmgbsa_folder):
+        """
+        Store the renumbered per-residue MM-GBSA decomposition table as a JSON blob in
+        the `md_mmgbsa_decomposition` table of md_registers.db (keyed by assay_id), and
+        also write it as a CSV inside the mmgbsa folder. Returns the CSV path (or None).
+
+        Mirrors MolDock._store_processed_mmgbsa_df_in_db() / _write_mmgbsa_fps().
+        """
+        import sqlite3
+        import json
+        from datetime import datetime
+
+        csv_path = None
+        try:
+            csv_path = os.path.join(mmgbsa_folder, 'mmgbsa_decomposition.csv')
+            decomp_df.round(3).to_csv(csv_path, index=False)
+        except Exception as e:
+            print(f"⚠️  Could not write per-residue decomposition CSV: {e}")
+            csv_path = None
+
+        try:
+            conn = sqlite3.connect(self.__md_registers_db)
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS md_mmgbsa_decomposition (
+                    assay_id INTEGER PRIMARY KEY,
+                    data TEXT NOT NULL,
+                    mmgbsa_folder TEXT,
+                    created_date TEXT
+                )
+            """)
+            cursor.execute(
+                "INSERT OR REPLACE INTO md_mmgbsa_decomposition "
+                "(assay_id, data, mmgbsa_folder, created_date) VALUES (?, ?, ?, ?)",
+                (
+                    assay_id,
+                    decomp_df.to_json(orient='split'),
+                    mmgbsa_folder,
+                    datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                ),
+            )
+            conn.commit()
+            conn.close()
+            print(f"   ✓ Per-residue decomposition stored in database (assay_id={assay_id})")
+        except Exception as e:
+            print(f"⚠️  Error storing per-residue MM-GBSA decomposition in database: {e}")
+
+        return csv_path
 
     def list_md_assays(self):
         """List all MD assays registered in the project."""
