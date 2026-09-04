@@ -2312,11 +2312,48 @@ class MolDyn:
             import subprocess
 
             if run_mode in ['fg', 'foreground']:
+                # A foreground run still must not overlap a run already in
+                # progress — whether that other run is itself foreground or
+                # queue-managed — or two AMBER processes end up fighting
+                # over the GPU with the queue none the wiser. It registers
+                # itself into the same shared md_queue table (see
+                # md_queue.register_foreground_run()) so both directions
+                # (fg-vs-fg, fg-vs-queue) correctly wait on each other.
+                can_start, why_not = md_queue.can_start_foreground()
+                if not can_start:
+                    print(f"❌ {why_not}")
+                    print("   Choose 'queue' instead, or wait for the current run to finish.")
+                    return None
+
                 print("\n▶️  Starting MD simulation in the foreground...")
                 try:
-                    subprocess.run([execution_script_path], check=True, cwd=md_assay_folder)
-                except subprocess.CalledProcessError as e:
-                    print(f"❌ MD simulation exited with code {e.returncode}.")
+                    proc = subprocess.Popen([execution_script_path], cwd=md_assay_folder)
+                except Exception as e:
+                    print(f"❌ Error starting MD simulation: {e}")
+                    return None
+
+                queue_id, err = md_queue.register_foreground_run(
+                    self.name, self.path, assay_id, md_assay_folder,
+                    md_assay_label or f'assay_{assay_id}', proc.pid,
+                )
+                if queue_id is None:
+                    # Extremely small race window between can_start_foreground()
+                    # and the process actually starting above; the process is
+                    # already running at this point, so we let it continue
+                    # rather than kill a simulation that has already begun
+                    # computing — just warn that it isn't tracked.
+                    print(f"⚠️  {err} (this run was already started and will continue; "
+                          f"it is not tracked by the shared MD queue).")
+
+                returncode = proc.wait()
+                status = 'completed' if returncode == 0 else 'failed'
+                if queue_id is not None:
+                    md_queue.finish_foreground_run(
+                        queue_id, self.path, assay_id, status,
+                        None if status == 'completed' else f'run_md.sh exited with code {returncode}',
+                    )
+                if returncode != 0:
+                    print(f"❌ MD simulation exited with code {returncode}.")
                 return None
 
             elif run_mode in ['queue', 'q']:

@@ -73,6 +73,12 @@ COLUMNS_DICT = {
     'enqueued_at': 'TEXT NOT NULL',
     'started_at': 'TEXT',
     'finished_at': 'TEXT',
+    # For a queue-managed job: the worker process's own pid (it runs
+    # run_md.sh via a blocking subprocess.run inside itself). For a
+    # foreground-started job (see register_foreground_run()): the pid of
+    # the run_md.sh process itself, since there is no separate worker.
+    # Either way, _pid_alive(worker_pid) is what "is this row still
+    # actually executing" means throughout this module.
     'worker_pid': 'INTEGER',
     'run_log_file': 'TEXT',
     'error_message': 'TEXT',
@@ -159,6 +165,91 @@ def queue_position(queue_id):
         conn.close()
 
 
+def can_start_foreground():
+    """
+    Cheap pre-check for a foreground start: True if nothing is currently
+    'running' on the shared queue (queue-managed *or* a previously
+    registered foreground run). Callers should still call
+    register_foreground_run() atomically right before actually starting
+    the process — this function only avoids launching a process that is
+    obviously going to have to be refused, it does not itself close the
+    (small, human-interactive-timescale) race between this check and the
+    process actually starting.
+    """
+    _reap_stale_state()
+    conn, cursor = _connect()
+    try:
+        cursor.execute(f"SELECT COUNT(*) FROM {QUEUE_TABLE} WHERE status = 'running'")
+        running = cursor.fetchone()[0]
+    finally:
+        conn.close()
+    if running > 0:
+        return False, "Another MD job is already running on the shared MD queue."
+    return True, None
+
+
+def register_foreground_run(project_name, project_path, assay_id, assay_folder_path, md_assay_label, pid):
+    """
+    Register a directly (foreground-)started run as a 'running' row so
+    other sessions calling ensure_worker_running()/can_start_foreground()
+    see it and won't start a second job concurrently — this is what makes
+    'fg' and 'queue' starts correctly wait on each other, not just queue
+    starts on other queue starts.
+
+    Must be called with the process's real pid *after* it has actually
+    been started (so a live pid is always available to check liveness
+    against later — see _reap_stale_state()), but the check-and-insert
+    below is still atomic (BEGIN IMMEDIATE) against a concurrent claim/
+    registration happening in the tiny window since can_start_foreground()
+    was last called.
+
+    Returns (queue_id, None) on success, or (None, error_message) if
+    something else is already running — the caller already started the
+    process in that case and must decide how to handle it (see
+    MolDyn._start_md_simulation()'s fg branch).
+    """
+    conn, cursor = _connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cursor.execute(f"SELECT COUNT(*) FROM {QUEUE_TABLE} WHERE status = 'running'")
+        if cursor.fetchone()[0] > 0:
+            conn.rollback()
+            return None, "Another MD job is already running on the shared MD queue."
+        data_dict = {
+            'project_name': project_name,
+            'project_path': project_path,
+            'assay_id': assay_id,
+            'assay_folder_path': assay_folder_path,
+            'md_assay_label': md_assay_label,
+            'status': 'running',
+            'enqueued_at': _now(),
+            'started_at': _now(),
+            'worker_pid': pid,  # here: the run_md.sh process's own pid, not a queue worker's
+        }
+        queue_id = dbm.insert_data_dinamically_into_table(cursor, QUEUE_TABLE, data_dict)
+        conn.commit()
+        return queue_id, None
+    finally:
+        conn.close()
+
+
+def finish_foreground_run(queue_id, project_path, assay_id, status, error_message=None):
+    """Record the outcome of a foreground run registered via
+    register_foreground_run(), then release anything that queued up while
+    it was running."""
+    conn, cursor = _connect()
+    try:
+        cursor.execute(
+            f"UPDATE {QUEUE_TABLE} SET status = ?, finished_at = ?, error_message = ? WHERE queue_id = ?",
+            (status, _now(), error_message, queue_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    _mirror_status_to_project_db(project_path, assay_id, status)
+    ensure_worker_running()
+
+
 def _worker_lock_alive():
     if not os.path.exists(LOCK_FILE):
         return False
@@ -221,6 +312,15 @@ def ensure_worker_running():
 
     conn, cursor = _connect()
     try:
+        # A 'running' row can belong either to a queue-managed job (whose
+        # worker holds LOCK_FILE — already checked above) or to a directly
+        # foreground-started job (see register_foreground_run()), which
+        # holds no worker lock at all. Checking the table directly, not
+        # just the lock file, is what makes fg and queue starts correctly
+        # wait on each other.
+        cursor.execute(f"SELECT COUNT(*) FROM {QUEUE_TABLE} WHERE status = 'running'")
+        if cursor.fetchone()[0] > 0:
+            return False
         cursor.execute(f"SELECT COUNT(*) FROM {QUEUE_TABLE} WHERE status = 'queued'")
         n_queued = cursor.fetchone()[0]
     finally:
@@ -293,31 +393,46 @@ def _spawn_worker():
 def _claim_next_job():
     """
     Atomically claim the oldest 'queued' row (FIFO by enqueued_at) for this
-    worker process. Returns a dict with the claimed job's fields, or None
-    if the queue is empty.
+    worker process — but only if nothing else is currently 'running'.
+
+    That last check matters even though ensure_worker_running() already
+    refuses to *spawn* a worker while something is running: a foreground
+    job (see register_foreground_run()) can start concurrently with an
+    already-running worker's brief gap between finishing one job and
+    claiming the next, so the claim itself must re-verify exclusivity, not
+    just rely on the spawn-time check. The whole check-then-claim runs
+    inside one BEGIN IMMEDIATE transaction so it is atomic against any
+    other connection (another worker, or a foreground run registering)
+    doing the same check concurrently.
+
+    Returns a dict with the claimed job's fields, or None if the queue is
+    empty or something else is currently running (the caller should treat
+    both cases the same way — see run_worker_loop()).
     """
     conn, cursor = _connect()
     try:
-        while True:
-            cursor.execute(
-                f"SELECT {', '.join(_JOB_COLUMNS)} FROM {QUEUE_TABLE} "
-                f"WHERE status = 'queued' ORDER BY enqueued_at ASC, queue_id ASC LIMIT 1"
-            )
-            row = cursor.fetchone()
-            if row is None:
-                return None
-            queue_id = row[0]
-            cursor.execute(
-                f"UPDATE {QUEUE_TABLE} SET status = 'running', started_at = ?, worker_pid = ? "
-                f"WHERE queue_id = ? AND status = 'queued'",
-                (_now(), os.getpid(), queue_id),
-            )
-            conn.commit()
-            if cursor.rowcount == 1:
-                return dict(zip(_JOB_COLUMNS, row))
-            # Someone else (e.g. a concurrent cancel) changed this row
-            # between the SELECT and the UPDATE above — retry with the
-            # next-oldest candidate.
+        conn.execute("BEGIN IMMEDIATE")
+        cursor.execute(f"SELECT COUNT(*) FROM {QUEUE_TABLE} WHERE status = 'running'")
+        if cursor.fetchone()[0] > 0:
+            conn.rollback()
+            return None
+
+        cursor.execute(
+            f"SELECT {', '.join(_JOB_COLUMNS)} FROM {QUEUE_TABLE} "
+            f"WHERE status = 'queued' ORDER BY enqueued_at ASC, queue_id ASC LIMIT 1"
+        )
+        row = cursor.fetchone()
+        if row is None:
+            conn.rollback()
+            return None
+
+        queue_id = row[0]
+        cursor.execute(
+            f"UPDATE {QUEUE_TABLE} SET status = 'running', started_at = ?, worker_pid = ? WHERE queue_id = ?",
+            (_now(), os.getpid(), queue_id),
+        )
+        conn.commit()
+        return dict(zip(_JOB_COLUMNS, row))
     finally:
         conn.close()
 
@@ -396,10 +511,15 @@ def run_worker_loop():
     """
     Entry point for the detached worker process (see _spawn_worker()).
     Repeatedly claims and runs the oldest queued job — machine-wide, across
-    every project — until the queue is empty, then releases the worker
-    lock and exits. A fresh worker is spawned by the next
-    ensure_worker_running() call (from any project) once something new is
-    enqueued.
+    every project — until _claim_next_job() returns None, then releases
+    the worker lock and exits. That happens either because the queue is
+    genuinely empty, or because a foreground-started run (see
+    register_foreground_run()) is currently occupying the "one job at a
+    time" slot; either way it is safe to exit here, since whichever run is
+    still 'running' will call ensure_worker_running() itself when it
+    finishes (this worker's own next-job claim for the queue-managed case,
+    or finish_foreground_run() for the foreground case) — spawning a fresh
+    worker then if anything is still queued.
     """
     while True:
         job = _claim_next_job()
