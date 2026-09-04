@@ -930,6 +930,14 @@ class MolDyn:
         try:
             import sqlite3
 
+            # Ask which pose-selection procedure to use:
+            #   'guided' — assay -> unique ligand -> pose (the historical flow)
+            #   'direct' — assay -> type the Pose_ID straight away (ligand is derived
+            #              from the pose row); skips the ligand and pose listings
+            procedure = self._select_pose_selection_procedure()
+            if procedure is None:
+                return
+
             # Connect to docking registers database
             conn = sqlite3.connect(self.__docking_registers_db)
             cursor = conn.cursor()
@@ -939,15 +947,21 @@ class MolDyn:
             if docking_assay_params_dict is None:
                 return
 
-            # Select unique ligand molecules in the selected docking assay
-            docking_assay_params_dict = self._select_unique_ligands_in_docking_assay(docking_assay_params_dict)
-            if docking_assay_params_dict is None:
-                return
+            if procedure == 'guided':
+                # Select unique ligand molecules in the selected docking assay
+                docking_assay_params_dict = self._select_unique_ligands_in_docking_assay(docking_assay_params_dict)
+                if docking_assay_params_dict is None:
+                    return
 
-            # Select pose id for the selected ligand to perform MD assay
-            docking_assay_params_dict = self._select_ligand_pose_for_md_assay(docking_assay_params_dict)
-            if docking_assay_params_dict is None:
-                return
+                # Select pose id for the selected ligand to perform MD assay
+                docking_assay_params_dict = self._select_ligand_pose_for_md_assay(docking_assay_params_dict)
+                if docking_assay_params_dict is None:
+                    return
+            else:
+                # Direct: user supplies the Pose_ID; ligand name comes from that row
+                docking_assay_params_dict = self._select_pose_directly(docking_assay_params_dict)
+                if docking_assay_params_dict is None:
+                    return
 
             # Select a MD method to perform the MD assay
             md_parameters_dict = self._select_md_method()
@@ -1113,8 +1127,116 @@ class MolDyn:
             if md_assay_folder and os.path.exists(md_assay_folder):
                 print(f"⚠️  Assay folder left on disk for inspection: {md_assay_folder}")
         
+    def _select_pose_selection_procedure(self):
+        """
+        Ask the user how the docked pose for the MD assay should be selected.
+
+        Returns:
+            'guided' — assay -> unique ligand -> pose (list-driven, the default flow)
+            'direct' — assay -> Pose_ID typed directly (ligand derived from the row)
+            None     — the user cancelled
+        """
+        print("\n🧭 HOW DO YOU WANT TO SELECT THE DOCKED POSE?")
+        print("-" * 60)
+        print("  1 - Guided     (docking assay -> ligand -> pose)")
+        print("  2 - Direct     (docking assay -> Pose_ID entered directly)")
+        while True:
+            selection = input("\n🔎 Enter 1 or 2 (or 'cancel' to exit): ").strip().lower()
+            if selection in ['cancel', 'quit', 'exit']:
+                print("❌ Operation cancelled.")
+                return None
+            if selection in ['1', 'guided']:
+                return 'guided'
+            if selection in ['2', 'direct']:
+                return 'direct'
+            print("❌ Invalid option. Please enter 1 or 2.")
+
+    def _resolve_docking_results_db(self, docking_assay_params_dict):
+        """
+        Remap the assay folder path for the current project layout and return the
+        path to the docking results database (<assay_folder>/results/<assay_name>.db).
+        Both the remapped folder path and the results-db path are written back into
+        docking_assay_params_dict.
+        """
+        assay_folder_path = self._remap_project_path(docking_assay_params_dict.get('assay_folder_path'))
+        docking_assay_params_dict['assay_folder_path'] = assay_folder_path
+        assay_name = docking_assay_params_dict.get('assay_name')
+        docking_results_db = os.path.join(assay_folder_path, 'results', f'{assay_name}.db')
+        docking_assay_params_dict['docking_results_db'] = docking_results_db
+        return docking_results_db
+
+    def _select_pose_directly(self, docking_assay_params_dict):
+        """
+        Direct pose-selection procedure: the user types a Pose_ID that exists in the
+        selected docking assay's Results table. The ligand name, pose rank, docking
+        score and cluster size are read back from that row (and shown for
+        confirmation), so the ligand and pose listing prompts are skipped entirely.
+
+        Returns the updated docking_assay_params_dict (with selected_ligand_name,
+        selected_pose_id and docking_results_db set), or None if the user cancels.
+        """
+        try:
+            import sqlite3
+
+            assay_name = docking_assay_params_dict.get('assay_name')
+            docking_results_db = self._resolve_docking_results_db(docking_assay_params_dict)
+
+            if not os.path.exists(docking_results_db):
+                print(f"❌ Docking results database not found: {docking_results_db}")
+                return None
+
+            conn = sqlite3.connect(docking_results_db)
+            cursor = conn.cursor()
+
+            print(f"\n🧬 DIRECT POSE SELECTION FOR DOCKING ASSAY '{assay_name}'")
+            print("=" * 70)
+
+            try:
+                while True:
+                    selection = input("\n🔎 Enter the Pose_ID to use for the MD assay (or 'cancel' to exit): ").strip()
+                    if selection.lower() in ['cancel', 'quit', 'exit']:
+                        print("❌ Operation cancelled.")
+                        return None
+                    if not selection.lstrip('-').isdigit():
+                        print("❌ Pose_ID must be an integer. Please try again.")
+                        continue
+
+                    cursor.execute("""
+                        SELECT Pose_ID, LigName, pose_rank, docking_score, cluster_size
+                        FROM Results
+                        WHERE Pose_ID = ?;
+                    """, (int(selection),))
+                    row = cursor.fetchone()
+
+                    if row is None:
+                        print(f"❌ No pose with Pose_ID {selection} in docking assay '{assay_name}'. Please try again.")
+                        continue
+
+                    pose_id, ligname, pose_rank, docking_score, cluster_size = row
+                    print(f"\n✅ Found pose:")
+                    print(f"   Pose ID       : {pose_id}")
+                    print(f"   Ligand Name   : {ligname}")
+                    print(f"   Pose Rank     : {pose_rank}")
+                    print(f"   Docking Score : {docking_score}")
+                    print(f"   Cluster Size  : {cluster_size}")
+
+                    confirm = input("\n▶️  Proceed with this pose? (yes/no) [default: yes]: ").strip().lower() or 'yes'
+                    if confirm not in ['yes', 'y']:
+                        print("   Choose another Pose_ID.")
+                        continue
+
+                    docking_assay_params_dict['selected_ligand_name'] = ligname
+                    docking_assay_params_dict['selected_pose_id'] = int(pose_id)
+                    return docking_assay_params_dict
+            finally:
+                conn.close()
+
+        except Exception as e:
+            print(f"❌ Error selecting pose directly: {e}")
+            return None
+
     def _select_docking_assay(self, cursor):
-        
+
         # Check if docking_assays table exists
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='docking_assays';")
             if not cursor.fetchone():
@@ -1170,11 +1292,9 @@ class MolDyn:
             import sqlite3
 
             # Get required parameters from docking_assay_params_dict
-            assay_folder_path = self._remap_project_path(docking_assay_params_dict.get('assay_folder_path'))
-            docking_assay_params_dict['assay_folder_path'] = assay_folder_path
             assay_name = docking_assay_params_dict.get('assay_name')
-            # Connect to docking results database within the assay folder
-            docking_results_db = os.path.join(assay_folder_path, 'results', f'{assay_name}.db')
+            # Resolve (and store) the docking results database within the assay folder
+            docking_results_db = self._resolve_docking_results_db(docking_assay_params_dict)
             conn = sqlite3.connect(docking_results_db)
             cursor = conn.cursor()
 
