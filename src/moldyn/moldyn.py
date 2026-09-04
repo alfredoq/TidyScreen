@@ -3,6 +3,7 @@ import sys
 import os
 from tidyscreen.databases import DatabaseManager as dbm
 from tidyscreen.molecule_management import ligand_management as lm
+from tidyscreen.moldyn import md_queue
 
 
 # Add the parent directory to path to import our local tidyscreen module
@@ -1115,7 +1116,7 @@ class MolDyn:
             start_now = input("\n▶️  Do you want to start the MD simulation now? (yes/no) [default: no]: ").strip().lower() or 'no'
             bg_info = None
             if start_now in ['yes', 'y']:
-                bg_info = self._start_md_simulation(md_assay_folder)
+                bg_info = self._start_md_simulation(md_assay_folder, md_assay_id, md_assay_label=f'assay_{md_assay_id}')
             else:
                 print("ℹ️  MD simulation not started. Run the execution script in the assay folder when ready.")
 
@@ -1463,6 +1464,14 @@ class MolDyn:
                 'pose_id': 'INTEGER',
                 'receptor_template_name': 'TEXT',
                 'md_parameters': 'TEXT',
+                # Both of these are added lazily via ALTER TABLE elsewhere
+                # (status by md_queue._mirror_status_to_project_db(),
+                # mmgbsa_results by _store_mmgbsa_results()) — they MUST be
+                # listed here too, or the remove_legacy_table_columns() call
+                # below silently drops them again on the next assay creation
+                # (verbose=False skips its confirmation prompt).
+                'status': 'TEXT',
+                'mmgbsa_results': 'TEXT',
             }
             # Create md_assays table if it doesn't exist
             dbm.create_table_from_columns_dict(cursor, 'md_assays', columns_dict, verbose=False)
@@ -2265,35 +2274,125 @@ class MolDyn:
         except OSError as e:
             raise RuntimeError(f"Failed to write execution script '{execution_script_path}': {e}") from e
     
-    def _start_md_simulation(self, md_assay_folder):
+    def _start_md_simulation(self, md_assay_folder, assay_id, md_assay_label=None, mode=None):
+        """
+        Start (or enqueue) the MD simulation for one assay.
 
-        # Query if the user wants to run in the foreground or background
-        run_mode = input("\n⚙️  Do you want to run the MD simulation in the foreground or background? (fg/bg) [default: fg]: ").strip().lower() or 'fg'
+        assay_id is required so an enqueued job can be linked back to this
+        project's md_assays row (mirrored status update on completion — see
+        md_queue._mirror_status_to_project_db()).
+
+        mode, when given ('fg' or 'queue'), skips the interactive prompt —
+        used by perform_md_assay_on_receptor() when auto-enqueuing a whole
+        batch of replicas without asking once per replica.
+
+        'queue' replaces the old untracked background path: only one MD job
+        runs at a time, machine-wide (see md_queue.py); a queued job starts
+        immediately if the queue is idle, or automatically when whatever is
+        currently running finishes.
+        """
         execution_script_path = os.path.join(md_assay_folder, "run_md.sh")
+
+        if mode is None:
+            run_mode = input(
+                "\n⚙️  Run the MD simulation in the foreground, or enqueue it on the shared "
+                "MD queue? (fg/queue) [default: queue]: "
+            ).strip().lower() or 'queue'
+        else:
+            run_mode = mode
+
+        # 'bg'/'background' kept as input aliases for muscle-memory
+        # compatibility — there is no separate unmanaged-background path any
+        # more (see md_queue.py docstring for why: nothing else in moldyn.py
+        # prevents two backgrounded AMBER runs from fighting over the GPU).
+        if run_mode in ['bg', 'background']:
+            run_mode = 'queue'
+
         try:
             import subprocess
 
             if run_mode in ['fg', 'foreground']:
                 print("\n▶️  Starting MD simulation in the foreground...")
-                subprocess.run([execution_script_path], check=True, cwd=md_assay_folder)
+                try:
+                    subprocess.run([execution_script_path], check=True, cwd=md_assay_folder)
+                except subprocess.CalledProcessError as e:
+                    print(f"❌ MD simulation exited with code {e.returncode}.")
                 return None
 
-            elif run_mode in ['bg', 'background']:
-                print("\n▶️  Starting MD simulation in the background...")
-                process = subprocess.Popen([execution_script_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=md_assay_folder)
-                print(f"   🆔 Process ID: {process.pid}")
-                # No dedicated subprocess log file (output goes to per-stage
-                # min/heating/equilibration/production .out files instead);
-                # completion is judged from those via get_md_assay_status-style checks.
-                return {'background': True, 'pid': process.pid, 'log_file': None}
+            elif run_mode in ['queue', 'q']:
+                queue_id = md_queue.enqueue_job(
+                    self.name, self.path, assay_id, md_assay_folder,
+                    md_assay_label or f'assay_{assay_id}',
+                )
+                started = md_queue.ensure_worker_running()
+                pos = md_queue.queue_position(queue_id)
+                if started or pos <= 1:
+                    print(f"▶️  Enqueued (queue_id={queue_id}) — worker started, will begin immediately.")
+                else:
+                    print(f"📥 Enqueued (queue_id={queue_id}); {pos - 1} job(s) ahead of it in the shared MD queue.")
+                print("   Use MolDyn.list_md_queue() to check progress.")
+                return {'queued': True, 'queue_id': queue_id}
 
             else:
-                print("❌ Invalid option. Please choose 'fg' or 'bg'.")
+                print("❌ Invalid option. Please choose 'fg' or 'queue'.")
                 return None
         except Exception as e:
             print(f"❌ Error starting MD simulation: {e}")
             return None
-            
+
+    def list_md_queue(self, all_projects=False):
+        """
+        Show jobs on the shared, machine-wide MD queue (see md_queue.py).
+        Defaults to this project's own jobs; pass all_projects=True to see
+        every project's jobs.
+        """
+        jobs = md_queue.list_jobs(None if all_projects else self.name)
+        scope_label = " (all projects)" if all_projects else f" — project '{self.name}'"
+        if not jobs:
+            print(f"📭 MD queue is empty{scope_label}.")
+            return jobs
+
+        status_glyphs = {
+            'queued': '⏳', 'running': '🔄', 'completed': '✅',
+            'failed': '❌', 'cancelled': '🚫', 'crashed': '💥',
+        }
+        print(f"\n🧬 MD QUEUE{scope_label}:")
+        print("=" * 70)
+        for job in jobs:
+            glyph = status_glyphs.get(job['status'], '❔')
+            print(f"{glyph} Queue ID: {job['queue_id']}  |  Project: {job['project_name']}  |  "
+                  f"Assay: {job['md_assay_label']} (assay_id={job['assay_id']})")
+            print(f"   Status: {job['status']}  |  Enqueued: {job['enqueued_at']}  |  "
+                  f"Started: {job['started_at'] or '-'}  |  Finished: {job['finished_at'] or '-'}")
+            if job['error_message']:
+                print(f"   ⚠️  {job['error_message']}")
+            print("-" * 70)
+        return jobs
+
+    def cancel_md_queue_job(self, queue_id):
+        """Cancel a job on the shared MD queue that has not started running yet."""
+        success, error = md_queue.cancel_job(queue_id)
+        if success:
+            print(f"✅ Queue job {queue_id} cancelled.")
+        else:
+            print(f"❌ Could not cancel queue job {queue_id}: {error}")
+        return success
+
+    def requeue_md_queue_job(self, queue_id):
+        """
+        Re-queue a failed/crashed/cancelled job on the shared MD queue.
+        Never automatic (see md_queue.py docstring) — a crashed job may have
+        left partially-written AMBER stage files that need a human look
+        before blindly re-running run_md.sh.
+        """
+        success, error = md_queue.requeue_job(queue_id)
+        if success:
+            print(f"✅ Queue job {queue_id} re-queued.")
+            md_queue.ensure_worker_running()
+        else:
+            print(f"❌ Could not re-queue job {queue_id}: {error}")
+        return success
+
     def perform_md_assay_on_receptor(self):
         """
         Configure one or more replica MD simulations starting from a registered
@@ -2335,10 +2434,21 @@ class MolDyn:
                     print("\n❌ Cancelled.")
                     return
 
-            # Optionally start the first replica automatically
-            start_first = 'no'
-            if n_replicas >= 1:
-                start_first = input("\n▶️  Start replica 1 automatically after setup? (yes/no) [default: no]: ").strip().lower() or 'no'
+            # Optionally start the replica(s) automatically. For a single
+            # replica this is the normal interactive fg/queue prompt (see
+            # _start_md_simulation()). For multiple replicas, the only
+            # automatic option is to enqueue all of them — md_queue.py
+            # serializes them machine-wide in creation order (FIFO), which
+            # is exactly "run them one after another, unattended".
+            start_single_replica = 'no'
+            queue_all_replicas = 'no'
+            if n_replicas == 1:
+                start_single_replica = input("\n▶️  Start this replica now? (yes/no) [default: no]: ").strip().lower() or 'no'
+            else:
+                queue_all_replicas = input(
+                    "\n▶️  Enqueue all replicas to run automatically, one after another, "
+                    "via the shared MD queue? (yes/no) [default: no]: "
+                ).strip().lower() or 'no'
 
             print(f"\n🔁 Creating {n_replicas} replica(s) for template '{template_dict['pdb_template_name']}'...")
 
@@ -2398,14 +2508,17 @@ class MolDyn:
 
                     print(f"✅ {replica_label.capitalize()} prepared in: {md_assay_folder}")
 
-                    # Auto-start only for the first replica if the user requested it
-                    if replica_idx == 1 and start_first in ['yes', 'y']:
-                        bg_info = self._start_md_simulation(md_assay_folder)
-                    else:
-                        if replica_idx == 1:
-                            print(f"ℹ️  Replica 1 not started. Run the execution script manually when ready.")
+                    if n_replicas == 1:
+                        if start_single_replica in ['yes', 'y']:
+                            bg_info = self._start_md_simulation(md_assay_folder, md_assay_id, md_assay_label=f'assay_{md_assay_id}')
                         else:
-                            print(f"ℹ️  {replica_label.capitalize()} requires manual start: {md_assay_folder}")
+                            print(f"ℹ️  Replica 1 not started. Run the execution script manually when ready.")
+                    elif queue_all_replicas in ['yes', 'y']:
+                        bg_info = self._start_md_simulation(
+                            md_assay_folder, md_assay_id, md_assay_label=f'assay_{md_assay_id}', mode='queue',
+                        )
+                    else:
+                        print(f"ℹ️  {replica_label.capitalize()} requires manual start: {md_assay_folder}")
 
                 except Exception as e:
                     print(f"\n❌ Error setting up {replica_label}: {e}")
