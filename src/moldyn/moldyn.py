@@ -3029,6 +3029,30 @@ class MolDyn:
             ).strip().lower() or 'no'
             params['keep_files'] = keep_str in ['yes', 'y']
 
+            # Parallel execution via MMPBSA.py.MPI (mpirun). A multi-frame trajectory
+            # benefits from splitting frames across MPI ranks; MMPBSA.py.MPI mirrors
+            # the serial MMPBSA.py CLI and is invoked as `mpirun -np N MMPBSA.py.MPI ...`.
+            mpi_str = input(
+                "\nParallelize using MMPBSA.py.MPI (mpirun)? (yes/no) [default: yes]: "
+            ).strip().lower() or 'yes'
+            params['use_mpi'] = mpi_str in ['yes', 'y']
+
+            if params['use_mpi']:
+                nproc_str = input(
+                    "Number of processors to use [default: 8]: "
+                ).strip() or '8'
+                try:
+                    n_processors = int(nproc_str)
+                    if n_processors < 1:
+                        print("⚠️  Invalid processor count, defaulting to 8")
+                        n_processors = 8
+                except ValueError:
+                    print("⚠️  Invalid processor count, defaulting to 8")
+                    n_processors = 8
+                params['n_processors'] = n_processors
+            else:
+                params['n_processors'] = 1
+
             print(f"\n✅ MM-GBSA parameters configured:")
             print(f"   Ligand mask : {params['ligand_mask']}")
             print(f"   Strip mask  : {params['strip_mask']}")
@@ -3036,6 +3060,10 @@ class MolDyn:
             print(f"   Salt conc.  : {params['saltcon']} M")
             print(f"   Frames      : {params['startframe']} to {params['endframe']}, every {params['interval']}")
             print(f"   Per-residue : {'yes' if params['per_residue'] else 'no'}")
+            if params['use_mpi']:
+                print(f"   Execution   : parallel (MMPBSA.py.MPI, {params['n_processors']} processors)")
+            else:
+                print(f"   Execution   : serial (MMPBSA.py)")
             return params
 
         except KeyboardInterrupt:
@@ -3206,8 +3234,41 @@ class MolDyn:
         amber_bin = os.path.expanduser('~/Programas/Amber26/ambertools26/bin')
         amber_path_export = f"export PATH={amber_bin}:$PATH"
 
+        # MMPBSA.py / MMPBSA.py.MPI are pulled from the 'tidyscreen' conda env when
+        # present there, since that is the environment whose Python (and mpi4py, for
+        # the MPI variant) they are meant to run under; fall back to PATH / AmberTools.
+        tidyscreen_conda_bin = os.path.expanduser('~/anaconda3/envs/tidyscreen/bin')
+
+        def _resolve_mmpbsa_bin(name):
+            conda_path = os.path.join(tidyscreen_conda_bin, name)
+            if os.path.exists(conda_path):
+                return conda_path
+            return _shutil.which(name) or os.path.join(amber_bin, name)
+
         ante_bin = _shutil.which('ante-MMPBSA.py') or os.path.join(amber_bin, 'ante-MMPBSA.py')
-        mmpbsa_bin = _shutil.which('MMPBSA.py') or os.path.join(amber_bin, 'MMPBSA.py')
+        mmpbsa_bin = _resolve_mmpbsa_bin('MMPBSA.py')
+        mmpbsa_mpi_bin = _resolve_mmpbsa_bin('MMPBSA.py.MPI')
+
+        # mpirun: tidyscreen_installation.sh installs mpi4py + mpich into the
+        # 'tidyscreen' conda env itself, so mpirun there is guaranteed to match the
+        # mpi4py that MMPBSA.py.MPI in that same env was built against. Prefer that
+        # pairing; fall back to whatever is on PATH, then to the base anaconda env
+        # (older installs that predate the mpi4py/mpich addition put mpirun there
+        # instead), then to a bare name as a last resort.
+        base_conda_bin = os.path.expanduser('~/anaconda3/bin')
+
+        def _first_existing(*candidates):
+            for c in candidates:
+                if c and os.path.exists(c):
+                    return c
+            return None
+
+        mpirun_bin = (
+            _first_existing(os.path.join(tidyscreen_conda_bin, 'mpirun'))
+            or _shutil.which('mpirun')
+            or _first_existing(os.path.join(base_conda_bin, 'mpirun'))
+            or 'mpirun'
+        )
 
         script_path      = os.path.join(mmgbsa_folder, 'run_mmgbsa.sh')
         ante_log         = os.path.join(mmgbsa_folder, 'ante_mmpbsa.log')
@@ -3263,9 +3324,15 @@ class MolDyn:
                 f.write(f"cpptraj -i {cpptraj_in} > {cpptraj_log} 2>&1\n")
                 f.write('echo "   cpptraj trajectory processing done"\n\n')
 
-                # --- Step 3: MMPBSA.py ---
-                f.write('echo "--- Step 3: MMPBSA.py (MM-GBSA calculation) ---"\n')
-                f.write(f"MMPBSA.py -O \\\n")
+                # --- Step 3: MMPBSA.py (serial) or MMPBSA.py.MPI (parallel) ---
+                use_mpi = mmgbsa_params.get('use_mpi', False)
+                n_processors = mmgbsa_params.get('n_processors', 8)
+                if use_mpi:
+                    f.write(f'echo "--- Step 3: MMPBSA.py.MPI (MM-GBSA calculation, {n_processors} processors) ---"\n')
+                    f.write(f"{mpirun_bin} -np {n_processors} {mmpbsa_mpi_bin} -O \\\n")
+                else:
+                    f.write('echo "--- Step 3: MMPBSA.py (MM-GBSA calculation) ---"\n')
+                    f.write(f"{mmpbsa_bin} -O \\\n")
                 f.write(f"    -i  {mmgbsa_in} \\\n")
                 f.write(f"    -o  {results_dat} \\\n")
                 f.write(f"    -eo {energies_csv} \\\n")

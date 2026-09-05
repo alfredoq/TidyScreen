@@ -75,6 +75,12 @@ conda run -n $ENV_NAME pip install git+https://github.com/alfredoq/TidyScreen@de
 
 echo "y" | conda install -n $ENV_NAME -c conda-forge ambertools==23.6 espaloma espaloma_charge chemicalite visidata vmd-python vina pdbfixer prolif
 
+# mpi4py + mpich provide 'mpirun' inside the TidyScreen environment itself, matched
+# against the same environment's ambertools MMPBSA.py.MPI (mpi4py must be built
+# against the MPI implementation that launches it, so both are installed together
+# here rather than relying on mpirun from an unrelated conda env).
+echo "y" | conda install -n $ENV_NAME -c conda-forge mpi4py mpich
+
 conda run -n $ENV_NAME pip install git+https://github.com/forlilab/Meeko@develop
 
 echo "y" | conda install -n $ENV_NAME -c bioconda autodock autogrid
