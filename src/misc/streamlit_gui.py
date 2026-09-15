@@ -623,7 +623,9 @@ elif page == "ChemSpace Inspection":
     db_path = os.path.join(st.session_state["active_project_path"], "chemspace", "processed_data", "chemspace.db")
     _chemspace_table_sigs = st_funcs.get_table_signatures(db_path)
     df = st_funcs.get_tables_info(db_path, signatures=_chemspace_table_sigs)
-    
+    if not df.empty:
+        df = df.sort_values("table", key=lambda s: s.str.lower()).reset_index(drop=True)
+
     ## Create a button to show the project tables info DataFrame
     if "show_tables_info" not in st.session_state:
         st.session_state["show_tables_info"] = False
