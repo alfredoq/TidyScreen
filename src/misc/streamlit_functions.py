@@ -2176,6 +2176,126 @@ def get_training_set_interaction_frequencies(project_path: str, training_set_id:
         return None
 
 
+def _interaction_seq_sort_key(name: str):
+    first = name.split("_")[0]
+    try:
+        return (int(first), name)
+    except ValueError:
+        return (0, name)
+
+
+def get_binder_pose_fingerprints(project_path: str, assay_name: str, pose_file: str) -> "list[dict] | None":
+    """
+    Retrieve all computed ProLIF fingerprints for a single pose registered in the
+    Positive/Negative Binders registry, read directly from its docking assay's
+    results database (populated by MolDock.compute_fingerprints()).
+
+    Unlike get_training_set_fingerprints_for_pose(), this doesn't require the pose
+    to belong to a consolidated training-set snapshot; it works for any pose still
+    tracked in the raw binders registry.
+
+    Args:
+        project_path (str): Root path of the active project.
+        assay_name (str): Name of the docking assay the pose belongs to.
+        pose_file (str): PDB filename of the pose ('{LigName}_{run_number}.pdb').
+
+    Returns:
+        List of dicts with keys 'prolif_conditions_id' and 'fingerprint' (dict of
+        interaction->bool), ordered by prolif_conditions_id. Returns None if the
+        assay's results DB, the pose, or any fingerprint can't be found.
+    """
+    results_db_path = os.path.join(project_path, "docking", "docking_assays", assay_name, "results", f"{assay_name}.db")
+    if not os.path.exists(results_db_path):
+        return None
+    pose_info = get_filename_to_pose_id_map(results_db_path).get(pose_file)
+    if not pose_info:
+        return None
+    pose_id = pose_info["pose_id"]
+    tables = get_prolif_tables_by_pose_ids(results_db_path, [pose_id])
+    if not tables:
+        return None
+
+    def _cond_id(table_name):
+        try:
+            return int(table_name.rsplit("_", 1)[-1])
+        except ValueError:
+            return table_name
+
+    entries = []
+    for table in sorted(tables, key=_cond_id):
+        df = get_prolif_fingerprint_for_pose(results_db_path, table, pose_id)
+        if df is None or df.empty:
+            continue
+        fingerprint = {col: bool(val) for col, val in df.iloc[0].items()}
+        entries.append({"prolif_conditions_id": _cond_id(table), "fingerprint": fingerprint})
+    return entries or None
+
+
+def _iter_binder_registry_fingerprints(project_path: str, binder_type: str, prolif_conditions_id: int):
+    """
+    Yield the flattened fingerprint dict for every pose in the positive/negative
+    binders registry that has a fingerprint stored under prolif_conditions_id,
+    resolving each pose's results DB from its own assay_name (poses in a single
+    registry may come from different docking assays).
+    """
+    df = get_binders_registry(project_path, binder_type)
+    if df is None or df.empty:
+        return
+    table_name = f"processed_prolif_fps_json_condition_{prolif_conditions_id}"
+    filename_maps = {}
+    for _, row in df.iterrows():
+        assay_name = row["assay_name"]
+        if assay_name not in filename_maps:
+            results_db_path = os.path.join(project_path, "docking", "docking_assays", assay_name, "results", f"{assay_name}.db")
+            fmap = get_filename_to_pose_id_map(results_db_path) if os.path.exists(results_db_path) else {}
+            filename_maps[assay_name] = (results_db_path, fmap)
+        results_db_path, fmap = filename_maps[assay_name]
+        pose_info = fmap.get(row["pose_file"])
+        if not pose_info:
+            continue
+        df_fp = get_prolif_fingerprint_for_pose(results_db_path, table_name, pose_info["pose_id"])
+        if df_fp is None or df_fp.empty:
+            continue
+        yield {col: bool(val) for col, val in df_fp.iloc[0].items()}
+
+
+def get_binder_registry_all_interactions(project_path: str, binder_type: str, prolif_conditions_id: int) -> "list[str]":
+    """
+    Return a sorted list of all unique interaction keys present across every pose
+    in the positive/negative binders registry for a given ProLIF conditions ID.
+    """
+    all_keys: set = set()
+    for fp in _iter_binder_registry_fingerprints(project_path, binder_type, prolif_conditions_id):
+        all_keys.update(fp.keys())
+    return sorted(all_keys, key=_interaction_seq_sort_key)
+
+
+def get_binder_registry_interaction_frequencies(project_path: str, binder_type: str, prolif_conditions_id: int) -> "pd.DataFrame | None":
+    """
+    Compute the frequency (count and percentage) of each interaction across all
+    poses in the positive/negative binders registry for a given ProLIF conditions ID.
+
+    Returns:
+        DataFrame with columns ['Interaction', 'Count', 'Frequency (%)'].
+        Returns None if no fingerprint data is found.
+    """
+    counts: dict = {}
+    n_poses = 0
+    for fp in _iter_binder_registry_fingerprints(project_path, binder_type, prolif_conditions_id):
+        n_poses += 1
+        for k, v in fp.items():
+            if v:
+                counts[k] = counts.get(k, 0) + 1
+    if not counts or n_poses == 0:
+        return None
+    df = pd.DataFrame([
+        {"Interaction": k, "Count": v, "Frequency (%)": round(100.0 * v / n_poses, 1)}
+        for k, v in counts.items()
+    ])
+    df = df.iloc[sorted(range(len(df)), key=lambda i: _interaction_seq_sort_key(df["Interaction"].iloc[i]))].reset_index(drop=True)
+    return df
+
+
 def restore_binders_from_snapshot(project_path: str, training_set_id: str) -> "dict | str":
     """
     Repopulate the Positive and Negative Binders tables from a training set snapshot.
