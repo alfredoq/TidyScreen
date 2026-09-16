@@ -4119,6 +4119,17 @@ elif page == "Docking analysis":
                                     if selected_file:
                                         st.session_state[idx_key] = pdb_names.index(selected_file)
 
+                                ## ProLIF fingerprint availability for this directory — decides
+                                ## whether the viewer shares the row with a fingerprint side panel,
+                                ## mirroring the pose viewer under ML features management ->
+                                ## Training Set Registries.
+                                dir_name = entry['directory']
+                                dir_pose_ids = [
+                                    filename_to_pose_id[f]["pose_id"]
+                                    for f in pdb_names if f in filename_to_pose_id
+                                ]
+                                prolif_tables_dir = st_funcs.get_prolif_tables_by_pose_ids(results_db_path, dir_pose_ids)
+
                                 if selected_file:
                                     full_path = os.path.join(entry["path"], selected_file)
                                     with open(full_path, "r") as f:
@@ -4133,256 +4144,234 @@ elif page == "Docking analysis":
                                         view.setStyle({"model": 1}, {"sphere": {"colorscheme": "elementColors", "scale": 0.3, "opacity": 0.6}, "stick": {"colorscheme": "elementColors", "opacity": 0.6}})
                                     view.zoomTo()
 
-                                    ## Navigation prev/next arrow buttons flanking the viewer
-                                    current_idx = st.session_state[idx_key]
-                                    has_ref = st.session_state.get("reference_pdb_data")
-                                    prev_col, viewer_col, next_col = st.columns([0.5, 8, 0.5 if not has_ref else 1])
-                                    with prev_col:
-                                        st.write("")  ## vertical alignment spacer
-                                        st.write("")
-                                        st.write("")
-                                        if st.button("◀ (←)", key=f"prev_pose_{entry['directory']}", disabled=(current_idx == 0)):
-                                            st.session_state[idx_key] = current_idx - 1
-                                            st.rerun()
-                                    with viewer_col:
-                                        st.components.v1.html(view.write_html(), height=520)
-                                    with next_col:
-                                        st.write("")
-                                        st.write("")
-                                        st.write("")
-                                        if st.button("▶ (→)", key=f"next_pose_{entry['directory']}", disabled=(current_idx >= len(pdb_names) - 1)):
-                                            st.session_state[idx_key] = current_idx + 1
-                                            st.rerun()
-                                        if has_ref:
+                                    if prolif_tables_dir:
+                                        _viewer_area_dir, _fp_area_dir = st.columns([3, 2])
+                                    else:
+                                        _viewer_area_dir = st.container()
+                                        _fp_area_dir = None
+
+                                    with _viewer_area_dir:
+                                        ## Navigation prev/next arrow buttons flanking the viewer
+                                        current_idx = st.session_state[idx_key]
+                                        has_ref = st.session_state.get("reference_pdb_data")
+                                        prev_col, viewer_col, next_col = st.columns([0.5, 8, 0.5 if not has_ref else 1])
+                                        with prev_col:
+                                            st.write("")  ## vertical alignment spacer
                                             st.write("")
-                                            flag_pos_key = f"flag_pos_{entry['directory']}_{selected_file}"
-                                            if st.button("✅ Flag positive binding pose (Y)", key=flag_pos_key):
-                                                result = st_funcs.save_positive_binder(
-                                                    project_path=st.session_state["active_project_path"],
-                                                    assay_name=st.session_state.get("selected_assay_name", "unknown"),
-                                                    pose_file=selected_file,
-                                                    directory=entry["directory"],
-                                                    pose_full_path=full_path,
-                                                )
-                                                if result == "saved":
-                                                    st.success(f"Saved: {selected_file}")
-                                                elif result == "duplicate":
-                                                    st.warning("Already flagged as positive.")
-                                                elif result == "conflict":
-                                                    st.error("Already flagged as negative binder.")
-                                                else:
-                                                    st.error(result)
-                                            flag_neg_key = f"flag_neg_{entry['directory']}_{selected_file}"
-                                            if st.button("❌ Flag negative binding pose (N)", key=flag_neg_key):
-                                                result = st_funcs.save_negative_binder(
-                                                    project_path=st.session_state["active_project_path"],
-                                                    assay_name=st.session_state.get("selected_assay_name", "unknown"),
-                                                    pose_file=selected_file,
-                                                    directory=entry["directory"],
-                                                    pose_full_path=full_path,
-                                                )
-                                                if result == "saved":
-                                                    st.success(f"Saved: {selected_file}")
-                                                elif result == "duplicate":
-                                                    st.warning("Already flagged as negative.")
-                                                elif result == "conflict":
-                                                    st.error("Already flagged as positive binder.")
-                                                else:
-                                                    st.error(result)
-
-                                    ## Keyboard shortcuts for the buttons above: Left/Right arrows
-                                    ## navigate prev/next, Y flags positive, N flags negative.
-                                    ## Streamlit has no native keybinding API, so this injects a
-                                    ## hidden component whose JS reaches into the parent document
-                                    ## (components render in a same-origin iframe) and clicks the
-                                    ## matching button by its visible label. Ignored while a text
-                                    ## field/select is focused, or a modifier key is held, so it
-                                    ## doesn't hijack normal typing or browser shortcuts.
-                                    st.components.v1.html(
-                                        """
-                                        <script>
-                                        (function() {
-                                            const doc = window.parent.document;
-                                            if (window.parent.__tsPoseKeyHandler) {
-                                                doc.removeEventListener('keydown', window.parent.__tsPoseKeyHandler);
-                                            }
-                                            function clickButtonByPrefix(prefix) {
-                                                const buttons = doc.querySelectorAll('button');
-                                                for (const btn of buttons) {
-                                                    if (btn.textContent.trim().startsWith(prefix) && !btn.disabled) {
-                                                        btn.click();
-                                                        return true;
-                                                    }
-                                                }
-                                                return false;
-                                            }
-                                            function handler(e) {
-                                                const active = doc.activeElement;
-                                                const tag = active ? active.tagName : '';
-                                                if (tag === 'INPUT' || tag === 'TEXTAREA' || (active && active.isContentEditable)) return;
-                                                if (e.ctrlKey || e.metaKey || e.altKey) return;
-                                                if (e.key === 'ArrowLeft') { clickButtonByPrefix('◀'); }
-                                                else if (e.key === 'ArrowRight') { clickButtonByPrefix('▶'); }
-                                                else if (e.key === 'y' || e.key === 'Y') { clickButtonByPrefix('✅ Flag positive binding pose'); }
-                                                else if (e.key === 'n' || e.key === 'N') { clickButtonByPrefix('❌ Flag negative binding pose'); }
-                                            }
-                                            window.parent.__tsPoseKeyHandler = handler;
-                                            doc.addEventListener('keydown', handler);
-                                        })();
-                                        </script>
-                                        """,
-                                        height=0,
-                                    )
-
-                                    ## pose counter label
-                                    pose_info = filename_to_pose_id.get(selected_file, {})
-                                    pose_id_label = pose_info.get("pose_id", "?")
-                                    lig_label = pose_info["ligname"] if pose_info else "?"
-                                    st.caption(f"Pose ID: {pose_id_label}  |  {lig_label}  ({current_idx + 1} of {len(pdb_names)})")
-
-                                    ## VMD script creation
-                                    with st.expander("🎬 Create VMD Script", expanded=False):
-                                        _default_vmd_path = os.path.join(
-                                            os.path.expanduser("~"), "Desktop",
-                                            os.path.splitext(selected_file)[0] + "_vmd.tcl"
-                                        )
-                                        _vmd_path = st.text_input(
-                                            "Save script to:",
-                                            value=_default_vmd_path,
-                                            key=f"vmd_path_{entry['directory']}_{selected_file}",
-                                        )
-                                        if st.button("💾 Save VMD Script", key=f"btn_save_vmd_{entry['directory']}_{selected_file}"):
-                                            try:
-                                                _ref_pdb_path = None
-                                                if st.session_state.get("reference_pdb_data"):
-                                                    _ref_pdb_path = os.path.join(
-                                                        os.path.dirname(os.path.abspath(_vmd_path.strip())),
-                                                        "reference.pdb"
+                                            st.write("")
+                                            if st.button("◀ (←)", key=f"prev_pose_{entry['directory']}", disabled=(current_idx == 0)):
+                                                st.session_state[idx_key] = current_idx - 1
+                                                st.rerun()
+                                        with viewer_col:
+                                            st.components.v1.html(view.write_html(), height=520)
+                                        with next_col:
+                                            st.write("")
+                                            st.write("")
+                                            st.write("")
+                                            if st.button("▶ (→)", key=f"next_pose_{entry['directory']}", disabled=(current_idx >= len(pdb_names) - 1)):
+                                                st.session_state[idx_key] = current_idx + 1
+                                                st.rerun()
+                                            if has_ref:
+                                                st.write("")
+                                                flag_pos_key = f"flag_pos_{entry['directory']}_{selected_file}"
+                                                if st.button("✅ Flag positive binding pose (Y)", key=flag_pos_key):
+                                                    result = st_funcs.save_positive_binder(
+                                                        project_path=st.session_state["active_project_path"],
+                                                        assay_name=st.session_state.get("selected_assay_name", "unknown"),
+                                                        pose_file=selected_file,
+                                                        directory=entry["directory"],
+                                                        pose_full_path=full_path,
                                                     )
-                                                    with open(_ref_pdb_path, "w") as _rf:
-                                                        _rf.write(st.session_state["reference_pdb_data"])
-                                                _script = st_funcs.generate_vmd_script(
-                                                    os.path.abspath(full_path), _ref_pdb_path
-                                                )
-                                                _vmd_out = _vmd_path.strip()
-                                                os.makedirs(os.path.dirname(os.path.abspath(_vmd_out)), exist_ok=True)
-                                                with open(_vmd_out, "w") as _sf:
-                                                    _sf.write(_script)
-                                                st.success(f"VMD script saved to: {_vmd_out}")
-                                                if _ref_pdb_path:
-                                                    st.info(f"Reference PDB saved alongside: {_ref_pdb_path}")
-                                            except Exception as _e:
-                                                st.error(f"Could not save VMD script: {_e}")
+                                                    if result == "saved":
+                                                        st.success(f"Saved: {selected_file}")
+                                                    elif result == "duplicate":
+                                                        st.warning("Already flagged as positive.")
+                                                    elif result == "conflict":
+                                                        st.error("Already flagged as negative binder.")
+                                                    else:
+                                                        st.error(result)
+                                                flag_neg_key = f"flag_neg_{entry['directory']}_{selected_file}"
+                                                if st.button("❌ Flag negative binding pose (N)", key=flag_neg_key):
+                                                    result = st_funcs.save_negative_binder(
+                                                        project_path=st.session_state["active_project_path"],
+                                                        assay_name=st.session_state.get("selected_assay_name", "unknown"),
+                                                        pose_file=selected_file,
+                                                        directory=entry["directory"],
+                                                        pose_full_path=full_path,
+                                                    )
+                                                    if result == "saved":
+                                                        st.success(f"Saved: {selected_file}")
+                                                    elif result == "duplicate":
+                                                        st.warning("Already flagged as negative.")
+                                                    elif result == "conflict":
+                                                        st.error("Already flagged as positive binder.")
+                                                    else:
+                                                        st.error(result)
 
-                                    ## Export the currently visualized pose to a .pdb file
-                                    with st.expander("📄 Export pose PDB", expanded=False):
-                                        _default_pdb_path = os.path.join(
-                                            os.path.expanduser("~"), "Desktop",
-                                            os.path.splitext(selected_file)[0] + ".pdb"
+                                        ## Keyboard shortcuts for the buttons above: Left/Right arrows
+                                        ## navigate prev/next, Y flags positive, N flags negative.
+                                        ## Streamlit has no native keybinding API, so this injects a
+                                        ## hidden component whose JS reaches into the parent document
+                                        ## (components render in a same-origin iframe) and clicks the
+                                        ## matching button by its visible label. Ignored while a text
+                                        ## field/select is focused, or a modifier key is held, so it
+                                        ## doesn't hijack normal typing or browser shortcuts.
+                                        st.components.v1.html(
+                                            """
+                                            <script>
+                                            (function() {
+                                                const doc = window.parent.document;
+                                                if (window.parent.__tsPoseKeyHandler) {
+                                                    doc.removeEventListener('keydown', window.parent.__tsPoseKeyHandler);
+                                                }
+                                                function clickButtonByPrefix(prefix) {
+                                                    const buttons = doc.querySelectorAll('button');
+                                                    for (const btn of buttons) {
+                                                        if (btn.textContent.trim().startsWith(prefix) && !btn.disabled) {
+                                                            btn.click();
+                                                            return true;
+                                                        }
+                                                    }
+                                                    return false;
+                                                }
+                                                function handler(e) {
+                                                    const active = doc.activeElement;
+                                                    const tag = active ? active.tagName : '';
+                                                    if (tag === 'INPUT' || tag === 'TEXTAREA' || (active && active.isContentEditable)) return;
+                                                    if (e.ctrlKey || e.metaKey || e.altKey) return;
+                                                    if (e.key === 'ArrowLeft') { clickButtonByPrefix('◀'); }
+                                                    else if (e.key === 'ArrowRight') { clickButtonByPrefix('▶'); }
+                                                    else if (e.key === 'y' || e.key === 'Y') { clickButtonByPrefix('✅ Flag positive binding pose'); }
+                                                    else if (e.key === 'n' || e.key === 'N') { clickButtonByPrefix('❌ Flag negative binding pose'); }
+                                                }
+                                                window.parent.__tsPoseKeyHandler = handler;
+                                                doc.addEventListener('keydown', handler);
+                                            })();
+                                            </script>
+                                            """,
+                                            height=0,
                                         )
-                                        _export_pdb_path = st.text_input(
-                                            "Save pose PDB to:",
-                                            value=_default_pdb_path,
-                                            key=f"export_pdb_path_{entry['directory']}_{selected_file}",
-                                        )
-                                        if st.button("💾 Save pose PDB", key=f"btn_export_pdb_{entry['directory']}_{selected_file}"):
-                                            try:
-                                                _pdb_out = _export_pdb_path.strip()
-                                                os.makedirs(os.path.dirname(os.path.abspath(_pdb_out)), exist_ok=True)
-                                                with open(_pdb_out, "w") as _pf:
-                                                    _pf.write(pdb_data)
-                                                st.success(f"Pose PDB saved to: {_pdb_out}")
-                                            except Exception as _e:
-                                                st.error(f"Could not save pose PDB: {_e}")
 
-                                ## ProLIF Fingerprints for this pose directory — always follows
-                                ## the pose currently selected above (no separate pose picker),
-                                ## so the FPS shown can never drift from the extracted pose set,
-                                ## regardless of which score column was used to extract it.
-                                dir_name = entry['directory']
-                                dir_pose_ids = [
-                                    filename_to_pose_id[f]["pose_id"]
-                                    for f in pdb_names if f in filename_to_pose_id
-                                ]
-                                prolif_tables_dir = st_funcs.get_prolif_tables_by_pose_ids(results_db_path, dir_pose_ids)
-                                prolif_dir_key = f"show_prolif_{dir_name}"
-                                if not prolif_tables_dir:
-                                    _sp, _col = st.columns([2, 8])
-                                    with _col:
-                                        st.button("Show ProLIF Fingerprints", disabled=True, key=f"btn_prolif_disabled_{dir_name}")
-                                else:
-                                    if prolif_dir_key not in st.session_state:
-                                        st.session_state[prolif_dir_key] = False
-                                    _dir_label = {
-                                        "most_stable_poses": "most_stable",
-                                        "most_populated_poses": "most_populated",
-                                        "most_populated_and_stable_poses": "most_populated_and_stable",
-                                        "all_poses": "all_poses",
-                                    }.get(dir_name, dir_name)
-                                    _sp, _col = st.columns([2, 8])
-                                    with _col:
-                                        if st.button(
-                                            f"{'Hide' if st.session_state[prolif_dir_key] else 'Show'} ProLIF FPS - {_dir_label}",
-                                            key=f"btn_prolif_{dir_name}"
-                                        ):
-                                            st.session_state[prolif_dir_key] = not st.session_state[prolif_dir_key]
-                                            st.rerun()
-                                    if st.session_state[prolif_dir_key]:
-                                        selected_table_dir = st.selectbox(
-                                            "Select a ProLIF condition table:",
-                                            prolif_tables_dir,
-                                            key=f"select_prolif_table_{dir_name}"
-                                        )
-                                        pose_label_map = st_funcs.get_pose_labels_for_pose_ids(results_db_path, dir_pose_ids)
-                                        selected_prolif_pose_dir = filename_to_pose_id.get(selected_file, {}).get("pose_id")
-                                        st.caption(
-                                            f"Fingerprints for the pose selected above: "
-                                            f"{pose_label_map.get(selected_prolif_pose_dir, selected_file)}"
-                                        )
-                                        fps_dir_df = st_funcs.get_prolif_fingerprint_for_pose(results_db_path, selected_table_dir, selected_prolif_pose_dir)
-                                        reserved_dir = {"pose_id"}
-                                        all_columns_dir = st_funcs.get_prolif_all_column_names_by_pose_ids(results_db_path, selected_table_dir, dir_pose_ids)
-                                        all_itypes_dir = sorted(set(
-                                            col.split("_")[-1] for col in all_columns_dir if col not in reserved_dir
-                                        ))
-                                        if fps_dir_df is not None and not fps_dir_df.empty:
-                                            st.markdown("**Filter by interaction type:**")
-                                            filter_cols_dir = st.columns(min(len(all_itypes_dir), 6))
-                                            selected_types_dir = []
-                                            for i, itype in enumerate(all_itypes_dir):
-                                                ck_key = f"prolif_filter_{dir_name}_{itype}"
-                                                if ck_key not in st.session_state:
-                                                    st.session_state[ck_key] = True
-                                                if filter_cols_dir[i % len(filter_cols_dir)].checkbox(itype, key=ck_key):
-                                                    selected_types_dir.append(itype)
-                                            keep_dir = [c for c in fps_dir_df.columns
-                                                        if c in reserved_dir or c.split("_")[-1] in selected_types_dir]
-                                            st.dataframe(fps_dir_df[keep_dir], use_container_width=True)
-                                        else:
-                                            st.warning(f"No fingerprint data found for pose {selected_file} in table {selected_table_dir}.")
-                                            selected_types_dir = []
+                                        ## pose counter label
+                                        pose_info = filename_to_pose_id.get(selected_file, {})
+                                        pose_id_label = pose_info.get("pose_id", "?")
+                                        lig_label = pose_info["ligname"] if pose_info else "?"
+                                        st.caption(f"Pose ID: {pose_id_label}  |  {lig_label}  ({current_idx + 1} of {len(pdb_names)})")
 
-                                        show_all_dir_key = f"show_all_prolif_{dir_name}"
-                                        if show_all_dir_key not in st.session_state:
-                                            st.session_state[show_all_dir_key] = False
-                                        _sp, _col = st.columns([3, 7])
-                                        with _col:
+                                        ## VMD script creation
+                                        with st.expander("🎬 Create VMD Script", expanded=False):
+                                            _default_vmd_path = os.path.join(
+                                                os.path.expanduser("~"), "Desktop",
+                                                os.path.splitext(selected_file)[0] + "_vmd.tcl"
+                                            )
+                                            _vmd_path = st.text_input(
+                                                "Save script to:",
+                                                value=_default_vmd_path,
+                                                key=f"vmd_path_{entry['directory']}_{selected_file}",
+                                            )
+                                            if st.button("💾 Save VMD Script", key=f"btn_save_vmd_{entry['directory']}_{selected_file}"):
+                                                try:
+                                                    _ref_pdb_path = None
+                                                    if st.session_state.get("reference_pdb_data"):
+                                                        _ref_pdb_path = os.path.join(
+                                                            os.path.dirname(os.path.abspath(_vmd_path.strip())),
+                                                            "reference.pdb"
+                                                        )
+                                                        with open(_ref_pdb_path, "w") as _rf:
+                                                            _rf.write(st.session_state["reference_pdb_data"])
+                                                    _script = st_funcs.generate_vmd_script(
+                                                        os.path.abspath(full_path), _ref_pdb_path
+                                                    )
+                                                    _vmd_out = _vmd_path.strip()
+                                                    os.makedirs(os.path.dirname(os.path.abspath(_vmd_out)), exist_ok=True)
+                                                    with open(_vmd_out, "w") as _sf:
+                                                        _sf.write(_script)
+                                                    st.success(f"VMD script saved to: {_vmd_out}")
+                                                    if _ref_pdb_path:
+                                                        st.info(f"Reference PDB saved alongside: {_ref_pdb_path}")
+                                                except Exception as _e:
+                                                    st.error(f"Could not save VMD script: {_e}")
+
+                                        ## Export the currently visualized pose to a .pdb file
+                                        with st.expander("📄 Export pose PDB", expanded=False):
+                                            _default_pdb_path = os.path.join(
+                                                os.path.expanduser("~"), "Desktop",
+                                                os.path.splitext(selected_file)[0] + ".pdb"
+                                            )
+                                            _export_pdb_path = st.text_input(
+                                                "Save pose PDB to:",
+                                                value=_default_pdb_path,
+                                                key=f"export_pdb_path_{entry['directory']}_{selected_file}",
+                                            )
+                                            if st.button("💾 Save pose PDB", key=f"btn_export_pdb_{entry['directory']}_{selected_file}"):
+                                                try:
+                                                    _pdb_out = _export_pdb_path.strip()
+                                                    os.makedirs(os.path.dirname(os.path.abspath(_pdb_out)), exist_ok=True)
+                                                    with open(_pdb_out, "w") as _pf:
+                                                        _pf.write(pdb_data)
+                                                    st.success(f"Pose PDB saved to: {_pdb_out}")
+                                                except Exception as _e:
+                                                    st.error(f"Could not save pose PDB: {_e}")
+
+                                    ## ProLIF Fingerprints side panel — always follows the pose
+                                    ## currently selected in the viewer (no separate pose picker),
+                                    ## so the FPS shown can never drift from the extracted pose set,
+                                    ## regardless of which score column was used to extract it.
+                                    if _fp_area_dir is not None:
+                                        with _fp_area_dir:
+                                            st.markdown("##### 🔬 ProLIF Fingerprints")
+                                            selected_table_dir = st.selectbox(
+                                                "Select a ProLIF condition table:",
+                                                prolif_tables_dir,
+                                                key=f"select_prolif_table_{dir_name}"
+                                            )
+                                            pose_label_map = st_funcs.get_pose_labels_for_pose_ids(results_db_path, dir_pose_ids)
+                                            selected_prolif_pose_dir = filename_to_pose_id.get(selected_file, {}).get("pose_id")
+                                            st.caption(
+                                                f"Fingerprints for the pose selected above: "
+                                                f"{pose_label_map.get(selected_prolif_pose_dir, selected_file)}"
+                                            )
+                                            fps_dir_df = st_funcs.get_prolif_fingerprint_for_pose(results_db_path, selected_table_dir, selected_prolif_pose_dir)
+                                            reserved_dir = {"pose_id"}
+                                            all_columns_dir = st_funcs.get_prolif_all_column_names_by_pose_ids(results_db_path, selected_table_dir, dir_pose_ids)
+                                            all_itypes_dir = sorted(set(
+                                                col.split("_")[-1] for col in all_columns_dir if col not in reserved_dir
+                                            ))
+                                            if fps_dir_df is not None and not fps_dir_df.empty:
+                                                with st.expander("Filter by interaction type", expanded=False):
+                                                    selected_types_dir = []
+                                                    for itype in all_itypes_dir:
+                                                        ck_key = f"prolif_filter_{dir_name}_{itype}"
+                                                        if ck_key not in st.session_state:
+                                                            st.session_state[ck_key] = True
+                                                        if st.checkbox(itype, key=ck_key):
+                                                            selected_types_dir.append(itype)
+                                                keep_dir = [c for c in fps_dir_df.columns
+                                                            if c in reserved_dir or c.split("_")[-1] in selected_types_dir]
+                                                st.dataframe(fps_dir_df[keep_dir], use_container_width=True, hide_index=True)
+                                            else:
+                                                st.warning(f"No fingerprint data found for pose {selected_file} in table {selected_table_dir}.")
+                                                selected_types_dir = []
+
+                                            show_all_dir_key = f"show_all_prolif_{dir_name}"
+                                            if show_all_dir_key not in st.session_state:
+                                                st.session_state[show_all_dir_key] = False
                                             if st.button(
                                                 f"{'Hide' if st.session_state[show_all_dir_key] else 'Show'} all fingerprints for {selected_table_dir}",
                                                 key=f"btn_all_prolif_{dir_name}"
                                             ):
                                                 st.session_state[show_all_dir_key] = not st.session_state[show_all_dir_key]
                                                 st.rerun()
-                                        if st.session_state[show_all_dir_key]:
-                                            all_fps_dir_df = st_funcs.get_all_prolif_fingerprints_by_pose_ids(results_db_path, selected_table_dir, dir_pose_ids)
-                                            if all_fps_dir_df is not None and not all_fps_dir_df.empty:
-                                                all_fps_dir_df.insert(1, "pose_name", all_fps_dir_df["pose_id"].map(lambda pid: pose_label_map.get(pid, str(pid))))
-                                                all_fps_dir_df = all_fps_dir_df.sort_values("pose_name").reset_index(drop=True)
-                                                keep_all_dir = [c for c in all_fps_dir_df.columns
-                                                                if c in reserved_dir | {"pose_name"} or c.split("_")[-1] in selected_types_dir]
-                                                st.dataframe(all_fps_dir_df[keep_all_dir], use_container_width=True)
-                                            else:
-                                                st.warning("Could not retrieve fingerprints for all poses.")
+                                            if st.session_state[show_all_dir_key]:
+                                                all_fps_dir_df = st_funcs.get_all_prolif_fingerprints_by_pose_ids(results_db_path, selected_table_dir, dir_pose_ids)
+                                                if all_fps_dir_df is not None and not all_fps_dir_df.empty:
+                                                    all_fps_dir_df.insert(1, "pose_name", all_fps_dir_df["pose_id"].map(lambda pid: pose_label_map.get(pid, str(pid))))
+                                                    all_fps_dir_df = all_fps_dir_df.sort_values("pose_name").reset_index(drop=True)
+                                                    keep_all_dir = [c for c in all_fps_dir_df.columns
+                                                                    if c in reserved_dir | {"pose_name"} or c.split("_")[-1] in selected_types_dir]
+                                                    st.dataframe(all_fps_dir_df[keep_all_dir], use_container_width=True)
+                                                else:
+                                                    st.warning("Could not retrieve fingerprints for all poses.")
                                 st.divider()
                         else:
                             _sp, _col = st.columns([1, 9])
