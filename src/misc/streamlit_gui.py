@@ -4134,7 +4134,7 @@ elif page == "Docking analysis":
                                     full_path = os.path.join(entry["path"], selected_file)
                                     with open(full_path, "r") as f:
                                         pdb_data = f.read()
-                                    view = py3Dmol.view(width=800, height=500)
+                                    view = py3Dmol.view(width=480, height=420)
                                     ## Add selected pose (model 0) — stick + spectrum cartoon
                                     view.addModel(pdb_data, "pdb")
                                     view.setStyle({"model": 0}, {"stick": {}, "cartoon": {"color": "spectrum"}})
@@ -4154,7 +4154,7 @@ elif page == "Docking analysis":
                                         ## Navigation prev/next arrow buttons flanking the viewer
                                         current_idx = st.session_state[idx_key]
                                         has_ref = st.session_state.get("reference_pdb_data")
-                                        prev_col, viewer_col, next_col = st.columns([0.5, 8, 0.5 if not has_ref else 1])
+                                        prev_col, viewer_col, next_col = st.columns([0.5, 8, 0.5])
                                         with prev_col:
                                             st.write("")  ## vertical alignment spacer
                                             st.write("")
@@ -4163,7 +4163,7 @@ elif page == "Docking analysis":
                                                 st.session_state[idx_key] = current_idx - 1
                                                 st.rerun()
                                         with viewer_col:
-                                            st.components.v1.html(view.write_html(), height=520)
+                                            st.components.v1.html(view.write_html(), height=430)
                                         with next_col:
                                             st.write("")
                                             st.write("")
@@ -4171,10 +4171,15 @@ elif page == "Docking analysis":
                                             if st.button("▶ (→)", key=f"next_pose_{entry['directory']}", disabled=(current_idx >= len(pdb_names) - 1)):
                                                 st.session_state[idx_key] = current_idx + 1
                                                 st.rerun()
-                                            if has_ref:
-                                                st.write("")
+
+                                        ## Flag buttons — placed below the viewer (not beside it) so
+                                        ## their labels don't crowd/overflow the row when the ProLIF
+                                        ## fingerprint side panel is also present.
+                                        if has_ref:
+                                            _flag_sp_l, _flag_pos_col, _flag_neg_col, _flag_sp_r = st.columns([1, 3, 3, 1])
+                                            with _flag_pos_col:
                                                 flag_pos_key = f"flag_pos_{entry['directory']}_{selected_file}"
-                                                if st.button("✅ Flag positive binding pose (Y)", key=flag_pos_key):
+                                                if st.button("✅ Flag + (Y)", key=flag_pos_key, use_container_width=True):
                                                     result = st_funcs.save_positive_binder(
                                                         project_path=st.session_state["active_project_path"],
                                                         assay_name=st.session_state.get("selected_assay_name", "unknown"),
@@ -4190,8 +4195,9 @@ elif page == "Docking analysis":
                                                         st.error("Already flagged as negative binder.")
                                                     else:
                                                         st.error(result)
+                                            with _flag_neg_col:
                                                 flag_neg_key = f"flag_neg_{entry['directory']}_{selected_file}"
-                                                if st.button("❌ Flag negative binding pose (N)", key=flag_neg_key):
+                                                if st.button("❌ Flag - (N)", key=flag_neg_key, use_container_width=True):
                                                     result = st_funcs.save_negative_binder(
                                                         project_path=st.session_state["active_project_path"],
                                                         assay_name=st.session_state.get("selected_assay_name", "unknown"),
@@ -4241,8 +4247,8 @@ elif page == "Docking analysis":
                                                     if (e.ctrlKey || e.metaKey || e.altKey) return;
                                                     if (e.key === 'ArrowLeft') { clickButtonByPrefix('◀'); }
                                                     else if (e.key === 'ArrowRight') { clickButtonByPrefix('▶'); }
-                                                    else if (e.key === 'y' || e.key === 'Y') { clickButtonByPrefix('✅ Flag positive binding pose'); }
-                                                    else if (e.key === 'n' || e.key === 'N') { clickButtonByPrefix('❌ Flag negative binding pose'); }
+                                                    else if (e.key === 'y' || e.key === 'Y') { clickButtonByPrefix('✅ Flag +'); }
+                                                    else if (e.key === 'n' || e.key === 'N') { clickButtonByPrefix('❌ Flag -'); }
                                                 }
                                                 window.parent.__tsPoseKeyHandler = handler;
                                                 doc.addEventListener('keydown', handler);
@@ -4320,11 +4326,27 @@ elif page == "Docking analysis":
                                     if _fp_area_dir is not None:
                                         with _fp_area_dir:
                                             st.markdown("##### 🔬 ProLIF Fingerprints")
+                                            ## Track the chosen table by index in our own session_state
+                                            ## entry (not just the widget's key). The ◀/▶ pose-nav
+                                            ## buttons above call st.rerun() before this widget is
+                                            ## reached, so on that aborted run it never gets
+                                            ## instantiated and Streamlit drops its key's state —
+                                            ## the next run would otherwise silently fall back to the
+                                            ## first table. Mirrors the pose selectbox's idx_key fix.
+                                            prolif_table_idx_key = f"prolif_table_idx_{dir_name}"
+                                            if prolif_table_idx_key not in st.session_state:
+                                                st.session_state[prolif_table_idx_key] = 0
+                                            st.session_state[prolif_table_idx_key] = max(
+                                                0, min(st.session_state[prolif_table_idx_key], len(prolif_tables_dir) - 1)
+                                            )
                                             selected_table_dir = st.selectbox(
                                                 "Select a ProLIF condition table:",
                                                 prolif_tables_dir,
+                                                index=st.session_state[prolif_table_idx_key],
                                                 key=f"select_prolif_table_{dir_name}"
                                             )
+                                            if selected_table_dir:
+                                                st.session_state[prolif_table_idx_key] = prolif_tables_dir.index(selected_table_dir)
                                             pose_label_map = st_funcs.get_pose_labels_for_pose_ids(results_db_path, dir_pose_ids)
                                             selected_prolif_pose_dir = filename_to_pose_id.get(selected_file, {}).get("pose_id")
                                             st.caption(
