@@ -4361,12 +4361,21 @@ elif page == "Docking analysis":
                                             ))
                                             if fps_dir_df is not None and not fps_dir_df.empty:
                                                 with st.expander("Filter by interaction type", expanded=False):
+                                                    ## Persist per-type choices in our own session_state
+                                                    ## dict (not just the checkbox key): the ◀/▶ pose-nav
+                                                    ## buttons above call st.rerun() before this widget is
+                                                    ## reached, which drops the checkbox's key state and
+                                                    ## would otherwise silently re-check every box.
+                                                    filter_state_key = f"prolif_filter_state_{dir_name}"
+                                                    if filter_state_key not in st.session_state:
+                                                        st.session_state[filter_state_key] = {}
                                                     selected_types_dir = []
                                                     for itype in all_itypes_dir:
                                                         ck_key = f"prolif_filter_{dir_name}_{itype}"
-                                                        if ck_key not in st.session_state:
-                                                            st.session_state[ck_key] = True
-                                                        if st.checkbox(itype, key=ck_key):
+                                                        _default_checked = st.session_state[filter_state_key].get(itype, True)
+                                                        checked = st.checkbox(itype, value=_default_checked, key=ck_key)
+                                                        st.session_state[filter_state_key][itype] = checked
+                                                        if checked:
                                                             selected_types_dir.append(itype)
                                                 keep_dir = [c for c in fps_dir_df.columns
                                                             if c in reserved_dir or c.split("_")[-1] in selected_types_dir]
