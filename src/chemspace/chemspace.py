@@ -1364,6 +1364,184 @@ class ChemSpace:
             print(f"❌ Error renaming table '{old_name}': {e}")
             return None
 
+    def copy_tables_within_projects(self, source_project_name: Optional[str] = None,
+                                     source_table_name: Optional[str] = None,
+                                     dest_table_name: Optional[str] = None) -> Optional[str]:
+        """
+        Copy a table from another project's chemspace database into the active project's
+        chemspace database. The source table's schema (columns, types and constraints such
+        as PRIMARY KEY/UNIQUE) is preserved exactly via its original CREATE TABLE statement,
+        rather than reconstructed, since tables may have been extended beyond the base
+        compounds schema (e.g. extra columns added by later processing steps).
+
+        Args:
+            source_project_name (Optional[str]): Name of the project to copy from. If None,
+                prompts an interactive project selection.
+            source_table_name (Optional[str]): Name of the table to copy from the source
+                project. If None, prompts an interactive table selection.
+            dest_table_name (Optional[str]): Name to give the copied table in the active
+                project. If None, defaults to the source table name (sanitized).
+
+        Returns:
+            Optional[str]: The name of the table created in the active project's database,
+                or None if the operation failed or was cancelled.
+        """
+        from tidyscreen.projects.projects_management import ProjectsManagement
+
+        try:
+            # --- Select source project ---
+            projects_manager = ProjectsManagement()
+            all_projects = projects_manager.list_all_projects(print_output=False) or []
+
+            if not all_projects:
+                print("❌ No projects found in the projects database.")
+                return None
+
+            if source_project_name is None:
+                print("\n📋 Available projects:")
+                for idx, proj in enumerate(all_projects, 1):
+                    marker = " (active)" if proj['name'] == self.name else ""
+                    print(f"  [{idx}] {proj['name']}{marker}")
+                while True:
+                    selection = input("Select source project by number or name (or 'cancel' to abort): ").strip()
+                    if selection.lower() == 'cancel':
+                        print("❌ Operation cancelled by user.")
+                        return None
+                    if selection.isdigit():
+                        idx = int(selection) - 1
+                        if 0 <= idx < len(all_projects):
+                            source_project_name = all_projects[idx]['name']
+                            break
+                        print("⚠️ Invalid selection. Try again.")
+                    else:
+                        matching = [p for p in all_projects if p['name'] == selection]
+                        if matching:
+                            source_project_name = selection
+                            break
+                        print("⚠️ Invalid selection. Try again.")
+
+            source_project = ActivateProject(source_project_name)
+            if not source_project.project_exists():
+                print(f"❌ Project '{source_project_name}' not found.")
+                return None
+
+            source_chemspace_db = os.path.join(source_project.path, 'chemspace', 'processed_data', 'chemspace.db')
+            if not os.path.exists(source_chemspace_db):
+                print(f"❌ ChemSpace database not found for project '{source_project_name}' at {source_chemspace_db}")
+                return None
+
+            # --- Select source table ---
+            source_tables = self.list_tables_at_path(source_chemspace_db)
+            if not source_tables:
+                print(f"❌ No tables found in project '{source_project_name}'.")
+                return None
+
+            if source_table_name is None:
+                source_table_name = self._select_table_interactive(
+                    f"SELECT TABLE TO COPY FROM PROJECT '{source_project_name}'",
+                    show_compound_count=False,
+                    tables_override=source_tables
+                )
+                if not source_table_name:
+                    print("❌ No table selected. Copy cancelled.")
+                    return None
+            elif source_table_name not in source_tables:
+                print(f"❌ Table '{source_table_name}' not found in project '{source_project_name}'.")
+                return None
+
+            # --- Resolve destination table name, checking for a name collision ---
+            if dest_table_name is None:
+                dest_table_name = source_table_name
+            dest_table_name = self._sanitize_table_name(dest_table_name)
+
+            existing_tables = self.get_all_tables()
+            overwrite = False
+
+            while dest_table_name in existing_tables:
+                print(f"\n⚠️  Table '{dest_table_name}' already exists in the active project '{self.name}'.")
+                print("Choose an action:")
+                print("  [1] Overwrite the existing table")
+                print("  [2] Save the copy under a different name")
+                print("  [3] Cancel")
+                action = input("Select action (1/2/3): ").strip()
+
+                if action == '1':
+                    confirm = input(
+                        f"⚠️  This will permanently delete the existing '{dest_table_name}' table in "
+                        f"'{self.name}'. Continue? (yes/no): "
+                    ).strip().lower()
+                    if confirm not in ['yes', 'y']:
+                        print("Overwrite cancelled.")
+                        continue
+                    overwrite = True
+                    break
+                elif action == '2':
+                    new_name = input(f"Enter a new name for the copied table (was '{dest_table_name}'): ").strip()
+                    if not new_name:
+                        print("❌ No name provided.")
+                        continue
+                    dest_table_name = self._sanitize_table_name(new_name)
+                    existing_tables = self.get_all_tables()
+                elif action == '3':
+                    print("❌ Copy cancelled by user.")
+                    return None
+                else:
+                    print("⚠️ Invalid selection. Try again.")
+
+            # --- Perform the copy ---
+            same_database = os.path.abspath(source_chemspace_db) == os.path.abspath(self.__chemspace_db)
+            schema_source = 'main' if same_database else 'src_copy'
+
+            conn = sqlite3.connect(self.__chemspace_db)
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+
+            if not same_database:
+                cursor.execute("ATTACH DATABASE ? AS src_copy", (source_chemspace_db,))
+
+            try:
+                cursor.execute(
+                    f"SELECT sql FROM {schema_source}.sqlite_master WHERE type='table' AND name=?",
+                    (source_table_name,)
+                )
+                schema_row = cursor.fetchone()
+                if not schema_row or not schema_row[0]:
+                    print(f"❌ Could not read schema for table '{source_table_name}'.")
+                    return None
+
+                create_sql = re.sub(
+                    rf'CREATE TABLE\s+["`\[]?{re.escape(source_table_name)}["`\]]?',
+                    f'CREATE TABLE "{dest_table_name}"',
+                    schema_row[0], count=1, flags=re.IGNORECASE
+                )
+
+                if overwrite:
+                    cursor.execute(f'DROP TABLE IF EXISTS "{dest_table_name}"')
+
+                cursor.execute(create_sql)
+                cursor.execute(
+                    f'INSERT INTO "{dest_table_name}" SELECT * FROM {schema_source}."{source_table_name}"'
+                )
+
+                conn.commit()
+
+                cursor.execute(f'SELECT COUNT(*) FROM "{dest_table_name}"')
+                row_count = cursor.fetchone()[0]
+            finally:
+                if not same_database:
+                    cursor.execute("DETACH DATABASE src_copy")
+                conn.close()
+
+            print(f"✅ Copied table '{source_table_name}' from project '{source_project_name}' to "
+                  f"'{dest_table_name}' in project '{self.name}' ({row_count:,} rows).")
+
+            return dest_table_name
+
+        except Exception as e:
+            print(f"❌ Error copying table between projects: {e}")
+            return None
+
     @staticmethod
     def _detect_csv_delimiter_and_header(csv_file_path: str) -> Tuple[Any, Optional[int]]:
         """
