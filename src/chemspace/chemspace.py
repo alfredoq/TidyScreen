@@ -2115,7 +2115,10 @@ class ChemSpace:
                 if compute_inchi and result['compounds_added'] > 0:
                     print(f"\n🧪 Computing InChI keys for loaded compounds...")
                     try:
-                        inchi_df = self.compute_inchi_keys(table_name, update_database=True)
+                        # Reuse the worker count already resolved for the CSV load itself
+                        # (interactively, if the user was prompted) instead of letting
+                        # compute_inchi_keys() fall back to its own min(cpu_count(), 8) default.
+                        inchi_df = self.compute_inchi_keys(table_name, update_database=True, max_workers=max_workers)
                         if not inchi_df.empty:
                             # Count successful InChI computations
                             valid_inchi_count = len(inchi_df[
