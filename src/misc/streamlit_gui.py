@@ -7518,9 +7518,14 @@ elif page == "RF model training":
 elif page == "Mol Viewer":
     st.title("Molecular Viewer")
 
+    def _mv_parse_smiles(smiles):
+        params = Chem.SmilesParserParams()
+        params.removeHs = False
+        return Chem.MolFromSmiles(smiles, params)
+
     def _mv_draw_molecule(smiles, smarts=None):
         try:
-            mol = Chem.MolFromSmiles(smiles)
+            mol = _mv_parse_smiles(smiles)
             if mol is None:
                 return None, 0, None
             highlight_atoms, highlight_bonds, match_count = [], [], 0
@@ -7547,7 +7552,7 @@ elif page == "Mol Viewer":
 
     def _mv_draw_3d(smiles):
         try:
-            mol = Chem.MolFromSmiles(smiles)
+            mol = _mv_parse_smiles(smiles)
             if mol is None:
                 return None
             mol = Chem.AddHs(mol)
@@ -7580,7 +7585,7 @@ elif page == "Mol Viewer":
                     else:
                         st.warning("No SMARTS match found in this molecule.")
 
-                mv_mol = Chem.MolFromSmiles(smiles_input)
+                mv_mol = _mv_parse_smiles(smiles_input)
                 mv_descriptor_func = _mv_descriptor_funcs.get(mv_descriptor_name)
                 if mv_mol is not None and mv_descriptor_func is not None:
                     try:
