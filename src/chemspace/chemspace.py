@@ -6,7 +6,7 @@ import re
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional, Any, Callable, Set, Union
 import sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from multiprocessing import cpu_count
 import numpy as np
 import time
@@ -21,6 +21,17 @@ try:
     TQDM_AVAILABLE = True
 except ImportError:
     TQDM_AVAILABLE = False
+
+# Number of data rows read (via pd.read_csv(..., nrows=...)) to resolve interactive
+# decisions (column mapping, SMILES validity, delimiter sanity) for load_csv_file()
+# without loading the whole file into memory first.
+_CSV_SAMPLE_ROWS = 2000
+
+# Cap on how many duplicate/unparseable SMILES strings load_csv_file() keeps around and
+# prints for a single load, so a file with millions of duplicates doesn't turn an
+# unbounded in-memory list (and an equally unbounded stdout print loop) into the actual
+# memory/time bottleneck. The true counts are still tracked and reported in full.
+_MAX_REPORTED_SMILES = 50
 
 # Add the parent directory to path to import our local tidyscreen module
 parent_dir = os.path.dirname(os.path.dirname(__file__))
@@ -175,10 +186,18 @@ def _process_chunk_worker(chunk_df: pd.DataFrame, smiles_column: str,
                          name_available: bool, flag_available: bool,
                          start_idx: int, flag_description_available,
                          strip_salts: bool = False,
-                         retain_largest_fragment: bool = False) -> Tuple[List[Tuple[str, str, str, str]], int, int, int, List[str]]:
+                         retain_largest_fragment: bool = False,
+                         skip_duplicates: bool = False) -> Tuple[List[Tuple[str, str, str, str]], int, int, int, List[str], List[Optional[str]]]:
     """
     Worker function to process a chunk of DataFrame in parallel.
     This function must be at module level to be pickleable for multiprocessing.
+
+    Also computes each row's duplicate-detection key here (see
+    _compute_structure_dedup_key()) rather than leaving that to _insert_compounds().
+    That RDKit canonicalization is the actual CPU-heavy step of the load pipeline;
+    computing it in the worker processes is what makes the parallel chunking in
+    _process_csv_parallel() actually use multiple cores, instead of every chunk's
+    dedup-key work being redone serially in the main process afterwards.
 
     Args:
         chunk_df (pd.DataFrame): Chunk of DataFrame to process
@@ -192,16 +211,22 @@ def _process_chunk_worker(chunk_df: pd.DataFrame, smiles_column: str,
         strip_salts (bool): Whether to strip salt/counter-ion fragments from SMILES using RDKit's SaltRemover
         retain_largest_fragment (bool): Whether to reduce multi-fragment SMILES down to only
             their largest fragment using RDKit's LargestFragmentChooser (applied after strip_salts)
+        skip_duplicates (bool): Whether the caller will be deduplicating compounds. When True, a
+            duplicate-detection key (see _compute_structure_dedup_key()) is computed here for each
+            kept row, in the worker process.
 
     Returns:
-        Tuple[List[Tuple[str, str, str, str]], int, int, int, List[str]]: (list of (smiles, name, flag,
-            flag_description) tuples, count of compounds whose SMILES had a salt/counter-ion
-            fragment removed, count of compounds reduced to their largest fragment, count of
-            compounds dropped because RDKit could not parse their SMILES, the original (pre-cleanup)
-            SMILES strings of those dropped compounds)
+        Tuple[List[Tuple[str, str, str, str]], int, int, int, List[str], List[Optional[str]]]:
+            (list of (smiles, name, flag, flag_description) tuples, count of compounds whose SMILES
+            had a salt/counter-ion fragment removed, count of compounds reduced to their largest
+            fragment, count of compounds dropped because RDKit could not parse their SMILES, the
+            original (pre-cleanup) SMILES strings of those dropped compounds, and -- when
+            skip_duplicates is True -- the duplicate-detection key for each entry in compounds_data,
+            in the same order (otherwise an empty list))
     """
     compounds_data = []
     failed_smiles = []
+    dedup_keys = []
     salts_stripped_count = 0
     fragments_retained_count = 0
     failed_count = 0
@@ -215,6 +240,18 @@ def _process_chunk_worker(chunk_df: pd.DataFrame, smiles_column: str,
     if retain_largest_fragment:
         from rdkit.Chem.MolStandardize import rdMolStandardize
         fragment_chooser = rdMolStandardize.LargestFragmentChooser()
+
+    # Separate instances from the ones above: the dedup key always strips salts and
+    # reduces to the largest fragment for comparison purposes, regardless of whether
+    # strip_salts/retain_largest_fragment are enabled for what actually gets stored
+    # (see _compute_structure_dedup_key()'s docstring).
+    dedup_salt_remover = None
+    dedup_fragment_chooser = None
+    if skip_duplicates:
+        from rdkit.Chem import SaltRemover as _SaltRemover
+        from rdkit.Chem.MolStandardize import rdMolStandardize as _rdMolStandardize
+        dedup_salt_remover = _SaltRemover.SaltRemover()
+        dedup_fragment_chooser = _rdMolStandardize.LargestFragmentChooser()
 
     for local_idx, (_, row) in enumerate(chunk_df.iterrows()):
         global_idx = start_idx + local_idx
@@ -266,8 +303,10 @@ def _process_chunk_worker(chunk_df: pd.DataFrame, smiles_column: str,
                 fragments_retained_count += 1
 
         compounds_data.append((smiles, name, flag, flag_description))
+        if skip_duplicates:
+            dedup_keys.append(_compute_structure_dedup_key(smiles, dedup_salt_remover, dedup_fragment_chooser))
 
-    return compounds_data, salts_stripped_count, fragments_retained_count, failed_count, failed_smiles
+    return compounds_data, salts_stripped_count, fragments_retained_count, failed_count, failed_smiles, dedup_keys
 
 def _compute_inchi_keys_worker(chunk_data: List[Tuple[int, str, str, str]]) -> List[Tuple[int, str, str, str]]:
     """
@@ -1385,10 +1424,50 @@ class ChemSpace:
         a comma-delimited CSV with a header row.
         """
         delimiter, header = self._detect_csv_delimiter_and_header(csv_file_path)
+        return pd.read_csv(csv_file_path, **self._csv_read_kwargs(delimiter, header))
+
+    @staticmethod
+    def _csv_read_kwargs(delimiter, header) -> Dict[str, Any]:
+        """
+        pandas.read_csv() kwargs shared by every reader for a compounds file (full read,
+        sample read, and chunked streaming read), so the same delimiter/header/engine
+        combination is used consistently across all three.
+        """
         read_kwargs = {'sep': delimiter, 'header': header}
         if delimiter == r'\s+':
             read_kwargs['engine'] = 'python'
-        return pd.read_csv(csv_file_path, **read_kwargs)
+        return read_kwargs
+
+    def _read_csv_sample(self, csv_file_path: str, delimiter, header,
+                          n: int = _CSV_SAMPLE_ROWS) -> pd.DataFrame:
+        """
+        Reads only the first `n` data rows of a compounds file. Used by load_csv_file() to
+        resolve every interactive decision (column mapping, flag_description text, SMILES
+        validity, delimiter-mismatch check) without loading the whole file into memory --
+        the same decisions are then reapplied verbatim to every chunk streamed in later by
+        _iter_csv_chunks().
+        """
+        return pd.read_csv(csv_file_path, nrows=n, **self._csv_read_kwargs(delimiter, header))
+
+    def _iter_csv_chunks(self, csv_file_path: str, delimiter, header, chunk_size: int):
+        """
+        Streams a compounds file off disk in row chunks via pandas' own chunked reader,
+        instead of reading the whole file into one DataFrame and slicing copies out of it.
+        Returns a `TextFileReader` iterator; each `next()` reads (and allocates) only one
+        chunk_size-row DataFrame at a time.
+        """
+        return pd.read_csv(csv_file_path, chunksize=chunk_size, **self._csv_read_kwargs(delimiter, header))
+
+    @staticmethod
+    def _count_csv_data_rows(csv_file_path: str, header) -> int:
+        """
+        Counts data rows via a raw line count, without loading the file into a DataFrame --
+        used to decide whether to parallelize and to size chunks (mirroring what len(df)
+        used to provide) while keeping this step itself O(1) in memory.
+        """
+        with open(csv_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            total_lines = sum(1 for _ in f)
+        return max(0, total_lines - (1 if header is not None else 0))
 
     @staticmethod
     def _detect_delimiter_mismatch(csv_file_path: str, df: pd.DataFrame) -> Optional[str]:
@@ -1634,7 +1713,11 @@ class ChemSpace:
                 counter-ions) that SaltRemover's curated salt list misses. If None (default), the
                 user is interactively prompted (y/N). Pass True/False explicitly to skip the prompt.
             parallel_threshold (int): Number of rows above which parallel processing is used (default: 10000)
-            max_workers (Optional[int]): Maximum number of parallel workers. If None, uses cpu_count()
+            max_workers (Optional[int]): Maximum number of parallel workers. If None (default) and
+                parallel processing will actually be used (i.e. the file has more rows than
+                parallel_threshold), the user is interactively prompted for a worker count
+                (1 to cpu_count(), defaulting to min(cpu_count(), 8)). Pass an explicit value to
+                skip the prompt, e.g. for scripted/non-interactive use.
             chunk_size (Optional[int]): Size of each chunk for parallel processing. If None, automatically calculated
             run_in_background (Optional[bool]): If True, once the table/column/cleanup options are
                 resolved, hand the actual row parsing/insertion/InChI computation off to a separate
@@ -1731,13 +1814,19 @@ class ChemSpace:
             # Read CSV file
             print(f"📖 Reading CSV file: {csv_file_path}")
             print(f"📋 Target table: {table_name}")
-            
-            # Read the .csv file to be inputed, auto-detecting delimiter and header presence
-            df = self._read_compounds_csv(csv_file_path)
+
+            # Detect delimiter/header from just the first few lines, then read only a small
+            # sample (not the whole file) to resolve every interactive decision below (column
+            # mapping, SMILES validity, delimiter sanity). The full file is only ever streamed
+            # in chunks later, in _execute_csv_load()/_process_csv_parallel(), so it's never
+            # held in memory all at once -- this is what lets a file far larger than available
+            # RAM still be loaded.
+            delimiter, header = self._detect_csv_delimiter_and_header(csv_file_path)
+            sample_df = self._read_csv_sample(csv_file_path, delimiter, header)
 
             # Safety check: catch the "wrong delimiter collapsed everything into one
             # column, and the first data row got silently used as the header" failure mode.
-            delimiter_warning = self._detect_delimiter_mismatch(csv_file_path, df)
+            delimiter_warning = self._detect_delimiter_mismatch(csv_file_path, sample_df)
             if delimiter_warning:
                 return {
                     'success': False,
@@ -1747,11 +1836,12 @@ class ChemSpace:
                     'errors': 1
                 }
 
-            # Parse the df to check columns and information
-            df = self._parse_df_from_csv_file(df, smiles_column, name_column, flag_column)
+            # Resolve column mapping (interactive) and apply it to the sample for validation
+            column_mapping = self._resolve_csv_column_mapping(sample_df, smiles_column, name_column, flag_column)
+            sample_df = self._apply_csv_column_mapping(sample_df, column_mapping, smiles_column, name_column, flag_column)
 
             # Validate required columns (only SMILES is mandatory)
-            if smiles_column not in df.columns:
+            if smiles_column not in sample_df.columns:
                 return {
                     'success': False,
                     'message': f"Missing required SMILES column: {smiles_column}",
@@ -1762,7 +1852,7 @@ class ChemSpace:
 
             # Safety check: the resolved SMILES column must actually contain parseable
             # SMILES, not garbage produced by a delimiter/column mismatch.
-            smiles_valid, smiles_valid_fraction = self._validate_smiles_column_sample(df, smiles_column)
+            smiles_valid, smiles_valid_fraction = self._validate_smiles_column_sample(sample_df, smiles_column)
             if not smiles_valid:
                 return {
                     'success': False,
@@ -1775,9 +1865,9 @@ class ChemSpace:
                 }
 
             # Check if optional columns exist and warn if they don't
-            name_available = name_column and name_column in df.columns
-            flag_available = flag_column and flag_column in df.columns
-            flag_description_available = 'flag_description' in df.columns
+            name_available = name_column and name_column in sample_df.columns
+            flag_available = flag_column and flag_column in sample_df.columns
+            flag_description_available = 'flag_description' in sample_df.columns
 
             if not name_available:
                 print(f"⚠️  Name column '{name_column}' not found. Will use 'nd' as default.")
@@ -1802,10 +1892,36 @@ class ChemSpace:
                 ).strip().lower()
                 retain_largest_fragment = retain_largest_fragment_choice in ['y', 'yes']
 
-            # Every interactive decision (table name/replace, column mapping, cleanup options)
-            # has now been resolved, so this is the last point where it's still cheap to ask
-            # whether the actual (potentially long-running) parsing/insertion/InChI work should
-            # be handed off to a background process instead of blocking the caller.
+            # Total row count, via a raw line count rather than loading the whole file into a
+            # DataFrame -- used below for the worker-count prompt and by _execute_csv_load() to
+            # decide whether to parallelize and to size chunks (mirroring what len(df) used to
+            # provide).
+            total_rows = self._count_csv_data_rows(csv_file_path, header)
+
+            # Query the user on how many worker processes to use, unless the caller already
+            # decided explicitly. Only relevant once parallel processing will actually kick in
+            # (see the same total_rows > parallel_threshold check in _execute_csv_load()); asking
+            # otherwise would be noise for small files that are always processed sequentially.
+            if max_workers is None and total_rows > parallel_threshold:
+                available_cpus = cpu_count()
+                default_workers = min(available_cpus, 8)
+                workers_choice = input(
+                    f"\n👥 {total_rows} rows will be processed in parallel. How many worker "
+                    f"processes to use? (1-{available_cpus} available) [default: {default_workers}]: "
+                ).strip()
+                if workers_choice:
+                    try:
+                        max_workers = max(1, min(int(workers_choice), available_cpus))
+                    except ValueError:
+                        print(f"⚠️  Invalid input. Using default: {default_workers}")
+                        max_workers = default_workers
+                else:
+                    max_workers = default_workers
+
+            # Every interactive decision (table name/replace, column mapping, cleanup options,
+            # worker count) has now been resolved, so this is the last point where it's still
+            # cheap to ask whether the actual (potentially long-running) parsing/insertion/InChI
+            # work should be handed off to a background process instead of blocking the caller.
             if run_in_background is None:
                 run_mode = input(
                     "\n⚙️  Do you want to run the CSV loading in the foreground "
@@ -1815,14 +1931,16 @@ class ChemSpace:
 
             if run_in_background:
                 return self._load_csv_file_in_background(
-                    df, table_name, csv_filename, smiles_column, name_column, flag_column,
+                    csv_file_path, delimiter, header, column_mapping, total_rows,
+                    table_name, csv_filename, smiles_column, name_column, flag_column,
                     name_available, flag_available, flag_description_available,
                     skip_duplicates, compute_inchi, strip_salts, retain_largest_fragment,
                     parallel_threshold, max_workers, chunk_size
                 )
 
             return self._execute_csv_load(
-                df, table_name, csv_filename, smiles_column, name_column, flag_column,
+                csv_file_path, delimiter, header, column_mapping, total_rows,
+                table_name, csv_filename, smiles_column, name_column, flag_column,
                 name_available, flag_available, flag_description_available,
                 skip_duplicates, compute_inchi, strip_salts, retain_largest_fragment,
                 parallel_threshold, max_workers, chunk_size
@@ -1839,7 +1957,8 @@ class ChemSpace:
                 'errors': 1
             }
 
-    def _execute_csv_load(self, df: pd.DataFrame, table_name: str, csv_filename: str,
+    def _execute_csv_load(self, csv_file_path: str, delimiter, header, column_mapping: Dict[str, Any],
+                          total_rows: int, table_name: str, csv_filename: str,
                           smiles_column: str, name_column: Optional[str], flag_column: Optional[str],
                           name_available: bool, flag_available: bool, flag_description_available: bool,
                           skip_duplicates: bool, compute_inchi: bool,
@@ -1852,30 +1971,42 @@ class ChemSpace:
         resolved. Split out so it can be run either directly (foreground) or inside a separate
         process (background) via _load_csv_file_in_background().
 
+        The file itself is only read here (never before this point): for a large file, it is
+        streamed in chunks by _process_csv_parallel() and never held in memory as a single
+        DataFrame; for a small one (at or below parallel_threshold), a single full read is fine.
+
         Returns:
             dict: Results containing success status, counts, and messages.
         """
         try:
             # Determine if parallel processing should be used
-            use_parallel = len(df) > parallel_threshold
-            
+            use_parallel = total_rows > parallel_threshold
+
             if use_parallel:
-                print(f"🚀 Large dataset detected ({len(df)} rows). Using parallel processing...")
+                print(f"🚀 Large dataset detected ({total_rows} rows). Using parallel processing...")
                 # Set up parallel processing parameters
                 if max_workers is None:
                     max_workers = min(cpu_count(), 8)  # Limit to reasonable number
                 if chunk_size is None:
-                    chunk_size = max(1000, len(df) // (max_workers * 4))  # Ensure reasonable chunk size
+                    # Capped at 50,000: since chunks are now streamed with only ~2x max_workers
+                    # of them held in memory at once (see _process_csv_parallel()), peak memory
+                    # is roughly chunk_size * 2 * max_workers -- leaving this uncapped would let
+                    # it grow proportionally with total_rows for very large files, defeating that.
+                    chunk_size = max(1000, min(50000, total_rows // (max_workers * 4)))
                 print(f"   👥 Workers: {max_workers}")
                 print(f"   📦 Chunk size: {chunk_size}")
-                # Process in parallel chunks
+                # Stream and process in parallel chunks
                 result = self._process_csv_parallel(
-                    df, table_name, smiles_column, name_column, flag_column,
+                    csv_file_path, delimiter, header, column_mapping, total_rows, table_name,
+                    smiles_column, name_column, flag_column,
                     name_available, flag_available, flag_description_available,
                     skip_duplicates, max_workers, chunk_size, strip_salts, retain_largest_fragment
                 )
             else:
-                print(f"📝 Processing {len(df)} rows sequentially...")
+                print(f"📝 Processing {total_rows} rows sequentially...")
+                # Small file: a single full read is fine, it's below parallel_threshold.
+                df = pd.read_csv(csv_file_path, **self._csv_read_kwargs(delimiter, header))
+                df = self._apply_csv_column_mapping(df, column_mapping, smiles_column, name_column, flag_column)
                 # Sequential processing for smaller files
                 compounds_data = []
                 salts_stripped_count = 0
@@ -1925,7 +2056,8 @@ class ChemSpace:
                         smiles, was_stripped = _strip_salts_from_smiles(smiles, salt_remover)
                         if smiles is None:
                             cleanup_failures_count += 1
-                            cleanup_failures_smiles.append(original_smiles)
+                            if len(cleanup_failures_smiles) < _MAX_REPORTED_SMILES:
+                                cleanup_failures_smiles.append(original_smiles)
                             continue
                         if was_stripped:
                             salts_stripped_count += 1
@@ -1933,7 +2065,8 @@ class ChemSpace:
                         smiles, was_reduced = _retain_largest_fragment_from_smiles(smiles, fragment_chooser)
                         if smiles is None:
                             cleanup_failures_count += 1
-                            cleanup_failures_smiles.append(original_smiles)
+                            if len(cleanup_failures_smiles) < _MAX_REPORTED_SMILES:
+                                cleanup_failures_smiles.append(original_smiles)
                             continue
                         if was_reduced:
                             fragments_retained_count += 1
@@ -1959,6 +2092,9 @@ class ChemSpace:
                     print(f"      Duplicate SMILES:")
                     for _dup_smiles in result['duplicate_smiles']:
                         print(f"      - {_dup_smiles}")
+                    _dup_remaining = result['duplicates_skipped'] - len(result['duplicate_smiles'])
+                    if _dup_remaining > 0:
+                        print(f"      ... and {_dup_remaining} more (not listed)")
                 print(f"   ❌ Errors: {result['errors']}")
                 print(f"   📈 Total compounds in table '{table_name}': {table_count}")
                 if strip_salts:
@@ -1971,6 +2107,9 @@ class ChemSpace:
                         print(f"      Unparseable SMILES:")
                         for _bad_smiles in result['cleanup_failures_smiles']:
                             print(f"      - {_bad_smiles}")
+                        _failures_remaining = result['cleanup_failures'] - len(result['cleanup_failures_smiles'])
+                        if _failures_remaining > 0:
+                            print(f"      ... and {_failures_remaining} more (not listed)")
 
                 # Automatically compute InChI keys if requested
                 if compute_inchi and result['compounds_added'] > 0:
@@ -2009,7 +2148,8 @@ class ChemSpace:
                 'errors': 1
             }
 
-    def _load_csv_file_in_background(self, df: pd.DataFrame, table_name: str, csv_filename: str,
+    def _load_csv_file_in_background(self, csv_file_path: str, delimiter, header, column_mapping: Dict[str, Any],
+                                     total_rows: int, table_name: str, csv_filename: str,
                                      smiles_column: str, name_column: Optional[str], flag_column: Optional[str],
                                      name_available: bool, flag_available: bool, flag_description_available: bool,
                                      skip_duplicates: bool, compute_inchi: bool,
@@ -2024,12 +2164,14 @@ class ChemSpace:
 
         The table has already been created (or emptied, if the user chose to replace it) and
         every interactive decision has already been resolved by the time this is called --
-        including _parse_df_from_csv_file()'s column-mapping and flag_description prompts, which
-        it re-asks unconditionally on every call. Re-reading and re-parsing the CSV from scratch
-        in the detached child (as _project_dimensionality_in_background() does for its cheap,
-        non-interactive model reload) would therefore re-trigger those prompts against a closed
-        stdin and crash with an I/O error. Instead, the already-resolved DataFrame is pickled to
-        disk here and the child just loads it back, with no re-parsing involved.
+        including _resolve_csv_column_mapping()'s column-mapping and flag_description prompts,
+        which would otherwise be re-asked against a closed stdin and crash with an I/O error if
+        the detached child tried to resolve them itself. Since that resolution (column_mapping)
+        is just a small dict of strings, it -- along with the file path, delimiter, header, and
+        row count -- is passed to the child directly as literals in the generated script, the
+        same way every other already-resolved option here is. The child then streams the CSV
+        from disk itself via _execute_csv_load(), exactly as the foreground path would; no
+        DataFrame is ever pickled to disk or held in memory by either process.
 
         Returns:
             dict: Minimal status dict describing the launch; the real load result (counts,
@@ -2044,42 +2186,36 @@ class ChemSpace:
         base_name = f'csv_load_{table_name}_{timestamp}'
         log_file_path = os.path.join(logs_dir, f'{base_name}.log')
         script_path = os.path.join(logs_dir, f'{base_name}.py')
-        data_path = os.path.join(logs_dir, f'{base_name}_data.pkl')
-
-        df.to_pickle(data_path)
 
         script = f"""
-import os
-import pandas as pd
 from tidyscreen import tidyscreen
 from tidyscreen.chemspace.chemspace import ChemSpace
 
 project = tidyscreen.ActivateProject({self.name!r})
 cs = ChemSpace(project)
 
-df = pd.read_pickle({data_path!r})
-
-try:
-    cs._execute_csv_load(
-        df,
-        {table_name!r},
-        {csv_filename!r},
-        {smiles_column!r},
-        {name_column!r},
-        {flag_column!r},
-        {name_available!r},
-        {flag_available!r},
-        {flag_description_available!r},
-        {skip_duplicates!r},
-        {compute_inchi!r},
-        {strip_salts!r},
-        {retain_largest_fragment!r},
-        {parallel_threshold!r},
-        {max_workers!r},
-        {chunk_size!r},
-    )
-finally:
-    os.remove({data_path!r})
+cs._execute_csv_load(
+    {csv_file_path!r},
+    {delimiter!r},
+    {header!r},
+    {column_mapping!r},
+    {total_rows!r},
+    {table_name!r},
+    {csv_filename!r},
+    {smiles_column!r},
+    {name_column!r},
+    {flag_column!r},
+    {name_available!r},
+    {flag_available!r},
+    {flag_description_available!r},
+    {skip_duplicates!r},
+    {compute_inchi!r},
+    {strip_salts!r},
+    {retain_largest_fragment!r},
+    {parallel_threshold!r},
+    {max_workers!r},
+    {chunk_size!r},
+)
 """
         with open(script_path, 'w') as f:
             f.write(script)
@@ -2688,87 +2824,82 @@ finally:
                 'smiles': None
             }    
     
-    def _parse_df_from_csv_file(self, df, smiles_column, name_column, flag_column):
-        
+    def _resolve_csv_column_mapping(self, sample_df: pd.DataFrame, smiles_column: str,
+                                     name_column: str, flag_column: str) -> Dict[str, Any]:
+        """
+        Interactively resolves which columns of the CSV map to smiles/name/flag (prompting
+        for a column selection when one of them isn't found by name) and the flag_description
+        text to broadcast to every row, using only a small sample of the file. This is the
+        interactive half of what used to be _parse_df_from_csv_file(); it runs exactly once,
+        and the resulting plan is then applied identically to every chunk streamed from the
+        full file by _apply_csv_column_mapping() -- so these prompts aren't re-asked (and the
+        full file never needs to be loaded just to resolve them) regardless of file size.
+
+        Returns:
+            Dict[str, Any]: {'rename_map': {original_col: target_col, ...}, 'flag_description': str}
+        """
         print("Parsing dataframe from .csv file to check columns and information...")
-        
-        # Parsing the smiles column
-        if smiles_column not in df.columns:
-            print(f"❌ The specified SMILES column '{smiles_column}' was not found in the CSV file.")
+
+        rename_map: Dict[str, str] = {}
+
+        def _resolve_one(column_name: str, label: str):
+            if column_name in sample_df.columns:
+                return
+            print(f"❌ The specified {label} column '{column_name}' was not found in the CSV file.")
             print("Available columns:")
-            for idx, col in enumerate(df.columns):
+            for idx, col in enumerate(sample_df.columns):
                 print(f"  [{idx}] {col}")
             selected_idx = None
             while selected_idx is None:
                 try:
-                    user_input = input("Please enter the number of the column to use as SMILES: ").strip()
+                    user_input = input(f"Please enter the number of the column to use as {label}: ").strip()
                     selected_idx = int(user_input)
-                    if selected_idx < 0 or selected_idx >= len(df.columns):
+                    if selected_idx < 0 or selected_idx >= len(sample_df.columns):
                         print("Invalid selection. Please try again.")
                         selected_idx = None
                 except ValueError:
                     print("Invalid input. Please enter a valid number.")
-            selected_col = df.columns[selected_idx]
-            print(f"Renaming column '{selected_col}' to '{smiles_column}'.")
-            df.rename(columns={selected_col: smiles_column}, inplace=True)
-        
-        # Parsing the name column        
-        if name_column not in df.columns:
-            print(f"❌ The specified NAMES column '{name_column}' was not found in the CSV file.")
-            print("Available columns:")
-            for idx, col in enumerate(df.columns):
-                print(f"  [{idx}] {col}")
-            selected_idx = None
-            while selected_idx is None:
-                try:
-                    user_input = input("Please enter the number of the column to use as NAMES: ").strip()
-                    selected_idx = int(user_input)
-                    if selected_idx < 0 or selected_idx >= len(df.columns):
-                        print("Invalid selection. Please try again.")
-                        selected_idx = None
-                except ValueError:
-                    print("Invalid input. Please enter a valid number.")
-            selected_col = df.columns[selected_idx]
-            print(f"Renaming column '{selected_col}' to '{name_column}'.")
-            df.rename(columns={selected_col: name_column}, inplace=True)
-        
-        # Parsing the flag column
-        if flag_column not in df.columns:
-            print(f"❌ The specified FLAG column '{flag_column}' was not found in the CSV file.")
-            print("Available columns:")
-            for idx, col in enumerate(df.columns):
-                print(f"  [{idx}] {col}")
-            selected_idx = None
-            while selected_idx is None:
-                try:
-                    user_input = input("Please enter the number of the column to use as FLAGS: ").strip()
-                    selected_idx = int(user_input)
-                    if selected_idx < 0 or selected_idx >= len(df.columns):
-                        print("Invalid selection. Please try again.")
-                        selected_idx = None
-                except ValueError:
-                    print("Invalid input. Please enter a valid number.")
-            selected_col = df.columns[selected_idx]
-            print(f"Renaming column '{selected_col}' to '{flag_column}'.")
-            df.rename(columns={selected_col: flag_column}, inplace=True)
-        
+            selected_col = sample_df.columns[selected_idx]
+            print(f"Renaming column '{selected_col}' to '{column_name}'.")
+            rename_map[selected_col] = column_name
+
+        _resolve_one(smiles_column, "SMILES")
+        _resolve_one(name_column, "NAMES")
+        _resolve_one(flag_column, "FLAGS")
+
         # Add 'flag_description' column to the dataframe
         flag_description = input("Enter a description for the 'flag' column to be added to all rows: ").strip()
-        df['flag_description'] = flag_description
+
+        return {'rename_map': rename_map, 'flag_description': flag_description}
+
+    @staticmethod
+    def _apply_csv_column_mapping(chunk_df: pd.DataFrame, column_mapping: Dict[str, Any],
+                                   smiles_column: str, name_column: str, flag_column: str) -> pd.DataFrame:
+        """
+        Applies the column rename + flag_description decisions from
+        _resolve_csv_column_mapping() to one chunk of rows, with no interaction -- so the
+        same plan can be reapplied identically to every chunk streamed from a large file.
+        """
+        if column_mapping['rename_map']:
+            chunk_df = chunk_df.rename(columns=column_mapping['rename_map'])
+        else:
+            chunk_df = chunk_df.copy()
+        chunk_df['flag_description'] = column_mapping['flag_description']
 
         # Only keep the required columns
         required_columns = [smiles_column, name_column, flag_column, 'flag_description']
         # If any required column is missing, add it with default value 'nd' (except flag_description)
         for col in [smiles_column, name_column, flag_column]:
-            if col not in df.columns:
-                df[col] = 'nd'
-        df = df[required_columns]
-        
-        return df
+            if col not in chunk_df.columns:
+                chunk_df[col] = 'nd'
+        chunk_df = chunk_df[required_columns]
+
+        return chunk_df
     
     def _insert_compounds(self, compounds_data: List[Tuple], table_name: str, skip_duplicates: bool = True,
                          show_progress: bool = False,
-                         structure_keys: Optional[Set[str]] = None) -> Dict[str, Any]:
+                         structure_keys: Optional[Set[str]] = None,
+                         precomputed_dedup_keys: Optional[List[Optional[str]]] = None) -> Dict[str, Any]:
         """
         Insert compounds data into the database.
 
@@ -2789,6 +2920,15 @@ finally:
                 chunk) can share one set across calls instead of re-scanning the table
                 each time. If None, it is seeded once from the table's current contents
                 for this call only.
+            precomputed_dedup_keys (Optional[List[Optional[str]]]): Dedup key for each entry in
+                compounds_data, in the same order, already computed by the caller (e.g. by
+                _process_chunk_worker() in a worker process). When given, the RDKit
+                canonicalization in _compute_structure_dedup_key() -- the expensive part of
+                this method -- is skipped here entirely; only the cheap set-membership check
+                and the SQLite insert are done in this (the calling) process. This is what
+                lets _process_csv_parallel() actually spread dedup-key computation across
+                multiple cores instead of redoing it serially after the parallel chunks
+                complete.
 
         Returns:
             dict: Results containing counts and status
@@ -2812,7 +2952,7 @@ finally:
 
             salt_remover = None
             fragment_chooser = None
-            if skip_duplicates:
+            if skip_duplicates and (structure_keys is None or precomputed_dedup_keys is None):
                 from rdkit.Chem import SaltRemover
                 from rdkit.Chem.MolStandardize import rdMolStandardize
                 salt_remover = SaltRemover.SaltRemover()
@@ -2827,19 +2967,23 @@ finally:
                             structure_keys.add(existing_key)
 
             if show_progress and TQDM_AVAILABLE:
-                compound_iterator = tqdm(compounds_data, desc="Inserting compounds", unit="cmpd")
+                compound_iterator = enumerate(tqdm(compounds_data, desc="Inserting compounds", unit="cmpd"))
             else:
-                compound_iterator = compounds_data
+                compound_iterator = enumerate(compounds_data)
                 if show_progress and not TQDM_AVAILABLE:
                     print(f"   💾 Inserting {len(compounds_data)} compounds into '{table_name}'...")
 
-            for compound_data in compound_iterator:
+            for idx, compound_data in compound_iterator:
                 if skip_duplicates:
-                    structure_key = _compute_structure_dedup_key(compound_data[0], salt_remover, fragment_chooser)
+                    if precomputed_dedup_keys is not None:
+                        structure_key = precomputed_dedup_keys[idx]
+                    else:
+                        structure_key = _compute_structure_dedup_key(compound_data[0], salt_remover, fragment_chooser)
                     if structure_key is not None:
                         if structure_key in structure_keys:
                             duplicates_skipped += 1
-                            duplicate_smiles.append(compound_data[0])
+                            if len(duplicate_smiles) < _MAX_REPORTED_SMILES:
+                                duplicate_smiles.append(compound_data[0])
                             continue
                         structure_keys.add(structure_key)
 
@@ -2849,10 +2993,12 @@ finally:
                 except sqlite3.IntegrityError:
                     if skip_duplicates:
                         duplicates_skipped += 1
-                        duplicate_smiles.append(compound_data[0])
+                        if len(duplicate_smiles) < _MAX_REPORTED_SMILES:
+                            duplicate_smiles.append(compound_data[0])
                     else:
                         errors += 1
-                        error_smiles.append(compound_data[0])
+                        if len(error_smiles) < _MAX_REPORTED_SMILES:
+                            error_smiles.append(compound_data[0])
                 except Exception as e:
                     print(f"⚠️  Error inserting compound {compound_data[1]}: {e}")
                     errors += 1
@@ -8842,16 +8988,31 @@ plt.show()
             
             return error_result
     
-    def _process_csv_parallel(self, df: pd.DataFrame, table_name: str,
+    def _process_csv_parallel(self, csv_file_path: str, delimiter, header, column_mapping: Dict[str, Any],
+                             total_rows: int, table_name: str,
                              smiles_column: str, name_column: Optional[str], flag_column: Optional[str],
                              name_available: bool, flag_available: bool, flag_description_available: bool, skip_duplicates: bool,
                              max_workers: int, chunk_size: int, strip_salts: bool = False,
                              retain_largest_fragment: bool = False) -> Dict[str, Any]:
         """
-        Process CSV data using parallel processing with chunks and comprehensive progress tracking.
+        Process a CSV file in parallel, streaming chunks directly off disk with comprehensive
+        progress tracking.
+
+        Chunks are read with pandas.read_csv(..., chunksize=...) (see _iter_csv_chunks()) rather
+        than loading the whole file into one DataFrame and slicing chunk copies out of it --
+        that used to mean holding the entire file, plus a second full copy spread across all its
+        chunk slices, in memory at once. Only a bounded number of chunks (about 2x max_workers)
+        are ever in flight: the next chunk is read from disk and submitted only as an earlier one
+        completes, so peak memory scales with chunk_size * max_workers rather than with file size.
 
         Args:
-            df (pd.DataFrame): DataFrame containing the CSV data
+            csv_file_path (str): Path to the CSV file to stream
+            delimiter: pandas `sep` value already detected for this file (see _detect_csv_delimiter_and_header())
+            header: pandas `header` value already detected for this file
+            column_mapping (Dict[str, Any]): Column rename/flag_description plan from
+                _resolve_csv_column_mapping(), applied identically to every chunk as it's read
+            total_rows (int): Total data row count (from _count_csv_data_rows()), used only for
+                progress reporting
             table_name (str): Name of the target table
             smiles_column (str): Name of the SMILES column
             name_column (Optional[str]): Name of the name column
@@ -8872,13 +9033,10 @@ plt.show()
             # Record start time for performance tracking
             start_time = time.time()
 
-            # Split DataFrame into chunks
-            print(f"   📦 Splitting {len(df)} rows into chunks...")
-            chunks = self._split_dataframe_into_chunks(df, chunk_size)
-            num_chunks = len(chunks)
+            num_chunks = max(1, -(-total_rows // chunk_size))  # ceil division, for progress display only
 
             print(f"   📊 Parallel Processing Setup:")
-            print(f"      📦 Total chunks: {num_chunks}")
+            print(f"      📦 Estimated chunks: {num_chunks}")
             print(f"      📏 Chunk size: {chunk_size}")
             print(f"      👥 Workers: {max_workers}")
 
@@ -8902,130 +9060,163 @@ plt.show()
             # Initialize progress bar if tqdm is available
             if TQDM_AVAILABLE:
                 progress_bar = tqdm(
-                    total=len(df),
+                    total=total_rows,
                     desc="Processing compounds",
                     unit="compounds",
                     bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
                 )
             else:
                 progress_bar = None
-                print(f"   🚀 Starting parallel processing of {num_chunks} chunks...")
-            
+                print(f"   🚀 Streaming and processing ~{num_chunks} chunks...")
+
+            chunk_reader = self._iter_csv_chunks(csv_file_path, delimiter, header, chunk_size)
+
+            processed_chunks = 0
+            failed_chunks = 0
+
             with ProcessPoolExecutor(max_workers=max_workers) as executor:
-                # Submit all chunk processing jobs with timing
-                future_to_chunk = {}
-                chunk_submission_start = time.time()
-                
-                for i, chunk in enumerate(chunks):
+                pending: Dict[Any, Dict[str, Any]] = {}
+                next_chunk_index = 0
+                reader_exhausted = False
+
+                def _submit_next_chunk():
+                    nonlocal next_chunk_index, reader_exhausted
+                    if reader_exhausted:
+                        return
+                    try:
+                        raw_chunk = next(chunk_reader)
+                    except StopIteration:
+                        reader_exhausted = True
+                        return
+                    mapped_chunk = self._apply_csv_column_mapping(
+                        raw_chunk, column_mapping, smiles_column, name_column, flag_column
+                    )
                     future = executor.submit(
                         _process_chunk_worker,
-                        chunk, smiles_column, name_column, flag_column,
-                        name_available, flag_available, i * chunk_size, flag_description_available,
-                        strip_salts, retain_largest_fragment
+                        mapped_chunk, smiles_column, name_column, flag_column,
+                        name_available, flag_available, next_chunk_index * chunk_size, flag_description_available,
+                        strip_salts, retain_largest_fragment, skip_duplicates
                     )
-                    future_to_chunk[future] = {
-                        'index': i,
-                        'size': len(chunk),
-                        'submitted_at': time.time()
-                    }
-                
-                chunk_submission_time = time.time() - chunk_submission_start
-                print(f"   ⏱️  All {num_chunks} chunks submitted in {chunk_submission_time:.2f}s")
-                
-                # Collect results and insert into database with detailed progress
-                processed_chunks = 0
-                failed_chunks = 0
-                
-                for future in as_completed(future_to_chunk):
-                    chunk_info = future_to_chunk[future]
-                    chunk_idx = chunk_info['index']
-                    chunk_size_actual = chunk_info['size']
-                    
-                    try:
-                        # Process chunk result
-                        chunk_start_time = time.time()
-                        compounds_data, chunk_salts_stripped, chunk_fragments_retained, chunk_cleanup_failures, chunk_cleanup_failures_smiles = future.result()
-                        total_salts_stripped += chunk_salts_stripped
-                        total_fragments_retained += chunk_fragments_retained
-                        total_cleanup_failures += chunk_cleanup_failures
-                        total_cleanup_failures_smiles.extend(chunk_cleanup_failures_smiles)
-                        chunk_process_time = time.time() - chunk_start_time
+                    pending[future] = {'index': next_chunk_index, 'size': len(mapped_chunk)}
+                    next_chunk_index += 1
 
-                        if compounds_data:
-                            # Insert this chunk's data into database
-                            insert_start_time = time.time()
-                            chunk_result = self._insert_compounds(compounds_data, table_name, skip_duplicates,
-                                                                    structure_keys=structure_keys)
-                            insert_time = time.time() - insert_start_time
+                # Keep roughly 2x max_workers chunks in flight: enough that workers are never
+                # starved waiting on the next disk read, without ever holding the whole file.
+                in_flight_target = max(1, max_workers * 2)
+                for _ in range(in_flight_target):
+                    _submit_next_chunk()
 
-                            if chunk_result['success']:
-                                total_compounds_added += chunk_result['compounds_added']
-                                total_duplicates_skipped += chunk_result['duplicates_skipped']
-                                total_errors += chunk_result['errors']
-                                total_duplicate_smiles.extend(chunk_result.get('duplicate_smiles', []))
-                                
-                                # Detailed chunk statistics (only show every 5th chunk to avoid spam)
-                                if not TQDM_AVAILABLE and (processed_chunks + 1) % 5 == 0:
-                                    print(f"   ✅ Chunk {chunk_idx + 1}/{num_chunks}: "
-                                          f"{chunk_result['compounds_added']} added, "
-                                          f"{chunk_result['duplicates_skipped']} duplicates, "
-                                          f"{chunk_result['errors']} errors "
-                                          f"(Process: {chunk_process_time:.2f}s, Insert: {insert_time:.2f}s)")
-                        
-                        processed_rows += chunk_size_actual
-                        processed_chunks += 1
-                        
-                        # Update progress bar or print progress
-                        if progress_bar:
-                            progress_bar.update(chunk_size_actual)
-                            progress_bar.set_postfix({
-                                'chunks': f"{processed_chunks}/{num_chunks}",
-                                'added': total_compounds_added,
-                                'duplicates': total_duplicates_skipped,
-                                'errors': total_errors
-                            })
-                        elif processed_chunks % 10 == 0 or processed_chunks == num_chunks:
-                            elapsed_time = time.time() - start_time
-                            remaining_chunks = num_chunks - processed_chunks
-                            estimated_remaining = (elapsed_time / processed_chunks) * remaining_chunks if processed_chunks > 0 else 0
-                            
-                            print(f"   ⏳ Progress: {processed_chunks}/{num_chunks} chunks "
-                                  f"({processed_rows:,}/{len(df):,} rows) "
-                                  f"[{elapsed_time:.1f}s elapsed, ~{estimated_remaining:.1f}s remaining]")
-                            print(f"      📊 Current totals: {total_compounds_added:,} added, "
-                                  f"{total_duplicates_skipped:,} duplicates, {total_errors:,} errors")
-                        
-                    except Exception as e:
-                        failed_chunks += 1
-                        total_errors += chunk_size_actual  # Estimate errors for failed chunk
-                        processed_chunks += 1
-                        processed_rows += chunk_size_actual
-                        
-                        print(f"   ❌ Chunk {chunk_idx + 1} failed: {e}")
-                        
-                        # Update progress even for failed chunks
-                        if progress_bar:
-                            progress_bar.update(chunk_size_actual)
-                            progress_bar.set_postfix({
-                                'chunks': f"{processed_chunks}/{num_chunks}",
-                                'failed': failed_chunks,
-                                'errors': total_errors
-                            })
-                
-                # Close progress bar
-                if progress_bar:
-                    progress_bar.close()
-            
+                while pending:
+                    done, _ = wait(pending.keys(), return_when=FIRST_COMPLETED)
+                    for future in done:
+                        chunk_info = pending.pop(future)
+                        chunk_idx = chunk_info['index']
+                        chunk_size_actual = chunk_info['size']
+
+                        try:
+                            # Process chunk result
+                            chunk_start_time = time.time()
+                            compounds_data, chunk_salts_stripped, chunk_fragments_retained, chunk_cleanup_failures, chunk_cleanup_failures_smiles, chunk_dedup_keys = future.result()
+                            total_salts_stripped += chunk_salts_stripped
+                            total_fragments_retained += chunk_fragments_retained
+                            total_cleanup_failures += chunk_cleanup_failures
+                            if len(total_cleanup_failures_smiles) < _MAX_REPORTED_SMILES:
+                                total_cleanup_failures_smiles.extend(
+                                    chunk_cleanup_failures_smiles[:_MAX_REPORTED_SMILES - len(total_cleanup_failures_smiles)]
+                                )
+                            chunk_process_time = time.time() - chunk_start_time
+
+                            if compounds_data:
+                                # Insert this chunk's data into database. The dedup keys were already
+                                # computed in the worker process (chunk_dedup_keys), so this only does
+                                # the cheap set-membership check plus the SQLite insert here.
+                                insert_start_time = time.time()
+                                chunk_result = self._insert_compounds(compounds_data, table_name, skip_duplicates,
+                                                                        structure_keys=structure_keys,
+                                                                        precomputed_dedup_keys=chunk_dedup_keys if skip_duplicates else None)
+                                insert_time = time.time() - insert_start_time
+
+                                if chunk_result['success']:
+                                    total_compounds_added += chunk_result['compounds_added']
+                                    total_duplicates_skipped += chunk_result['duplicates_skipped']
+                                    total_errors += chunk_result['errors']
+                                    if len(total_duplicate_smiles) < _MAX_REPORTED_SMILES:
+                                        dup_smiles = chunk_result.get('duplicate_smiles', [])
+                                        total_duplicate_smiles.extend(
+                                            dup_smiles[:_MAX_REPORTED_SMILES - len(total_duplicate_smiles)]
+                                        )
+
+                                    # Detailed chunk statistics (only show every 5th chunk to avoid spam)
+                                    if not TQDM_AVAILABLE and (processed_chunks + 1) % 5 == 0:
+                                        print(f"   ✅ Chunk {chunk_idx + 1}: "
+                                              f"{chunk_result['compounds_added']} added, "
+                                              f"{chunk_result['duplicates_skipped']} duplicates, "
+                                              f"{chunk_result['errors']} errors "
+                                              f"(Process: {chunk_process_time:.2f}s, Insert: {insert_time:.2f}s)")
+                                else:
+                                    failed_chunks += 1
+                                    total_errors += chunk_size_actual
+                                    print(f"   ❌ Chunk {chunk_idx + 1} insert failed: {chunk_result.get('message', 'unknown error')}")
+
+                            processed_rows += chunk_size_actual
+                            processed_chunks += 1
+
+                            # Update progress bar or print progress
+                            if progress_bar:
+                                progress_bar.update(chunk_size_actual)
+                                progress_bar.set_postfix({
+                                    'chunks': processed_chunks,
+                                    'added': total_compounds_added,
+                                    'duplicates': total_duplicates_skipped,
+                                    'errors': total_errors
+                                })
+                            elif processed_chunks % 10 == 0:
+                                elapsed_time = time.time() - start_time
+                                rate = processed_rows / elapsed_time if elapsed_time > 0 else 0
+                                remaining_rows = max(0, total_rows - processed_rows)
+                                estimated_remaining = remaining_rows / rate if rate > 0 else 0
+
+                                print(f"   ⏳ Progress: {processed_chunks} chunks "
+                                      f"({processed_rows:,}/{total_rows:,} rows) "
+                                      f"[{elapsed_time:.1f}s elapsed, ~{estimated_remaining:.1f}s remaining]")
+                                print(f"      📊 Current totals: {total_compounds_added:,} added, "
+                                      f"{total_duplicates_skipped:,} duplicates, {total_errors:,} errors")
+
+                        except Exception as e:
+                            failed_chunks += 1
+                            total_errors += chunk_size_actual  # Estimate errors for failed chunk
+                            processed_chunks += 1
+                            processed_rows += chunk_size_actual
+
+                            print(f"   ❌ Chunk {chunk_idx + 1} failed: {e}")
+
+                            # Update progress even for failed chunks
+                            if progress_bar:
+                                progress_bar.update(chunk_size_actual)
+                                progress_bar.set_postfix({
+                                    'chunks': processed_chunks,
+                                    'failed': failed_chunks,
+                                    'errors': total_errors
+                                })
+
+                        # Keep the pipeline full: submit the next chunk (if any remain) now
+                        # that a slot has freed up.
+                        _submit_next_chunk()
+
+            # Close progress bar
+            if progress_bar:
+                progress_bar.close()
+
             # Final timing and statistics
             total_time = time.time() - start_time
-            rows_per_second = len(df) / total_time if total_time > 0 else 0
-            
+            rows_per_second = processed_rows / total_time if total_time > 0 else 0
+
             print(f"\n   🏁 Parallel Processing Complete!")
             print(f"      ⏱️  Total time: {total_time:.2f}s")
             print(f"      📈 Processing rate: {rows_per_second:,.0f} rows/second")
-            print(f"      ✅ Successful chunks: {processed_chunks - failed_chunks}/{num_chunks}")
+            print(f"      ✅ Successful chunks: {processed_chunks - failed_chunks}/{processed_chunks}")
             if failed_chunks > 0:
-                print(f"      ❌ Failed chunks: {failed_chunks}/{num_chunks}")
+                print(f"      ❌ Failed chunks: {failed_chunks}/{processed_chunks}")
             print(f"      📊 Final counts: {total_compounds_added:,} added, "
                   f"{total_duplicates_skipped:,} duplicates, {total_errors:,} errors")
             if strip_salts:
@@ -9047,39 +9238,17 @@ plt.show()
                 'cleanup_failures_smiles': total_cleanup_failures_smiles,
                 'duplicate_smiles': total_duplicate_smiles
             }
-            
+
         except Exception as e:
             return {
                 'success': False,
                 'message': f"Parallel processing error: {e}",
                 'compounds_added': 0,
                 'duplicates_skipped': 0,
-                'errors': len(df),
+                'errors': total_rows,
                 'cleanup_failures_smiles': [],
                 'duplicate_smiles': []
             }
-    
-    def _split_dataframe_into_chunks(self, df: pd.DataFrame, chunk_size: int) -> List[pd.DataFrame]:
-        """
-        Split a DataFrame into chunks of specified size.
-        
-        Args:
-            df (pd.DataFrame): DataFrame to split
-            chunk_size (int): Size of each chunk
-            
-        Returns:
-            List[pd.DataFrame]: List of DataFrame chunks
-        """
-        chunks = []
-        num_chunks = len(df) // chunk_size + (1 if len(df) % chunk_size != 0 else 0)
-        
-        for i in range(num_chunks):
-            start_idx = i * chunk_size
-            end_idx = min((i + 1) * chunk_size, len(df))
-            chunk = df.iloc[start_idx:end_idx].copy()
-            chunks.append(chunk)
-        
-        return chunks
 
     def filter_using_workflow(self, table_name: Optional[str] = None, workflow_name: Optional[str] = None,
                     save_results: Optional[bool] = None,
