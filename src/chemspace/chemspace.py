@@ -17519,6 +17519,83 @@ plt.show()
             print(f"      ❌ Error in streaming unimolecular reaction: {e}")
             return 0
 
+    # Page cache (KiB, negative PRAGMA cache_size units) for bulk-loading step products. SQLite's
+    # default (~2 MB) is far smaller than the UNIQUE(smiles, name) index of a large table, and
+    # products arrive in random SMILES order, so with the default every insert is a cache miss.
+    _BULK_LOAD_CACHE_KIB = 1_000_000
+
+    # Keys per existence-check query in _insert_batch_reporting_duplicates(): two bound
+    # parameters each, kept well under SQLite's 999-variable limit on older builds.
+    _DUPLICATE_CHECK_KEYS_PER_QUERY = 400
+
+    @staticmethod
+    def _insert_batch_reporting_duplicates(cursor: sqlite3.Cursor, table_name: str, insert_query: str,
+                                           batch: List[Tuple], duplicates: Dict[str, Any]) -> int:
+        """
+        Insert the rows of a batch that are not already present, skipping (and reporting) rows
+        whose (smiles, name) duplicates a row already in the table or an earlier row of the batch.
+
+        Duplicates are found per batch -- the batch's keys are looked up through the table's
+        UNIQUE(smiles, name) index in one query, and repeats within the batch by a set local to
+        the batch -- rather than by remembering every key ever loaded, which cost ~260 bytes per
+        product (tens of GB at 100M products). Only the surviving rows are inserted.
+
+        Filtering before inserting, instead of relying on INSERT OR IGNORE alone, matters for two
+        reasons: SQLite spends an AUTOINCREMENT id on every ignored row (leaving gaps in the ids,
+        which were always dense here), and an ignored row can't be identified after the fact
+        without journaling every batch in a SAVEPOINT, which was measured at ~+60% load time.
+
+        Args:
+            cursor (sqlite3.Cursor): Cursor on the connection loading the table
+            table_name (str): Table being loaded
+            insert_query (str): INSERT statement whose first two parameters are smiles, name
+            batch (List[Tuple]): Rows to insert
+            duplicates (Dict): Updated in place: 'count' is incremented per skipped row and
+                (smiles, name) of the first _MAX_REPORTED_SMILES skipped rows are appended to
+                'examples'
+
+        Returns:
+            int: Number of rows actually inserted
+        """
+        step = ChemSpace._DUPLICATE_CHECK_KEYS_PER_QUERY
+        existing = set()
+        for i in range(0, len(batch), step):
+            keys = [(row[0], row[1]) for row in batch[i:i + step]]
+            placeholders = ",".join(["(?,?)"] * len(keys))
+            cursor.execute(
+                f"SELECT smiles, name FROM {table_name} WHERE (smiles, name) IN (VALUES {placeholders})",
+                [value for key in keys for value in key]
+            )
+            existing.update(cursor.fetchall())
+
+        new_rows = []
+        seen_in_batch = set()
+        for row in batch:
+            key = (row[0], row[1])
+            if key in existing or key in seen_in_batch:
+                duplicates['count'] += 1
+                if len(duplicates['examples']) < _MAX_REPORTED_SMILES:
+                    duplicates['examples'].append(key)
+                continue
+            seen_in_batch.add(key)
+            new_rows.append(row)
+
+        if new_rows:
+            cursor.executemany(insert_query, new_rows)
+        return len(new_rows)
+
+    @staticmethod
+    def _print_skipped_duplicates(duplicates: Dict[str, Any]) -> None:
+        """Print the skipped-duplicate summary collected by _insert_batch_reporting_duplicates()."""
+        if not duplicates['count']:
+            return
+        print(f"   ⚠️  {duplicates['count']:,} product(s) skipped: duplicate (smiles, name) "
+              f"already present in this batch/table")
+        for smiles, name in duplicates['examples']:
+            print(f"      - {name}: {smiles}")
+        if duplicates['count'] > len(duplicates['examples']):
+            print(f"      ... and {duplicates['count'] - len(duplicates['examples']):,} more")
+
     def _consolidate_temp_files_to_table(self, temp_files: List[str], output_table_name: str,
                                         workflow_name: str, step_num: int,
                                         compute_inchi: bool = True) -> bool:
@@ -17548,7 +17625,8 @@ plt.show()
             cursor = conn.cursor()
             cursor.execute("PRAGMA journal_mode=WAL")
             cursor.execute("PRAGMA synchronous=NORMAL")
-            
+            cursor.execute(f"PRAGMA cache_size=-{self._BULK_LOAD_CACHE_KIB}")
+
             # Create products table
             cursor.execute(f'''
                 CREATE TABLE IF NOT EXISTS {output_table_name} (
@@ -17573,14 +17651,13 @@ plt.show()
             creation_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             total_inserted = 0
 
-            # Track (smiles, name) keys already seen -- both rows already present in
-            # the table and rows seen earlier across temp files/batches in this same
-            # consolidation -- so a product about to be silently dropped by the
-            # UNIQUE(smiles, name) constraint can be reported with its SMILES instead
-            # of only being reflected as a count mismatch (mirrors _save_step_products()).
-            cursor.execute(f"SELECT smiles, name FROM {output_table_name}")
-            seen_keys = set(cursor.fetchall())
-            duplicate_products = []
+            # Products dropped by the UNIQUE(smiles, name) constraint -- whether they duplicate a
+            # row already in the table or one from earlier in this consolidation -- are reported
+            # with their SMILES rather than only as a count mismatch (mirrors
+            # _save_step_products()). They are found via _insert_batch_reporting_duplicates()
+            # instead of a Python set of every key seen: that set cost ~260 bytes per product
+            # (tens of GB at 100M products) and was the only thing it was used for.
+            duplicates = {'count': 0, 'examples': []}
 
             # Process files in batches to avoid memory issues
             batch_size = 1000
@@ -17598,7 +17675,7 @@ plt.show()
                 try:
                     with open(temp_file, 'r', newline='', encoding='utf-8') as f:
                         # Plain csv.reader with positional access instead of DictReader:
-                        # the temp files are written by our own _process_*_chunk_to_file_worker()
+                        # the temp files are written by our own _process_*_range_to_file_worker()
                         # functions, which always emit 'smiles', 'name', 'flag' as the first
                         # three columns, so the per-row dict construction DictReader does
                         # (header lookup + dict build) is pure overhead here — ~2x slower
@@ -17610,11 +17687,6 @@ plt.show()
                         for row in reader:
                             if not row:
                                 continue
-                            key = (row[0], row[1])
-                            if key in seen_keys:
-                                duplicate_products.append({'smiles': row[0], 'name': row[1]})
-                                continue
-                            seen_keys.add(key)
                             batch.append((
                                 row[0],
                                 row[1],
@@ -17625,36 +17697,30 @@ plt.show()
                             ))
 
                             if len(batch) >= batch_size:
-                                cursor.executemany(insert_query, batch)
-                                total_inserted += cursor.rowcount
+                                total_inserted += self._insert_batch_reporting_duplicates(
+                                    cursor, output_table_name, insert_query, batch, duplicates)
                                 batch = []
 
                         # Insert remaining items in batch
                         if batch:
-                            cursor.executemany(insert_query, batch)
-                            total_inserted += cursor.rowcount
+                            total_inserted += self._insert_batch_reporting_duplicates(
+                                cursor, output_table_name, insert_query, batch, duplicates)
 
                 except Exception as e:
                     print(f"   ⚠️  Error processing file {temp_file}: {e}")
                     continue
 
-            # Build the indexes after the table is populated, not before: indexes
-            # created on an empty table force SQLite to rebalance their b-trees on
-            # every single-row insert above, which measured slower than building the
-            # indexes once against fully-populated data (same fix as applied to
-            # _update_table_with_inchi_keys()).
-            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{output_table_name}_smiles ON {output_table_name}(smiles)")
-            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{output_table_name}_step ON {output_table_name}(workflow_step)")
+            # No secondary indexes: UNIQUE(smiles, name) already provides an index whose leading
+            # column is smiles (so lookups by smiles are covered), and an index on workflow_step
+            # is useless when every row of a step table has the same step. Each of the two
+            # indexes this used to build cost a full sort of the table (~20% of the load time
+            # measured at 3M rows) and ~10% extra disk.
 
             conn.commit()
             conn.close()
 
             print(f"   💾 Consolidated {total_inserted:,} products to table '{output_table_name}'")
-            if duplicate_products:
-                print(f"   ⚠️  {len(duplicate_products):,} product(s) skipped: duplicate (smiles, name) "
-                      f"already present in this batch/table")
-                for dup in duplicate_products:
-                    print(f"      - {dup['name']}: {dup['smiles']}")
+            self._print_skipped_duplicates(duplicates)
 
             # Compute InChI keys for the newly consolidated products, mirroring the same
             # post-save step used by load_csv_file() and _save_step_products()
@@ -19105,7 +19171,8 @@ plt.show()
             cursor = conn.cursor()
             cursor.execute("PRAGMA journal_mode=WAL")
             cursor.execute("PRAGMA synchronous=NORMAL")
-            
+            cursor.execute(f"PRAGMA cache_size=-{self._BULK_LOAD_CACHE_KIB}")
+
             # Create products table with step metadata
             cursor.execute(f'''
                 CREATE TABLE IF NOT EXISTS {table_name} (
@@ -19120,11 +19187,10 @@ plt.show()
                 )
             ''')
 
-            # Insert products. Uses a single executemany() batch rather than a
-            # per-product execute() in a loop: a separate execute() per row crosses
-            # the sqlite3 C-API boundary once per row, which dominates runtime for
-            # large product sets (same reasoning as _update_table_with_inchi_keys()'s
-            # itertuples()+executemany() switch).
+            # Insert products in executemany() batches rather than a per-product execute() in a
+            # loop: a separate execute() per row crosses the sqlite3 C-API boundary once per row,
+            # which dominates runtime for large product sets (same reasoning as
+            # _update_table_with_inchi_keys()'s itertuples()+executemany() switch).
             insert_query = f'''
                 INSERT OR IGNORE INTO {table_name}
                 (smiles, name, flag, workflow_step, workflow_name, creation_date)
@@ -19133,51 +19199,36 @@ plt.show()
 
             creation_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-            # Track (smiles, name) keys already seen -- both rows already present in
-            # the table (e.g. an existing table name being reused) and rows seen
-            # earlier in this same products list -- so that a product about to be
-            # silently dropped by the UNIQUE(smiles, name) constraint can be reported
-            # with its SMILES instead of only being reflected as a count mismatch.
-            cursor.execute(f"SELECT smiles, name FROM {table_name}")
-            seen_keys = set(cursor.fetchall())
+            # Products dropped by the UNIQUE(smiles, name) constraint -- duplicates of rows already
+            # in the table (e.g. an existing table name being reused) or of earlier products in
+            # this same list -- are reported with their SMILES rather than only as a count
+            # mismatch. See _insert_batch_reporting_duplicates().
+            duplicates = {'count': 0, 'examples': []}
 
-            batch = []
-            duplicate_products = []
-            for product in products:
-                key = (product['smiles'], product['name'])
-                if key in seen_keys:
-                    duplicate_products.append(product)
-                    continue
-                seen_keys.add(key)
-                batch.append((
-                    product['smiles'],
-                    product['name'],
-                    product.get('flag', 'step_product'),
-                    step_num,
-                    workflow_name,
-                    creation_date
-                ))
+            inserted_count = 0
+            batch_size = 1000
+            for start in range(0, len(products), batch_size):
+                batch = [
+                    (
+                        product['smiles'],
+                        product['name'],
+                        product.get('flag', 'step_product'),
+                        step_num,
+                        workflow_name,
+                        creation_date
+                    )
+                    for product in products[start:start + batch_size]
+                ]
+                inserted_count += self._insert_batch_reporting_duplicates(
+                    cursor, table_name, insert_query, batch, duplicates)
 
-            cursor.executemany(insert_query, batch)
-            inserted_count = cursor.rowcount
-
-            # Build the indexes after the table is populated, not before: indexes
-            # created on an empty table force SQLite to rebalance their b-trees on
-            # every single-row insert above, which measured slower than building the
-            # indexes once against fully-populated data (same fix as applied to
-            # _update_table_with_inchi_keys() and _consolidate_temp_files_to_table()).
-            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_smiles ON {table_name}(smiles)")
-            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_step ON {table_name}(workflow_step)")
+            # No secondary indexes: see _consolidate_temp_files_to_table().
 
             conn.commit()
             conn.close()
 
             print(f"   💾 Saved {inserted_count} products to table '{table_name}'")
-            if duplicate_products:
-                print(f"   ⚠️  {len(duplicate_products)} product(s) skipped: duplicate (smiles, name) "
-                      f"already present in this batch/table")
-                for dup in duplicate_products:
-                    print(f"      - {dup['name']}: {dup['smiles']}")
+            self._print_skipped_duplicates(duplicates)
 
             # Compute InChI keys for the newly stored products, mirroring the same
             # post-save step used by load_csv_file()
