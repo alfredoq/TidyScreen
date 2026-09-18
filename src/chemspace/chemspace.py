@@ -18630,8 +18630,10 @@ plt.show()
                 print(f"   🔢 Potential combinations: {same_table_combinations:,} (including self-reactions)")
                 
                 # Ask if user wants to exclude self-reactions
-                exclude_self = input("   ❓ Exclude self-reactions (same compound with itself)? (y/n): ").strip().lower()
-                exclude_self_reactions = exclude_self in ['y', 'yes']
+                exclude_self_reactions = self._ask_yes_no(
+                    "   ❓ Exclude self-reactions (same compound with itself)? (y/n): ")
+                if exclude_self_reactions is None:
+                    return {}
                 
                 if exclude_self_reactions:
                     unique_combinations = primary_source['count'] * (primary_source['count'] - 1)
@@ -18648,8 +18650,7 @@ plt.show()
             
             if combinations > 1000000:
                 print(f"   ⚠️  WARNING: Large number of combinations may take significant time!")
-                proceed = input("   Continue anyway? (y/n): ").strip().lower()
-                if proceed not in ['y', 'yes']:
+                if not self._ask_yes_no("   Continue anyway? (y/n): "):
                     return {}
             
             return {
@@ -18714,20 +18715,8 @@ plt.show()
                     })
             
             # Select input sources (same fine-grained picker for every step, including step 1)
-            selected_sources = []
-
             print(f"\nSelect input sources (comma-separated numbers or 'all'):")
-            selection = input("Selection: ").strip().lower()
-
-            if selection == 'all':
-                selected_sources = all_sources
-            else:
-                try:
-                    indices = [int(x.strip()) - 1 for x in selection.split(',')]
-                    selected_sources = [all_sources[i] for i in indices if 0 <= i < len(all_sources)]
-                except:
-                    print("❌ Invalid selection")
-                    return {}
+            selected_sources = self._select_sources_by_indices(all_sources)
 
             if not selected_sources:
                 print("❌ No sources selected")
@@ -18973,6 +18962,75 @@ plt.show()
                 except ValueError:
                     print("❌ Please enter a valid number or 'cancel'")
                     
+        except KeyboardInterrupt:
+            return None
+
+    @staticmethod
+    def _ask_yes_no(prompt: str) -> Optional[bool]:
+        """
+        Ask a yes/no question until a valid answer is given.
+
+        Anything other than y/yes/n/no (including an empty answer) is reported and asked again,
+        rather than being treated as a "no" or aborting the workflow step.
+
+        Args:
+            prompt (str): Text shown to the user
+
+        Returns:
+            Optional[bool]: True for yes, False for no, None if cancelled with Ctrl-C
+        """
+        try:
+            while True:
+                answer = input(prompt).strip().lower()
+                if answer in ['y', 'yes']:
+                    return True
+                if answer in ['n', 'no']:
+                    return False
+                print("❌ Please answer 'y' or 'n'")
+        except KeyboardInterrupt:
+            return None
+
+    def _select_sources_by_indices(self, sources: List[Dict]) -> Optional[List[Dict]]:
+        """
+        Prompt for one or more sources ("1,3", "2", or "all") until a valid selection is entered.
+
+        Anything that isn't a valid selection -- an empty answer, non-numeric text, or a number
+        outside 1..len(sources) -- is reported and asked again instead of aborting the workflow
+        step, matching _select_source_by_index(). Repeated numbers are only counted once.
+
+        Args:
+            sources (List[Dict]): List of available sources
+
+        Returns:
+            Optional[List[Dict]]: The selected sources in the order entered, or None if cancelled
+        """
+        try:
+            while True:
+                selection = input(
+                    f"Selection (1-{len(sources)}, comma-separated, 'all' or 'cancel'): "
+                ).strip().lower()
+
+                if selection in ['cancel', 'quit', 'exit']:
+                    return None
+
+                if selection == 'all':
+                    return list(sources)
+
+                tokens = [token.strip() for token in selection.split(',') if token.strip()]
+                if not tokens:
+                    print("❌ Nothing entered. Please enter one or more numbers, 'all' or 'cancel'")
+                    continue
+
+                invalid = [token for token in tokens
+                           if not token.isdigit() or not 1 <= int(token) <= len(sources)]
+                if invalid:
+                    print(f"❌ Invalid selection: {', '.join(invalid)}. "
+                          f"Please enter numbers between 1 and {len(sources)}")
+                    continue
+
+                indices = list(dict.fromkeys(int(token) - 1 for token in tokens))
+                return [sources[i] for i in indices]
+
         except KeyboardInterrupt:
             return None
 
