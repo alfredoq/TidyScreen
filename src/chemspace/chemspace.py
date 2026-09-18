@@ -603,108 +603,6 @@ def _filter_chunk_worker_by_descriptor_bounds(chunk_data: List[Tuple], descripto
 
     return results, removed_counts
 
-def _process_bimolecular_chunk_worker(chunk_data: List[Tuple], reaction_smarts: str,
-                                    reaction_name: str, workflow_name: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """
-    Worker function to process a chunk of bimolecular reaction combinations.
-    This function must be at module level to be pickleable for multiprocessing.
-
-    Args:
-        chunk_data (List[Tuple]): List of (primary_compound, secondary_compound) tuples
-        reaction_smarts (str): SMARTS pattern for the reaction
-        reaction_name (str): Name of the reaction
-        workflow_name (str): Name of the workflow
-
-    Returns:
-        Tuple[List[Dict], List[Dict]]: (products, ambiguous_reactants) — ambiguous_reactants has
-            one entry per reactant pair in this chunk for which RunReactants() returned more than
-            one product set (the pair matched the reaction template at more than one site).
-    """
-    try:
-        from rdkit import Chem
-        from rdkit.Chem import AllChem
-        from rdkit import RDLogger
-        RDLogger.DisableLog('rdApp.*')
-
-        products = []
-        ambiguous_reactants = []
-
-        # Parse reaction
-        rxn = AllChem.ReactionFromSmarts(reaction_smarts)
-        if rxn is None:
-            return [], []
-
-        for primary_compound, secondary_compound in chunk_data:
-            try:
-                # Parse molecules
-                primary_mol = Chem.MolFromSmiles(primary_compound['smiles'])
-                secondary_mol = Chem.MolFromSmiles(secondary_compound['smiles'])
-
-                if primary_mol is None or secondary_mol is None:
-                    continue
-
-                # Run reaction
-                reaction_results = rxn.RunReactants((primary_mol, secondary_mol))
-
-                # Flag reactant pairs that matched the reaction template at more than one
-                # site, generating more than one product possibility for the same pair
-                if len(reaction_results) > 1:
-                    primary_id = primary_compound.get('id', 'unk')
-                    secondary_id = secondary_compound.get('id', 'unk')
-                    ambiguous_reactants.append({
-                        'reactant1_id': primary_id,
-                        'reactant1_name': primary_compound.get('name', f"cpd_{primary_id}"),
-                        'reactant1_smiles': primary_compound['smiles'],
-                        'reactant2_id': secondary_id,
-                        'reactant2_name': secondary_compound.get('name', f"cpd_{secondary_id}"),
-                        'reactant2_smiles': secondary_compound['smiles'],
-                        'product_possibilities': len(reaction_results),
-                    })
-
-                # Process products. When a reactant pair matches at more than one
-                # site (ambiguous), different product_sets can yield the exact same
-                # product structure (e.g. a symmetric reactant reacting at either of
-                # two equivalent groups) -- dedupe by canonical SMILES within this
-                # pair so the same product isn't written to the database twice.
-                seen_product_smiles = set()
-                for product_set_idx, product_set in enumerate(reaction_results):
-                    for product_idx, product_mol in enumerate(product_set):
-                        try:
-                            Chem.SanitizeMol(product_mol)
-                            product_smiles = Chem.MolToSmiles(product_mol)
-
-                            if product_smiles in seen_product_smiles:
-                                continue
-                            seen_product_smiles.add(product_smiles)
-
-                            # Generate product name
-                            primary_name = primary_compound.get('name', f"cpd_{primary_compound.get('id', 'unk')}")
-                            secondary_name = secondary_compound.get('name', f"cpd_{secondary_compound.get('id', 'unk')}")
-                            product_name = f"{primary_name}+{secondary_name}_{reaction_name}_{product_set_idx}_{product_idx}"
-
-                            products.append({
-                                'smiles': product_smiles,
-                                'name': product_name,
-                                'flag': 'parallel_bimolecular_product',
-                                'reactant1_name': primary_name,
-                                'reactant1_smiles': primary_compound['smiles'],
-                                'reactant2_name': secondary_name,
-                                'reactant2_smiles': secondary_compound['smiles'],
-                                'reaction_name': reaction_name,
-                                'workflow': workflow_name
-                            })
-
-                        except Exception:
-                            continue
-
-            except Exception:
-                continue
-
-        return products, ambiguous_reactants
-
-    except Exception:
-        return [], []
-
 def _process_unimolecular_chunk_worker(chunk_data: List[Dict], reaction_smarts: str,
                                      reaction_name: str, workflow_name: str,
                                      name_prefix: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -800,119 +698,221 @@ def _process_unimolecular_chunk_worker(chunk_data: List[Dict], reaction_smarts: 
     except Exception:
         return [], []
 
-def _process_bimolecular_chunk_to_file_worker(chunk_data: List[Tuple], reaction_smarts: str,
-                                            reaction_name: str, workflow_name: str,
-                                            output_file_path: str) -> Tuple[int, List[Dict[str, Any]]]:
+# Per-process state for the index-range bimolecular workers below. Populated once per worker
+# process by _init_bimolecular_range_worker() (ProcessPoolExecutor initializer), so the full
+# reactant lists are handed to each process a single time instead of being pickled into every
+# task, and tasks themselves are just four integers.
+_bimol_state: Dict[str, Any] = {}
+
+
+def _init_bimolecular_range_worker(primary_records: List[Dict[str, Any]],
+                                   secondary_records: List[Dict[str, Any]],
+                                   reaction_smarts: str, reaction_name: str,
+                                   workflow_name: str) -> None:
     """
-    Worker function to process a bimolecular chunk and write results directly to a CSV file.
+    ProcessPoolExecutor initializer for the bimolecular index-range workers. Stores the
+    reactant records and the parsed reaction in module-level state for this process.
+    Must be at module level to be pickleable for multiprocessing.
+    """
+    from rdkit.Chem import AllChem
+    from rdkit import RDLogger
+    RDLogger.DisableLog('rdApp.*')
 
-    Args:
-        chunk_data (List[Tuple]): List of (primary_compound, secondary_compound) tuples
-        reaction_smarts (str): SMARTS pattern for the reaction
-        reaction_name (str): Name of the reaction
-        workflow_name (str): Name of the workflow
-        output_file_path (str): Path to output CSV file
+    _bimol_state.clear()
+    _bimol_state.update({
+        'primary': primary_records,
+        'secondary': secondary_records,
+        'rxn': AllChem.ReactionFromSmarts(reaction_smarts),
+        'reaction_name': reaction_name,
+        'workflow_name': workflow_name,
+        # Parsed secondary reactants for the last j-range this process handled
+        'secondary_range': None,
+        'secondary_parsed': [],
+    })
 
-    Returns:
-        Tuple[int, List[Dict]]: (products_count, ambiguous_reactants) — ambiguous_reactants has
-            one entry per reactant pair in this chunk for which RunReactants() returned more than
-            one product set (the pair matched the reaction template at more than one site).
+
+def _reactant_name(compound: Dict[str, Any]) -> str:
+    return compound.get('name', f"cpd_{compound.get('id', 'unk')}")
+
+
+def _iter_bimolecular_range_products(i_start: int, i_end: int, j_start: int, j_end: int,
+                                     flag: str, ambiguous_out: List[Dict[str, Any]]):
+    """
+    Run the bimolecular reaction for primary[i_start:i_end] x secondary[j_start:j_end] (records
+    held in _bimol_state), yielding one product row dict at a time so callers can write them
+    out as they are produced instead of holding a whole chunk's products in memory.
+
+    Each reactant is parsed once per range rather than once per pair. Reactant pairs for which
+    RunReactants() returns more than one product set (the pair matched the template at more than
+    one site) are appended to ambiguous_out.
+    """
+    from rdkit import Chem
+
+    state = _bimol_state
+    rxn = state['rxn']
+    if rxn is None:
+        return
+
+    reaction_name = state['reaction_name']
+    workflow_name = state['workflow_name']
+    primary = state['primary']
+    secondary = state['secondary']
+
+    # Tasks are ordered j-outer / i-inner, so consecutive tasks handled by a process usually
+    # share a j-range and this cache avoids re-parsing the secondary reactants for each one.
+    if state['secondary_range'] != (j_start, j_end):
+        parsed = []
+        for compound in secondary[j_start:j_end]:
+            try:
+                mol = Chem.MolFromSmiles(compound['smiles'])
+            except Exception:
+                mol = None
+            parsed.append((compound, mol, _reactant_name(compound)))
+        state['secondary_parsed'] = parsed
+        state['secondary_range'] = (j_start, j_end)
+    secondary_parsed = state['secondary_parsed']
+
+    for i in range(i_start, i_end):
+        primary_compound = primary[i]
+        try:
+            primary_mol = Chem.MolFromSmiles(primary_compound['smiles'])
+        except Exception:
+            primary_mol = None
+        if primary_mol is None:
+            continue
+        primary_name = _reactant_name(primary_compound)
+
+        for secondary_compound, secondary_mol, secondary_name in secondary_parsed:
+            if secondary_mol is None:
+                continue
+
+            try:
+                reaction_results = rxn.RunReactants((primary_mol, secondary_mol))
+
+                # Flag reactant pairs that matched the reaction template at more than one
+                # site, generating more than one product possibility for the same pair
+                if len(reaction_results) > 1:
+                    primary_id = primary_compound.get('id', 'unk')
+                    secondary_id = secondary_compound.get('id', 'unk')
+                    ambiguous_out.append({
+                        'reactant1_id': primary_id,
+                        'reactant1_name': primary_name,
+                        'reactant1_smiles': primary_compound['smiles'],
+                        'reactant2_id': secondary_id,
+                        'reactant2_name': secondary_name,
+                        'reactant2_smiles': secondary_compound['smiles'],
+                        'product_possibilities': len(reaction_results),
+                    })
+
+                # When a reactant pair matches at more than one site (ambiguous), different
+                # product_sets can yield the exact same product structure (e.g. a symmetric
+                # reactant reacting at either of two equivalent groups) -- dedupe by canonical
+                # SMILES within this pair so the same product isn't emitted twice.
+                seen_product_smiles = set()
+                for product_set_idx, product_set in enumerate(reaction_results):
+                    for product_idx, product_mol in enumerate(product_set):
+                        try:
+                            Chem.SanitizeMol(product_mol)
+                            product_smiles = Chem.MolToSmiles(product_mol)
+                        except Exception:
+                            continue
+
+                        if product_smiles in seen_product_smiles:
+                            continue
+                        seen_product_smiles.add(product_smiles)
+
+                        yield {
+                            'smiles': product_smiles,
+                            'name': f"{primary_name}+{secondary_name}_{reaction_name}_{product_set_idx}_{product_idx}",
+                            'flag': flag,
+                            'reactant1_name': primary_name,
+                            'reactant1_smiles': primary_compound['smiles'],
+                            'reactant2_name': secondary_name,
+                            'reactant2_smiles': secondary_compound['smiles'],
+                            'reaction_name': reaction_name,
+                            'workflow': workflow_name,
+                        }
+            except Exception:
+                continue
+
+
+def _process_bimolecular_range_worker(i_start: int, i_end: int, j_start: int, j_end: int
+                                      ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    In-memory worker for one primary/secondary index range. Returns (products, ambiguous_reactants).
+    Requires _init_bimolecular_range_worker() to have run in this process. Must be at module
+    level to be pickleable for multiprocessing.
     """
     try:
-        import csv
-        from rdkit import Chem
-        from rdkit.Chem import AllChem
-        from rdkit import RDLogger
-        RDLogger.DisableLog('rdApp.*')
+        ambiguous_reactants: List[Dict[str, Any]] = []
+        products = list(_iter_bimolecular_range_products(
+            i_start, i_end, j_start, j_end, 'parallel_bimolecular_product', ambiguous_reactants
+        ))
+        return products, ambiguous_reactants
+    except Exception:
+        return [], []
 
+
+def _process_bimolecular_range_to_file_worker(i_start: int, i_end: int, j_start: int, j_end: int,
+                                              output_file_path: str
+                                              ) -> Tuple[int, List[Dict[str, Any]]]:
+    """
+    Streaming worker for one primary/secondary index range: writes products to a CSV file as
+    they are produced. Returns (products_count, ambiguous_reactants). Requires
+    _init_bimolecular_range_worker() to have run in this process. Must be at module level to
+    be pickleable for multiprocessing.
+    """
+    try:
         products_count = 0
-        ambiguous_reactants = []
+        ambiguous_reactants: List[Dict[str, Any]] = []
 
-        # Parse reaction
-        rxn = AllChem.ReactionFromSmarts(reaction_smarts)
-        if rxn is None:
-            return 0, []
-
-        # Open file for writing
         with open(output_file_path, 'w', newline='', encoding='utf-8') as csvfile:
             fieldnames = ['smiles', 'name', 'flag', 'reactant1_name', 'reactant1_smiles',
-                         'reactant2_name', 'reactant2_smiles', 'reaction_name', 'workflow']
+                          'reactant2_name', 'reactant2_smiles', 'reaction_name', 'workflow']
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
 
-            for primary_compound, secondary_compound in chunk_data:
+            for row in _iter_bimolecular_range_products(
+                    i_start, i_end, j_start, j_end, 'stream_bimolecular_product', ambiguous_reactants):
                 try:
-                    # Parse molecules
-                    primary_mol = Chem.MolFromSmiles(primary_compound['smiles'])
-                    secondary_mol = Chem.MolFromSmiles(secondary_compound['smiles'])
-
-                    if primary_mol is None or secondary_mol is None:
-                        continue
-
-                    # Run reaction
-                    reaction_results = rxn.RunReactants((primary_mol, secondary_mol))
-
-                    # Flag reactant pairs that matched the reaction template at more than one
-                    # site, generating more than one product possibility for the same pair
-                    if len(reaction_results) > 1:
-                        primary_id = primary_compound.get('id', 'unk')
-                        secondary_id = secondary_compound.get('id', 'unk')
-                        ambiguous_reactants.append({
-                            'reactant1_id': primary_id,
-                            'reactant1_name': primary_compound.get('name', f"cpd_{primary_id}"),
-                            'reactant1_smiles': primary_compound['smiles'],
-                            'reactant2_id': secondary_id,
-                            'reactant2_name': secondary_compound.get('name', f"cpd_{secondary_id}"),
-                            'reactant2_smiles': secondary_compound['smiles'],
-                            'product_possibilities': len(reaction_results),
-                        })
-
-                    # Process products and write immediately. When a reactant pair
-                    # matches at more than one site (ambiguous), different
-                    # product_sets can yield the exact same product structure
-                    # (e.g. a symmetric reactant reacting at either of two
-                    # equivalent groups) -- dedupe by canonical SMILES within this
-                    # pair so the same product isn't written to the database twice.
-                    seen_product_smiles = set()
-                    for product_set_idx, product_set in enumerate(reaction_results):
-                        for product_idx, product_mol in enumerate(product_set):
-                            try:
-                                Chem.SanitizeMol(product_mol)
-                                product_smiles = Chem.MolToSmiles(product_mol)
-
-                                if product_smiles in seen_product_smiles:
-                                    continue
-                                seen_product_smiles.add(product_smiles)
-
-                                # Generate product name
-                                primary_name = primary_compound.get('name', f"cpd_{primary_compound.get('id', 'unk')}")
-                                secondary_name = secondary_compound.get('name', f"cpd_{secondary_compound.get('id', 'unk')}")
-                                product_name = f"{primary_name}+{secondary_name}_{reaction_name}_{product_set_idx}_{product_idx}"
-
-                                # Write product directly to file
-                                writer.writerow({
-                                    'smiles': product_smiles,
-                                    'name': product_name,
-                                    'flag': 'stream_bimolecular_product',
-                                    'reactant1_name': primary_name,
-                                    'reactant1_smiles': primary_compound['smiles'],
-                                    'reactant2_name': secondary_name,
-                                    'reactant2_smiles': secondary_compound['smiles'],
-                                    'reaction_name': reaction_name,
-                                    'workflow': workflow_name
-                                })
-                                products_count += 1
-
-                            except Exception:
-                                continue
-
+                    writer.writerow(row)
+                    products_count += 1
                 except Exception:
                     continue
 
         return products_count, ambiguous_reactants
-
     except Exception:
         return 0, []
+
+
+def _bimolecular_range_shape(n_primary: int, n_secondary: int, chunk_size: int) -> Tuple[int, int]:
+    """
+    Tile size (primary rows, secondary rows) so each task covers about chunk_size pairs: whole
+    secondary lists per task when they fit (so secondary reactants are parsed once per task),
+    otherwise single primary rows against chunk_size-sized secondary slices.
+    """
+    j_step = max(1, min(n_secondary, chunk_size))
+    i_step = max(1, chunk_size // j_step)
+    return i_step, j_step
+
+
+def _iter_bimolecular_ranges(n_primary: int, n_secondary: int, chunk_size: int):
+    """
+    Lazily yield (i_start, i_end, j_start, j_end) tiles covering the n_primary x n_secondary grid,
+    j-outer / i-inner. When the secondary list fits in one tile this is plain primary-major
+    order, i.e. the same pair order as the old flat chunking.
+    """
+    i_step, j_step = _bimolecular_range_shape(n_primary, n_secondary, chunk_size)
+    for j_start in range(0, n_secondary, j_step):
+        j_end = min(j_start + j_step, n_secondary)
+        for i_start in range(0, n_primary, i_step):
+            yield i_start, min(i_start + i_step, n_primary), j_start, j_end
+
+
+def _count_bimolecular_ranges(n_primary: int, n_secondary: int, chunk_size: int) -> int:
+    i_step, j_step = _bimolecular_range_shape(n_primary, n_secondary, chunk_size)
+    return -(-n_primary // i_step) * -(-n_secondary // j_step)
+
 
 def _process_unimolecular_chunk_to_file_worker(chunk_data: List[Dict], reaction_smarts: str,
                                              reaction_name: str, workflow_name: str,
@@ -3762,6 +3762,136 @@ cs._execute_csv_load(
         except Exception as e:
             print(f"❌ Error getting columns for table '{table_name}': {e}")
             return []
+
+    # Columns the bimolecular reaction workers actually read from a reactant.
+    _REACTANT_COLUMNS = ('id', 'name', 'smiles')
+
+    def _get_reactant_records(self, table_name: str) -> List[Dict[str, Any]]:
+        """
+        Load only the columns reaction workers need (id, name, smiles) from a table, as a list
+        of dicts. Unlike _get_table_as_dataframe(), this skips SELECT * over every column
+        (fingerprint/descriptor blobs included) and the DataFrame round trip.
+
+        Args:
+            table_name (str): Name of the table to read
+
+        Returns:
+            List[Dict[str, Any]]: One dict per compound; empty list if the table is missing,
+                has no smiles column, or an error occurs
+        """
+        try:
+            if table_name not in self.get_all_tables():
+                print(f"⚠️  Table '{table_name}' does not exist")
+                return []
+
+            available = self._get_table_columns(table_name)
+            columns = [c for c in self._REACTANT_COLUMNS if c in available]
+            if 'smiles' not in columns:
+                print(f"⚠️  Table '{table_name}' has no 'smiles' column")
+                return []
+
+            conn = sqlite3.connect(self.__chemspace_db)
+            try:
+                cursor = conn.execute(f"SELECT {', '.join(columns)} FROM {table_name}")
+                records = [dict(zip(columns, row)) for row in cursor]
+            finally:
+                conn.close()
+
+            print(f"✅ Retrieved {len(records)} reactants from '{table_name}'")
+            return records
+
+        except Exception as e:
+            print(f"❌ Error retrieving reactants from table '{table_name}': {e}")
+            return []
+
+    @classmethod
+    def _to_reactant_records(cls, reactants: Union[pd.DataFrame, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+        """Accept either a DataFrame or already-loaded reactant records; return records."""
+        if isinstance(reactants, pd.DataFrame):
+            columns = [c for c in cls._REACTANT_COLUMNS if c in reactants.columns]
+            return reactants[columns].to_dict('records')
+        return reactants
+
+    def _run_bimolecular_range_pool(self, primary_records: List[Dict[str, Any]],
+                                    secondary_records: List[Dict[str, Any]],
+                                    reaction_info: Dict[str, Any], workflow_name: str,
+                                    max_workers: int, chunk_size: int, worker_fn: Callable,
+                                    extra_args_fn: Callable[[int], Tuple],
+                                    on_result: Callable[[int, Any], int],
+                                    progress_desc: str) -> int:
+        """
+        Run worker_fn over index-range tiles of the primary x secondary grid in a process pool.
+
+        The reactant records go to each worker once through the pool initializer, tiles are
+        submitted lazily (about 2 x max_workers in flight), and nothing per-pair is ever built in
+        the parent process.
+
+        Args:
+            worker_fn (Callable): Module-level worker taking (i_start, i_end, j_start, j_end, *extra)
+            extra_args_fn (Callable[[int], Tuple]): Given the task index (submission order), returns
+                the extra positional args for worker_fn; called in the parent, in order
+            on_result (Callable[[int, Any], int]): Called in the parent as each task completes, with
+                (task_index, worker_result); returns the running product total for progress display
+            progress_desc (str): Label for the progress bar
+
+        Returns:
+            int: Number of tasks run
+        """
+        n_primary, n_secondary = len(primary_records), len(secondary_records)
+        total_tasks = _count_bimolecular_ranges(n_primary, n_secondary, chunk_size)
+        ranges = enumerate(_iter_bimolecular_ranges(n_primary, n_secondary, chunk_size))
+
+        progress_bar = tqdm(total=total_tasks, desc=progress_desc, unit="chunks") if TQDM_AVAILABLE else None
+        processed = 0
+        running_total = 0
+
+        with ProcessPoolExecutor(
+            max_workers=max_workers,
+            initializer=_init_bimolecular_range_worker,
+            initargs=(primary_records, secondary_records, reaction_info['smarts'],
+                      reaction_info['name'], workflow_name),
+        ) as executor:
+            in_flight = {}
+
+            def submit_next() -> bool:
+                try:
+                    idx, tile = next(ranges)
+                except StopIteration:
+                    return False
+                future = executor.submit(worker_fn, *tile, *extra_args_fn(idx))
+                in_flight[future] = idx
+                return True
+
+            for _ in range(max(1, max_workers) * 2):
+                if not submit_next():
+                    break
+
+            while in_flight:
+                done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+                for future in done:
+                    idx = in_flight.pop(future)
+                    try:
+                        running_total = on_result(idx, future.result())
+                    except Exception as e:
+                        print(f"   ❌ Error processing chunk {idx}: {e}")
+                    processed += 1
+
+                    if progress_bar:
+                        progress_bar.update(1)
+                        progress_bar.set_postfix({
+                            'products': running_total,
+                            'chunks': f"{processed}/{total_tasks}"
+                        })
+                    elif processed % max(1, total_tasks // 10) == 0:
+                        print(f"      📊 Progress: {processed / total_tasks * 100:.1f}% "
+                              f"({running_total:,} products)")
+
+                    submit_next()
+
+        if progress_bar:
+            progress_bar.close()
+
+        return total_tasks
 
     def compute_inchi_keys(self, table_name: str,
                           update_database: bool = True,
@@ -14219,33 +14349,39 @@ plt.show()
             print(f"❌ Error in filter_using_physicochemical_workflow: {e}")
             return pd.DataFrame()
 
-    def inform_table_physicochemical_profile(self, table_name: Optional[str] = None,
-                    workflow_name: Optional[str] = None) -> pd.DataFrame:
+    def inform_table_physicochemical_profile(self, table_name: Optional[Union[str, List[str]]] = None,
+                    workflow_name: Optional[str] = None) -> Union[pd.DataFrame, Dict[str, pd.DataFrame]]:
         """
         Report the observed range of physicochemical descriptors (as defined by a
-        saved physicochemical filtering workflow) for the compounds in a given table.
+        saved physicochemical filtering workflow) for the compounds in one or more tables.
 
         Unlike filter_using_physicochemical_workflow(), this does not filter or save
         anything -- it computes each descriptor listed in the workflow for every
-        parseable compound in the table and prints an on-screen summary (min, max,
+        parseable compound in each table and prints an on-screen summary (min, max,
         mean, median, std) alongside the workflow's configured [min, max] bounds and
-        how many compounds currently fall outside that range.
+        how many compounds currently fall outside that range. Each table's report is
+        computed and printed independently (a "by table" report) -- tables are never
+        pooled together for the descriptor statistics.
 
         Args:
-            table_name (Optional[str]): Name of the table containing compounds to profile.
-                If None, shows interactive selection.
+            table_name (Optional[Union[str, List[str]]]): Name of the table(s) containing
+                compounds to profile. A single string profiles one table; a list profiles
+                each table in turn against the same workflow. If None, shows interactive
+                selection (single or multiple).
             workflow_name (Optional[str]): Name of the physicochemical workflow whose
                 descriptors should be profiled. If None, shows interactive selection.
 
         Returns:
-            pd.DataFrame: One row per descriptor with columns
-                ['descriptor', 'min', 'max', 'mean', 'median', 'std', 'workflow_min',
-                'workflow_max', 'within_range', 'out_of_range', 'n']. Empty DataFrame
-                on error or if no compounds/descriptors could be evaluated. The count
-                of compounds matching all filters simultaneously is available via
-                `report_df.attrs['matching_all_filters']` (and the valid compound
-                count via `report_df.attrs['valid_compounds']`), and is printed in
-                the on-screen summary.
+            Union[pd.DataFrame, Dict[str, pd.DataFrame]]: When a single table is profiled,
+                one row per descriptor with columns ['descriptor', 'min', 'max', 'mean',
+                'median', 'std', 'workflow_min', 'workflow_max', 'within_range',
+                'out_of_range', 'n'] -- identical to the previous single-table behavior.
+                When multiple tables are profiled, a dict mapping each table name to its
+                own independent report DataFrame (same columns, never pooled/merged across
+                tables). Empty DataFrame on error or if no compounds/descriptors could be
+                evaluated for any requested table. Each per-table DataFrame carries
+                `.attrs['matching_all_filters']` and `.attrs['valid_compounds']` for that
+                table alone, and these are also printed in the on-screen summary.
         """
         try:
             print(f"\n📊 Starting physicochemical profile report...")
@@ -14259,32 +14395,25 @@ plt.show()
 
             # Interactive table selection if not provided
             if table_name is None:
-                table_name = self._select_table_for_filtering()
-                if not table_name:
+                table_names = self._select_tables_for_physicochemical_profiling()
+                if not table_names:
+                    print("❌ No table selected for profiling")
+                    return pd.DataFrame()
+            else:
+                table_names = [table_name] if isinstance(table_name, str) else list(dict.fromkeys(table_name))
+                if not table_names:
                     print("❌ No table selected for profiling")
                     return pd.DataFrame()
 
-            print(f"   📋 Table: '{table_name}'")
             print(f"   🧪 Workflow: '{workflow_name}'")
 
-            # Load workflow filters (descriptor names + configured bounds)
+            # Load workflow filters (descriptor names + configured bounds), shared across tables
             print(f"   🔍 Loading workflow filters...")
             workflow_filters = self._load_physicochemical_workflow_filters(workflow_name)
             if not workflow_filters:
                 print(f"❌ No filters found for workflow '{workflow_name}'")
                 return pd.DataFrame()
 
-            # Load compounds from table
-            print(f"   📊 Loading compounds from table '{table_name}'...")
-            compounds_df = self._get_table_as_dataframe(table_name)
-            if compounds_df.empty:
-                print(f"❌ No compounds found in table '{table_name}'")
-                return pd.DataFrame()
-
-            total_compounds = len(compounds_df)
-            print(f"   ✅ Loaded {total_compounds:,} compounds")
-
-            from rdkit import Chem
             from rdkit import RDLogger
             RDLogger.DisableLog('rdApp.*')
 
@@ -14292,111 +14421,264 @@ plt.show()
             descriptor_names = [name for name, _, _ in workflow_filters]
             configured_bounds = {name: (lower, upper) for name, lower, upper in workflow_filters}
 
-            descriptor_values: Dict[str, List[float]] = {name: [] for name in descriptor_names}
-            invalid_smiles_count = 0
-            matching_all_filters = 0
+            per_table_reports: Dict[str, pd.DataFrame] = {}
+            for current_table in table_names:
+                report_df = self._compute_physicochemical_profile_for_table(
+                    current_table, workflow_name, descriptor_funcs, descriptor_names, configured_bounds
+                )
+                if report_df is not None and not report_df.empty:
+                    per_table_reports[current_table] = report_df
 
-            print(f"   🧮 Computing {len(descriptor_names)} descriptor(s) for {total_compounds:,} compounds...")
-
-            if TQDM_AVAILABLE:
-                iterator = tqdm(compounds_df.iterrows(), total=total_compounds,
-                                desc="Computing descriptors", unit="compounds")
-            else:
-                iterator = compounds_df.iterrows()
-
-            for _, compound in iterator:
-                mol = Chem.MolFromSmiles(compound.get('smiles', None))
-                if mol is None:
-                    invalid_smiles_count += 1
-                    continue
-
-                compound_values = {}
-                for descriptor_name in descriptor_names:
-                    descriptor_func = descriptor_funcs.get(descriptor_name)
-                    if descriptor_func is None:
-                        continue
-                    try:
-                        value = descriptor_func(mol)
-                        descriptor_values[descriptor_name].append(value)
-                        compound_values[descriptor_name] = value
-                    except Exception:
-                        continue
-
-                if len(compound_values) == len(descriptor_names) and all(
-                        configured_bounds[name][0] <= value <= configured_bounds[name][1]
-                        for name, value in compound_values.items()):
-                    matching_all_filters += 1
-
-            valid_compounds = total_compounds - invalid_smiles_count
-            if valid_compounds == 0:
-                print(f"❌ No valid compounds (parseable SMILES) found in table '{table_name}'")
+            if not per_table_reports:
+                print(f"❌ No physicochemical profile could be generated for any of the requested table(s)")
                 return pd.DataFrame()
 
-            report_rows = []
-            for descriptor_name in descriptor_names:
-                values = descriptor_values[descriptor_name]
-                if not values:
-                    print(f"   ⚠️  Descriptor '{descriptor_name}' could not be computed for any compound (skipped)")
-                    continue
+            # Single-table call: preserve the original return shape exactly
+            if len(table_names) == 1:
+                return per_table_reports.get(table_names[0], pd.DataFrame())
 
-                values_array = np.array(values, dtype=float)
-                lower_bound, upper_bound = configured_bounds[descriptor_name]
-                out_of_range = int(np.sum((values_array < lower_bound) | (values_array > upper_bound)))
-                within_range = len(values) - out_of_range
+            # Multi-table call: each table keeps its own independent report (never pooled)
+            matching_all_filters = {t: df.attrs.get('matching_all_filters', 0) for t, df in per_table_reports.items()}
+            valid_compounds = {t: df.attrs.get('valid_compounds', 0) for t, df in per_table_reports.items()}
 
-                report_rows.append({
-                    'descriptor': descriptor_name,
-                    'min': float(np.min(values_array)),
-                    'max': float(np.max(values_array)),
-                    'mean': float(np.mean(values_array)),
-                    'median': float(np.median(values_array)),
-                    'std': float(np.std(values_array)),
-                    'workflow_min': lower_bound,
-                    'workflow_max': upper_bound,
-                    'within_range': within_range,
-                    'out_of_range': out_of_range,
-                    'n': len(values)
-                })
+            # Print a by-table summary (one row per table, each computed independently)
+            print(f"\n{'=' * 90}")
+            print(f"📊 PHYSICOCHEMICAL PROFILE SUMMARY (BY TABLE)  |  Workflow: '{workflow_name}'  |  "
+                    f"{len(per_table_reports)} table(s)")
+            print(f"{'=' * 90}")
+            print(f"{'Table':<35}{'Valid compounds':>18}{'Matching ALL filters':>25}{'%':>10}")
+            print(f"{'-' * 90}")
+            for t in per_table_reports:
+                valid = valid_compounds[t]
+                matching = matching_all_filters[t]
+                pct = (matching / valid) * 100 if valid else 0
+                print(f"{t:<35}{valid:>18,}{matching:>25,}{pct:>9.1f}%")
+            print(f"{'=' * 90}\n")
 
-            if not report_rows:
-                print(f"❌ No descriptors from workflow '{workflow_name}' could be evaluated on table '{table_name}'")
-                return pd.DataFrame()
-
-            report_df = pd.DataFrame(report_rows)
-            report_df.attrs['matching_all_filters'] = matching_all_filters
-            report_df.attrs['valid_compounds'] = valid_compounds
-
-            # Print the on-screen report
-            print(f"\n{'=' * 130}")
-            print(f"📊 PHYSICOCHEMICAL PROFILE  |  Table: '{table_name}'  |  Workflow: '{workflow_name}'")
-            print(f"{'=' * 130}")
-            print(f"   Total compounds in table: {total_compounds:,}")
-            print(f"   Valid (parseable) compounds: {valid_compounds:,}")
-            if invalid_smiles_count:
-                print(f"   ⚠️  Invalid/unparseable SMILES skipped: {invalid_smiles_count:,}")
-            matching_all_pct = (matching_all_filters / valid_compounds) * 100 if valid_compounds else 0
-            print(f"   ✅ Compounds matching ALL filters simultaneously: {matching_all_filters:,} "
-                    f"({matching_all_pct:.1f}% of valid compounds)")
-            print(f"{'-' * 130}")
-            print(f"{'Descriptor':<25}{'Min':>10}{'Max':>10}{'Mean':>10}{'Median':>10}{'Std':>10}"
-                    f"{'Workflow Range':>22}{'Within range':>17}{'Out-of-range':>17}")
-            print(f"{'-' * 130}")
-            for row in report_rows:
-                workflow_range_str = f"[{row['workflow_min']}, {row['workflow_max']}]"
-                within_range_pct = (row['within_range'] / row['n']) * 100 if row['n'] else 0
-                out_of_range_pct = (row['out_of_range'] / row['n']) * 100 if row['n'] else 0
-                within_range_str = f"{row['within_range']:,} ({within_range_pct:.1f}%)"
-                out_of_range_str = f"{row['out_of_range']:,} ({out_of_range_pct:.1f}%)"
-                print(f"{row['descriptor']:<25}{row['min']:>10.3f}{row['max']:>10.3f}{row['mean']:>10.3f}"
-                        f"{row['median']:>10.3f}{row['std']:>10.3f}{workflow_range_str:>22}"
-                        f"{within_range_str:>17}{out_of_range_str:>17}")
-            print(f"{'=' * 130}\n")
-
-            return report_df
+            return per_table_reports
 
         except Exception as e:
             print(f"❌ Error generating physicochemical profile report: {e}")
             return pd.DataFrame()
+
+    def _compute_physicochemical_profile_for_table(self, table_name: str, workflow_name: str,
+                    descriptor_funcs: Dict[str, Callable], descriptor_names: List[str],
+                    configured_bounds: Dict[str, Tuple[float, float]]) -> Optional[pd.DataFrame]:
+        """
+        Compute and print the physicochemical profile report for a single table, given an
+        already-resolved workflow. Factored out of inform_table_physicochemical_profile()
+        so it can be called once per table when multiple tables are requested.
+
+        Returns:
+            Optional[pd.DataFrame]: The per-descriptor report (with 'matching_all_filters'
+                and 'valid_compounds' set in .attrs), or None/empty DataFrame if the table
+                had no compounds or no descriptor could be evaluated.
+        """
+        from rdkit import Chem
+
+        # Load compounds from table
+        print(f"\n   📊 Loading compounds from table '{table_name}'...")
+        compounds_df = self._get_table_as_dataframe(table_name)
+        if compounds_df.empty:
+            print(f"❌ No compounds found in table '{table_name}'")
+            return pd.DataFrame()
+
+        total_compounds = len(compounds_df)
+        print(f"   ✅ Loaded {total_compounds:,} compounds")
+
+        descriptor_values: Dict[str, List[float]] = {name: [] for name in descriptor_names}
+        invalid_smiles_count = 0
+        matching_all_filters = 0
+
+        print(f"   🧮 Computing {len(descriptor_names)} descriptor(s) for {total_compounds:,} compounds...")
+
+        if TQDM_AVAILABLE:
+            iterator = tqdm(compounds_df.iterrows(), total=total_compounds,
+                            desc="Computing descriptors", unit="compounds")
+        else:
+            iterator = compounds_df.iterrows()
+
+        for _, compound in iterator:
+            mol = Chem.MolFromSmiles(compound.get('smiles', None))
+            if mol is None:
+                invalid_smiles_count += 1
+                continue
+
+            compound_values = {}
+            for descriptor_name in descriptor_names:
+                descriptor_func = descriptor_funcs.get(descriptor_name)
+                if descriptor_func is None:
+                    continue
+                try:
+                    value = descriptor_func(mol)
+                    descriptor_values[descriptor_name].append(value)
+                    compound_values[descriptor_name] = value
+                except Exception:
+                    continue
+
+            if len(compound_values) == len(descriptor_names) and all(
+                    configured_bounds[name][0] <= value <= configured_bounds[name][1]
+                    for name, value in compound_values.items()):
+                matching_all_filters += 1
+
+        valid_compounds = total_compounds - invalid_smiles_count
+        if valid_compounds == 0:
+            print(f"❌ No valid compounds (parseable SMILES) found in table '{table_name}'")
+            return pd.DataFrame()
+
+        report_rows = []
+        for descriptor_name in descriptor_names:
+            values = descriptor_values[descriptor_name]
+            if not values:
+                print(f"   ⚠️  Descriptor '{descriptor_name}' could not be computed for any compound (skipped)")
+                continue
+
+            values_array = np.array(values, dtype=float)
+            lower_bound, upper_bound = configured_bounds[descriptor_name]
+            out_of_range = int(np.sum((values_array < lower_bound) | (values_array > upper_bound)))
+            within_range = len(values) - out_of_range
+
+            report_rows.append({
+                'descriptor': descriptor_name,
+                'min': float(np.min(values_array)),
+                'max': float(np.max(values_array)),
+                'mean': float(np.mean(values_array)),
+                'median': float(np.median(values_array)),
+                'std': float(np.std(values_array)),
+                'workflow_min': lower_bound,
+                'workflow_max': upper_bound,
+                'within_range': within_range,
+                'out_of_range': out_of_range,
+                'n': len(values)
+            })
+
+        if not report_rows:
+            print(f"❌ No descriptors from workflow '{workflow_name}' could be evaluated on table '{table_name}'")
+            return pd.DataFrame()
+
+        report_df = pd.DataFrame(report_rows)
+        report_df.attrs['matching_all_filters'] = matching_all_filters
+        report_df.attrs['valid_compounds'] = valid_compounds
+
+        # Print the on-screen report
+        print(f"\n{'=' * 130}")
+        print(f"📊 PHYSICOCHEMICAL PROFILE  |  Table: '{table_name}'  |  Workflow: '{workflow_name}'")
+        print(f"{'=' * 130}")
+        print(f"   Total compounds in table: {total_compounds:,}")
+        print(f"   Valid (parseable) compounds: {valid_compounds:,}")
+        if invalid_smiles_count:
+            print(f"   ⚠️  Invalid/unparseable SMILES skipped: {invalid_smiles_count:,}")
+        matching_all_pct = (matching_all_filters / valid_compounds) * 100 if valid_compounds else 0
+        print(f"   ✅ Compounds matching ALL filters simultaneously: {matching_all_filters:,} "
+                f"({matching_all_pct:.1f}% of valid compounds)")
+        print(f"{'-' * 130}")
+        print(f"{'Descriptor':<25}{'Min':>10}{'Max':>10}{'Mean':>10}{'Median':>10}{'Std':>10}"
+                f"{'Workflow Range':>22}{'Within range':>17}{'Out-of-range':>17}")
+        print(f"{'-' * 130}")
+        for row in report_rows:
+            workflow_range_str = f"[{row['workflow_min']}, {row['workflow_max']}]"
+            within_range_pct = (row['within_range'] / row['n']) * 100 if row['n'] else 0
+            out_of_range_pct = (row['out_of_range'] / row['n']) * 100 if row['n'] else 0
+            within_range_str = f"{row['within_range']:,} ({within_range_pct:.1f}%)"
+            out_of_range_str = f"{row['out_of_range']:,} ({out_of_range_pct:.1f}%)"
+            print(f"{row['descriptor']:<25}{row['min']:>10.3f}{row['max']:>10.3f}{row['mean']:>10.3f}"
+                    f"{row['median']:>10.3f}{row['std']:>10.3f}{workflow_range_str:>22}"
+                    f"{within_range_str:>17}{out_of_range_str:>17}")
+        print(f"{'=' * 130}\n")
+
+        return report_df
+
+    def _select_tables_for_physicochemical_profiling(self) -> Optional[List[str]]:
+        """
+        Interactive multi-selection of table(s) to profile, for
+        inform_table_physicochemical_profile().
+
+        Returns:
+            Optional[List[str]]: Selected table names (in the order chosen, de-duplicated),
+                or None if cancelled/no tables available
+        """
+        try:
+            available_tables = self.get_all_tables()
+
+            if not available_tables:
+                print("❌ No tables available for profiling")
+                return None
+
+            print(f"\n📋 SELECT TABLE(S) FOR PHYSICOCHEMICAL PROFILING")
+            print("=" * 60)
+            print(f"Available tables ({len(available_tables)} total):")
+            print("-" * 60)
+
+            table_info = []
+            for i, t in enumerate(available_tables, 1):
+                try:
+                    table_type = self._classify_table_type(t)
+                    type_icon = self._get_table_type_icon(table_type)
+                    print(f"{i:3d}. {type_icon} {t:<35} [{table_type}]")
+                    table_info.append({'name': t, 'type': table_type})
+                except Exception as e:
+                    print(f"{i:3d}. ❓ {t:<35} [Error: {e}]")
+                    table_info.append({'name': t, 'type': 'unknown'})
+
+            print("-" * 60)
+            print("Commands: Enter table number(s)/name(s) (comma-separated) to profile multiple "
+                    "tables, 'all', or 'cancel' to abort")
+
+            while True:
+                try:
+                    selection = input(f"\n🔍 Select table(s) for profiling: ").strip()
+
+                    if selection.lower() in ['cancel', 'quit', 'exit']:
+                        return None
+
+                    if selection.lower() == 'all':
+                        return list(available_tables)
+
+                    parts = [p.strip() for p in selection.split(',') if p.strip()]
+                    if not parts:
+                        print("❌ No selection entered")
+                        continue
+
+                    selected: List[str] = []
+                    seen = set()
+                    invalid_parts = []
+                    for part in parts:
+                        try:
+                            idx = int(part) - 1
+                            if 0 <= idx < len(available_tables):
+                                candidate = available_tables[idx]
+                            else:
+                                invalid_parts.append(part)
+                                continue
+                        except ValueError:
+                            matches = [t for t in available_tables if t.lower() == part.lower()]
+                            if not matches:
+                                invalid_parts.append(part)
+                                continue
+                            candidate = matches[0]
+
+                        if candidate not in seen:
+                            seen.add(candidate)
+                            selected.append(candidate)
+
+                    if invalid_parts:
+                        print(f"❌ Invalid selection(s): {', '.join(invalid_parts)}")
+                        continue
+
+                    if not selected:
+                        print("❌ No valid table(s) selected")
+                        continue
+
+                    print(f"\n✅ Selected table(s): {', '.join(selected)}")
+                    return selected
+
+                except KeyboardInterrupt:
+                    print("\n❌ Table selection cancelled")
+                    return None
+
+        except Exception as e:
+            print(f"❌ Error selecting table(s) for profiling: {e}")
+            return None
 
     def check_duplicates(self, table_name: Optional[str] = None,
                     duplicate_by: str = 'smiles',
@@ -16748,12 +17030,17 @@ plt.show()
 
             ambiguous_reactants: List[Dict[str, Any]] = []
 
-            # Get compound data
-            primary_df = self._get_table_as_dataframe(table_config['primary_table'])
-            secondary_df = self._get_table_as_dataframe(table_config['secondary_table'])
+            # Get compound data: only the columns the workers use (id, name, smiles), not the
+            # full tables. The sequential fallback below still loads DataFrames, but only when
+            # the combination count is small.
+            primary_records = self._get_reactant_records(table_config['primary_table'])
+            if table_config['secondary_table'] == table_config['primary_table']:
+                secondary_records = primary_records
+            else:
+                secondary_records = self._get_reactant_records(table_config['secondary_table'])
             
-            primary_count = len(primary_df)
-            secondary_count = len(secondary_df)
+            primary_count = len(primary_records)
+            secondary_count = len(secondary_records)
             total_combinations = primary_count * secondary_count
             
             print(f"📊 Primary reactants: {primary_count:,} compounds")
@@ -16773,7 +17060,7 @@ plt.show()
                 try:
                     start_time = time.time()
                     total_products = self._stream_bimolecular_reaction_to_disk(
-                        primary_df, secondary_df, reaction_info, workflow_name,
+                        primary_records, secondary_records, reaction_info, workflow_name,
                         temp_dir, max_workers, chunk_size, temp_files_created,
                         ambiguous_reactants=ambiguous_reactants
                     )
@@ -16834,11 +17121,13 @@ plt.show()
                         chunk_size = max(100, total_combinations // (max_workers * 4))
 
                     products = self._apply_bimolecular_reaction_parallel(
-                        primary_df, secondary_df, reaction_info, workflow_name,
+                        primary_records, secondary_records, reaction_info, workflow_name,
                         max_workers, chunk_size, ambiguous_reactants=ambiguous_reactants
                     )
                 else:
-                    # Use existing sequential method
+                    # Use existing sequential method (small enough to load full DataFrames)
+                    primary_df = self._get_table_as_dataframe(table_config['primary_table'])
+                    secondary_df = self._get_table_as_dataframe(table_config['secondary_table'])
                     products = self._apply_bimolecular_reaction(
                         primary_df, secondary_df, reaction_info, workflow_name,
                         ambiguous_reactants=ambiguous_reactants
@@ -17088,7 +17377,8 @@ plt.show()
                 'ambiguous_reactants': []
             }
 
-    def _stream_bimolecular_reaction_to_disk(self, primary_df: pd.DataFrame, secondary_df: pd.DataFrame,
+    def _stream_bimolecular_reaction_to_disk(self, primary_df: Union[pd.DataFrame, List[Dict[str, Any]]],
+                                        secondary_df: Union[pd.DataFrame, List[Dict[str, Any]]],
                                         reaction_info: Dict[str, Any], workflow_name: str,
                                         temp_dir: str, max_workers: int, chunk_size: Optional[int],
                                         temp_files_created: List[str],
@@ -17097,13 +17387,14 @@ plt.show()
         Stream bimolecular reaction results directly to disk files.
 
         Args:
-            primary_df (pd.DataFrame): Primary reactants
-            secondary_df (pd.DataFrame): Secondary reactants
+            primary_df (Union[pd.DataFrame, List[Dict]]): Primary reactants, as a DataFrame or as
+                records from _get_reactant_records() (only id, name and smiles are used)
+            secondary_df (Union[pd.DataFrame, List[Dict]]): Secondary reactants, same forms
             reaction_info (Dict): Reaction information
             workflow_name (str): Workflow name
             temp_dir (str): Temporary directory for files
             max_workers (int): Maximum workers
-            chunk_size (Optional[int]): Chunk size
+            chunk_size (Optional[int]): Approximate number of reactant pairs per task
             temp_files_created (List[str]): List to track created files
             ambiguous_reactants (Optional[List[Dict]]): If provided, appended in place with one
                 entry per reactant pair (across all chunks) for which RunReactants() returned
@@ -17115,82 +17406,41 @@ plt.show()
             int: Total number of products streamed
         """
         try:
-            from concurrent.futures import ProcessPoolExecutor, as_completed
-            import csv
-            import os
-            
-            reaction_smarts = reaction_info['smarts']
             reaction_name = reaction_info['name']
-            
+
+            primary_records = self._to_reactant_records(primary_df)
+            secondary_records = self._to_reactant_records(secondary_df)
+
             # Set default chunk size if not provided
-            total_combinations = len(primary_df) * len(secondary_df)
+            total_combinations = len(primary_records) * len(secondary_records)
             if chunk_size is None:
                 chunk_size = max(1000, total_combinations // (max_workers * 8))  # Smaller chunks for streaming
-            
-            # Create chunks for streaming processing
-            chunks = self._create_bimolecular_chunks(primary_df, secondary_df, chunk_size)
-            
-            print(f"   📦 Created {len(chunks)} chunks for streaming processing")
+
+            total_tasks = _count_bimolecular_ranges(len(primary_records), len(secondary_records), chunk_size)
+            print(f"   📦 Split into {total_tasks} chunks for streaming processing")
             print(f"   🌊 Each chunk will be streamed directly to disk")
 
-            total_products = 0
-            processed_chunks = 0
+            totals = {'products': 0}
             all_ambiguous_reactants = []
 
-            # Initialize progress tracking
-            if TQDM_AVAILABLE:
-                progress_bar = tqdm(
-                    total=len(chunks),
-                    desc=f"Streaming {reaction_name}",
-                    unit="chunks"
-                )
-            else:
-                progress_bar = None
+            def extra_args(idx: int) -> Tuple[str]:
+                temp_file_path = os.path.join(temp_dir, f'bimolecular_chunk_{idx:06d}.csv')
+                temp_files_created.append(temp_file_path)
+                return (temp_file_path,)
 
-            # Process chunks and stream to disk
-            with ProcessPoolExecutor(max_workers=max_workers) as executor:
-                # Submit streaming jobs
-                future_to_chunk = {}
-                for i, chunk in enumerate(chunks):
-                    temp_file_path = os.path.join(temp_dir, f'bimolecular_chunk_{i:06d}.csv')
-                    temp_files_created.append(temp_file_path)
+            def on_result(idx: int, result: Tuple[int, List[Dict[str, Any]]]) -> int:
+                chunk_products_count, chunk_ambiguous = result
+                totals['products'] += chunk_products_count
+                all_ambiguous_reactants.extend(chunk_ambiguous)
+                return totals['products']
 
-                    future = executor.submit(
-                        _process_bimolecular_chunk_to_file_worker,
-                        chunk, reaction_smarts, reaction_name, workflow_name, temp_file_path
-                    )
-                    future_to_chunk[future] = i
+            self._run_bimolecular_range_pool(
+                primary_records, secondary_records, reaction_info, workflow_name,
+                max_workers, chunk_size, _process_bimolecular_range_to_file_worker,
+                extra_args, on_result, f"Streaming {reaction_name}"
+            )
 
-                # Collect results
-                for future in as_completed(future_to_chunk):
-                    chunk_idx = future_to_chunk[future]
-
-                    try:
-                        chunk_products_count, chunk_ambiguous = future.result()
-                        total_products += chunk_products_count
-                        all_ambiguous_reactants.extend(chunk_ambiguous)
-                        processed_chunks += 1
-
-                        if progress_bar:
-                            progress_bar.update(1)
-                            progress_bar.set_postfix({
-                                'products': total_products,
-                                'chunks': f"{processed_chunks}/{len(chunks)}"
-                            })
-                        else:
-                            if processed_chunks % max(1, len(chunks) // 10) == 0:
-                                progress = (processed_chunks / len(chunks)) * 100
-                                print(f"      📊 Progress: {progress:.1f}% ({total_products:,} products streamed)")
-
-                    except Exception as e:
-                        print(f"   ❌ Error processing chunk {chunk_idx}: {e}")
-                        processed_chunks += 1
-                        if progress_bar:
-                            progress_bar.update(1)
-
-            if progress_bar:
-                progress_bar.close()
-
+            total_products = totals['products']
             print(f"   ✅ Streaming completed: {total_products:,} products in {len(temp_files_created)} files")
             if all_ambiguous_reactants:
                 print(f"   ⚠️  {len(all_ambiguous_reactants)} reactant pair(s) matched the reaction template "
@@ -17872,7 +18122,8 @@ plt.show()
                 'parallel_used': False
             }
 
-    def _apply_bimolecular_reaction_parallel(self, primary_df: pd.DataFrame, secondary_df: pd.DataFrame,
+    def _apply_bimolecular_reaction_parallel(self, primary_df: Union[pd.DataFrame, List[Dict[str, Any]]],
+                                        secondary_df: Union[pd.DataFrame, List[Dict[str, Any]]],
                                         reaction_info: Dict[str, Any], workflow_name: str,
                                         max_workers: int, chunk_size: int,
                                         ambiguous_reactants: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
@@ -17880,12 +18131,13 @@ plt.show()
         Apply a bimolecular reaction using parallel processing.
 
         Args:
-            primary_df (pd.DataFrame): Primary reactants dataframe
-            secondary_df (pd.DataFrame): Secondary reactants dataframe
+            primary_df (Union[pd.DataFrame, List[Dict]]): Primary reactants, as a DataFrame or as
+                records from _get_reactant_records() (only id, name and smiles are used)
+            secondary_df (Union[pd.DataFrame, List[Dict]]): Secondary reactants, same forms
             reaction_info (Dict): Reaction information
             workflow_name (str): Name of the workflow
             max_workers (int): Maximum number of parallel workers
-            chunk_size (int): Size of each chunk for parallel processing
+            chunk_size (int): Approximate number of reactant pairs per task
             ambiguous_reactants (Optional[List[Dict]]): If provided, appended in place with one
                 entry per reactant pair (across all chunks) for which RunReactants() returned
                 more than one product set — i.e. the pair matched the reaction template at more
@@ -17896,77 +18148,33 @@ plt.show()
             List[Dict]: List of reaction products
         """
         try:
-            from concurrent.futures import ProcessPoolExecutor, as_completed
-            
-            reaction_smarts = reaction_info['smarts']
             reaction_name = reaction_info['name']
-            
+
             print(f"   🔗 Reaction: {reaction_name}")
-            print(f"   ⚗️  SMARTS: {reaction_smarts}")
-            
-            # Prepare data chunks for parallel processing
-            total_combinations = len(primary_df) * len(secondary_df)
-            chunks = self._create_bimolecular_chunks(primary_df, secondary_df, chunk_size)
-            
-            print(f"   📦 Created {len(chunks)} chunks for parallel processing")
+            print(f"   ⚗️  SMARTS: {reaction_info['smarts']}")
+
+            primary_records = self._to_reactant_records(primary_df)
+            secondary_records = self._to_reactant_records(secondary_df)
+
+            total_tasks = _count_bimolecular_ranges(len(primary_records), len(secondary_records), chunk_size)
+            print(f"   📦 Split into {total_tasks} chunks for parallel processing")
 
             all_products = []
             all_ambiguous_reactants = []
-            processed_chunks = 0
-            successful_reactions = 0
 
-            # Initialize progress tracking
-            if TQDM_AVAILABLE:
-                progress_bar = tqdm(
-                    total=len(chunks),
-                    desc=f"Parallel {reaction_name}",
-                    unit="chunks"
-                )
-            else:
-                progress_bar = None
+            def on_result(idx: int, result: Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]) -> int:
+                chunk_products, chunk_ambiguous = result
+                all_products.extend(chunk_products)
+                all_ambiguous_reactants.extend(chunk_ambiguous)
+                return len(all_products)
 
-            # Process chunks in parallel
-            with ProcessPoolExecutor(max_workers=max_workers) as executor:
-                # Submit all chunks
-                future_to_chunk = {
-                    executor.submit(
-                        _process_bimolecular_chunk_worker,
-                        chunk, reaction_smarts, reaction_name, workflow_name
-                    ): i for i, chunk in enumerate(chunks)
-                }
-                
-                # Collect results
-                for future in as_completed(future_to_chunk):
-                    chunk_idx = future_to_chunk[future]
-                    
-                    try:
-                        chunk_products, chunk_ambiguous = future.result()
-                        all_products.extend(chunk_products)
-                        all_ambiguous_reactants.extend(chunk_ambiguous)
-                        successful_reactions += len(chunk_products)
-                        processed_chunks += 1
+            self._run_bimolecular_range_pool(
+                primary_records, secondary_records, reaction_info, workflow_name,
+                max_workers, chunk_size, _process_bimolecular_range_worker,
+                lambda idx: (), on_result, f"Parallel {reaction_name}"
+            )
 
-                        if progress_bar:
-                            progress_bar.update(1)
-                            progress_bar.set_postfix({
-                                'products': len(all_products),
-                                'chunks': f"{processed_chunks}/{len(chunks)}"
-                            })
-                        else:
-                            if processed_chunks % max(1, len(chunks) // 10) == 0:
-                                progress = (processed_chunks / len(chunks)) * 100
-                                print(f"      📊 Progress: {progress:.1f}% ({len(all_products)} products)")
-
-                    except Exception as e:
-                        print(f"   ❌ Error processing chunk {chunk_idx}: {e}")
-                        processed_chunks += 1
-                        if progress_bar:
-                            progress_bar.update(1)
-
-            if progress_bar:
-                progress_bar.close()
-
-            print(f"   ✅ Parallel processing completed: {len(all_products)} products from {successful_reactions} reactions")
+            print(f"   ✅ Parallel processing completed: {len(all_products)} products")
             if all_ambiguous_reactants:
                 print(f"   ⚠️  {len(all_ambiguous_reactants)} reactant pair(s) matched the reaction template "
                       f"at more than one site (multiple product possibilities from the same pair)")
@@ -18079,39 +18287,6 @@ plt.show()
         except Exception as e:
             print(f"      ❌ Error in parallel unimolecular reaction: {e}")
             return []
-
-    def _create_bimolecular_chunks(self, primary_df: pd.DataFrame, secondary_df: pd.DataFrame, 
-                                chunk_size: int) -> List[List[Tuple]]:
-        """
-        Create chunks for parallel bimolecular reaction processing.
-        
-        Args:
-            primary_df (pd.DataFrame): Primary reactants
-            secondary_df (pd.DataFrame): Secondary reactants
-            chunk_size (int): Size of each chunk
-            
-        Returns:
-            List[List[Tuple]]: List of chunks, each containing compound pairs
-        """
-        chunks = []
-        current_chunk = []
-        
-        for _, primary_compound in primary_df.iterrows():
-            for _, secondary_compound in secondary_df.iterrows():
-                current_chunk.append((
-                    primary_compound.to_dict(),
-                    secondary_compound.to_dict()
-                ))
-                
-                if len(current_chunk) >= chunk_size:
-                    chunks.append(current_chunk)
-                    current_chunk = []
-        
-        # Add remaining compounds
-        if current_chunk:
-            chunks.append(current_chunk)
-        
-        return chunks
 
     def _create_unimolecular_chunks(self, compounds_df: pd.DataFrame, 
                                 chunk_size: int) -> List[List[Dict]]:
