@@ -603,101 +603,6 @@ def _filter_chunk_worker_by_descriptor_bounds(chunk_data: List[Tuple], descripto
 
     return results, removed_counts
 
-def _process_unimolecular_chunk_worker(chunk_data: List[Dict], reaction_smarts: str,
-                                     reaction_name: str, workflow_name: str,
-                                     name_prefix: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """
-    Worker function to process a chunk of unimolecular reactions.
-    This function must be at module level to be pickleable for multiprocessing.
-
-    Args:
-        chunk_data (List[Dict]): List of compound dictionaries
-        reaction_smarts (str): SMARTS pattern for the reaction
-        reaction_name (str): Name of the reaction
-        workflow_name (str): Name of the workflow
-        name_prefix (str): Prefix for product names
-
-    Returns:
-        Tuple[List[Dict], List[Dict]]: (products, ambiguous_reactants) — ambiguous_reactants has
-            one entry per reactant in this chunk for which RunReactants() returned more than one
-            product set (the reactant matched the reaction template at more than one site).
-    """
-    try:
-        from rdkit import Chem
-        from rdkit.Chem import AllChem
-        from rdkit import RDLogger
-        RDLogger.DisableLog('rdApp.*')
-
-        products = []
-        ambiguous_reactants = []
-
-        # Parse reaction
-        rxn = AllChem.ReactionFromSmarts(reaction_smarts)
-        if rxn is None:
-            return [], []
-
-        for compound in chunk_data:
-            try:
-                # Parse molecule
-                reactant_mol = Chem.MolFromSmiles(compound['smiles'])
-                if reactant_mol is None:
-                    continue
-
-                # Run reaction
-                reaction_results = rxn.RunReactants((reactant_mol,))
-
-                # Flag reactants that matched the reaction template at more than one site,
-                # generating more than one distinct product from that reactant alone
-                if len(reaction_results) > 1:
-                    reactant_id = compound.get('id', 'unk')
-                    ambiguous_reactants.append({
-                        'reactant_id': reactant_id,
-                        'reactant_name': compound.get('name', f"cpd_{reactant_id}"),
-                        'reactant_smiles': compound['smiles'],
-                        'product_possibilities': len(reaction_results),
-                    })
-
-                # Process products. When a reactant matches at more than one site
-                # (ambiguous), different product_sets can yield the exact same
-                # product structure (e.g. a symmetric reactant reacting at either of
-                # two equivalent groups) -- dedupe by canonical SMILES within this
-                # reactant so the same product isn't written to the database twice.
-                seen_product_smiles = set()
-                for product_set_idx, product_set in enumerate(reaction_results):
-                    for product_idx, product_mol in enumerate(product_set):
-                        try:
-                            Chem.SanitizeMol(product_mol)
-                            product_smiles = Chem.MolToSmiles(product_mol)
-
-                            if product_smiles in seen_product_smiles:
-                                continue
-                            seen_product_smiles.add(product_smiles)
-
-                            # Generate product name
-                            original_name = compound.get('name', f"cpd_{compound.get('id', 'unk')}")
-                            product_name = f"{name_prefix}{original_name}_{reaction_name}_{product_set_idx}_{product_idx}"
-
-                            products.append({
-                                'smiles': product_smiles,
-                                'name': product_name,
-                                'flag': 'parallel_unimolecular_product',
-                                'reactant_name': original_name,
-                                'reactant_smiles': compound['smiles'],
-                                'reaction_name': reaction_name,
-                                'workflow': workflow_name
-                            })
-
-                        except Exception:
-                            continue
-
-            except Exception:
-                continue
-
-        return products, ambiguous_reactants
-
-    except Exception:
-        return [], []
-
 # Per-process state for the index-range bimolecular workers below. Populated once per worker
 # process by _init_bimolecular_range_worker() (ProcessPoolExecutor initializer), so the full
 # reactant lists are handed to each process a single time instead of being pickled into every
@@ -914,111 +819,159 @@ def _count_bimolecular_ranges(n_primary: int, n_secondary: int, chunk_size: int)
     return -(-n_primary // i_step) * -(-n_secondary // j_step)
 
 
-def _process_unimolecular_chunk_to_file_worker(chunk_data: List[Dict], reaction_smarts: str,
-                                             reaction_name: str, workflow_name: str,
-                                             name_prefix: str, output_file_path: str) -> Tuple[int, List[Dict[str, Any]]]:
+# Per-process state for the index-range unimolecular workers below; see _bimol_state.
+_unimol_state: Dict[str, Any] = {}
+
+
+def _init_unimolecular_range_worker(records: List[Dict[str, Any]], reaction_smarts: str,
+                                    reaction_name: str, workflow_name: str,
+                                    name_prefix: str) -> None:
     """
-    Worker function to process a unimolecular chunk and write results directly to a CSV file.
+    ProcessPoolExecutor initializer for the unimolecular index-range workers. Stores the reactant
+    records and the parsed reaction in module-level state for this process.
+    Must be at module level to be pickleable for multiprocessing.
+    """
+    from rdkit.Chem import AllChem
+    from rdkit import RDLogger
+    RDLogger.DisableLog('rdApp.*')
 
-    Args:
-        chunk_data (List[Dict]): List of compound dictionaries
-        reaction_smarts (str): SMARTS pattern for the reaction
-        reaction_name (str): Name of the reaction
-        workflow_name (str): Name of the workflow
-        name_prefix (str): Prefix for product names
-        output_file_path (str): Path to output CSV file
+    _unimol_state.clear()
+    _unimol_state.update({
+        'records': records,
+        'rxn': AllChem.ReactionFromSmarts(reaction_smarts),
+        'reaction_name': reaction_name,
+        'workflow_name': workflow_name,
+        'name_prefix': name_prefix,
+    })
 
-    Returns:
-        Tuple[int, List[Dict]]: (products_count, ambiguous_reactants) — ambiguous_reactants has
-            one entry per reactant in this chunk for which RunReactants() returned more than one
-            product set (the reactant matched the reaction template at more than one site).
+
+def _iter_unimolecular_range_products(start: int, end: int, flag: str,
+                                      ambiguous_out: List[Dict[str, Any]]):
+    """
+    Run the unimolecular reaction for records[start:end] (records held in _unimol_state),
+    yielding one product row dict at a time so callers can write them out as they are produced.
+
+    Reactants for which RunReactants() returns more than one product set (the reactant matched the
+    template at more than one site) are appended to ambiguous_out.
+    """
+    from rdkit import Chem
+
+    state = _unimol_state
+    rxn = state['rxn']
+    if rxn is None:
+        return
+
+    reaction_name = state['reaction_name']
+    workflow_name = state['workflow_name']
+    name_prefix = state['name_prefix']
+
+    for compound in state['records'][start:end]:
+        try:
+            reactant_mol = Chem.MolFromSmiles(compound['smiles'])
+            if reactant_mol is None:
+                continue
+
+            reaction_results = rxn.RunReactants((reactant_mol,))
+            original_name = _reactant_name(compound)
+
+            # Flag reactants that matched the reaction template at more than one site,
+            # generating more than one distinct product from that reactant alone
+            if len(reaction_results) > 1:
+                ambiguous_out.append({
+                    'reactant_id': compound.get('id', 'unk'),
+                    'reactant_name': original_name,
+                    'reactant_smiles': compound['smiles'],
+                    'product_possibilities': len(reaction_results),
+                })
+
+            # When a reactant matches at more than one site (ambiguous), different product_sets
+            # can yield the exact same product structure (e.g. a symmetric reactant reacting at
+            # either of two equivalent groups) -- dedupe by canonical SMILES within this
+            # reactant so the same product isn't emitted twice.
+            seen_product_smiles = set()
+            for product_set_idx, product_set in enumerate(reaction_results):
+                for product_idx, product_mol in enumerate(product_set):
+                    try:
+                        Chem.SanitizeMol(product_mol)
+                        product_smiles = Chem.MolToSmiles(product_mol)
+                    except Exception:
+                        continue
+
+                    if product_smiles in seen_product_smiles:
+                        continue
+                    seen_product_smiles.add(product_smiles)
+
+                    yield {
+                        'smiles': product_smiles,
+                        'name': f"{name_prefix}{original_name}_{reaction_name}_{product_set_idx}_{product_idx}",
+                        'flag': flag,
+                        'reactant_name': original_name,
+                        'reactant_smiles': compound['smiles'],
+                        'reaction_name': reaction_name,
+                        'workflow': workflow_name,
+                    }
+        except Exception:
+            continue
+
+
+def _process_unimolecular_range_worker(start: int, end: int
+                                       ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    In-memory worker for one index range of reactants. Returns (products, ambiguous_reactants).
+    Requires _init_unimolecular_range_worker() to have run in this process. Must be at module
+    level to be pickleable for multiprocessing.
     """
     try:
-        import csv
-        from rdkit import Chem
-        from rdkit.Chem import AllChem
-        from rdkit import RDLogger
-        RDLogger.DisableLog('rdApp.*')
+        ambiguous_reactants: List[Dict[str, Any]] = []
+        products = list(_iter_unimolecular_range_products(
+            start, end, 'parallel_unimolecular_product', ambiguous_reactants
+        ))
+        return products, ambiguous_reactants
+    except Exception:
+        return [], []
 
+
+def _process_unimolecular_range_to_file_worker(start: int, end: int, output_file_path: str
+                                               ) -> Tuple[int, List[Dict[str, Any]]]:
+    """
+    Streaming worker for one index range of reactants: writes products to a CSV file as they are
+    produced. Returns (products_count, ambiguous_reactants). Requires
+    _init_unimolecular_range_worker() to have run in this process. Must be at module level to be
+    pickleable for multiprocessing.
+    """
+    try:
         products_count = 0
-        ambiguous_reactants = []
+        ambiguous_reactants: List[Dict[str, Any]] = []
 
-        # Parse reaction
-        rxn = AllChem.ReactionFromSmarts(reaction_smarts)
-        if rxn is None:
-            return 0, []
-
-        # Open file for writing
         with open(output_file_path, 'w', newline='', encoding='utf-8') as csvfile:
             fieldnames = ['smiles', 'name', 'flag', 'reactant_name',
-                         'reactant_smiles', 'reaction_name', 'workflow']
+                          'reactant_smiles', 'reaction_name', 'workflow']
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
 
-            for compound in chunk_data:
+            for row in _iter_unimolecular_range_products(
+                    start, end, 'stream_unimolecular_product', ambiguous_reactants):
                 try:
-                    # Parse molecule
-                    reactant_mol = Chem.MolFromSmiles(compound['smiles'])
-                    if reactant_mol is None:
-                        continue
-
-                    # Run reaction
-                    reaction_results = rxn.RunReactants((reactant_mol,))
-
-                    # Flag reactants that matched the reaction template at more than one site,
-                    # generating more than one distinct product from that reactant alone
-                    if len(reaction_results) > 1:
-                        reactant_id = compound.get('id', 'unk')
-                        ambiguous_reactants.append({
-                            'reactant_id': reactant_id,
-                            'reactant_name': compound.get('name', f"cpd_{reactant_id}"),
-                            'reactant_smiles': compound['smiles'],
-                            'product_possibilities': len(reaction_results),
-                        })
-
-                    # Process products and write immediately. When a reactant
-                    # matches at more than one site (ambiguous), different
-                    # product_sets can yield the exact same product structure
-                    # (e.g. a symmetric reactant reacting at either of two
-                    # equivalent groups) -- dedupe by canonical SMILES within this
-                    # reactant so the same product isn't written to the database twice.
-                    seen_product_smiles = set()
-                    for product_set_idx, product_set in enumerate(reaction_results):
-                        for product_idx, product_mol in enumerate(product_set):
-                            try:
-                                Chem.SanitizeMol(product_mol)
-                                product_smiles = Chem.MolToSmiles(product_mol)
-
-                                if product_smiles in seen_product_smiles:
-                                    continue
-                                seen_product_smiles.add(product_smiles)
-
-                                # Generate product name
-                                original_name = compound.get('name', f"cpd_{compound.get('id', 'unk')}")
-                                product_name = f"{name_prefix}{original_name}_{reaction_name}_{product_set_idx}_{product_idx}"
-
-                                # Write product directly to file
-                                writer.writerow({
-                                    'smiles': product_smiles,
-                                    'name': product_name,
-                                    'flag': 'stream_unimolecular_product',
-                                    'reactant_name': original_name,
-                                    'reactant_smiles': compound['smiles'],
-                                    'reaction_name': reaction_name,
-                                    'workflow': workflow_name
-                                })
-                                products_count += 1
-
-                            except Exception:
-                                continue
-
+                    writer.writerow(row)
+                    products_count += 1
                 except Exception:
                     continue
 
         return products_count, ambiguous_reactants
-
     except Exception:
         return 0, []
+
+
+def _iter_unimolecular_ranges(n_records: int, chunk_size: int):
+    """Lazily yield (start, end) slices of about chunk_size records covering n_records."""
+    chunk_size = max(1, chunk_size)
+    for start in range(0, n_records, chunk_size):
+        yield start, min(start + chunk_size, n_records)
+
+
+def _count_unimolecular_ranges(n_records: int, chunk_size: int) -> int:
+    return -(-n_records // max(1, chunk_size))
+
 
 @log_all_public_methods
 class ChemSpace:
@@ -3812,22 +3765,25 @@ cs._execute_csv_load(
             return reactants[columns].to_dict('records')
         return reactants
 
-    def _run_bimolecular_range_pool(self, primary_records: List[Dict[str, Any]],
-                                    secondary_records: List[Dict[str, Any]],
-                                    reaction_info: Dict[str, Any], workflow_name: str,
-                                    max_workers: int, chunk_size: int, worker_fn: Callable,
-                                    extra_args_fn: Callable[[int], Tuple],
-                                    on_result: Callable[[int, Any], int],
-                                    progress_desc: str) -> int:
+    def _run_range_pool(self, initializer: Callable, initargs: Tuple, tiles: Any, total_tasks: int,
+                        max_workers: int, worker_fn: Callable,
+                        extra_args_fn: Callable[[int], Tuple],
+                        on_result: Callable[[int, Any], int],
+                        progress_desc: str) -> int:
         """
-        Run worker_fn over index-range tiles of the primary x secondary grid in a process pool.
+        Run worker_fn over index-range tiles in a process pool whose workers are set up once by
+        initializer(*initargs) (which is where the reactant records are handed over, so tasks
+        themselves are just a few integers).
 
-        The reactant records go to each worker once through the pool initializer, tiles are
-        submitted lazily (about 2 x max_workers in flight), and nothing per-pair is ever built in
-        the parent process.
+        Tiles are submitted lazily (about 2 x max_workers in flight), so nothing per-compound or
+        per-pair is ever built in the parent process.
 
         Args:
-            worker_fn (Callable): Module-level worker taking (i_start, i_end, j_start, j_end, *extra)
+            initializer (Callable): Module-level ProcessPoolExecutor initializer
+            initargs (Tuple): Arguments for initializer
+            tiles (Iterable[Tuple]): Iterable of index tuples, one per task
+            total_tasks (int): Number of tiles (for progress reporting)
+            worker_fn (Callable): Module-level worker taking (*tile, *extra_args_fn(task_index))
             extra_args_fn (Callable[[int], Tuple]): Given the task index (submission order), returns
                 the extra positional args for worker_fn; called in the parent, in order
             on_result (Callable[[int, Any], int]): Called in the parent as each task completes, with
@@ -3837,25 +3793,18 @@ cs._execute_csv_load(
         Returns:
             int: Number of tasks run
         """
-        n_primary, n_secondary = len(primary_records), len(secondary_records)
-        total_tasks = _count_bimolecular_ranges(n_primary, n_secondary, chunk_size)
-        ranges = enumerate(_iter_bimolecular_ranges(n_primary, n_secondary, chunk_size))
-
+        tiles = enumerate(tiles)
         progress_bar = tqdm(total=total_tasks, desc=progress_desc, unit="chunks") if TQDM_AVAILABLE else None
         processed = 0
         running_total = 0
 
-        with ProcessPoolExecutor(
-            max_workers=max_workers,
-            initializer=_init_bimolecular_range_worker,
-            initargs=(primary_records, secondary_records, reaction_info['smarts'],
-                      reaction_info['name'], workflow_name),
-        ) as executor:
+        with ProcessPoolExecutor(max_workers=max_workers, initializer=initializer,
+                                 initargs=initargs) as executor:
             in_flight = {}
 
             def submit_next() -> bool:
                 try:
-                    idx, tile = next(ranges)
+                    idx, tile = next(tiles)
                 except StopIteration:
                     return False
                 future = executor.submit(worker_fn, *tile, *extra_args_fn(idx))
@@ -3892,6 +3841,46 @@ cs._execute_csv_load(
             progress_bar.close()
 
         return total_tasks
+
+    def _run_bimolecular_range_pool(self, primary_records: List[Dict[str, Any]],
+                                    secondary_records: List[Dict[str, Any]],
+                                    reaction_info: Dict[str, Any], workflow_name: str,
+                                    max_workers: int, chunk_size: int, worker_fn: Callable,
+                                    extra_args_fn: Callable[[int], Tuple],
+                                    on_result: Callable[[int, Any], int],
+                                    progress_desc: str) -> int:
+        """
+        Run worker_fn over (i_start, i_end, j_start, j_end) tiles of the primary x secondary grid.
+        See _run_range_pool() for the callback contracts.
+        """
+        n_primary, n_secondary = len(primary_records), len(secondary_records)
+        return self._run_range_pool(
+            _init_bimolecular_range_worker,
+            (primary_records, secondary_records, reaction_info['smarts'],
+             reaction_info['name'], workflow_name),
+            _iter_bimolecular_ranges(n_primary, n_secondary, chunk_size),
+            _count_bimolecular_ranges(n_primary, n_secondary, chunk_size),
+            max_workers, worker_fn, extra_args_fn, on_result, progress_desc
+        )
+
+    def _run_unimolecular_range_pool(self, records: List[Dict[str, Any]],
+                                     reaction_info: Dict[str, Any], workflow_name: str,
+                                     name_prefix: str, max_workers: int, chunk_size: int,
+                                     worker_fn: Callable,
+                                     extra_args_fn: Callable[[int], Tuple],
+                                     on_result: Callable[[int, Any], int],
+                                     progress_desc: str) -> int:
+        """
+        Run worker_fn over (start, end) slices of the reactant records.
+        See _run_range_pool() for the callback contracts.
+        """
+        return self._run_range_pool(
+            _init_unimolecular_range_worker,
+            (records, reaction_info['smarts'], reaction_info['name'], workflow_name, name_prefix),
+            _iter_unimolecular_ranges(len(records), chunk_size),
+            _count_unimolecular_ranges(len(records), chunk_size),
+            max_workers, worker_fn, extra_args_fn, on_result, progress_desc
+        )
 
     def compute_inchi_keys(self, table_name: str,
                           update_database: bool = True,
@@ -17231,15 +17220,15 @@ plt.show()
                     # Process each source with streaming
                     for source in table_config['sources']:
                         print(f"\n🔬 Streaming processing source: '{source['name']}'")
-                        compounds_df = self._get_table_as_dataframe(source['name'])
+                        records = self._get_reactant_records(source['name'])
                         
-                        if compounds_df.empty:
+                        if not records:
                             print(f"   ⚠️  No compounds found, skipping...")
                             continue
                         
                         source_prefix = f"stream_step{step_num}_{source['name']}_"
                         source_products = self._stream_unimolecular_reaction_to_disk(
-                            compounds_df, reaction_info, workflow_name, source_prefix,
+                            records, reaction_info, workflow_name, source_prefix,
                             temp_dir, max_workers, chunk_size, temp_files_created,
                             ambiguous_reactants=ambiguous_reactants
                         )
@@ -17300,13 +17289,13 @@ plt.show()
                 
                 for source in table_config['sources']:
                     print(f"\n🔬 Processing source: '{source['name']}'")
-                    compounds_df = self._get_table_as_dataframe(source['name'])
+                    records = self._get_reactant_records(source['name'])
                     
-                    if compounds_df.empty:
+                    if not records:
                         print(f"   ⚠️  No compounds found, skipping...")
                         continue
                     
-                    compound_count = len(compounds_df)
+                    compound_count = len(records)
                     use_parallel = compound_count >= parallel_threshold
                     
                     if use_parallel:
@@ -17318,12 +17307,13 @@ plt.show()
                         
                         source_prefix = f"step{step_num}_{source['name']}_"
                         products = self._apply_unimolecular_reaction_parallel(
-                            compounds_df, reaction_info, workflow_name, source_prefix,
+                            records, reaction_info, workflow_name, source_prefix,
                             max_workers, source_chunk_size, ambiguous_reactants=ambiguous_reactants
                         )
                     else:
-                        # Use existing sequential method
+                        # Use existing sequential method (small enough to load the full DataFrame)
                         source_prefix = f"step{step_num}_{source['name']}_"
+                        compounds_df = self._get_table_as_dataframe(source['name'])
                         products = self._apply_unimolecular_reaction(
                             compounds_df, reaction_info, workflow_name, source_prefix,
                             ambiguous_reactants=ambiguous_reactants
@@ -17455,7 +17445,7 @@ plt.show()
             print(f"   ❌ Error in streaming bimolecular reaction: {e}")
             return 0
 
-    def _stream_unimolecular_reaction_to_disk(self, compounds_df: pd.DataFrame,
+    def _stream_unimolecular_reaction_to_disk(self, compounds_df: Union[pd.DataFrame, List[Dict[str, Any]]],
                                             reaction_info: Dict[str, Any], workflow_name: str,
                                             name_prefix: str, temp_dir: str, max_workers: int,
                                             chunk_size: Optional[int], temp_files_created: List[str],
@@ -17464,13 +17454,14 @@ plt.show()
         Stream unimolecular reaction results directly to disk files.
 
         Args:
-            compounds_df (pd.DataFrame): Compounds dataframe
+            compounds_df (Union[pd.DataFrame, List[Dict]]): Reactants, as a DataFrame or as records
+                from _get_reactant_records() (only id, name and smiles are used)
             reaction_info (Dict): Reaction information
             workflow_name (str): Workflow name
             name_prefix (str): Prefix for product names
             temp_dir (str): Temporary directory for files
             max_workers (int): Maximum workers
-            chunk_size (Optional[int]): Chunk size
+            chunk_size (Optional[int]): Number of reactants per task
             temp_files_created (List[str]): List to track created files
             ambiguous_reactants (Optional[List[Dict]]): If provided, appended in place with one
                 entry per reactant (across all chunks) for which RunReactants() returned more
@@ -17482,74 +17473,38 @@ plt.show()
             int: Total number of products streamed
         """
         try:
-            from concurrent.futures import ProcessPoolExecutor, as_completed
-            import os
-
-            reaction_smarts = reaction_info['smarts']
             reaction_name = reaction_info['name']
+
+            records = self._to_reactant_records(compounds_df)
 
             # Set default chunk size if not provided
             if chunk_size is None:
-                chunk_size = max(500, len(compounds_df) // (max_workers * 8))  # Smaller chunks for streaming
+                chunk_size = max(500, len(records) // (max_workers * 8))  # Smaller chunks for streaming
 
-            # Create chunks for streaming processing
-            chunks = self._create_unimolecular_chunks(compounds_df, chunk_size)
+            total_tasks = _count_unimolecular_ranges(len(records), chunk_size)
+            print(f"      📦 Split into {total_tasks} chunks for streaming processing")
 
-            print(f"      📦 Created {len(chunks)} chunks for streaming processing")
-
-            total_products = 0
-            processed_chunks = 0
+            totals = {'products': 0}
             all_ambiguous_reactants = []
 
-            # Initialize progress tracking
-            if TQDM_AVAILABLE:
-                progress_bar = tqdm(
-                    total=len(chunks),
-                    desc=f"Streaming {reaction_name}",
-                    unit="chunks"
-                )
-            else:
-                progress_bar = None
+            def extra_args(idx: int) -> Tuple[str]:
+                temp_file_path = os.path.join(temp_dir, f'unimolecular_chunk_{idx:06d}.csv')
+                temp_files_created.append(temp_file_path)
+                return (temp_file_path,)
 
-            # Process chunks and stream to disk
-            with ProcessPoolExecutor(max_workers=max_workers) as executor:
-                # Submit streaming jobs
-                future_to_chunk = {}
-                for i, chunk in enumerate(chunks):
-                    temp_file_path = os.path.join(temp_dir, f'unimolecular_chunk_{i:06d}.csv')
-                    temp_files_created.append(temp_file_path)
+            def on_result(idx: int, result: Tuple[int, List[Dict[str, Any]]]) -> int:
+                chunk_products_count, chunk_ambiguous = result
+                totals['products'] += chunk_products_count
+                all_ambiguous_reactants.extend(chunk_ambiguous)
+                return totals['products']
 
-                    future = executor.submit(
-                        _process_unimolecular_chunk_to_file_worker,
-                        chunk, reaction_smarts, reaction_name, workflow_name, name_prefix, temp_file_path
-                    )
-                    future_to_chunk[future] = i
+            self._run_unimolecular_range_pool(
+                records, reaction_info, workflow_name, name_prefix, max_workers, chunk_size,
+                _process_unimolecular_range_to_file_worker, extra_args, on_result,
+                f"Streaming {reaction_name}"
+            )
 
-                # Collect results
-                for future in as_completed(future_to_chunk):
-                    chunk_idx = future_to_chunk[future]
-
-                    try:
-                        chunk_products_count, chunk_ambiguous = future.result()
-                        total_products += chunk_products_count
-                        all_ambiguous_reactants.extend(chunk_ambiguous)
-                        processed_chunks += 1
-
-                        if progress_bar:
-                            progress_bar.update(1)
-                            progress_bar.set_postfix({
-                                'products': total_products
-                            })
-
-                    except Exception as e:
-                        print(f"      ❌ Error processing chunk {chunk_idx}: {e}")
-                        processed_chunks += 1
-                        if progress_bar:
-                            progress_bar.update(1)
-
-            if progress_bar:
-                progress_bar.close()
-
+            total_products = totals['products']
             print(f"      ✅ Streaming completed: {total_products:,} products")
             if all_ambiguous_reactants:
                 print(f"      ⚠️  {len(all_ambiguous_reactants)} reactant(s) matched the reaction template "
@@ -18188,7 +18143,7 @@ plt.show()
             print(f"   ❌ Error in parallel bimolecular reaction: {e}")
             return []
 
-    def _apply_unimolecular_reaction_parallel(self, compounds_df: pd.DataFrame,
+    def _apply_unimolecular_reaction_parallel(self, compounds_df: Union[pd.DataFrame, List[Dict[str, Any]]],
                                             reaction_info: Dict[str, Any], workflow_name: str,
                                             name_prefix: str, max_workers: int,
                                             chunk_size: int,
@@ -18197,12 +18152,13 @@ plt.show()
         Apply a unimolecular reaction using parallel processing.
 
         Args:
-            compounds_df (pd.DataFrame): Compounds dataframe
+            compounds_df (Union[pd.DataFrame, List[Dict]]): Reactants, as a DataFrame or as records
+                from _get_reactant_records() (only id, name and smiles are used)
             reaction_info (Dict): Reaction information
             workflow_name (str): Name of the workflow
             name_prefix (str): Prefix for product names
             max_workers (int): Maximum number of parallel workers
-            chunk_size (int): Size of each chunk for parallel processing
+            chunk_size (int): Number of reactants per task
             ambiguous_reactants (Optional[List[Dict]]): If provided, appended in place with one
                 entry per reactant (across all chunks) for which RunReactants() returned more
                 than one product set — i.e. the reactant matched the reaction template at more
@@ -18213,66 +18169,27 @@ plt.show()
             List[Dict]: List of reaction products
         """
         try:
-            from concurrent.futures import ProcessPoolExecutor, as_completed
-            
-            reaction_smarts = reaction_info['smarts']
             reaction_name = reaction_info['name']
-            
-            # Create data chunks for parallel processing
-            chunks = self._create_unimolecular_chunks(compounds_df, chunk_size)
-            
-            print(f"      📦 Created {len(chunks)} chunks for parallel processing")
+
+            records = self._to_reactant_records(compounds_df)
+
+            total_tasks = _count_unimolecular_ranges(len(records), chunk_size)
+            print(f"      📦 Split into {total_tasks} chunks for parallel processing")
 
             all_products = []
             all_ambiguous_reactants = []
-            processed_chunks = 0
-            successful_reactions = 0
 
-            # Initialize progress tracking
-            if TQDM_AVAILABLE:
-                progress_bar = tqdm(
-                    total=len(chunks),
-                    desc=f"Parallel {reaction_name}",
-                    unit="chunks"
-                )
-            else:
-                progress_bar = None
+            def on_result(idx: int, result: Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]) -> int:
+                chunk_products, chunk_ambiguous = result
+                all_products.extend(chunk_products)
+                all_ambiguous_reactants.extend(chunk_ambiguous)
+                return len(all_products)
 
-            # Process chunks in parallel
-            with ProcessPoolExecutor(max_workers=max_workers) as executor:
-                # Submit all chunks
-                future_to_chunk = {
-                    executor.submit(
-                        _process_unimolecular_chunk_worker,
-                        chunk, reaction_smarts, reaction_name, workflow_name, name_prefix
-                    ): i for i, chunk in enumerate(chunks)
-                }
-
-                # Collect results
-                for future in as_completed(future_to_chunk):
-                    chunk_idx = future_to_chunk[future]
-
-                    try:
-                        chunk_products, chunk_ambiguous = future.result()
-                        all_products.extend(chunk_products)
-                        all_ambiguous_reactants.extend(chunk_ambiguous)
-                        successful_reactions += len(chunk_products)
-                        processed_chunks += 1
-
-                        if progress_bar:
-                            progress_bar.update(1)
-                            progress_bar.set_postfix({
-                                'products': len(all_products)
-                            })
-
-                    except Exception as e:
-                        print(f"      ❌ Error processing chunk {chunk_idx}: {e}")
-                        processed_chunks += 1
-                        if progress_bar:
-                            progress_bar.update(1)
-
-            if progress_bar:
-                progress_bar.close()
+            self._run_unimolecular_range_pool(
+                records, reaction_info, workflow_name, name_prefix, max_workers, chunk_size,
+                _process_unimolecular_range_worker, lambda idx: (), on_result,
+                f"Parallel {reaction_name}"
+            )
 
             print(f"      ✅ Parallel processing completed: {len(all_products)} products")
             if all_ambiguous_reactants:
@@ -18287,34 +18204,6 @@ plt.show()
         except Exception as e:
             print(f"      ❌ Error in parallel unimolecular reaction: {e}")
             return []
-
-    def _create_unimolecular_chunks(self, compounds_df: pd.DataFrame, 
-                                chunk_size: int) -> List[List[Dict]]:
-        """
-        Create chunks for parallel unimolecular reaction processing.
-        
-        Args:
-            compounds_df (pd.DataFrame): Compounds dataframe
-            chunk_size (int): Size of each chunk
-            
-        Returns:
-            List[List[Dict]]: List of chunks, each containing compound dictionaries
-        """
-        chunks = []
-        current_chunk = []
-        
-        for _, compound in compounds_df.iterrows():
-            current_chunk.append(compound.to_dict())
-            
-            if len(current_chunk) >= chunk_size:
-                chunks.append(current_chunk)
-                current_chunk = []
-        
-        # Add remaining compounds
-        if current_chunk:
-            chunks.append(current_chunk)
-        
-        return chunks
 
     def _display_parallel_workflow_summary(self, workflow_state: Dict[str, Any], workflow_name: str) -> None:
         """
