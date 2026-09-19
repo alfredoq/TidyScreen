@@ -140,6 +140,19 @@ def read_database_as_dataframe(db_path, table_name):
         print(f"❌ Error reading database: {e}")
         return pd.DataFrame()
     
+# SELECT COUNT(*) requires a full table scan in SQLite -- there is no cached row count.
+# Tables above this size have their scan capped via LIMIT so the ChemSpace page stays
+# responsive; a returned count of ROW_COUNT_THRESHOLD + 1 means "more than that many rows".
+ROW_COUNT_THRESHOLD = 100_000
+
+
+def format_row_count(count):
+    """Format a (possibly capped) row count for display, e.g. '>100,000 rows'."""
+    if count > ROW_COUNT_THRESHOLD:
+        return f">{ROW_COUNT_THRESHOLD:,}"
+    return f"{count:,}"
+
+
 @st.cache_data(show_spinner=False)
 def _get_table_row_count(db_path, table_name, mtime=None):
     """Cached per (db_path, table_name, mtime) — see get_tables_info."""
@@ -147,7 +160,9 @@ def _get_table_row_count(db_path, table_name, mtime=None):
     try:
         conn = sqlite3.connect(db_path, timeout=10)
         cursor = conn.cursor()
-        cursor.execute(f"SELECT COUNT(*) FROM [{table_name}]")
+        cursor.execute(
+            f"SELECT COUNT(*) FROM (SELECT 1 FROM [{table_name}] LIMIT {ROW_COUNT_THRESHOLD + 1})"
+        )
         return cursor.fetchone()[0]
     except Exception:
         return None

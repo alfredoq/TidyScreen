@@ -633,7 +633,10 @@ elif page == "ChemSpace Inspection":
         st.session_state["show_tables_info"] = not st.session_state["show_tables_info"]
         st.rerun()
     if st.session_state["show_tables_info"]:
-        st.dataframe(df)
+        _display_info_df = df.copy()
+        if not _display_info_df.empty:
+            _display_info_df["rows"] = _display_info_df["rows"].apply(st_funcs.format_row_count)
+        st.dataframe(_display_info_df)
 
         if df is not None and not df.empty:
             _drop_table_names = df["table"].tolist()
@@ -718,7 +721,8 @@ elif page == "ChemSpace Inspection":
                     if display_df is not None and not display_df.empty:
                         if _read_limit is not None:
                             st.info(
-                                f"Table '{display_selected_table}' has {_table_total_rows:,} rows; "
+                                f"Table '{display_selected_table}' has "
+                                f"{st_funcs.format_row_count(_table_total_rows)} rows; "
                                 f"showing only the first {_display_row_limit:,}."
                             )
                         _display_df_sel = display_df.copy()
