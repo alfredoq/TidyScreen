@@ -1180,6 +1180,10 @@ class ChemSpace:
             print(f"❌ Error retrieving table list: {e}")
             return []
 
+    # SELECT COUNT(*) requires a full table scan in SQLite -- there is no cached row count.
+    # Tables above this size have their scan capped via LIMIT so list_tables() stays fast.
+    __ROW_COUNT_THRESHOLD = 100_000
+
     def list_tables(self, chemspace_db_path: Optional[str] = None, verbose: bool = True) -> List[str]:
         """
         Get list of all tables in a chemspace database, printing a formatted listing (with
@@ -1210,14 +1214,22 @@ class ChemSpace:
             if not tables:
                 print("📝 No tables found")
             else:
+                threshold = self.__ROW_COUNT_THRESHOLD
                 try:
                     conn = sqlite3.connect(resolved_path)
                     cursor = conn.cursor()
                     for i, t in enumerate(tables, 1):
                         try:
-                            cursor.execute(f"SELECT COUNT(*) FROM {t}")
+                            # LIMIT lets SQLite stop scanning a large table early instead of
+                            # counting every row, at the cost of only reporting "> threshold".
+                            cursor.execute(
+                                f"SELECT COUNT(*) FROM (SELECT 1 FROM {t} LIMIT {threshold + 1})"
+                            )
                             count = cursor.fetchone()[0]
-                            print(f"{i:3d}. {t:<40} ({count:,} rows)")
+                            if count > threshold:
+                                print(f"{i:3d}. {t:<40} (>{threshold:,} rows)")
+                            else:
+                                print(f"{i:3d}. {t:<40} ({count:,} rows)")
                         except Exception:
                             print(f"{i:3d}. {t}")
                     conn.close()
