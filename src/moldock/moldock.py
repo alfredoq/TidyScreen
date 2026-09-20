@@ -1161,7 +1161,8 @@ class MolDock:
             cur.execute("DETACH DATABASE src_copy")
             conn.close()
 
-    def _copy_receptor_for_assay(self, src_root: str, receptor_info: Dict[str, Any], undo: list) -> Optional[Dict[str, Any]]:
+    def _copy_receptor_for_assay(self, src_root: str, receptor_info: Dict[str, Any], undo: list,
+                                 allow_reuse: bool = True) -> Optional[Dict[str, Any]]:
         """
         Make the receptor used by a source-project assay available in the active project and
         return the receptor_info dict (paths and ids re-linked to the active project) that the
@@ -1232,7 +1233,7 @@ class MolDock:
         folder_name = os.path.basename(rec_folder)
         if dest_name in dest_names or os.path.exists(os.path.join(self.__receptor_path, folder_name)):
             action, dest_name_new = self._prompt_copy_conflict(
-                "Receptor model", dest_name, _exists, _name_ok, can_reuse=dest_name in dest_names
+                "Receptor model", dest_name, _exists, _name_ok, can_reuse=allow_reuse and dest_name in dest_names
             )
             if action == 'cancel':
                 print("❌ Copy cancelled by user.")
@@ -1354,14 +1355,22 @@ class MolDock:
         undo.append(("receptor_models row", lambda i=ids: self._delete_rows_by_rowid(dest_rec_db, 'receptor_models', i)))
 
         # --- receptor_info snapshot stored in the assay ---
-        new_info = dict(receptor_info)
+        # Defaults come from the DB row; a stored assay snapshot (receptor_info) takes precedence
+        new_info = {
+            'id': src_row['id'], 'pdb_id': src_row.get('pdb_id'),
+            'receptor_model_name': src_row['receptor_model_name'],
+            'template_name': src_row.get('template_name'), 'pdb_model_name': pdb_model_name,
+            'pdbqt_file': src_row['pdbqt_file'], 'configs': self._json_or(src_row.get('configs'), {}),
+            'notes': src_row.get('notes'),
+        }
+        new_info.update(receptor_info)
         new_info.update({
             'id': new_receptor_id,
             'pdb_id': new_pdb_id,
             'receptor_model_name': dest_name,
             'pdbqt_file': tr(src_row['pdbqt_file']),
         })
-        cfg = dict(receptor_info.get('configs') or {})
+        cfg = dict(new_info.get('configs') or {})
         if cfg.get('grids_path'):
             cfg['grids_path'] = tr(cfg['grids_path'])
         new_info['configs'] = cfg
@@ -1444,6 +1453,159 @@ class MolDock:
                 rconn.close()
         return id_map
 
+    def _select_source_project(self, source_project_name: Optional[str] = None):
+        """
+        Resolve the project to copy from: validates `source_project_name`, or prompts a selection
+        when it is None. Returns the source ActivateProject, or None if cancelled/invalid/same as active.
+        """
+        from tidyscreen.projects.projects_management import ProjectsManagement
+
+        all_projects = ProjectsManagement().list_all_projects(print_output=False) or []
+        if not all_projects:
+            print("❌ No projects found in the projects database.")
+            return None
+
+        if source_project_name is None:
+            print("\n📋 Available projects:")
+            for idx, proj in enumerate(all_projects, 1):
+                marker = " (active)" if proj['name'] == self.name else ""
+                print(f"  [{idx}] {proj['name']}{marker}")
+            while True:
+                selection = input("Select source project by number or name (or 'cancel' to abort): ").strip()
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    print("❌ Operation cancelled by user.")
+                    return None
+                if selection.isdigit() and 0 <= int(selection) - 1 < len(all_projects):
+                    source_project_name = all_projects[int(selection) - 1]['name']
+                    break
+                if any(p['name'] == selection for p in all_projects):
+                    source_project_name = selection
+                    break
+                print("⚠️ Invalid selection. Try again.")
+
+        source_project = ActivateProject(source_project_name)
+        if not source_project.project_exists():
+            print(f"❌ Project '{source_project_name}' not found.")
+            return None
+        if os.path.abspath(source_project.path) == os.path.abspath(self.path):
+            print("❌ Source and destination projects are the same.")
+            return None
+        return source_project
+
+    def copy_receptor_model_between_projects(self, source_project_name: Optional[str] = None,
+                                             source_receptor: Optional[Any] = None) -> Optional[Dict[str, Any]]:
+        """
+        Copy a receptor model for docking (as created by create_receptor_for_docking() or
+        import_receptor_model()) from another project into the active project, together with the
+        PDB template and PDB model it originated from.
+
+        Copied, with paths and ids re-linked to the active project:
+          - the receptor folder (processed/ PDBQT + receptor_checked.pdb, grid maps, ...)
+          - the receptor_models record (all columns, e.g. configs and tleap_config)
+          - the pdb_templates record it was built from (if a template with the same name already
+            exists in the active project, the receptor is linked to that one instead)
+          - the pdb_models record (full PDB content) that the template came from (skipped if a model
+            with the same name already exists)
+
+        If the receptor name or folder already exists in the active project, the copy can be saved
+        under a different name or cancelled. If any step fails, everything already created in the
+        active project is removed.
+
+        Args:
+            source_project_name (Optional[str]): Project to copy from. If None, prompts a selection.
+            source_receptor (Optional[Any]): Receptor model id (int) or receptor_model_name (str) in the
+                source project. If None, prompts a selection.
+
+        Returns:
+            Optional[Dict[str, Any]]: receptor_info of the receptor created in the active project (same
+                shape as _select_receptor_from_db), or None if the copy failed or was cancelled.
+        """
+        undo: list = []
+
+        def _abort(message: Optional[str] = None):
+            if message:
+                print(message)
+            if undo:
+                print("↩️  Rolling back changes made in the active project...")
+                for label, action in reversed(undo):
+                    try:
+                        action()
+                    except Exception as rb_err:
+                        print(f"   ⚠️  Rollback of {label} failed: {rb_err}")
+                undo.clear()
+            return None
+
+        try:
+            print(f"\n📋 COPY RECEPTOR MODEL BETWEEN PROJECTS")
+            print("=" * 50)
+
+            source_project = self._select_source_project(source_project_name)
+            if source_project is None:
+                return None
+            source_project_name = source_project.name
+            src_root = source_project.path
+
+            # --- Read source receptor models and select one ---
+            src_rec_db = os.path.join(src_root, 'docking', 'receptors', 'receptors.db')
+            if not os.path.exists(src_rec_db):
+                print(f"❌ No receptors database found for project '{source_project_name}' at {src_rec_db}")
+                return None
+            sconn = self._open_db_readonly(src_rec_db)
+            try:
+                if not sconn.execute("SELECT 1 FROM sqlite_master WHERE name='receptor_models'").fetchone():
+                    print(f"❌ Receptor models table not found in project '{source_project_name}'.")
+                    return None
+                receptors = sconn.execute(
+                    "SELECT id, receptor_model_name, template_name, pdb_model_name FROM receptor_models ORDER BY id"
+                ).fetchall()
+            finally:
+                sconn.close()
+            if not receptors:
+                print(f"❌ No receptor models found in project '{source_project_name}'.")
+                return None
+
+            if source_receptor is None:
+                print(f"\n🎯 Receptor models in project '{source_project_name}':")
+                for idx, (rid, rname, tname, mname) in enumerate(receptors, 1):
+                    print(f"  [{idx}] {rname} (ID: {rid}) | template: {tname} | PDB model: {mname}")
+                while True:
+                    selection = input("Select receptor to copy by number or name (or 'cancel' to abort): ").strip()
+                    if selection.lower() in ['cancel', 'quit', 'exit']:
+                        print("❌ Operation cancelled by user.")
+                        return None
+                    if selection.isdigit() and 0 <= int(selection) - 1 < len(receptors):
+                        selected = receptors[int(selection) - 1]
+                        break
+                    matching = [r for r in receptors if r[1] == selection]
+                    if matching:
+                        selected = matching[0]
+                        break
+                    print("⚠️ Invalid selection. Try again.")
+            else:
+                matching = [r for r in receptors if r[0] == source_receptor or r[1] == source_receptor]
+                if not matching:
+                    print(f"❌ Receptor '{source_receptor}' not found in project '{source_project_name}'.")
+                    return None
+                selected = matching[0]
+
+            print(f"\n🎯 Copying receptor '{selected[1]}' (ID: {selected[0]}) from project '{source_project_name}'")
+            new_info = self._copy_receptor_for_assay(
+                src_root, {'id': selected[0], 'receptor_model_name': selected[1]}, undo, allow_reuse=False
+            )
+            if new_info is None:
+                return _abort("❌ Receptor was not copied.")
+
+            print(f"\n✅ Copied receptor '{selected[1]}' from project '{source_project_name}' to "
+                  f"'{new_info['receptor_model_name']}' (ID: {new_info['id']}) in project '{self.name}'.")
+            print(f"   🧬 PDB template: {new_info.get('template_name')} (ID: {new_info.get('pdb_id')})")
+            print(f"   🧫 PDB model:    {new_info.get('pdb_model_name')}")
+            return new_info
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return _abort(f"❌ Error copying receptor model between projects: {e}")
+
     def copy_docking_assay_between_projects(self, source_project_name: Optional[str] = None,
                                             source_assay: Optional[Any] = None,
                                             copy_binders: bool = True,
@@ -1476,7 +1638,6 @@ class MolDock:
             Optional[Dict[str, Any]]: Info about the assay created in the active project, or None if
                 the copy failed or was cancelled.
         """
-        from tidyscreen.projects.projects_management import ProjectsManagement
         from datetime import datetime
 
         undo: list = []
@@ -1502,37 +1663,11 @@ class MolDock:
             print("=" * 50)
 
             # --- Select source project ---
-            all_projects = ProjectsManagement().list_all_projects(print_output=False) or []
-            if not all_projects:
-                print("❌ No projects found in the projects database.")
+            source_project = self._select_source_project(source_project_name)
+            if source_project is None:
                 return None
-
-            if source_project_name is None:
-                print("\n📋 Available projects:")
-                for idx, proj in enumerate(all_projects, 1):
-                    marker = " (active)" if proj['name'] == self.name else ""
-                    print(f"  [{idx}] {proj['name']}{marker}")
-                while True:
-                    selection = input("Select source project by number or name (or 'cancel' to abort): ").strip()
-                    if selection.lower() in ['cancel', 'quit', 'exit']:
-                        print("❌ Operation cancelled by user.")
-                        return None
-                    if selection.isdigit() and 0 <= int(selection) - 1 < len(all_projects):
-                        source_project_name = all_projects[int(selection) - 1]['name']
-                        break
-                    if any(p['name'] == selection for p in all_projects):
-                        source_project_name = selection
-                        break
-                    print("⚠️ Invalid selection. Try again.")
-
-            source_project = ActivateProject(source_project_name)
-            if not source_project.project_exists():
-                print(f"❌ Project '{source_project_name}' not found.")
-                return None
+            source_project_name = source_project.name
             src_root = source_project.path
-            if os.path.abspath(src_root) == os.path.abspath(self.path):
-                print("❌ Source and destination projects are the same.")
-                return None
 
             # --- Read source assays and select one ---
             src_assays_db = os.path.join(src_root, 'docking', 'docking_registers', 'docking_assays.db')
