@@ -958,6 +958,897 @@ class MolDock:
             print(f"❌ Error copying docking method between projects: {e}")
             return None
 
+    # ------------------------------------------------------------------
+    # Copy of docking assays between projects
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _open_db_readonly(db_path: str) -> sqlite3.Connection:
+        """Open a SQLite file read-only (falls back to a normal connection, e.g. for WAL files)."""
+        from pathlib import Path
+        try:
+            conn = sqlite3.connect(Path(db_path).resolve().as_uri() + '?mode=ro', uri=True)
+            conn.execute("SELECT 1 FROM sqlite_master LIMIT 1")
+            return conn
+        except sqlite3.OperationalError:
+            return sqlite3.connect(db_path)
+
+    @staticmethod
+    def _json_or(text: Any, default: Any) -> Any:
+        """json.loads() that returns `default` for empty or invalid input."""
+        try:
+            return json.loads(text) if text else default
+        except (json.JSONDecodeError, TypeError):
+            return default
+
+    @staticmethod
+    def _translate_path(path: Any, src_root: str, dest_root: str, mappings=()) -> Any:
+        """
+        Translate a path stored in a source-project database to the destination project.
+
+        The stored path is first normalised to the source project's current location (it may be
+        stale if that project was moved), then `mappings` ((src_prefix, dest_prefix) pairs, e.g. a
+        receptor or assay folder that gets a new name) are tried, and finally the plain
+        source-root -> destination-root swap is applied. Non-string/empty values pass through.
+        """
+        if not path or not isinstance(path, str):
+            return path
+        markers = ('/docking/', '/chemspace/', '/ml/', '/dynamics/')
+        src_root = src_root.rstrip('/')
+        dest_root = dest_root.rstrip('/')
+
+        norm = path
+        if not os.path.exists(norm):
+            for marker in markers:
+                pos = norm.find(marker)
+                if pos != -1:
+                    norm = os.path.join(src_root, norm[pos + 1:])
+                    break
+
+        for src_prefix, dest_prefix in mappings:
+            if not src_prefix:
+                continue
+            src_prefix = src_prefix.rstrip('/')
+            if norm == src_prefix or norm.startswith(src_prefix + '/'):
+                return dest_prefix.rstrip('/') + norm[len(src_prefix):]
+
+        if norm == src_root or norm.startswith(src_root + '/'):
+            return dest_root + norm[len(src_root):]
+        return path
+
+    def _copy_db_rows(self, src_db: str, dest_db: str, table: str, where: str = '', params=(),
+                      transform=None, skip_cols=(), or_ignore: bool = False) -> List[int]:
+        """
+        Copy rows of `table` from one SQLite file into another, preserving the source schema.
+
+        The destination table is created from the source's CREATE statement if missing, and columns
+        present only in the source (e.g. receptor_models.tleap_config) are added. `transform(dict)`
+        may edit each row (or return None to skip it); `skip_cols` (typically the autoincrement PK)
+        are not copied. Returns the rowids of the inserted rows ([] if the source table is absent).
+        """
+        sconn = self._open_db_readonly(src_db)
+        try:
+            sconn.row_factory = sqlite3.Row
+            schema = sconn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            ).fetchone()
+            if not schema or not schema[0]:
+                return []
+            src_col_info = sconn.execute(f'PRAGMA table_info("{table}")').fetchall()
+            query = f'SELECT * FROM "{table}"' + (f' WHERE {where}' if where else '')
+            rows = [dict(r) for r in sconn.execute(query, params)]
+        finally:
+            sconn.close()
+
+        os.makedirs(os.path.dirname(dest_db), exist_ok=True)
+        dconn = sqlite3.connect(dest_db)
+        new_ids: List[int] = []
+        try:
+            cur = dconn.cursor()
+            if not cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
+                cur.execute(schema[0])
+            dest_cols = {r[1] for r in cur.execute(f'PRAGMA table_info("{table}")')}
+            for col in src_col_info:
+                if col[1] not in dest_cols and col[1] not in skip_cols:
+                    cur.execute(f'ALTER TABLE "{table}" ADD COLUMN "{col[1]}" {col[2] or ""}')
+                    dest_cols.add(col[1])
+
+            for row in rows:
+                if transform is not None:
+                    row = transform(row)
+                    if row is None:
+                        continue
+                row = {k: v for k, v in row.items() if k in dest_cols and k not in skip_cols}
+                cols = ', '.join(f'"{k}"' for k in row)
+                marks = ', '.join('?' for _ in row)
+                cur.execute(
+                    f'INSERT {"OR IGNORE " if or_ignore else ""}INTO "{table}" ({cols}) VALUES ({marks})',
+                    list(row.values())
+                )
+                if cur.rowcount > 0:
+                    new_ids.append(cur.lastrowid)
+            dconn.commit()
+        except Exception:
+            dconn.rollback()
+            raise
+        finally:
+            dconn.close()
+        return new_ids
+
+    @staticmethod
+    def _delete_rows_by_rowid(db_path: str, table: str, rowids: List[int]) -> None:
+        """Delete rows by rowid (used to roll back a partially completed copy)."""
+        if not rowids or not os.path.exists(db_path):
+            return
+        conn = sqlite3.connect(db_path)
+        try:
+            marks = ', '.join('?' for _ in rowids)
+            conn.execute(f'DELETE FROM "{table}" WHERE rowid IN ({marks})', list(rowids))
+            conn.commit()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _drop_table(db_path: str, table: str) -> None:
+        """Drop a table if it exists (used to roll back a partially completed copy)."""
+        if not os.path.exists(db_path):
+            return
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute(f'DROP TABLE IF EXISTS "{table}"')
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _prompt_copy_conflict(self, kind: str, name: str, exists_fn, name_ok_fn, can_reuse: bool = True):
+        """
+        Ask what to do when an item being copied already exists in the active project.
+
+        Returns (action, name) where action is 'reuse', 'rename' (name = the new, unused name) or 'cancel'.
+        """
+        while True:
+            print(f"\n⚠️  {kind} '{name}' already exists in the active project '{self.name}'.")
+            print("Choose an action:")
+            if can_reuse:
+                print("  [1] Reuse the existing one (nothing is copied)")
+            print("  [2] Copy under a different name")
+            print("  [3] Cancel")
+            action = input("Select action: ").strip()
+
+            if action == '1' and can_reuse:
+                return 'reuse', name
+            if action == '2':
+                new_name = input(f"Enter a new name (was '{name}'): ").strip()
+                if not name_ok_fn(new_name):
+                    print("❌ Invalid name (use letters, numbers, spaces, hyphens and underscores).")
+                    continue
+                if exists_fn(new_name):
+                    print(f"❌ '{new_name}' already exists too.")
+                    continue
+                return 'rename', new_name
+            if action == '3':
+                return 'cancel', name
+            print("⚠️ Invalid selection. Try again.")
+
+    def _copy_chemspace_table_between_dbs(self, src_db: str, dest_db: str, src_table: str, dest_table: str) -> int:
+        """Copy a chemspace table (schema preserved verbatim) via ATTACH. Returns the row count."""
+        import re
+        conn = sqlite3.connect(dest_db)
+        cur = conn.cursor()
+        cur.execute("ATTACH DATABASE ? AS src_copy", (src_db,))
+        created = False
+        try:
+            row = cur.execute(
+                "SELECT sql FROM src_copy.sqlite_master WHERE type='table' AND name=?", (src_table,)
+            ).fetchone()
+            if not row or not row[0]:
+                raise ValueError(f"Could not read schema for table '{src_table}'")
+            create_sql = re.sub(
+                rf'CREATE TABLE\s+(IF NOT EXISTS\s+)?["`\[]?{re.escape(src_table)}["`\]]?',
+                f'CREATE TABLE "{dest_table}"', row[0], count=1, flags=re.IGNORECASE
+            )
+            cur.execute(create_sql)
+            created = True
+            cur.execute(f'INSERT INTO "{dest_table}" SELECT * FROM src_copy."{src_table}"')
+            conn.commit()
+            return cur.execute(f'SELECT COUNT(*) FROM "{dest_table}"').fetchone()[0]
+        except Exception:
+            conn.rollback()
+            if created:
+                cur.execute(f'DROP TABLE IF EXISTS "{dest_table}"')
+                conn.commit()
+            raise
+        finally:
+            cur.execute("DETACH DATABASE src_copy")
+            conn.close()
+
+    def _copy_receptor_for_assay(self, src_root: str, receptor_info: Dict[str, Any], undo: list) -> Optional[Dict[str, Any]]:
+        """
+        Make the receptor used by a source-project assay available in the active project and
+        return the receptor_info dict (paths and ids re-linked to the active project) that the
+        copied assay must store. Copies the receptor folder (processed/ + grid maps), its
+        receptor_models row, and the linked pdb_templates / pdb_models rows. Returns None if the
+        user cancels or the source receptor cannot be found. Rollback actions are appended to `undo`.
+        """
+        if not receptor_info:
+            print("⚠️  Assay has no receptor_info; nothing to copy for the receptor.")
+            return receptor_info
+
+        src_receptors_dir = os.path.join(src_root, 'docking', 'receptors')
+        src_rec_db = os.path.join(src_receptors_dir, 'receptors.db')
+        src_pdbs_db = os.path.join(src_receptors_dir, 'pdbs.db')
+        dest_rec_db = os.path.join(self.__receptor_path, 'receptors.db')
+        dest_pdbs_db = os.path.join(self.__receptor_path, 'pdbs.db')
+
+        # --- Locate the source receptor_models row ---
+        if not os.path.exists(src_rec_db):
+            print(f"❌ Receptors database not found in source project: {src_rec_db}")
+            return None
+        sconn = self._open_db_readonly(src_rec_db)
+        try:
+            sconn.row_factory = sqlite3.Row
+            src_row = None
+            if receptor_info.get('id') is not None:
+                src_row = sconn.execute("SELECT * FROM receptor_models WHERE id = ?", (receptor_info['id'],)).fetchone()
+            if src_row is None and receptor_info.get('receptor_model_name'):
+                src_row = sconn.execute(
+                    "SELECT * FROM receptor_models WHERE receptor_model_name = ?",
+                    (receptor_info['receptor_model_name'],)
+                ).fetchone()
+            src_row = dict(src_row) if src_row else None
+        finally:
+            sconn.close()
+        if not src_row:
+            print("❌ The receptor used by this assay was not found in the source project's receptors database.")
+            return None
+
+        # --- Locate the source receptor folder (processed/ + grid maps live under it) ---
+        src_pdbqt = self._translate_path(src_row['pdbqt_file'], src_root, src_root)
+        if not os.path.exists(src_pdbqt):
+            # _translate_path with identical roots only normalises stale paths onto src_root
+            src_pdbqt = self._translate_path(receptor_info.get('pdbqt_file'), src_root, src_root)
+        rec_folder = os.path.abspath(os.path.dirname(os.path.dirname(src_pdbqt))) if src_pdbqt else ''
+        receptors_root = os.path.abspath(src_receptors_dir)
+        # The folder must be a sub-folder of <src>/docking/receptors/ (never the receptors root itself)
+        if not rec_folder or not os.path.isdir(rec_folder) or rec_folder == receptors_root or \
+                os.path.commonpath([rec_folder, receptors_root]) != receptors_root:
+            print(f"❌ Could not locate the receptor folder in the source project (PDBQT: {src_pdbqt}).")
+            return None
+
+        # --- Resolve name collisions in the destination ---
+        dest_names = set()
+        if os.path.exists(dest_rec_db):
+            dconn = sqlite3.connect(dest_rec_db)
+            try:
+                if dconn.execute("SELECT 1 FROM sqlite_master WHERE name='receptor_models'").fetchone():
+                    dest_names = {r[0] for r in dconn.execute("SELECT receptor_model_name FROM receptor_models")}
+            finally:
+                dconn.close()
+
+        def _safe(n): return "".join(c for c in n if c.isalnum() or c in ('_', '-', '.')).strip()
+        def _name_ok(n): return bool(n) and bool(_safe(n)) and n.replace('_', '').replace('-', '').replace(' ', '').isalnum()
+        def _exists(n): return n in dest_names or os.path.exists(os.path.join(self.__receptor_path, _safe(n)))
+
+        dest_name = src_row['receptor_model_name']
+        folder_name = os.path.basename(rec_folder)
+        if dest_name in dest_names or os.path.exists(os.path.join(self.__receptor_path, folder_name)):
+            action, dest_name_new = self._prompt_copy_conflict(
+                "Receptor model", dest_name, _exists, _name_ok, can_reuse=dest_name in dest_names
+            )
+            if action == 'cancel':
+                print("❌ Copy cancelled by user.")
+                return None
+            if action == 'reuse':
+                dconn = sqlite3.connect(dest_rec_db)
+                try:
+                    r = dconn.execute(
+                        "SELECT id, pdb_id, receptor_model_name, template_name, pdb_model_name, pdbqt_file, configs, notes "
+                        "FROM receptor_models WHERE receptor_model_name = ?", (dest_name,)
+                    ).fetchone()
+                finally:
+                    dconn.close()
+                print(f"♻️  Reusing receptor '{dest_name}' already present in '{self.name}'.")
+                return {'id': r[0], 'pdb_id': r[1], 'receptor_model_name': r[2], 'template_name': r[3],
+                        'pdb_model_name': r[4], 'pdbqt_file': r[5],
+                        'configs': self._json_or(r[6], None), 'notes': r[7]}
+            dest_name = dest_name_new
+            folder_name = _safe(dest_name)
+
+        # --- Copy the receptor folder ---
+        dest_folder = os.path.join(self.__receptor_path, folder_name)
+        os.makedirs(self.__receptor_path, exist_ok=True)
+        shutil.copytree(rec_folder, dest_folder)
+        undo.append(("receptor folder", lambda p=dest_folder: shutil.rmtree(p, ignore_errors=True)))
+        print(f"   ✓ Copied receptor folder → {dest_folder}")
+
+        mappings = [(rec_folder, dest_folder)]
+        tr = lambda p: self._translate_path(p, src_root, self.path, mappings)
+
+        # --- pdb_templates / pdb_models (linked records) ---
+        new_pdb_id = None
+        pdb_model_name = src_row.get('pdb_model_name')
+        if os.path.exists(src_pdbs_db):
+            sconn = self._open_db_readonly(src_pdbs_db)
+            try:
+                sconn.row_factory = sqlite3.Row
+                has_tmpl = sconn.execute("SELECT 1 FROM sqlite_master WHERE name='pdb_templates'").fetchone()
+                tmpl = None
+                if has_tmpl:
+                    if src_row.get('pdb_id') is not None:
+                        tmpl = sconn.execute("SELECT * FROM pdb_templates WHERE pdb_id = ?", (src_row['pdb_id'],)).fetchone()
+                    if tmpl is None and src_row.get('template_name'):
+                        tmpl = sconn.execute("SELECT * FROM pdb_templates WHERE pdb_template_name = ?",
+                                             (src_row['template_name'],)).fetchone()
+                tmpl = dict(tmpl) if tmpl else None
+            finally:
+                sconn.close()
+
+            if tmpl:
+                pdb_model_name = tmpl.get('pdb_model_name') or pdb_model_name
+                existing = None
+                if os.path.exists(dest_pdbs_db):
+                    dconn = sqlite3.connect(dest_pdbs_db)
+                    try:
+                        if dconn.execute("SELECT 1 FROM sqlite_master WHERE name='pdb_templates'").fetchone():
+                            existing = dconn.execute(
+                                "SELECT pdb_id FROM pdb_templates WHERE pdb_template_name = ?",
+                                (tmpl['pdb_template_name'],)
+                            ).fetchone()
+                    finally:
+                        dconn.close()
+                if existing:
+                    new_pdb_id = existing[0]
+                    print(f"   ♻️  PDB template '{tmpl['pdb_template_name']}' already exists in '{self.name}'; linking to it.")
+                else:
+                    def _tf_tmpl(d):
+                        for key in ('original_pdb_path', 'processed_pdb_path', 'checked_pdb_path', 'template_folder_path'):
+                            if key in d:
+                                d[key] = tr(d[key])
+                        if 'project_name' in d:
+                            d['project_name'] = self.name
+                        return d
+                    ids = self._copy_db_rows(src_pdbs_db, dest_pdbs_db, 'pdb_templates', 'pdb_id = ?',
+                                             (tmpl['pdb_id'],), transform=_tf_tmpl, skip_cols=('pdb_id',))
+                    if ids:
+                        new_pdb_id = ids[0]
+                        undo.append(("pdb_templates row", lambda i=ids: self._delete_rows_by_rowid(dest_pdbs_db, 'pdb_templates', i)))
+
+            if pdb_model_name:
+                exists_model = False
+                if os.path.exists(dest_pdbs_db):
+                    dconn = sqlite3.connect(dest_pdbs_db)
+                    try:
+                        if dconn.execute("SELECT 1 FROM sqlite_master WHERE name='pdb_models'").fetchone():
+                            exists_model = dconn.execute(
+                                "SELECT 1 FROM pdb_models WHERE pdb_model_name = ?", (pdb_model_name,)
+                            ).fetchone() is not None
+                    finally:
+                        dconn.close()
+                if not exists_model:
+                    def _tf_model(d):
+                        if 'project_name' in d:
+                            d['project_name'] = self.name
+                        return d
+                    ids = self._copy_db_rows(src_pdbs_db, dest_pdbs_db, 'pdb_models', 'pdb_model_name = ?',
+                                             (pdb_model_name,), transform=_tf_model, skip_cols=('file_id',))
+                    if ids:
+                        undo.append(("pdb_models row", lambda i=ids: self._delete_rows_by_rowid(dest_pdbs_db, 'pdb_models', i)))
+
+        # --- receptor_models row ---
+        def _tf_receptor(d):
+            d['receptor_model_name'] = dest_name
+            d['pdb_id'] = new_pdb_id
+            d['pdbqt_file'] = tr(d.get('pdbqt_file'))
+            if 'pdb_to_convert' in d:
+                d['pdb_to_convert'] = tr(d['pdb_to_convert'])
+            cfg = self._json_or(d.get('configs'), None)
+            if isinstance(cfg, dict):
+                if cfg.get('grids_path'):
+                    cfg['grids_path'] = tr(cfg['grids_path'])
+                d['configs'] = json.dumps(cfg, indent=2)
+            return d
+        ids = self._copy_db_rows(src_rec_db, dest_rec_db, 'receptor_models', 'id = ?', (src_row['id'],),
+                                 transform=_tf_receptor, skip_cols=('id',))
+        if not ids:
+            raise RuntimeError("Could not insert the receptor_models record in the active project.")
+        new_receptor_id = ids[0]
+        undo.append(("receptor_models row", lambda i=ids: self._delete_rows_by_rowid(dest_rec_db, 'receptor_models', i)))
+
+        # --- receptor_info snapshot stored in the assay ---
+        new_info = dict(receptor_info)
+        new_info.update({
+            'id': new_receptor_id,
+            'pdb_id': new_pdb_id,
+            'receptor_model_name': dest_name,
+            'pdbqt_file': tr(src_row['pdbqt_file']),
+        })
+        cfg = dict(receptor_info.get('configs') or {})
+        if cfg.get('grids_path'):
+            cfg['grids_path'] = tr(cfg['grids_path'])
+        new_info['configs'] = cfg
+        print(f"   ✓ Registered receptor '{dest_name}' (ID: {new_receptor_id}) in '{self.name}'")
+        return new_info
+
+    def _copy_prolif_conditions_for_results_db(self, src_root: str, results_db: str, undo: list) -> Dict[int, int]:
+        """
+        Copy the ProLIF conditions referenced by fingerprint tables in an (already copied) results DB
+        and renumber those tables to the condition ids used in the active project.
+
+        Fingerprint tables are named 'processed_prolif_fps_json_condition_<N>', where N is an id in the
+        source project's params.db. Identical conditions already present in the active project are
+        reused. Returns the {source_id: dest_id} map.
+        """
+        prefix = 'processed_prolif_fps_json_condition_'
+        rconn = sqlite3.connect(results_db)
+        try:
+            tables = [r[0] for r in rconn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE ?", (prefix + '%',))]
+        finally:
+            rconn.close()
+        src_ids = sorted({int(t[len(prefix):]) for t in tables if t[len(prefix):].isdigit()})
+        if not src_ids:
+            return {}
+
+        src_params = os.path.join(src_root, 'docking', 'params', 'params.db')
+        dest_params = self.__docking_params_db
+        id_map: Dict[int, int] = {}
+
+        for old_id in src_ids:
+            src_cond = None
+            if os.path.exists(src_params):
+                sconn = self._open_db_readonly(src_params)
+                try:
+                    if sconn.execute("SELECT 1 FROM sqlite_master WHERE name='ProLIF_Conditions'").fetchone():
+                        src_cond = sconn.execute(
+                            "SELECT description, conditions FROM ProLIF_Conditions WHERE id = ?", (old_id,)
+                        ).fetchone()
+                finally:
+                    sconn.close()
+            if not src_cond:
+                print(f"   ⚠️  ProLIF condition {old_id} not found in source params.db; keeping id {old_id} as is.")
+                id_map[old_id] = old_id
+                continue
+
+            dest_id = None
+            if os.path.exists(dest_params):
+                dconn = sqlite3.connect(dest_params)
+                try:
+                    if dconn.execute("SELECT 1 FROM sqlite_master WHERE name='ProLIF_Conditions'").fetchone():
+                        wanted = self._json_or(src_cond[1], src_cond[1])
+                        for cid, ctext in dconn.execute("SELECT id, conditions FROM ProLIF_Conditions"):
+                            if ctext == src_cond[1] or self._json_or(ctext, ctext) == wanted:
+                                dest_id = cid
+                                break
+                finally:
+                    dconn.close()
+            if dest_id is None:
+                ids = self._copy_db_rows(src_params, dest_params, 'ProLIF_Conditions', 'id = ?', (old_id,),
+                                         skip_cols=('id',))
+                dest_id = ids[0]
+                undo.append(("ProLIF condition row", lambda i=ids: self._delete_rows_by_rowid(dest_params, 'ProLIF_Conditions', i)))
+                print(f"   ✓ Copied ProLIF condition {old_id} → ID {dest_id}")
+            else:
+                print(f"   ♻️  ProLIF condition {old_id} matches existing condition ID {dest_id}")
+            id_map[old_id] = dest_id
+
+        # Two-phase rename so that swaps (e.g. 1→2 and 2→1) cannot collide
+        changes = {o: n for o, n in id_map.items() if o != n}
+        if changes:
+            rconn = sqlite3.connect(results_db)
+            try:
+                for old_id in changes:
+                    rconn.execute(f'ALTER TABLE "{prefix}{old_id}" RENAME TO "tmp_rename_{prefix}{old_id}"')
+                for old_id, new_id in changes.items():
+                    rconn.execute(f'ALTER TABLE "tmp_rename_{prefix}{old_id}" RENAME TO "{prefix}{new_id}"')
+                rconn.commit()
+            finally:
+                rconn.close()
+        return id_map
+
+    def copy_docking_assay_between_projects(self, source_project_name: Optional[str] = None,
+                                            source_assay: Optional[Any] = None,
+                                            copy_binders: bool = True,
+                                            assume_yes: bool = False) -> Optional[Dict[str, Any]]:
+        """
+        Copy a complete docking assay from another project into the active project so that the
+        assay can be analysed (extract_docked_poses, compute_fingerprints, GUI Analysis/ML,
+        perform_md_assay) from the active project without depending on the source project.
+
+        Copied, with paths and ids re-linked to the active project:
+          - the registry row in docking_assays.db (new assay_id / assay_name = 'assay_<id>')
+          - the assay folder (results DB renamed to assay_<new id>.db, extracted poses, logs,
+            analysis files; the scratch 'ligands/' folder is not copied)
+          - the ChemSpace table the assay was docked from (ligand SDF blobs)
+          - the docking method (docking_methods.db)
+          - the receptor (folder with PDBQT and grid maps, receptor_models, pdb_templates, pdb_models)
+          - the ProLIF conditions referenced by computed fingerprint tables (ids remapped)
+          - optionally, the positive/negative binder flags registered for the assay
+
+        Not copied: MD assays derived from the docking assay and training-set snapshots.
+        If any step fails or is cancelled, everything already created in the active project is removed.
+
+        Args:
+            source_project_name (Optional[str]): Project to copy from. If None, prompts a selection.
+            source_assay (Optional[Any]): Assay id (int) or name (str) in the source project. If None, prompts.
+            copy_binders (bool): Also copy the positive/negative binder flags of the assay. Default True.
+            assume_yes (bool): Skip the confirmation prompt before copying. Default False.
+
+        Returns:
+            Optional[Dict[str, Any]]: Info about the assay created in the active project, or None if
+                the copy failed or was cancelled.
+        """
+        from tidyscreen.projects.projects_management import ProjectsManagement
+        from datetime import datetime
+
+        undo: list = []
+
+        def _rollback():
+            for label, action in reversed(undo):
+                try:
+                    action()
+                except Exception as rb_err:
+                    print(f"   ⚠️  Rollback of {label} failed: {rb_err}")
+            undo.clear()
+
+        def _abort(message: Optional[str] = None):
+            if message:
+                print(message)
+            if undo:
+                print("↩️  Rolling back changes made in the active project...")
+                _rollback()
+            return None
+
+        try:
+            print(f"\n📋 COPY DOCKING ASSAY BETWEEN PROJECTS")
+            print("=" * 50)
+
+            # --- Select source project ---
+            all_projects = ProjectsManagement().list_all_projects(print_output=False) or []
+            if not all_projects:
+                print("❌ No projects found in the projects database.")
+                return None
+
+            if source_project_name is None:
+                print("\n📋 Available projects:")
+                for idx, proj in enumerate(all_projects, 1):
+                    marker = " (active)" if proj['name'] == self.name else ""
+                    print(f"  [{idx}] {proj['name']}{marker}")
+                while True:
+                    selection = input("Select source project by number or name (or 'cancel' to abort): ").strip()
+                    if selection.lower() in ['cancel', 'quit', 'exit']:
+                        print("❌ Operation cancelled by user.")
+                        return None
+                    if selection.isdigit() and 0 <= int(selection) - 1 < len(all_projects):
+                        source_project_name = all_projects[int(selection) - 1]['name']
+                        break
+                    if any(p['name'] == selection for p in all_projects):
+                        source_project_name = selection
+                        break
+                    print("⚠️ Invalid selection. Try again.")
+
+            source_project = ActivateProject(source_project_name)
+            if not source_project.project_exists():
+                print(f"❌ Project '{source_project_name}' not found.")
+                return None
+            src_root = source_project.path
+            if os.path.abspath(src_root) == os.path.abspath(self.path):
+                print("❌ Source and destination projects are the same.")
+                return None
+
+            # --- Read source assays and select one ---
+            src_assays_db = os.path.join(src_root, 'docking', 'docking_registers', 'docking_assays.db')
+            if not os.path.exists(src_assays_db):
+                print(f"❌ No docking assays database found for project '{source_project_name}' at {src_assays_db}")
+                return None
+            sconn = self._open_db_readonly(src_assays_db)
+            try:
+                sconn.row_factory = sqlite3.Row
+                if not sconn.execute("SELECT 1 FROM sqlite_master WHERE name='docking_assays'").fetchone():
+                    print(f"❌ Docking assays table not found in project '{source_project_name}'.")
+                    return None
+                assays = [dict(r) for r in sconn.execute("SELECT * FROM docking_assays ORDER BY assay_id")]
+            finally:
+                sconn.close()
+            if not assays:
+                print(f"❌ No docking assays found in project '{source_project_name}'.")
+                return None
+
+            if source_assay is None:
+                print(f"\n🧬 Docking assays in project '{source_project_name}':")
+                for idx, a in enumerate(assays, 1):
+                    print(f"  [{idx}] {a['assay_name']} (ID: {a['assay_id']}) | table: {a['table_name']} | "
+                          f"method: {a['docking_method_name']} ({a['docking_engine']}) | status: {a['status']}")
+                while True:
+                    selection = input("Select assay to copy by number or name (or 'cancel' to abort): ").strip()
+                    if selection.lower() in ['cancel', 'quit', 'exit']:
+                        print("❌ Operation cancelled by user.")
+                        return None
+                    if selection.isdigit() and 0 <= int(selection) - 1 < len(assays):
+                        assay = assays[int(selection) - 1]
+                        break
+                    matching = [a for a in assays if a['assay_name'] == selection]
+                    if matching:
+                        assay = matching[0]
+                        break
+                    print("⚠️ Invalid selection. Try again.")
+            else:
+                matching = [a for a in assays if a['assay_id'] == source_assay or a['assay_name'] == source_assay]
+                if not matching:
+                    print(f"❌ Assay '{source_assay}' not found in project '{source_project_name}'.")
+                    return None
+                assay = matching[0]
+
+            src_assay_id, src_assay_name = assay['assay_id'], assay['assay_name']
+
+            # --- Preflight (read-only): source folder and results DB ---
+            src_folder = os.path.join(src_root, 'docking', 'docking_assays', src_assay_name)
+            stored_folder = assay.get('assay_folder_path') or ''
+            if not os.path.isdir(src_folder):
+                if stored_folder and os.path.isdir(stored_folder):
+                    src_folder = stored_folder
+                else:
+                    print(f"❌ Assay folder not found for '{src_assay_name}' (looked in {src_folder} and {stored_folder or 'n/a'}).")
+                    return None
+            src_results_dir = os.path.join(src_folder, 'results')
+            src_results_db = os.path.join(src_results_dir, f"assay_{src_assay_id}.db")
+            if not os.path.isfile(src_results_db):
+                print(f"❌ Results database not found: {src_results_db}")
+                print("   Only assays whose docking results were processed can be copied.")
+                return None
+
+            total_size = 0
+            for dp, _, fns in os.walk(src_folder):
+                for fn in fns:
+                    try:
+                        total_size += os.path.getsize(os.path.join(dp, fn))
+                    except OSError:
+                        pass
+
+            receptor_info = self._json_or(assay.get('receptor_info'), {})
+            configuration = self._json_or(assay.get('configuration'), {})
+            if not isinstance(configuration, dict):
+                configuration = {}
+
+            print(f"\n🧬 Assay to copy: {src_assay_name} (ID: {src_assay_id}) from project '{source_project_name}'")
+            print(f"   📊 Table:    {assay['table_name']}")
+            print(f"   🧪 Method:   {assay['docking_method_name']} ({assay['docking_engine']})")
+            print(f"   🎯 Receptor: {receptor_info.get('receptor_model_name', 'N/A')}")
+            print(f"   📌 Status:   {assay['status']}")
+            print(f"   📁 Folder:   {src_folder} ({total_size / 1024 ** 2:,.1f} MB)")
+            if assay['status'] == 'failed':
+                print("   ⚠️  Assay status is 'failed'; results may be missing or partial.")
+
+            if not assume_yes:
+                confirm = input(f"\nCopy this assay into project '{self.name}'? (yes/no): ").strip().lower()
+                if confirm not in ['yes', 'y']:
+                    print("❌ Copy cancelled by user.")
+                    return None
+
+            dest_registers_dir = os.path.dirname(self.__docking_registers_db)
+            dest_assays_db = os.path.join(dest_registers_dir, 'docking_assays.db')
+            os.makedirs(dest_registers_dir, exist_ok=True)
+
+            # --- 1. ChemSpace table ---
+            print(f"\n[1/6] ChemSpace table")
+            dest_table = assay['table_name']
+            src_cs_db = os.path.join(src_root, 'chemspace', 'processed_data', 'chemspace.db')
+            dest_cs_db = self.__chemspace_db
+
+            def _tables(db):
+                if not os.path.exists(db):
+                    return set()
+                c = sqlite3.connect(db)
+                try:
+                    return {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                finally:
+                    c.close()
+
+            if dest_table not in _tables(src_cs_db):
+                print(f"   ⚠️  Table '{dest_table}' not found in the source ChemSpace; ligand-dependent analyses "
+                      f"(MMGBSA/ProLIF/MD) will need it in '{self.name}'.")
+            else:
+                dest_tables = _tables(dest_cs_db)
+                copy_table = True
+                if dest_table in dest_tables:
+                    action, new_name = self._prompt_copy_conflict(
+                        "ChemSpace table", dest_table,
+                        lambda n: n in dest_tables,
+                        lambda n: bool(n) and n.replace('_', '').isalnum() and not n[0].isdigit()
+                    )
+                    if action == 'cancel':
+                        return _abort("❌ Copy cancelled by user.")
+                    if action == 'reuse':
+                        copy_table = False
+                        print(f"   ♻️  Reusing existing table '{dest_table}' (assumed identical to the source).")
+                    else:
+                        dest_table = new_name
+                if copy_table:
+                    n_rows = self._copy_chemspace_table_between_dbs(src_cs_db, dest_cs_db, assay['table_name'], dest_table)
+                    undo.append(("chemspace table", lambda t=dest_table: self._drop_table(dest_cs_db, t)))
+                    print(f"   ✓ Copied table '{assay['table_name']}' → '{dest_table}' ({n_rows:,} rows)")
+
+            # --- 2. Docking method ---
+            print(f"\n[2/6] Docking method")
+            method_name = assay['docking_method_name']
+            dest_method_name, dest_method_id = method_name, None
+            src_methods_db = os.path.join(src_root, 'docking', 'docking_registers', 'docking_methods.db')
+            dest_methods_db = os.path.join(dest_registers_dir, 'docking_methods.db')
+
+            def _method_rows(db):
+                if not os.path.exists(db):
+                    return {}
+                c = self._open_db_readonly(db)
+                try:
+                    if not c.execute("SELECT 1 FROM sqlite_master WHERE name='docking_methods'").fetchone():
+                        return {}
+                    return {r[0]: r[1:] for r in c.execute(
+                        "SELECT method_name, id, docking_engine, parameters, ligand_prep_params FROM docking_methods")}
+                finally:
+                    c.close()
+
+            src_methods, dest_methods = _method_rows(src_methods_db), _method_rows(dest_methods_db)
+            if method_name not in src_methods:
+                print(f"   ⚠️  Method '{method_name}' no longer exists in the source project; the assay keeps its "
+                      f"stored method parameters (configuration) but no method record is created.")
+            else:
+                s, d = src_methods[method_name], dest_methods.get(method_name)
+                identical = d is not None and s[1] == d[1] and \
+                    self._json_or(s[2], s[2]) == self._json_or(d[2], d[2]) and \
+                    self._json_or(s[3], s[3]) == self._json_or(d[3], d[3])
+                if identical:
+                    dest_method_id = d[0]
+                    print(f"   ♻️  Identical method '{method_name}' already exists (ID: {dest_method_id}).")
+                else:
+                    result = self.copy_docking_method_between_projects(source_project_name, method_name, method_name)
+                    if not result:
+                        return _abort("❌ Docking method was not copied. Copy cancelled.")
+                    dest_method_name, dest_method_id = result['method_name'], result['method_id']
+                    if dest_method_name not in dest_methods:  # newly created (not an overwrite)
+                        undo.append(("docking method", lambda i=dest_method_id: self._delete_rows_by_rowid(dest_methods_db, 'docking_methods', [i])))
+
+            # --- 3. Receptor ---
+            print(f"\n[3/6] Receptor")
+            new_receptor_info = self._copy_receptor_for_assay(src_root, receptor_info, undo)
+            if new_receptor_info is None:
+                return _abort("❌ Receptor could not be copied. Copy cancelled.")
+
+            # --- 4. Registry row (gives the new assay id) ---
+            print(f"\n[4/6] Registry entry")
+            def _tf_assay(d):
+                d.update({
+                    'assay_name': 'temp_assay',
+                    'project_name': self.name,
+                    'table_name': dest_table,
+                    'docking_method_id': dest_method_id,
+                    'docking_method_name': dest_method_name,
+                    'receptor_info': json.dumps(new_receptor_info, indent=2),
+                    'assay_folder_path': '',
+                    'configuration': '{}',
+                    'last_modified': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                })
+                return d
+            ids = self._copy_db_rows(src_assays_db, dest_assays_db, 'docking_assays', 'assay_id = ?',
+                                     (src_assay_id,), transform=_tf_assay, skip_cols=('assay_id',))
+            if not ids:
+                return _abort("❌ Could not create the assay registry entry.")
+            new_assay_id = ids[0]
+            undo.append(("assay registry row", lambda i=ids: self._delete_rows_by_rowid(dest_assays_db, 'docking_assays', i)))
+            new_assay_name = f"assay_{new_assay_id}"
+            dest_folder = os.path.join(self.path, 'docking', 'docking_assays', new_assay_name)
+            if os.path.exists(dest_folder):
+                return _abort(f"❌ Destination folder already exists: {dest_folder}\n"
+                              f"   Remove or rename it and try again.")
+
+            # --- 5. Assay folder + results DB ---
+            print(f"\n[5/6] Assay folder and results")
+            src_folder_abs, src_results_abs = os.path.abspath(src_folder), os.path.abspath(src_results_dir)
+            results_names = {f"assay_{src_assay_id}.db", f"assay_{src_assay_id}.db-wal",
+                             f"assay_{src_assay_id}.db-shm", f"assay_{src_assay_id}.db-journal"}
+
+            def _ignore(dirpath, names):
+                ignored = set()
+                if os.path.abspath(dirpath) == src_folder_abs:
+                    ignored.update(n for n in names if n == 'ligands')
+                if os.path.abspath(dirpath) == src_results_abs:
+                    ignored.update(n for n in names if n in results_names)
+                return ignored
+
+            os.makedirs(os.path.dirname(dest_folder), exist_ok=True)
+            shutil.copytree(src_folder, dest_folder, ignore=_ignore)
+            undo.append(("assay folder", lambda p=dest_folder: shutil.rmtree(p, ignore_errors=True)))
+            os.makedirs(os.path.join(dest_folder, 'ligands'), exist_ok=True)
+            os.makedirs(os.path.join(dest_folder, 'results'), exist_ok=True)
+
+            dest_results_db = os.path.join(dest_folder, 'results', f"assay_{new_assay_id}.db")
+            sconn = self._open_db_readonly(src_results_db)
+            dconn = sqlite3.connect(dest_results_db)
+            try:
+                sconn.backup(dconn)
+            finally:
+                dconn.close()
+                sconn.close()
+            print(f"   ✓ Copied folder → {dest_folder}")
+            print(f"   ✓ Results DB → results/assay_{new_assay_id}.db")
+
+            condition_map = self._copy_prolif_conditions_for_results_db(src_root, dest_results_db, undo)
+
+            # --- Finalise the registry row ---
+            configuration['receptor_info'] = new_receptor_info
+            if isinstance(configuration.get('docking_method'), dict):
+                configuration['docking_method']['method_name'] = dest_method_name
+                if 'method_id' in configuration['docking_method']:
+                    configuration['docking_method']['method_id'] = dest_method_id
+            if isinstance(configuration.get('table_info'), dict):
+                configuration['table_info']['name'] = dest_table
+            configuration['assay_folder'] = {'path': dest_folder, 'created': True}
+            configuration['copied_from'] = {
+                'project_name': source_project_name,
+                'assay_id': src_assay_id,
+                'assay_name': src_assay_name,
+                'copied_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'prolif_condition_map': {str(k): v for k, v in condition_map.items()},
+            }
+            conn = sqlite3.connect(dest_assays_db)
+            try:
+                conn.execute('''
+                    UPDATE docking_assays
+                    SET assay_name = ?, assay_folder_path = ?, configuration = ?, last_modified = CURRENT_TIMESTAMP
+                    WHERE assay_id = ?
+                ''', (new_assay_name, dest_folder, json.dumps(configuration, indent=2), new_assay_id))
+                conn.commit()
+            finally:
+                conn.close()
+
+            # --- 6. Binder flags (non-critical: a failure here does not undo the copy) ---
+            binders_copied = {'positive': 0, 'negative': 0}
+            if copy_binders:
+                print(f"\n[6/6] Binder flags")
+                mappings = [(src_folder, dest_folder), (stored_folder, dest_folder)]
+                for kind in ('positive', 'negative'):
+                    table = f"{kind}_binders"
+                    src_db = os.path.join(src_root, 'ml', 'training_sets', f"{table}.db")
+                    dest_db = os.path.join(self.path, 'ml', 'training_sets', f"{table}.db")
+                    if not os.path.exists(src_db):
+                        continue
+                    try:
+                        def _tf_binder(d):
+                            d['assay_name'] = new_assay_name
+                            d['pose_full_path'] = self._translate_path(d.get('pose_full_path'), src_root, self.path, mappings)
+                            return d
+                        b_ids = self._copy_db_rows(src_db, dest_db, table, 'assay_name = ?', (src_assay_name,),
+                                                   transform=_tf_binder, skip_cols=('id',), or_ignore=True)
+                        binders_copied[kind] = len(b_ids)
+                    except Exception as b_err:
+                        print(f"   ⚠️  Could not copy {kind} binders: {b_err}")
+                print(f"   ✓ Binders copied: {binders_copied['positive']} positive, {binders_copied['negative']} negative")
+            else:
+                print(f"\n[6/6] Binder flags skipped (copy_binders=False)")
+
+            print(f"\n✅ Copied assay '{src_assay_name}' from project '{source_project_name}' to "
+                  f"'{new_assay_name}' (ID: {new_assay_id}) in project '{self.name}'.")
+            print(f"   📁 Folder:   {dest_folder}")
+            print(f"   💾 Registry: {dest_assays_db}")
+
+            return {
+                'assay_id': new_assay_id,
+                'assay_name': new_assay_name,
+                'assay_folder_path': dest_folder,
+                'results_db': dest_results_db,
+                'source_project': source_project_name,
+                'source_assay_id': src_assay_id,
+                'source_assay_name': src_assay_name,
+                'table_name': dest_table,
+                'docking_method_name': dest_method_name,
+                'docking_method_id': dest_method_id,
+                'receptor_info': new_receptor_info,
+                'prolif_condition_map': condition_map,
+                'binders_copied': binders_copied,
+            }
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return _abort(f"❌ Error copying docking assay between projects: {e}")
+
     def delete_docking_method(self):
         """
         Delete a docking method registry from the database as created using the create_docking_method method
