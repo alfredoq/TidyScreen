@@ -730,6 +730,234 @@ class MolDock:
             print(f"❌ Error importing docking method: {e}")
             return None
 
+    def copy_docking_method_between_projects(self, source_project_name: Optional[str] = None,
+                                             source_method_name: Optional[str] = None,
+                                             dest_method_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """
+        Copy a docking method from another project's docking_methods.db into the active
+        project's docking_methods.db. Engine, description, engine parameters and ligand
+        preparation parameters are copied verbatim as stored (no JSON round-trip).
+
+        Args:
+            source_project_name (Optional[str]): Project to copy from. If None, prompts an
+                interactive project selection.
+            source_method_name (Optional[str]): Method to copy from the source project. If None,
+                prompts an interactive method selection.
+            dest_method_name (Optional[str]): Name for the copied method in the active project.
+                If None, defaults to the source method name.
+
+        Returns:
+            Optional[Dict[str, Any]]: Info about the method created in the active project
+                (same shape as import_docking_method), or None if failed or cancelled.
+        """
+        from tidyscreen.projects.projects_management import ProjectsManagement
+
+        def _valid_name(name):
+            return bool(name) and name.replace('_', '').replace('-', '').replace(' ', '').isalnum()
+
+        try:
+            print(f"\n📋 COPY DOCKING METHOD BETWEEN PROJECTS")
+            print("=" * 50)
+
+            # --- Select source project ---
+            all_projects = ProjectsManagement().list_all_projects(print_output=False) or []
+            if not all_projects:
+                print("❌ No projects found in the projects database.")
+                return None
+
+            if source_project_name is None:
+                print("\n📋 Available projects:")
+                for idx, proj in enumerate(all_projects, 1):
+                    marker = " (active)" if proj['name'] == self.name else ""
+                    print(f"  [{idx}] {proj['name']}{marker}")
+                while True:
+                    selection = input("Select source project by number or name (or 'cancel' to abort): ").strip()
+                    if selection.lower() in ['cancel', 'quit', 'exit']:
+                        print("❌ Operation cancelled by user.")
+                        return None
+                    if selection.isdigit() and 0 <= int(selection) - 1 < len(all_projects):
+                        source_project_name = all_projects[int(selection) - 1]['name']
+                        break
+                    if any(p['name'] == selection for p in all_projects):
+                        source_project_name = selection
+                        break
+                    print("⚠️ Invalid selection. Try again.")
+
+            source_project = ActivateProject(source_project_name)
+            if not source_project.project_exists():
+                print(f"❌ Project '{source_project_name}' not found.")
+                return None
+
+            source_db = os.path.join(source_project.path, 'docking', 'docking_registers', 'docking_methods.db')
+            if not os.path.exists(source_db):
+                print(f"❌ No docking methods database found for project '{source_project_name}' at {source_db}")
+                return None
+
+            # --- Read source methods ---
+            src_conn = sqlite3.connect(source_db)
+            try:
+                src_cursor = src_conn.cursor()
+                src_cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='docking_methods'")
+                if not src_cursor.fetchone():
+                    print(f"❌ Docking methods table not found in project '{source_project_name}'.")
+                    return None
+                src_cursor.execute('''
+                    SELECT method_name, docking_engine, description, parameters, ligand_prep_params
+                    FROM docking_methods ORDER BY created_date ASC
+                ''')
+                source_methods = src_cursor.fetchall()
+            finally:
+                src_conn.close()
+
+            if not source_methods:
+                print(f"❌ No docking methods found in project '{source_project_name}'.")
+                return None
+
+            # --- Select source method ---
+            if source_method_name is None:
+                print(f"\n🧬 Docking methods in project '{source_project_name}':")
+                for idx, (name, engine, desc, _, _) in enumerate(source_methods, 1):
+                    print(f"  [{idx}] {name}  |  {engine}  |  {desc or 'No description'}")
+                while True:
+                    selection = input("Select method to copy by number or name (or 'cancel' to abort): ").strip()
+                    if selection.lower() in ['cancel', 'quit', 'exit']:
+                        print("❌ Operation cancelled by user.")
+                        return None
+                    if selection.isdigit() and 0 <= int(selection) - 1 < len(source_methods):
+                        selected = source_methods[int(selection) - 1]
+                        break
+                    matching = [m for m in source_methods if m[0] == selection]
+                    if matching:
+                        selected = matching[0]
+                        break
+                    print("⚠️ Invalid selection. Try again.")
+            else:
+                matching = [m for m in source_methods if m[0] == source_method_name]
+                if not matching:
+                    print(f"❌ Method '{source_method_name}' not found in project '{source_project_name}'.")
+                    return None
+                selected = matching[0]
+
+            src_name, docking_engine, description, params_text, ligand_prep_text = selected
+
+            # --- Resolve destination ---
+            docking_registers_dir = os.path.dirname(self.__docking_registers_db)
+            os.makedirs(docking_registers_dir, exist_ok=True)
+            dest_db = os.path.join(docking_registers_dir, 'docking_methods.db')
+
+            same_database = os.path.abspath(source_db) == os.path.abspath(dest_db)
+            dest_name = (dest_method_name if dest_method_name is not None else src_name).strip()
+
+            if not _valid_name(dest_name):
+                print("❌ Method name can only contain letters, numbers, spaces, hyphens, and underscores")
+                return None
+
+            conn = sqlite3.connect(dest_db)
+            try:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS docking_methods (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        method_name TEXT UNIQUE NOT NULL,
+                        docking_engine TEXT NOT NULL,
+                        description TEXT,
+                        parameters TEXT,
+                        ligand_prep_params TEXT,
+                        created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+
+                overwrite = False
+                while True:
+                    if same_database and dest_name == src_name:
+                        print("⚠️  Source and destination are the same method; choose a different name.")
+                        exists = True
+                        can_overwrite = False
+                    else:
+                        cursor.execute("SELECT COUNT(*) FROM docking_methods WHERE method_name = ?", (dest_name,))
+                        exists = cursor.fetchone()[0] > 0
+                        can_overwrite = True
+
+                    if not exists:
+                        break
+
+                    if can_overwrite:
+                        print(f"\n⚠️  Method '{dest_name}' already exists in the active project '{self.name}'.")
+                    print("Choose an action:")
+                    if can_overwrite:
+                        print("  [1] Overwrite the existing method")
+                    print("  [2] Save the copy under a different name")
+                    print("  [3] Cancel")
+                    action = input("Select action: ").strip()
+
+                    if action == '1' and can_overwrite:
+                        confirm = input(
+                            f"⚠️  This will replace the existing method '{dest_name}' in '{self.name}'. Continue? (yes/no): "
+                        ).strip().lower()
+                        if confirm not in ['yes', 'y']:
+                            print("Overwrite cancelled.")
+                            continue
+                        overwrite = True
+                        break
+                    elif action == '2':
+                        new_name = input(f"Enter a new name for the copied method (was '{dest_name}'): ").strip()
+                        if not _valid_name(new_name):
+                            print("❌ Method name can only contain letters, numbers, spaces, hyphens, and underscores")
+                            continue
+                        dest_name = new_name
+                    elif action == '3':
+                        print("❌ Copy cancelled by user.")
+                        return None
+                    else:
+                        print("⚠️ Invalid selection. Try again.")
+
+                # --- Perform the copy (stored text copied verbatim) ---
+                if overwrite:
+                    cursor.execute('''
+                        UPDATE docking_methods
+                        SET docking_engine = ?, description = ?, parameters = ?,
+                            ligand_prep_params = ?, created_date = CURRENT_TIMESTAMP
+                        WHERE method_name = ?
+                    ''', (docking_engine, description, params_text, ligand_prep_text, dest_name))
+                else:
+                    cursor.execute('''
+                        INSERT INTO docking_methods
+                            (method_name, docking_engine, description, parameters, ligand_prep_params)
+                        VALUES (?, ?, ?, ?, ?)
+                    ''', (dest_name, docking_engine, description, params_text, ligand_prep_text))
+
+                method_id = cursor.execute(
+                    "SELECT id FROM docking_methods WHERE method_name = ?", (dest_name,)
+                ).fetchone()[0]
+                conn.commit()
+            finally:
+                conn.close()
+
+            print(f"✅ Copied docking method '{src_name}' from project '{source_project_name}' to "
+                  f"'{dest_name}' in project '{self.name}'.")
+            print(f"📋 Method ID: {method_id}")
+            print(f"🗂️  Database:  {dest_db}")
+
+            def _loads(text):
+                try:
+                    return json.loads(text) if text else {}
+                except json.JSONDecodeError:
+                    return {}
+
+            return {
+                'method_id': method_id,
+                'method_name': dest_name,
+                'docking_engine': docking_engine,
+                'description': description,
+                'parameters': _loads(params_text),
+                'ligand_prep_params': _loads(ligand_prep_text),
+                'database_path': dest_db,
+            }
+
+        except Exception as e:
+            print(f"❌ Error copying docking method between projects: {e}")
+            return None
+
     def delete_docking_method(self):
         """
         Delete a docking method registry from the database as created using the create_docking_method method
