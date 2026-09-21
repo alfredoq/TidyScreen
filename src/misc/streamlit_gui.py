@@ -700,6 +700,9 @@ elif page == "ChemSpace Inspection":
             st.rerun()
 
         if st.session_state["show_display_table"]:
+            _delete_msg = st.session_state.pop("_delete_rows_msg", None)
+            if _delete_msg:
+                (st.success if _delete_msg[0] == "success" else st.error)(_delete_msg[1])
             display_table_names = df["table"].tolist()
             display_selected_table = st.selectbox(
                 "Select a table to display:",
@@ -712,28 +715,69 @@ elif page == "ChemSpace Inspection":
                 selected_display_cols = [col for col in display_columns if st.checkbox(col, value=True, key=f"display_col_{display_selected_table}_{col}")]
                 if selected_display_cols:
                     _display_row_limit = 10000
+                    _display_mtime = _chemspace_table_sigs.get(display_selected_table)
                     _table_total_rows = int(df.loc[df["table"] == display_selected_table, "rows"].iloc[0])
-                    _read_limit = _display_row_limit if _table_total_rows > _display_row_limit else None
+
+                    ## Per-column filters (AND-combined), pushed down to SQL so they search the
+                    ## whole table; the row cap below applies to the *matching* rows only.
+                    _display_filters = {}
+                    with st.expander("🔍 Column filters", expanded=False):
+                        st.caption(
+                            "Text: case-insensitive 'contains'. Numeric columns also accept "
+                            "`>5`, `>=5`, `<5`, `<=5`, `=5` or `a..b` (range). "
+                            "Filters are combined with AND."
+                        )
+                        _filter_grid = st.columns(min(4, len(selected_display_cols)))
+                        for _i, _col in enumerate(selected_display_cols):
+                            with _filter_grid[_i % len(_filter_grid)]:
+                                _display_filters[_col] = st.text_input(
+                                    _col,
+                                    key=f"display_filter_{display_selected_table}_{_col}",
+                                    placeholder="filter...",
+                                )
+                    _display_filters = {c: v.strip() for c, v in _display_filters.items() if v.strip()}
+                    _where_sql, _where_params = st_funcs.build_sql_filters(
+                        st_funcs.get_table_column_types(db_path, display_selected_table, mtime=_display_mtime),
+                        _display_filters,
+                    )
+                    if _where_sql:
+                        _matching_rows = st_funcs.count_table_rows(
+                            db_path, display_selected_table, _where_sql, _where_params, mtime=_display_mtime
+                        )
+                        st.caption(
+                            f"{_matching_rows:,} of {_table_total_rows:,} rows match the filters."
+                        )
+                    else:
+                        _matching_rows = _table_total_rows
+
+                    _read_limit = _display_row_limit if _matching_rows > _display_row_limit else None
                     display_df = st_funcs.read_table_columns_as_dataframe(
                         db_path, display_selected_table, selected_display_cols,
-                        limit=_read_limit, mtime=_chemspace_table_sigs.get(display_selected_table)
+                        limit=_read_limit, mtime=_display_mtime,
+                        where_sql=_where_sql, params=_where_params, with_rowid=True,
                     )
                     if display_df is not None and not display_df.empty:
                         if _read_limit is not None:
                             st.info(
-                                f"Table '{display_selected_table}' has "
-                                f"{st_funcs.format_row_count(_table_total_rows)} rows; "
-                                f"showing only the first {_display_row_limit:,}."
+                                f"{'Matching rows' if _where_sql else 'Table'} "
+                                f"({st_funcs.format_row_count(_matching_rows)}) exceed the display cap; "
+                                f"showing only the first {_display_row_limit:,}. "
+                                + ("Refine the filters to narrow them down." if _where_sql else "Use the filters to search the whole table.")
                             )
                         _display_df_sel = display_df.copy()
                         _display_df_sel.insert(0, "Select", False)
+                        # The editor's selection state is positional, so tie its key to the
+                        # active filters/columns and to the table version: changing either (including
+                        # after a row deletion) resets the selection instead of applying stale
+                        # checkmarks to different rows.
+                        _editor_sig = hash((tuple(selected_display_cols), tuple(sorted(_display_filters.items())), _display_mtime))
                         _edited_display = st.data_editor(
                             _display_df_sel,
                             column_config={"Select": st.column_config.CheckboxColumn("Select", default=False)},
                             disabled=[c for c in _display_df_sel.columns if c != "Select"],
                             hide_index=True,
                             use_container_width=True,
-                            key=f"data_editor_display_{display_selected_table}",
+                            key=f"data_editor_display_{display_selected_table}_{_editor_sig}",
                         )
                         _selected_display_rows = _edited_display[_edited_display["Select"]]
                         _n_sel_display = len(_selected_display_rows)
@@ -755,10 +799,10 @@ elif page == "ChemSpace Inspection":
                                 key=f"btn_subset_table_{display_selected_table}",
                                 disabled=(_n_sel_display == 0 or not _new_table_name.strip()),
                             ):
-                                _row_indices = list(_selected_display_rows.index)
+                                _row_ids = [int(i) for i in _selected_display_rows.index]
                                 result = st_funcs.create_subset_table(
                                     db_path, display_selected_table,
-                                    _new_table_name.strip(), _row_indices,
+                                    _new_table_name.strip(), _row_ids,
                                     columns=selected_display_cols
                                 )
                                 if result == "created":
@@ -775,10 +819,10 @@ elif page == "ChemSpace Inspection":
                                 key=f"btn_subset_all_cols_{display_selected_table}",
                                 disabled=(_n_sel_display == 0 or not _new_table_name.strip()),
                             ):
-                                _row_indices = list(_selected_display_rows.index)
+                                _row_ids = [int(i) for i in _selected_display_rows.index]
                                 result = st_funcs.create_subset_table(
                                     db_path, display_selected_table,
-                                    _new_table_name.strip(), _row_indices,
+                                    _new_table_name.strip(), _row_ids,
                                     columns=None
                                 )
                                 if result == "created":
@@ -787,6 +831,45 @@ elif page == "ChemSpace Inspection":
                                     st.error(f"A table named **'{_new_table_name.strip()}'** already exists. Choose a different name.")
                                 else:
                                     st.error(f"Could not create subset: {result}")
+
+                        st.markdown("---")
+                        st.markdown("**🗑️ Delete Rows**")
+                        _del_key = f"confirm_delete_rows_{display_selected_table}"
+                        _pending_del_ids = st.session_state.get(_del_key)
+                        if not _pending_del_ids:
+                            if st.button(
+                                f"🗑️ Delete selected rows ({_n_sel_display})",
+                                key=f"btn_delete_rows_{display_selected_table}",
+                                disabled=(_n_sel_display == 0),
+                                help="Select rows with the 'Select' checkboxes above to enable deletion.",
+                            ):
+                                # Freeze the ids now so the confirmation acts on exactly these rows.
+                                st.session_state[_del_key] = [int(i) for i in _selected_display_rows.index]
+                                st.rerun()
+                        else:
+                            st.warning(
+                                f"⚠️ Permanently delete {len(_pending_del_ids):,} row(s) from table "
+                                f"**'{display_selected_table}'**? This action cannot be undone!"
+                            )
+                            _delr1, _delr2 = st.columns(2)
+                            with _delr1:
+                                if st.button("Yes, delete", key=f"btn_confirm_delete_rows_{display_selected_table}"):
+                                    _del_result = st_funcs.delete_table_rows(db_path, display_selected_table, _pending_del_ids)
+                                    st.session_state[_del_key] = None
+                                    if _del_result.startswith("deleted:"):
+                                        st.session_state["_delete_rows_msg"] = (
+                                            "success",
+                                            f"✅ Deleted {_del_result.split(':', 1)[1]} row(s) from '{display_selected_table}'.",
+                                        )
+                                    else:
+                                        st.session_state["_delete_rows_msg"] = ("error", f"❌ Could not delete rows: {_del_result}")
+                                    st.rerun()
+                            with _delr2:
+                                if st.button("Cancel", key=f"btn_cancel_delete_rows_{display_selected_table}"):
+                                    st.session_state[_del_key] = None
+                                    st.rerun()
+                    elif _where_sql:
+                        st.info("No rows match the current filters.")
                     else:
                         st.info(f"Table '{display_selected_table}' is empty or could not be read.")
                 else:

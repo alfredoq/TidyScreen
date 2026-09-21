@@ -2435,46 +2435,152 @@ def get_table_columns(db_path: str, table_name: str, mtime=None) -> list:
 
 
 @st.cache_data(show_spinner=False)
-def read_table_columns_as_dataframe(db_path: str, table_name: str, columns: list, limit: int = None, mtime=None) -> "pd.DataFrame":
+def get_table_column_types(db_path: str, table_name: str, mtime=None) -> dict:
+    """
+    Return ``{column_name: is_numeric}`` for a SQLite table, based on the declared
+    column type using SQLite's affinity rules (INT / REAL / FLOA / DOUB / NUM / DEC).
+
+    Cached per (db_path, table_name, mtime), like get_table_columns().
+    """
+    try:
+        conn = sqlite3.connect(db_path)
+        rows = conn.execute(f"PRAGMA table_info([{table_name}])").fetchall()
+        conn.close()
+    except Exception:
+        return {}
+    numeric_tokens = ("INT", "REAL", "FLOA", "DOUB", "NUM", "DEC")
+    return {r[1]: any(tok in (r[2] or "").upper() for tok in numeric_tokens) for r in rows}
+
+
+def _parse_numeric_filter(ident: str, expr: str):
+    """Parse a numeric filter expression into ``(sql_clause, params)``, or None if invalid."""
+    try:
+        if ".." in expr:
+            low, high = expr.split("..", 1)
+            return f"{ident} BETWEEN ? AND ?", [float(low), float(high)]
+        for op in (">=", "<=", "==", ">", "<", "="):
+            if expr.startswith(op):
+                return f"{ident} {'=' if op == '==' else op} ?", [float(expr[len(op):])]
+    except ValueError:
+        pass
+    return None
+
+
+def build_sql_filters(column_types: dict, filters: dict) -> tuple:
+    """
+    Translate per-column filter expressions into a parametrised SQL WHERE clause.
+
+    Filters are AND-combined; empty expressions and unknown columns are ignored.
+
+    Supported expressions:
+        - Numeric columns: ``>5``, ``>=5``, ``<5``, ``<=5``, ``=5``, ``==5``,
+          ``a..b`` (inclusive range).
+        - Any other expression (or any non-numeric column): case-insensitive
+          substring match (``LIKE '%expr%'``; case-insensitivity is ASCII-only,
+          a SQLite limitation).
+
+    Args:
+        column_types (dict): ``{column_name: is_numeric}``, see get_table_column_types().
+        filters (dict): ``{column_name: expression}``.
+
+    Returns:
+        tuple[str, tuple]: ``(where_sql, params)``. ``where_sql`` is ``""`` when
+        no filter is active, otherwise it starts with ``" WHERE "``.
+    """
+    clauses, params = [], []
+    for col, expr in filters.items():
+        expr = (expr or "").strip()
+        if not expr or col not in column_types:
+            continue
+        ident = f"[{col}]"
+
+        numeric = _parse_numeric_filter(ident, expr) if column_types[col] else None
+        if numeric is not None:
+            clauses.append(numeric[0])
+            params.extend(numeric[1])
+            continue
+
+        escaped = expr.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        clauses.append(f"CAST({ident} AS TEXT) LIKE ? ESCAPE '\\'")
+        params.append(f"%{escaped}%")
+
+    if not clauses:
+        return "", ()
+    return " WHERE " + " AND ".join(clauses), tuple(params)
+
+
+@st.cache_data(show_spinner=False)
+def count_table_rows(db_path: str, table_name: str, where_sql: str = "", params: tuple = (), mtime=None) -> int:
+    """
+    Count the rows of a table that match an optional WHERE clause (see build_sql_filters()).
+    Returns 0 on error.
+    """
+    try:
+        conn = sqlite3.connect(db_path)
+        n = conn.execute(f"SELECT COUNT(*) FROM [{table_name}]{where_sql}", params).fetchone()[0]
+        conn.close()
+        return int(n)
+    except Exception:
+        return 0
+
+
+@st.cache_data(show_spinner=False)
+def read_table_columns_as_dataframe(db_path: str, table_name: str, columns: list, limit: int = None, mtime=None,
+                                    where_sql: str = "", params: tuple = (), with_rowid: bool = False) -> "pd.DataFrame":
     """
     Read selected columns from a SQLite table and return as a pandas DataFrame.
 
-    Cached per (db_path, table_name, columns, limit, mtime): on large tables this
-    query can be expensive, and Streamlit reruns the whole script on every widget
-    interaction (e.g. toggling a column checkbox), so without caching the full
-    table would be re-read from disk on every click.
+    Cached per (db_path, table_name, columns, limit, mtime, where_sql, params,
+    with_rowid): on large tables this query can be expensive, and Streamlit
+    reruns the whole script on every widget interaction (e.g. toggling a column
+    checkbox), so without caching the full table would be re-read from disk on
+    every click.
 
     Args:
         db_path (str): Path to the SQLite database.
         table_name (str): Name of the table.
         columns (list): List of column names to include.
-        limit (int, optional): If given, only read the first `limit` rows
+        limit (int, optional): If given, only read the first `limit` matching rows
             (pushed down as a SQL LIMIT) instead of loading the whole table.
+        where_sql (str, optional): WHERE clause from build_sql_filters(); applied
+            in SQL *before* `limit`, so the limit caps the matches, not the table.
+        params (tuple, optional): Bind parameters for `where_sql`.
+        with_rowid (bool, optional): If True, the DataFrame index is the SQLite
+            rowid of each row (stable identifier, usable with create_subset_table()).
+            Rows are then returned in rowid order.
 
     Returns:
         pd.DataFrame: DataFrame with the selected columns, or empty DataFrame on error.
     """
     try:
         col_expr = ", ".join(f"[{c}]" for c in columns)
+        if with_rowid:
+            col_expr = f"rowid AS [__rowid__], {col_expr}"
         conn = sqlite3.connect(db_path)
-        query = f"SELECT {col_expr} FROM [{table_name}]"
+        query = f"SELECT {col_expr} FROM [{table_name}]{where_sql}"
+        if with_rowid:
+            query += " ORDER BY rowid"
         if limit is not None:
             query += f" LIMIT {int(limit)}"
-        df = pd.read_sql_query(query, conn)
+        df = pd.read_sql_query(query, conn, params=params)
         conn.close()
+        if with_rowid:
+            df = df.set_index("__rowid__")
+            df.index.name = None
         return df
     except Exception as e:
         return pd.DataFrame()
 
 
-def create_subset_table(db_path: str, source_table: str, new_table: str, row_indices: list, columns: list = None) -> str:
+def create_subset_table(db_path: str, source_table: str, new_table: str, row_ids: list, columns: list = None) -> str:
     """
     Create a new table in a SQLite database as a subset of rows from an existing table.
 
-    Copies the rows identified by their 0-based positional indices (as returned by
-    pandas iloc) from source_table into a new table called new_table. Only the
-    columns listed in `columns` are written; if `columns` is None all columns are
-    preserved.  The new table must not already exist.
+    Copies the rows identified by their SQLite ``rowid`` (the index returned by
+    read_table_columns_as_dataframe(..., with_rowid=True)) from source_table into a
+    new table called new_table. Only the columns listed in `columns` are written;
+    if `columns` is None all columns are preserved. The new table must not already
+    exist.
 
     Returns 'created', 'duplicate', or 'error:<message>'.
 
@@ -2482,10 +2588,10 @@ def create_subset_table(db_path: str, source_table: str, new_table: str, row_ind
         db_path (str): Path to the SQLite database.
         source_table (str): Name of the source table.
         new_table (str): Name for the new subset table.
-        row_indices (list[int]): 0-based row positions to include in the subset.
+        row_ids (list[int]): rowids of the rows to include in the subset.
         columns (list[str], optional): Column names to include. Defaults to all columns.
     """
-    if not row_indices:
+    if not row_ids:
         return "error:No rows selected"
     try:
         conn = sqlite3.connect(db_path)
@@ -2495,17 +2601,60 @@ def create_subset_table(db_path: str, source_table: str, new_table: str, row_ind
         if existing:
             conn.close()
             return "duplicate"
-        if columns:
-            col_expr = ", ".join(f"[{c}]" for c in columns)
-            df_full = pd.read_sql_query(f"SELECT {col_expr} FROM [{source_table}]", conn)
-        else:
-            df_full = pd.read_sql_query(f"SELECT * FROM [{source_table}]", conn)
-        df_subset = df_full.iloc[row_indices]
-        df_subset.to_sql(new_table, conn, if_exists="fail", index=False)
+        col_expr = ", ".join(f"[{c}]" for c in columns) if columns else "*"
+        id_list = ", ".join(str(int(i)) for i in row_ids)
+        conn.execute(
+            f"CREATE TABLE [{new_table}] AS SELECT {col_expr} FROM [{source_table}] "
+            f"WHERE rowid IN ({id_list}) ORDER BY rowid"
+        )
+        conn.commit()
         conn.close()
         return "created"
     except Exception as e:
         return f"error:{e}"
+
+
+def delete_table_rows(db_path: str, table_name: str, row_ids: list) -> str:
+    """
+    Delete rows from a SQLite table, identified by their ``rowid`` (the index returned
+    by read_table_columns_as_dataframe(..., with_rowid=True)).
+
+    All deletions run in one transaction: either every row is deleted or none is.
+
+    Returns 'deleted:<n>' (n = rows actually removed) or 'error:<message>'.
+
+    Args:
+        db_path (str): Path to the SQLite database.
+        table_name (str): Name of the table.
+        row_ids (list[int]): rowids of the rows to delete.
+    """
+    if not row_ids:
+        return "error:No rows selected"
+    conn = None
+    try:
+        # isolation_level=None + explicit BEGIN/COMMIT, and always closed via `finally`
+        # (see get_table_signatures for why a bare try/except isn't enough).
+        conn = sqlite3.connect(db_path, isolation_level=None, timeout=10)
+        conn.execute("BEGIN")
+        try:
+            removed = 0
+            ids = [int(i) for i in row_ids]
+            for start in range(0, len(ids), 500):
+                chunk = ids[start:start + 500]
+                placeholders = ", ".join("?" * len(chunk))
+                removed += conn.execute(
+                    f"DELETE FROM [{table_name}] WHERE rowid IN ({placeholders})", chunk
+                ).rowcount
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        return f"deleted:{removed}"
+    except Exception as e:
+        return f"error:{e}"
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def drop_chemspace_tables(db_path: str, table_names: list) -> dict:
