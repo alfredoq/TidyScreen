@@ -6954,8 +6954,7 @@ plt.show()
                                       point_size: float = 20,
                                       reference_point_size: float = 15,
                                       alpha: float = 0.8,
-                                      reference_alpha: float = 0.25,
-                                      show: bool = False) -> Optional[str]:
+                                      reference_alpha: float = 0.25) -> Optional[str]:
         """
         Visualize one or more target tables' projected dimensionality-reduction coordinates
         (from project_dimensionality_on_table()) as a 2D scatter plot, overlaid on top of the
@@ -6990,7 +6989,6 @@ plt.show()
             reference_point_size (float): Marker size for the reference points
             alpha (float): Marker transparency for the projected points
             reference_alpha (float): Marker transparency for the reference points
-            show (bool): Whether to also display the plot interactively (plt.show())
 
         Returns:
             Optional[str]: Path to the saved PNG, or None if an error occurred
@@ -7206,10 +7204,6 @@ plt.show()
                 print(f"⚠️  '{output_path}' already exists -- overwriting.")
 
             fig.savefig(output_path, dpi=300, bbox_inches='tight')
-
-            if show:
-                plt.show()
-
             plt.close(fig)
 
             # Alongside the PNG, export the plotted data as CSV(s) and a standalone script that
@@ -8551,7 +8545,6 @@ ax.legend(loc='best', fontsize=8)
 ax.set_aspect('equal', adjustable='box')
 
 fig.savefig(OUTPUT_PATH, dpi=300, bbox_inches='tight')
-plt.show()
 '''
 
     def _select_projections_to_delete_interactive(self, candidates: List[Tuple[str, str]]
