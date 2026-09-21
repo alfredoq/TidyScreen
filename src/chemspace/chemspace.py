@@ -21761,6 +21761,171 @@ fig.savefig(OUTPUT_PATH, dpi=300, bbox_inches='tight')
             print(f"❌ Error enumerating stereoisomers: {e}")
             return pd.DataFrame()
 
+    def inspect_stereoisomer_enumeration(self, table_name: Optional[str] = None,
+                                         max_stereoisomers: int = 20,
+                                         include_original: bool = False,
+                                         top_n: int = 10) -> pd.DataFrame:
+        """
+        Dry run of enumerate_stereoisomers(): report statistics on the number of
+        stereoisomers per compound without generating them and without creating any table.
+
+        Stereoisomer counts are computed with RDKit's EnumerateStereoisomers.GetStereoisomerCount()
+        using the same (default) options as enumerate_stereoisomers(), i.e. only unassigned
+        stereocenters / double bonds are expanded. Counts are therefore cheap to obtain even
+        for compounds with many stereocenters (2^n isomers are never materialised).
+
+        Args:
+            table_name (Optional[str]): Name of the table to inspect. If None, prompts user.
+            max_stereoisomers (int): Cap per molecule that enumerate_stereoisomers() would use;
+                needed to estimate how many compounds would be truncated and the output size
+            include_original (bool): Mirror enumerate_stereoisomers(include_original=...) when
+                estimating the number of output rows
+            top_n (int): Number of compounds with the most stereoisomers to list
+
+        Returns:
+            pd.DataFrame: One row per compound (name, smiles, has_predefined_stereo,
+                num_stereocenters, num_unassigned_stereo_elements, possible_stereoisomers,
+                would_be_truncated). Empty on failure.
+        """
+        try:
+            try:
+                from rdkit import Chem
+                from rdkit.Chem import EnumerateStereoisomers
+                from rdkit import RDLogger
+                RDLogger.DisableLog('rdApp.*')
+            except ImportError:
+                print("❌ RDKit not installed. Please install RDKit to inspect stereoisomer enumeration:")
+                print("   conda install -c conda-forge rdkit")
+                return pd.DataFrame()
+
+            if table_name is None:
+                table_name = self._select_table_interactive("SELECT TABLE FOR STEREOISOMER ENUMERATION INSPECTION")
+                if not table_name:
+                    print("❌ No table selected for stereoisomer enumeration inspection")
+                    return pd.DataFrame()
+
+            compounds_df = self._get_table_as_dataframe(table_name)
+            if compounds_df.empty:
+                print(f"❌ No compounds found in table '{table_name}'")
+                return pd.DataFrame()
+
+            if 'smiles' not in compounds_df.columns:
+                print("❌ No 'smiles' column found in the table")
+                return pd.DataFrame()
+
+            print(f"🔍 Inspecting stereoisomer enumeration for table '{table_name}' (dry run, nothing is saved)")
+            print(f"   📊 Input molecules: {len(compounds_df):,}")
+            print(f"   🔄 Max stereoisomers per molecule: {max_stereoisomers}")
+
+            names = compounds_df['name'] if 'name' in compounds_df.columns else None
+            ids = compounds_df['id'] if 'id' in compounds_df.columns else None
+
+            records = []
+            invalid_smiles = 0
+
+            iterator = enumerate(compounds_df['smiles'])
+            if TQDM_AVAILABLE:
+                iterator = tqdm(iterator, total=len(compounds_df),
+                                desc="Counting stereoisomers", unit="molecules")
+
+            for position, smiles in iterator:
+                if names is not None:
+                    compound_name = names.iloc[position]
+                elif ids is not None:
+                    compound_name = f"compound_{ids.iloc[position]}"
+                else:
+                    compound_name = f"compound_{position + 1}"
+
+                mol = Chem.MolFromSmiles(smiles) if isinstance(smiles, str) and smiles else None
+                if mol is None:
+                    invalid_smiles += 1
+                    continue
+
+                try:
+                    possible = int(EnumerateStereoisomers.GetStereoisomerCount(mol))
+                    num_centers = len(Chem.FindMolChiralCenters(mol, includeUnassigned=True))
+                except Exception:
+                    invalid_smiles += 1
+                    continue
+
+                records.append({
+                    'name': compound_name,
+                    'smiles': smiles,
+                    'has_predefined_stereo': self._has_stereochemistry_definition(smiles),
+                    'num_stereocenters': num_centers,
+                    'num_unassigned_stereo_elements': possible.bit_length() - 1,
+                    'possible_stereoisomers': possible,
+                    'would_be_truncated': possible > max_stereoisomers
+                })
+
+            if TQDM_AVAILABLE and hasattr(iterator, 'close'):
+                iterator.close()
+
+            results_df = pd.DataFrame(records)
+            if results_df.empty:
+                print("❌ No valid molecules found to inspect")
+                return results_df
+
+            total = len(results_df)
+            counts = results_df['possible_stereoisomers']
+            enumerable = counts > 1
+            predefined = results_df['has_predefined_stereo']
+
+            # Rows enumerate_stereoisomers() would emit per compound: compounds with a single
+            # possible isomer yield nothing unless include_original is set
+            extra_original = 1 if include_original else 0
+            rows_if_enumerated = counts.clip(upper=max_stereoisomers).where(enumerable, 0) + extra_original
+            rows_keep_predefined = rows_if_enumerated.where(~predefined, 1)
+
+            print(f"\n✅ Stereoisomer enumeration inspection completed!")
+            print("=" * 60)
+            print(f"📊 Valid molecules: {total:,}   ❌ Invalid SMILES: {invalid_smiles:,}")
+            print(f"🎯 With enumerable stereochemistry (>1 stereoisomer): {int(enumerable.sum()):,} ({enumerable.mean() * 100:.1f}%)")
+            print(f"⚪ Without enumerable stereochemistry: {int((~enumerable).sum()):,}")
+            print(f"🧬 With predefined stereochemistry (@ / \\): {int(predefined.sum()):,} ({predefined.mean() * 100:.1f}%)")
+
+            print(f"\n📈 Stereoisomers per compound (all valid molecules):")
+            print(f"   Min: {counts.min():,}   Median: {counts.median():,.0f}   Mean: {counts.mean():,.2f}   Max: {counts.max():,}")
+            print(f"   P90: {counts.quantile(0.90):,.0f}   P99: {counts.quantile(0.99):,.0f}")
+            if enumerable.any():
+                print(f"   Among enumerable compounds -> Median: {counts[enumerable].median():,.0f}   "
+                      f"Mean: {counts[enumerable].mean():,.2f}")
+
+            print(f"\n📊 Distribution by number of unassigned stereo elements (centers / double bonds):")
+            distribution = results_df['num_unassigned_stereo_elements'].value_counts().sort_index()
+            max_bar = distribution.max()
+            for n_elements, n_compounds in distribution.items():
+                bar = '█' * max(1, int(30 * n_compounds / max_bar))
+                print(f"   {n_elements:>3} ({2 ** n_elements:>10,} isomers): {n_compounds:>10,} {bar}")
+
+            truncated = results_df['would_be_truncated']
+            print(f"\n✂️  Cap of {max_stereoisomers} stereoisomers per molecule:")
+            print(f"   Compounds that would be truncated: {int(truncated.sum()):,}")
+            print(f"   Stereoisomers dropped by the cap: {int((counts[truncated] - max_stereoisomers).sum()):,}")
+
+            print(f"\n🧪 Estimated output size of enumerate_stereoisomers():")
+            print(f"   Uncapped stereoisomers (enumerable compounds): {int(counts[enumerable].sum()):,}")
+            print(f"   Enumerate all compounds (cap applied):        {int(rows_if_enumerated.sum()):,} rows "
+                  f"({rows_if_enumerated.sum() / total:.2f}x)")
+            if predefined.any():
+                print(f"   Keep predefined stereochemistry (cap applied): {int(rows_keep_predefined.sum()):,} rows "
+                      f"({rows_keep_predefined.sum() / total:.2f}x)")
+
+            if top_n > 0 and enumerable.any():
+                print(f"\n🔝 Top {min(top_n, int(enumerable.sum()))} compounds with most stereoisomers:")
+                top_df = results_df.nlargest(top_n, 'possible_stereoisomers')
+                for rank, (_, row) in enumerate(top_df.iterrows(), 1):
+                    print(f"   {rank}. {row['name']}: {row['possible_stereoisomers']:,} stereoisomers "
+                          f"({row['num_stereocenters']} stereocenters)")
+                    print(f"      SMILES: {row['smiles']}")
+            print("=" * 60)
+
+            return results_df
+
+        except Exception as e:
+            print(f"❌ Error inspecting stereoisomer enumeration: {e}")
+            return pd.DataFrame()
+
     def _analyze_existing_stereochemistry(self, compounds_df: pd.DataFrame) -> Dict[str, Any]:
         """
         Analyze the compounds to detect existing stereochemistry definitions.
