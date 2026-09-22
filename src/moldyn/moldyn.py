@@ -610,28 +610,38 @@ class MolDyn:
         min1_params = {}
         min2_params = {}
 
-        # Set parameters for first minimization step (with restraints on solute)
-        print(f"\n🔹 First Minimization Step (with restraints on solute)")
+        # Set parameters for first minimization step
+        print(f"\n🔹 First Minimization Step")
         print("-" * 50)
         min1_params['min1_maxcyc'] = int(input("Maximum number of minimization cycles [default: 5000]: ").strip() or '5000')
         min1_params['min1_ncyc'] = int(input("Number of cycles for steepest descent [default: 2500]: ").strip() or '2500')
         if 'general_params' not in params:
             params['general_params'] = {}
         params['general_params']['cutoff'] = int(input("Cutoff distance for nonbonded interactions (Å) [default: 10]: ").strip() or '10')
-        min1_params['min1_restraint_selector'] = input("Restraint selector for first minimization (e.g., '(@C,N,CA,O)' ; '(!:WAT & !@Na+)' ) [default: '(!:WAT & !@Na+ & !@Cl-)']: ").strip() or '(!:WAT & !@Na+ & !@Cl-)'
-        min1_params['min1_restraint_wt'] = float(input("Restraint weight on solute (kcal/mol·Å²) [default: 10.0]: ").strip() or '10.0')
-        
+        min1_use_restraints = (input("Apply positional restraints on solute during first minimization? (yes/no) [default: yes]: ").strip().lower() or 'yes') in ['yes', 'y']
+        if min1_use_restraints:
+            min1_params['min1_restraint_selector'] = input("Restraint selector for first minimization (e.g., '(@C,N,CA,O)' ; '(!:WAT & !@Na+)' ) [default: '(!:WAT & !@Na+ & !@Cl-)']: ").strip() or '(!:WAT & !@Na+ & !@Cl-)'
+            min1_params['min1_restraint_wt'] = float(input("Restraint weight on solute (kcal/mol·Å²) [default: 10.0]: ").strip() or '10.0')
+        else:
+            min1_params['min1_restraint_selector'] = ''
+            min1_params['min1_restraint_wt'] = 0.0
+
         # Assign first minimization parameters to min_params
         params['first_minimization'] = min1_params
-        
-        # Set parameters for second minimization step (without restraints)
-        print(f"\n🔹 Second Minimization Step (without restraints)")
+
+        # Set parameters for second minimization step
+        print(f"\n🔹 Second Minimization Step")
         print("-" * 50)
         min2_params['min2_maxcyc'] = int(input("Maximum number of minimization cycles [default: 5000]: ").strip() or '5000')
         min2_params['min2_ncyc'] = int(input("Number of cycles for steepest descent [default: 2500]: ").strip() or '2500')
-        min2_params['min2_restraint_selector'] = input("Restraint selector for second minimization (e.g., '@C,N,CA,O' ; '!@WAT & !@Na+' ) [default: '@C,N,CA,O']: ").strip() or '@C,N,CA,O'
-        min2_params['min2_restraint_wt'] = float(input("Restraint weight on solute (kcal/mol·Å²) [default: 1.0]: ").strip() or '1.0')
-        
+        min2_use_restraints = (input("Apply positional restraints on solute during second minimization? (yes/no) [default: yes]: ").strip().lower() or 'yes') in ['yes', 'y']
+        if min2_use_restraints:
+            min2_params['min2_restraint_selector'] = input("Restraint selector for second minimization (e.g., '@C,N,CA,O' ; '!@WAT & !@Na+' ) [default: '@C,N,CA,O']: ").strip() or '@C,N,CA,O'
+            min2_params['min2_restraint_wt'] = float(input("Restraint weight on solute (kcal/mol·Å²) [default: 1.0]: ").strip() or '1.0')
+        else:
+            min2_params['min2_restraint_selector'] = ''
+            min2_params['min2_restraint_wt'] = 0.0
+
         # Assign second minimization parameters to min_params
         params['second_minimization'] = min2_params
 
@@ -648,8 +658,13 @@ class MolDyn:
         params['general_params']['collision_freq'] = float(input("Collision frequency (ps^-1) [default: 1]: ").strip() or '1')
         params['general_params']['thermostat'] = int(input("Thermostat selection [default: 3]: ").strip() or '3')
         heating_params['heating_steps'] = int(input("Number of steps for heating [default: 50000]: ").strip() or '50000')
-        heating_params['heating_restraint_selector'] = input("Restraint selector during heating (e.g., '(:* & !:WAT & !:Na+ & !:Cl-)', '@C,N,CA,O' ; '(!:WAT & !@Na+)' ) [default: '(:* & !:WAT & !:Na+ & !:Cl-)']: ").strip() or '(:* & !:WAT & !:Na+ & !:Cl-)'
-        heating_params['heating_restraint_wt'] = float(input("Restraint weight during heating (kcal/mol·Å²) [default: 0.5]: ").strip() or '0.5')
+        heating_use_restraints = (input("Apply positional restraints on solute during heating? (yes/no) [default: yes]: ").strip().lower() or 'yes') in ['yes', 'y']
+        if heating_use_restraints:
+            heating_params['heating_restraint_selector'] = input("Restraint selector during heating (e.g., '(:* & !:WAT & !:Na+ & !:Cl-)', '@C,N,CA,O' ; '(!:WAT & !@Na+)' ) [default: '(:* & !:WAT & !:Na+ & !:Cl-)']: ").strip() or '(:* & !:WAT & !:Na+ & !:Cl-)'
+            heating_params['heating_restraint_wt'] = float(input("Restraint weight during heating (kcal/mol·Å²) [default: 0.5]: ").strip() or '0.5')
+        else:
+            heating_params['heating_restraint_selector'] = ''
+            heating_params['heating_restraint_wt'] = 0.0
         heating_params['heating_restart_write'] = int(input("Number of frame to write restart [default: 1000]: ").strip() or '1000')
         heating_params['heating_trajectory_write'] = int(input("Number of frame to write to trajectory [default: 1000]: ").strip() or '1000')
         heating_params['heating_output_write'] = int(input("Number of frame to write to output [default: 1000]: ").strip() or '1000')
@@ -665,8 +680,13 @@ class MolDyn:
         print("-" * 70)
         equilibration_params = {}
         equilibration_params['equilibration_steps'] = int(input("Number of steps for equilibration [default: 500000]: ").strip() or '500000')
-        equilibration_params['equilibration_restraint_selector'] = input("Restraint selector during equilibration (e.g., '(:* & !:WAT & !:Na+ & !:Cl-)', '@C,N,CA,O' ; '(!:WAT & !@Na+)' ) [default: '@C,N,CA,O']: ").strip() or '@C,N,CA,O'
-        equilibration_params['equilibration_restraint_wt'] = float(input("Restraint weight during equilibration (kcal/mol·Å²) [default: 0.5]: ").strip() or '0.5')
+        equilibration_use_restraints = (input("Apply positional restraints on solute during equilibration? (yes/no) [default: yes]: ").strip().lower() or 'yes') in ['yes', 'y']
+        if equilibration_use_restraints:
+            equilibration_params['equilibration_restraint_selector'] = input("Restraint selector during equilibration (e.g., '(:* & !:WAT & !:Na+ & !:Cl-)', '@C,N,CA,O' ; '(!:WAT & !@Na+)' ) [default: '@C,N,CA,O']: ").strip() or '@C,N,CA,O'
+            equilibration_params['equilibration_restraint_wt'] = float(input("Restraint weight during equilibration (kcal/mol·Å²) [default: 0.5]: ").strip() or '0.5')
+        else:
+            equilibration_params['equilibration_restraint_selector'] = ''
+            equilibration_params['equilibration_restraint_wt'] = 0.0
         equilibration_params['equilibration_restart_write'] = int(input("Number of frame to write restart [default: 1000]: ").strip() or '1000')
         equilibration_params['equilibration_trajectory_write'] = int(input("Number of frame to write to trajectory [default: 1000]: ").strip() or '1000')
         equilibration_params['equilibration_output_write'] = int(input("Number of frame to write to output [default: 1000]: ").strip() or '1000')
@@ -682,8 +702,13 @@ class MolDyn:
         print("-" * 70)
         production_params = {}
         production_params['production_steps'] = int(input("Number of steps for production [default: 5000000]: ").strip() or '5000000')
-        production_params['production_restraint_selector'] = input("Restraint selector during production (e.g., '(:* & !:WAT & !:Na+ & !:Cl-)', '@C,N,CA,O' ; '(!:WAT & !@Na+)' ) [default: '@C,N,CA,O']: ").strip() or '@C,N,CA,O'
-        production_params['production_restraint_wt'] = float(input("Restraint weight during production (kcal/mol·Å²) [default: 0.5]: ").strip() or '0.5')
+        production_use_restraints = (input("Apply positional restraints on solute during production? (yes/no) [default: yes]: ").strip().lower() or 'yes') in ['yes', 'y']
+        if production_use_restraints:
+            production_params['production_restraint_selector'] = input("Restraint selector during production (e.g., '(:* & !:WAT & !:Na+ & !:Cl-)', '@C,N,CA,O' ; '(!:WAT & !@Na+)' ) [default: '@C,N,CA,O']: ").strip() or '@C,N,CA,O'
+            production_params['production_restraint_wt'] = float(input("Restraint weight during production (kcal/mol·Å²) [default: 0.5]: ").strip() or '0.5')
+        else:
+            production_params['production_restraint_selector'] = ''
+            production_params['production_restraint_wt'] = 0.0
         production_params['production_restart_write'] = int(input("Number of frame to write restart [default: 1000]: ").strip() or '1000')
         production_params['production_trajectory_write'] = int(input("Number of frame to write to trajectory [default: 1000]: ").strip() or '1000')
         production_params['production_output_write'] = int(input("Number of frame to write to output [default: 1000]: ").strip() or '1000')
@@ -1972,6 +1997,7 @@ class MolDyn:
         ## Prepare Min1 input file
         # Create min1 input file
         min1_in_file = os.path.join(md_assay_folder, "min1.in")
+        min1_restraint_selector = md_parameters_dict.get('first_minimization').get('min1_restraint_selector', '')
 
         with open(min1_in_file, 'w') as f:
             f.write(f"Minimization 1 stage\n")
@@ -1985,15 +2011,19 @@ class MolDyn:
             f.write(f"  cut={md_parameters_dict.get('general_params').get('cutoff')},\n")
             f.write(f"  ntpr=100,\n")
             f.write(f"  iwrap=1,\n")
-            f.write(f"  ntr=1,\n")
-            f.write(f"  restraint_wt={md_parameters_dict.get('first_minimization').get('min1_restraint_wt')},\n")
-            f.write(f"  restraintmask='{md_parameters_dict.get('first_minimization').get('min1_restraint_selector')}',\n")
+            if min1_restraint_selector:
+                f.write(f"  ntr=1,\n")
+                f.write(f"  restraint_wt={md_parameters_dict.get('first_minimization').get('min1_restraint_wt')},\n")
+                f.write(f"  restraintmask='{min1_restraint_selector}',\n")
+            else:
+                f.write(f"  ntr=0,\n")
             f.write(f"/\n")
             f.write(f"END\n")
-            
-        
+
+
         # ## Prepare Min2 input file
         min2_in_file = os.path.join(md_assay_folder, "min2.in")
+        min2_restraint_selector = md_parameters_dict.get('second_minimization').get('min2_restraint_selector', '')
 
         with open(min2_in_file, 'w') as f:
             f.write(f"Minimization 2 stage\n")
@@ -2007,15 +2037,19 @@ class MolDyn:
             f.write(f"  cut={md_parameters_dict.get('general_params').get('cutoff')},\n")
             f.write(f"  ntpr=100,\n")
             f.write(f"  iwrap=1,\n")
-            f.write(f"  ntr=1,\n")
-            f.write(f"  restraint_wt={md_parameters_dict.get('second_minimization').get('min2_restraint_wt')},\n")
-            f.write(f"  restraintmask='{md_parameters_dict.get('second_minimization').get('min2_restraint_selector')}',\n")
+            if min2_restraint_selector:
+                f.write(f"  ntr=1,\n")
+                f.write(f"  restraint_wt={md_parameters_dict.get('second_minimization').get('min2_restraint_wt')},\n")
+                f.write(f"  restraintmask='{min2_restraint_selector}',\n")
+            else:
+                f.write(f"  ntr=0,\n")
             f.write(f"/\n")
             f.write(f"END\n")
 
         # Prepare heating input file
         heating_in_file = os.path.join(md_assay_folder, "heating.in")
-        
+        heating_restraint_selector = md_parameters_dict.get('heating_params').get('heating_restraint_selector', '')
+
         with open(heating_in_file, 'w') as f:
             f.write(f"Heating stage\n")
             f.write(f"&cntrl\n")
@@ -2025,7 +2059,6 @@ class MolDyn:
             f.write(f"  ntb=2,\n")
             f.write(f"  ntp=1,\n")
             f.write(f"  cut={md_parameters_dict.get('general_params').get('cutoff')},\n")
-            f.write(f"  ntr=1,\n")
             f.write(f"  ntc=2,\n")
             f.write(f"  ntf=2,\n")
             f.write(f"  temp0={md_parameters_dict.get('general_params').get('target_temp')},\n")
@@ -2037,8 +2070,12 @@ class MolDyn:
             f.write(f"  ntpr={md_parameters_dict.get('heating_params').get('heating_output_write')},\n")
             f.write(f"  ntwx={md_parameters_dict.get('heating_params').get('heating_trajectory_write')},\n")
             f.write(f"  ntwr={md_parameters_dict.get('heating_params').get('heating_restart_write')},\n")
-            f.write(f"  restraint_wt={md_parameters_dict.get('heating_params').get('heating_restraint_wt')},\n")
-            f.write(f"  restraintmask='{md_parameters_dict.get('heating_params').get('heating_restraint_selector')}',\n")
+            if heating_restraint_selector:
+                f.write(f"  ntr=1,\n")
+                f.write(f"  restraint_wt={md_parameters_dict.get('heating_params').get('heating_restraint_wt')},\n")
+                f.write(f"  restraintmask='{heating_restraint_selector}',\n")
+            else:
+                f.write(f"  ntr=0,\n")
             f.write(f"  iwrap=1,\n")
             f.write(f"  nmropt=1,\n")
             f.write(f"&end\n")
@@ -2081,6 +2118,8 @@ class MolDyn:
                 f.write(f"  ntr=1,\n")
                 f.write(f"  restraint_wt={md_parameters_dict.get('equilibration_params').get('equilibration_restraint_wt')},\n")
                 f.write(f"  restraintmask='{eq_restraint_selector}',\n")
+            else:
+                f.write(f"  ntr=0,\n")
             f.write(f"/\n")
             f.write(f"END\n")
 
@@ -2111,6 +2150,8 @@ class MolDyn:
                 f.write(f"  ntr=1,\n")
                 f.write(f"  restraint_wt={md_parameters_dict.get('production_params').get('production_restraint_wt')},\n")
                 f.write(f"  restraintmask='{prod_restraint_selector}',\n")
+            else:
+                f.write(f"  ntr=0,\n")
             f.write(f"/\n")
             f.write(f"END\n")
 
@@ -2243,6 +2284,8 @@ class MolDyn:
                     f.write("  ntr=1,\n")
                     f.write(f"  restraint_wt={hp.get('heating_restraint_wt')},\n")
                     f.write(f"  restraintmask='{heat_ref}',\n")
+                else:
+                    f.write("  ntr=0,\n")
                 f.write("  iwrap=1,\n")
                 f.write("/\n")
                 f.write("END\n")
