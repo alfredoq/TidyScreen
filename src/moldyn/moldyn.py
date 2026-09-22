@@ -3280,9 +3280,18 @@ class MolDyn:
             if idecomp:
                 print_res = self._input_parameter_choice(
                     "print_res ('all', or a comma-separated list/range of "
-                    "residue numbers in topology numbering, e.g. '1-10,15,20-30')",
+                    "residue numbers in topology numbering, e.g. 1-10,15,20-30 "
+                    "-- no quotes)",
                     default='all'
                 )
+                # Strip any stray enclosing quotes the user may have typed by
+                # mimicking a quoted example (MMPBSA.py's print_res is a bare
+                # 'all' or comma-separated list, never a quoted string).
+                if print_res:
+                    stripped = print_res.strip()
+                    if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in ("'", '"'):
+                        stripped = stripped[1:-1].strip()
+                    print_res = stripped
                 dec_verbose = int(self._get_parameter_choice(
                     "dec_verbose (amount of decomposition information printed)",
                     [0, 1, 2, 3], default=0))
@@ -4168,14 +4177,22 @@ class MolDyn:
                 f.write(f"  idecomp={idecomp}, csv_format=0,\n")
                 print_res = mmgbsa_params.get('print_res')
                 if print_res:
+                    print_res = print_res.strip()
+                    # Strip stray enclosing quotes from conditions saved before the
+                    # wizard sanitised this (the prompt's quoted example, e.g.
+                    # '1-10,15,20-30', led some users to type the quotes literally,
+                    # which then failed the check below and silently fell back to
+                    # 'all' -- discarding the user's intended residue selection).
+                    if len(print_res) >= 2 and print_res[0] == print_res[-1] and print_res[0] in ("'", '"'):
+                        print_res = print_res[1:-1].strip()
                     # MMPBSA.py's print_res only accepts 'all' or a comma-separated
-                    # list/range of residue numbers (e.g. '1-10,15,20-30') -- NOT a
+                    # list/range of residue numbers (e.g. 1-10,15,20-30) -- NOT a
                     # cpptraj-style 'within X' selection, which fails at runtime with
                     # "SelectionError: Invalid selection! Integers expected." Guard
                     # against stale/imported conditions that still carry that mistake
                     # (an earlier version of this wizard suggested 'within 6' as the
                     # default) by falling back to 'all' instead of writing it out.
-                    if not re.fullmatch(r'all|[\d,\-\s]+', print_res.strip(), re.IGNORECASE):
+                    if not re.fullmatch(r'all|[\d,\-\s]+', print_res, re.IGNORECASE):
                         print(f"⚠️  Ignoring invalid print_res value '{print_res}' "
                               f"(MMPBSA.py requires 'all' or a residue number/range "
                               f"list, e.g. '1-10,15'); using 'all' instead.")
@@ -4634,9 +4651,9 @@ class MolDyn:
 
     def _process_mmgbsa_decomposition(self, assay_id, decomp_file, mmgbsa_folder, assay_info):
         """
-        Parse the MMPBSA.py per-residue decomposition output (`-do` file), renumber
-        the receptor residues back to the original (crystallographic) numbering, and
-        store the resulting table.
+        Parse the MMPBSA.py per-residue or pairwise decomposition output (`-do`
+        file), renumber the receptor residues back to the original
+        (crystallographic) numbering, and store the resulting table.
 
         This mirrors the per-residue MMGBSA fingerprint pipeline in
         MolDock.compute_fingerprints() (see MolDock._parse_mmgbsa_decomposition_output
@@ -4644,7 +4661,8 @@ class MolDyn:
         decomposition table produced by tleap/MMPBSA.py uses sequential residue
         numbering (1..N), which is mapped to the original receptor numbering via the
         `renumbering_dict` stored in `pdb_templates` when the receptor template was
-        created.
+        created. For a pairwise table (idecomp=3/4), both residue columns are
+        renumbered independently.
         """
         try:
             if not os.path.exists(decomp_file):
@@ -4658,31 +4676,50 @@ class MolDyn:
                 print(f"⚠️  No per-residue decomposition data parsed from: {decomp_file}")
                 return
 
+            is_pairwise = 'residue1' in decomp_df.columns
+
             # Renumber receptor residues to the original receptor numbering.
             renumbering_dict = self._get_receptor_renumbering_dict(
                 assay_info.get('receptor_template_name')
             )
             if renumbering_dict:
-                decomp_df['residue'] = decomp_df['residue'].apply(
-                    lambda x: renumbering_dict.get(x, x)
-                )
+                if is_pairwise:
+                    decomp_df['residue1'] = decomp_df['residue1'].apply(
+                        lambda x: renumbering_dict.get(x, x)
+                    )
+                    decomp_df['residue2'] = decomp_df['residue2'].apply(
+                        lambda x: renumbering_dict.get(x, x)
+                    )
+                else:
+                    decomp_df['residue'] = decomp_df['residue'].apply(
+                        lambda x: renumbering_dict.get(x, x)
+                    )
             else:
                 print(f"⚠️  No renumbering_dict available for template "
                       f"'{assay_info.get('receptor_template_name')}'; "
-                      f"per-residue table kept with sequential numbering.")
+                      f"decomposition table kept with sequential numbering.")
 
             csv_path = self._store_mmgbsa_decomposition(
                 assay_id, decomp_df, mmgbsa_folder
             )
 
-            print(f"\n📊 PER-RESIDUE MM-GBSA DECOMPOSITION (top contributors by |TOTAL|):")
-            print("-" * 60)
             top = decomp_df.reindex(
                 decomp_df['total'].abs().sort_values(ascending=False).index
             ).head(15)
-            for _, r in top.iterrows():
-                print(f"  {str(r['residue']):<14} : {r['total']:>9.3f} kcal/mol "
-                      f"(vdw {r['vdw']:>8.3f}, ele {r['ele']:>9.3f})")
+
+            if is_pairwise:
+                print(f"\n📊 PAIRWISE MM-GBSA DECOMPOSITION (top contributors by |TOTAL|):")
+                print("-" * 60)
+                for _, r in top.iterrows():
+                    label = f"{r['residue1']} - {r['residue2']}"
+                    print(f"  {label:<20} : {r['total']:>9.3f} kcal/mol "
+                          f"(vdw {r['vdw']:>8.3f}, ele {r['ele']:>9.3f})")
+            else:
+                print(f"\n📊 PER-RESIDUE MM-GBSA DECOMPOSITION (top contributors by |TOTAL|):")
+                print("-" * 60)
+                for _, r in top.iterrows():
+                    print(f"  {str(r['residue']):<14} : {r['total']:>9.3f} kcal/mol "
+                          f"(vdw {r['vdw']:>8.3f}, ele {r['ele']:>9.3f})")
             if csv_path:
                 print(f"\n  Full table : {csv_path}")
             print("-" * 60)
@@ -4692,16 +4729,34 @@ class MolDyn:
 
     def _parse_mmgbsa_decomposition_output(self, decomp_file):
         """
-        Parse an MMPBSA.py per-residue decomposition output file into a DataFrame with
-        columns: residue, vdw, ele, polar_solvation, nonpolar_solvation, gas, total.
+        Parse an MMPBSA.py per-residue decomposition output file (idecomp) into a
+        DataFrame. Two table layouts are supported, auto-detected from the header:
 
-        Mirrors MolDock._parse_mmgbsa_decomposition_output(). The 'Total Energy
-        Decomposition' table has the same layout for single-frame (docking) and
-        multi-frame (trajectory) runs — every numeric cell is 'avg +/- std', so the
-        fixed token offsets below hold in both cases (std is 0.000 for a single frame).
+        - Per-residue (idecomp=1/2): 'Residue | Location | Internal | ...' -> columns
+          residue, vdw, ele, polar_solvation, nonpolar_solvation, gas, total.
+        - Pairwise (idecomp=3/4): 'Resid 1 | Resid 2 | Internal | ...' -> columns
+          residue1, residue2, vdw, ele, polar_solvation, nonpolar_solvation, gas,
+          total (one row per residue-residue pair; used e.g. to isolate ligand-residue
+          interaction energies).
+
+        Mirrors MolDock._parse_mmgbsa_decomposition_output() for the per-residue
+        layout (MolDock only ever requests idecomp=2, so it has no pairwise case).
+        The 'Total Energy Decomposition' table has the same layout for single-frame
+        (docking) and multi-frame (trajectory) runs -- every numeric cell is
+        'avg +/- std', so the fixed token offsets below hold in both cases (std is
+        0.000 for a single frame).
         """
         import pandas as pd
         import re
+
+        per_residue_pattern = (
+            r"Residue\s+\|\s+Location\s+\|\s*Internal\s*\|\s*van der Waals\s*\|\s*"
+            r"Electrostatic\s*\|\s*Polar Solvation\s*\|\s*Non-Polar Solv\.\s*\|\s*TOTAL"
+        )
+        pairwise_pattern = (
+            r"Resid\s+1\s+\|\s+Resid\s+2\s+\|\s*Internal\s*\|\s*van der Waals\s*\|\s*"
+            r"Electrostatic\s*\|\s*Polar Solvation\s*\|\s*Non-Polar Solv\.\s*\|\s*TOTAL"
+        )
 
         try:
             with open(decomp_file, 'r') as f:
@@ -4709,13 +4764,14 @@ class MolDyn:
 
             start_idx = None
             end_idx = None
-            starting_pattern = (
-                r"Residue\s+\|\s+Location\s+\|\s+Internal\s+\|\s+van der Waals\s+\|\s+"
-                r"Electrostatic\s+\|\s+Polar Solvation\s+\|\s+Non-Polar Solv\.\s+\|\s+TOTAL"
-            )
+            table_kind = None
             for i, line in enumerate(lines):
-                if re.match(starting_pattern, line):
+                if start_idx is None and re.match(per_residue_pattern, line):
                     start_idx = i + 2  # skip the header + separator line
+                    table_kind = 'per_residue'
+                elif start_idx is None and re.match(pairwise_pattern, line):
+                    start_idx = i + 2
+                    table_kind = 'pairwise'
                 elif start_idx is not None and line.strip() == '':
                     end_idx = i
                     break
@@ -4725,32 +4781,63 @@ class MolDyn:
                 return pd.DataFrame()
 
             data = []
-            for line in lines[start_idx:end_idx]:
-                parts = line.split()
-                if len(parts) >= 8:
-                    resname = parts[4]
-                    resnumber = parts[5]
-                    vdw = float(parts[11])
-                    ele = float(parts[15])
-                    pol_solv = float(parts[19])
-                    nonpol_solv = float(parts[23])
-                    gas = vdw + ele
-                    total = float(parts[27])
-                    reskey = f"{resname}{resnumber}"
+            if table_kind == 'per_residue':
+                for line in lines[start_idx:end_idx]:
+                    parts = line.split()
+                    if len(parts) >= 8:
+                        resname = parts[4]
+                        resnumber = parts[5]
+                        vdw = float(parts[11])
+                        ele = float(parts[15])
+                        pol_solv = float(parts[19])
+                        nonpol_solv = float(parts[23])
+                        gas = vdw + ele
+                        total = float(parts[27])
+                        reskey = f"{resname}{resnumber}"
 
-                    # Normalise water residue name for consistency with the docking path
-                    if resname == 'WAT':
-                        reskey = f"HOH{resnumber}"
+                        # Normalise water residue name for consistency with the docking path
+                        if resname == 'WAT':
+                            reskey = f"HOH{resnumber}"
 
-                    data.append({
-                        'residue': reskey,
-                        'vdw': round(vdw, 3),
-                        'ele': round(ele, 3),
-                        'polar_solvation': round(pol_solv, 3),
-                        'nonpolar_solvation': round(nonpol_solv, 3),
-                        'gas': round(gas, 3),
-                        'total': round(total, 3),
-                    })
+                        data.append({
+                            'residue': reskey,
+                            'vdw': round(vdw, 3),
+                            'ele': round(ele, 3),
+                            'polar_solvation': round(pol_solv, 3),
+                            'nonpolar_solvation': round(nonpol_solv, 3),
+                            'gas': round(gas, 3),
+                            'total': round(total, 3),
+                        })
+            else:  # pairwise
+                for line in lines[start_idx:end_idx]:
+                    parts = line.split()
+                    if len(parts) >= 9:
+                        resname1, resnumber1 = parts[0], parts[1]
+                        resname2, resnumber2 = parts[3], parts[4]
+                        vdw = float(parts[10])
+                        ele = float(parts[14])
+                        pol_solv = float(parts[18])
+                        nonpol_solv = float(parts[22])
+                        gas = vdw + ele
+                        total = float(parts[26])
+
+                        reskey1 = f"{resname1}{resnumber1}"
+                        if resname1 == 'WAT':
+                            reskey1 = f"HOH{resnumber1}"
+                        reskey2 = f"{resname2}{resnumber2}"
+                        if resname2 == 'WAT':
+                            reskey2 = f"HOH{resnumber2}"
+
+                        data.append({
+                            'residue1': reskey1,
+                            'residue2': reskey2,
+                            'vdw': round(vdw, 3),
+                            'ele': round(ele, 3),
+                            'polar_solvation': round(pol_solv, 3),
+                            'nonpolar_solvation': round(nonpol_solv, 3),
+                            'gas': round(gas, 3),
+                            'total': round(total, 3),
+                        })
 
             return pd.DataFrame(data)
 
