@@ -1184,7 +1184,8 @@ class ChemSpace:
     # Tables above this size have their scan capped via LIMIT so list_tables() stays fast.
     __ROW_COUNT_THRESHOLD = 100_000
 
-    def list_tables(self, chemspace_db_path: Optional[str] = None, verbose: bool = True) -> List[str]:
+    def list_tables(self, chemspace_db_path: Optional[str] = None, verbose: bool = True,
+                     interactive: bool = True) -> List[str]:
         """
         Get list of all tables in a chemspace database, printing a formatted listing (with
         row counts) by default. Automatically uses the active project's own chemspace
@@ -1197,6 +1198,10 @@ class ChemSpace:
                 get_all_tables() passes False, since it's used pervasively throughout this
                 class as internal plumbing to build/filter candidate table lists -- printing
                 there would spam a listing as an unwanted side effect of unrelated operations.
+            interactive (bool): Whether to offer a 'details <num>' follow-up prompt (only
+                relevant when verbose is True) letting the user drill into a specific table --
+                exact row count, column schema, and a per-column non-null count. Set to False
+                for non-interactive/scripted use of the verbose listing.
 
         Returns:
             List[str]: List of table names
@@ -1238,7 +1243,86 @@ class ChemSpace:
                         print(f"{i:3d}. {t}")
             print("=" * 70)
 
+            if tables and interactive:
+                print("💡 Type 'details <num>' to view detailed table information, "
+                      "or press Enter to finish")
+                while True:
+                    try:
+                        selection = input("\n🔍 Command: ").strip()
+                    except KeyboardInterrupt:
+                        print()
+                        break
+
+                    if not selection or selection.lower() in ['cancel', 'quit', 'exit', 'done']:
+                        break
+
+                    if selection.lower().startswith('details'):
+                        parts = selection.split()
+                        if len(parts) != 2:
+                            print("❌ Invalid details command. Use 'details <number>'")
+                            continue
+                        try:
+                            detail_idx = int(parts[1]) - 1
+                        except ValueError:
+                            print("❌ Invalid details command. Use 'details <number>'")
+                            continue
+                        if 0 <= detail_idx < len(tables):
+                            self._show_table_details(tables[detail_idx], resolved_path)
+                        else:
+                            print(f"❌ Invalid table number. Please enter 1-{len(tables)}")
+                        continue
+
+                    print("❌ Unknown command. Use 'details <number>' or press Enter to finish")
+
         return tables
+
+    def _show_table_details(self, table_name: str, chemspace_db_path: str) -> None:
+        """
+        Print detailed information about a single chemspace table: its type, exact row
+        count, column schema, and a per-column non-null count (a more granular breakdown
+        of the row count than the capped total shown by the main list_tables() listing).
+
+        Args:
+            table_name (str): Name of the table to inspect
+            chemspace_db_path (str): Path to the chemspace.db file containing the table
+        """
+        try:
+            conn = sqlite3.connect(chemspace_db_path)
+            cursor = conn.cursor()
+
+            cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+            row_count = cursor.fetchone()[0]
+
+            cursor.execute(f"PRAGMA table_info({table_name})")
+            columns = cursor.fetchall()  # (cid, name, type, notnull, dflt_value, pk)
+
+            table_type = self._classify_table_type(table_name)
+            icon = self._get_table_type_icon(table_type)
+
+            print(f"\n📋 TABLE DETAILS: '{table_name}'")
+            print("=" * 70)
+            print(f"{icon} Type: {table_type}")
+            print(f"📊 Total rows: {row_count:,}")
+            print(f"🧬 Columns: {len(columns)}")
+            print("-" * 70)
+            print(f"{'Column':<25} {'Type':<12} {'Non-null rows':<15} {'PK':<4}")
+            print("-" * 70)
+
+            for _, col_name, col_type, notnull, _, pk in columns:
+                try:
+                    cursor.execute(f"SELECT COUNT({col_name}) FROM {table_name}")
+                    non_null_count = cursor.fetchone()[0]
+                    non_null_str = f"{non_null_count:,}"
+                except Exception:
+                    non_null_str = "?"
+                pk_str = "Yes" if pk else ""
+                print(f"{col_name[:24]:<25} {col_type[:11]:<12} {non_null_str:<15} {pk_str:<4}")
+
+            print("=" * 70)
+            conn.close()
+
+        except Exception as e:
+            print(f"❌ Error showing table details for '{table_name}': {e}")
 
     def get_all_tables(self) -> List[str]:
         """
