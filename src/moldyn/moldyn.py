@@ -4939,15 +4939,18 @@ class MolDyn:
 
         return csv_path
 
-    def _select_md_assay_with_mmgbsa_runs(self):
+    def _select_md_assays_with_mmgbsa_runs(self):
         """
         List ligand-receptor MD assays that have at least one MM-GBSA run folder
-        on disk, and prompt the user to pick one. Mirrors
-        _select_completed_md_assay_for_mmgbsa(), but scoped to assays that
-        actually have something to delete.
+        on disk, and prompt the user to pick one or more (comma-separated Assay
+        IDs, or 'all'). Mirrors _select_completed_md_assay_for_mmgbsa(), scoped to
+        assays that actually have something to delete, and extended to a
+        multi-selection so delete_mmgbsa_on_trajectory() can remove computations
+        for several assays in one pass.
 
-        Returns a dict {'assay_id', 'md_assay', 'description', 'assay_folder_path',
-        'ligand_name', 'pose_id', 'run_folders'}, or None if cancelled / none found.
+        Returns a list of dicts {'assay_id', 'md_assay', 'description',
+        'assay_folder_path', 'ligand_name', 'pose_id', 'run_folders'}, or None if
+        cancelled / none found.
         """
         import sqlite3
 
@@ -5010,25 +5013,52 @@ class MolDyn:
             assay_ids = [str(a['assay_id']) for a in candidates]
             while True:
                 selection = input(
-                    "\n🔎 Enter the Assay ID to manage MM-GBSA deletions (or 'cancel'): "
+                    "\n🔎 Enter the Assay ID(s) to manage MM-GBSA deletions "
+                    "(comma-separated for multiple, 'all', or 'cancel'): "
                 ).strip()
+
                 if selection.lower() in ['cancel', 'quit', 'exit']:
                     print("❌ Operation cancelled.")
                     return None
-                if selection in assay_ids:
-                    return next(a for a in candidates if str(a['assay_id']) == selection)
-                print("❌ Invalid Assay ID. Please try again.")
+
+                if selection.lower() == 'all':
+                    return candidates
+
+                requested = [s.strip() for s in selection.split(',') if s.strip()]
+                if not requested:
+                    print("❌ Please enter at least one Assay ID.")
+                    continue
+
+                invalid = [s for s in requested if s not in assay_ids]
+                if invalid:
+                    print(f"❌ Invalid Assay ID(s): {', '.join(invalid)}. Please try again.")
+                    continue
+
+                # De-duplicate while preserving order, in case an ID is repeated.
+                seen = set()
+                selected = []
+                for s in requested:
+                    a = next(a for a in candidates if str(a['assay_id']) == s)
+                    if a['assay_id'] not in seen:
+                        seen.add(a['assay_id'])
+                        selected.append(a)
+                return selected
 
         except Exception as e:
-            print(f"❌ Error selecting MD assay: {e}")
+            print(f"❌ Error selecting MD assay(s): {e}")
             return None
 
     def delete_mmgbsa_on_trajectory(self):
         """
-        Delete an MM-GBSA computation created by compute_mmgbsa_on_trajectory():
+        Delete MM-GBSA computation(s) created by compute_mmgbsa_on_trajectory():
         the run's results folder on disk, plus its associated database registries.
+        Accepts one or more comma-separated MD assay identifiers (or 'all'), so
+        computations for several assays can be removed in a single pass; a single
+        assay selection additionally offers picking a specific run (or all runs)
+        for that assay, while a multi-assay selection removes every MM-GBSA run
+        found for each selected assay.
 
-        For each selected run this removes:
+        For each deleted run this removes:
           - The on-disk run folder ('mmgbsa', 'mmgbsa_2', ...) under the assay
             folder (complex/receptor/ligand topologies, stripped trajectory,
             mmgbsa_results.dat, mmgbsa_decomp.dat, CSVs, logs, run_mmgbsa.sh).
@@ -5037,8 +5067,6 @@ class MolDyn:
           - If the run being deleted is the base 'mmgbsa' folder, also clears the
             legacy mmgbsa_results column on md_assays, since _store_mmgbsa_results()
             only ever mirrors that one run into it.
-
-        A single run or all runs for the chosen assay can be deleted in one pass.
         """
         import sqlite3
         import shutil as _shutil
@@ -5047,43 +5075,65 @@ class MolDyn:
             print("\n🗑️  DELETE MM-GBSA COMPUTATION")
             print("=" * 60)
 
-            assay_info = self._select_md_assay_with_mmgbsa_runs()
-            if assay_info is None:
+            selected_assays = self._select_md_assays_with_mmgbsa_runs()
+            if not selected_assays:
                 return
 
-            run_folders = assay_info['run_folders']
-            assay_id = assay_info['assay_id']
+            # (assay_id, md_assay_name, run_folder) triples to delete, gathered
+            # from either the single-assay run picker or the multi-assay bulk path.
+            to_delete = []
 
-            print(f"\n📁 MM-GBSA runs for assay '{assay_info['md_assay']}' (ID {assay_id}):")
-            for i, rf in enumerate(run_folders, 1):
-                has_results = os.path.exists(os.path.join(rf, 'mmgbsa_results.dat'))
-                status = "✅ results available" if has_results else "⏳ no results (incomplete/pending)"
-                print(f"  [{i}] {os.path.basename(rf):<14} {status}")
-            print(f"  [a] ALL runs for this assay")
+            if len(selected_assays) == 1:
+                assay_info = selected_assays[0]
+                run_folders = assay_info['run_folders']
 
-            while True:
-                selection = input(
-                    "\nSelect run to delete (number, 'a' for all, or 'cancel'): "
-                ).strip().lower()
-                if selection in ['cancel', 'quit', 'exit']:
-                    print("❌ Deletion cancelled.")
-                    return
-                if selection == 'a':
-                    to_delete = list(run_folders)
-                    break
-                try:
-                    idx = int(selection) - 1
-                    if 0 <= idx < len(run_folders):
-                        to_delete = [run_folders[idx]]
+                print(f"\n📁 MM-GBSA runs for assay '{assay_info['md_assay']}' "
+                      f"(ID {assay_info['assay_id']}):")
+                for i, rf in enumerate(run_folders, 1):
+                    has_results = os.path.exists(os.path.join(rf, 'mmgbsa_results.dat'))
+                    status = "✅ results available" if has_results else "⏳ no results (incomplete/pending)"
+                    print(f"  [{i}] {os.path.basename(rf):<14} {status}")
+                print(f"  [a] ALL runs for this assay")
+
+                while True:
+                    selection = input(
+                        "\nSelect run to delete (number, 'a' for all, or 'cancel'): "
+                    ).strip().lower()
+                    if selection in ['cancel', 'quit', 'exit']:
+                        print("❌ Deletion cancelled.")
+                        return
+                    if selection == 'a':
+                        chosen_runs = list(run_folders)
                         break
-                except ValueError:
-                    pass
-                print("❌ Invalid selection.")
+                    try:
+                        idx = int(selection) - 1
+                        if 0 <= idx < len(run_folders):
+                            chosen_runs = [run_folders[idx]]
+                            break
+                    except ValueError:
+                        pass
+                    print("❌ Invalid selection.")
+
+                to_delete = [
+                    (assay_info['assay_id'], assay_info['md_assay'], rf) for rf in chosen_runs
+                ]
+
+            else:
+                print(f"\n📋 Selected {len(selected_assays)} assays -- "
+                      f"ALL of their MM-GBSA runs will be deleted:")
+                for a in selected_assays:
+                    print(f"   - Assay {a['assay_id']} ({a['md_assay']}): "
+                          f"{len(a['run_folders'])} run(s) "
+                          f"({', '.join(os.path.basename(rf) for rf in a['run_folders'])})")
+                to_delete = [
+                    (a['assay_id'], a['md_assay'], rf)
+                    for a in selected_assays for rf in a['run_folders']
+                ]
 
             print(f"\n⚠️  This will permanently delete {len(to_delete)} MM-GBSA run(s) "
                   f"and their database records:")
-            for rf in to_delete:
-                print(f"   - {rf}")
+            for assay_id, md_assay_name, rf in to_delete:
+                print(f"   - [{md_assay_name}] {rf}")
             confirm = input("🗑️  Confirm deletion? (yes/no) [default: no]: ").strip().lower() or 'no'
             if confirm not in ['yes', 'y']:
                 print("❌ Deletion cancelled.")
@@ -5103,7 +5153,7 @@ class MolDyn:
                 decomp_has_folder_col = 'mmgbsa_folder' in {row[1] for row in cursor.fetchall()}
 
             deleted = []
-            for rf in to_delete:
+            for assay_id, md_assay_name, rf in to_delete:
                 folder_name = os.path.basename(rf.rstrip(os.sep))
                 # Match the DB rows loosely (exact path, or same folder name under
                 # any path) as well, in case the project was relocated since the
@@ -5155,14 +5205,14 @@ class MolDyn:
                     except Exception as e:
                         print(f"⚠️  Could not clear legacy mmgbsa_results column: {e}")
 
-                deleted.append(folder_name)
-                print(f"   ✓ Deleted run '{folder_name}'")
+                deleted.append((md_assay_name, folder_name))
+                print(f"   ✓ Deleted run '{folder_name}' (assay '{md_assay_name}')")
 
             conn.commit()
             conn.close()
 
             print(f"\n✅ Deleted {len(deleted)}/{len(to_delete)} MM-GBSA run(s) "
-                  f"for assay '{assay_info['md_assay']}'.")
+                  f"across {len(selected_assays)} assay(s).")
 
         except Exception as e:
             print(f"❌ Error deleting MM-GBSA computation: {e}")
