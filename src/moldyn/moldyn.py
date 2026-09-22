@@ -872,9 +872,9 @@ class MolDyn:
         try:
             import sqlite3
 
-            conn = sqlite3.connect(self.__md_registers_db)
+            conn = sqlite3.connect(self.__md_methods_db)
             cursor = conn.cursor()
-            
+
             # Check if md_methods table exists
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='md_methods';")
             if not cursor.fetchone():
