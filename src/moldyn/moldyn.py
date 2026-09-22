@@ -63,6 +63,10 @@ class MolDyn:
         # Set up molecular dynamics methods registers database path within the project directory
         self.__md_methods_db = os.path.join(self.path, 'dynamics/md_registers', 'md_methods.db')
 
+        # Set up MM-GBSA computation conditions (named parameter presets) database
+        # path within the project directory -- mirrors MolDock's docking_methods.db
+        self.__mmgbsa_conditions_db = os.path.join(self.path, 'dynamics/md_registers', 'mmgbsa_conditions.db')
+
         # Set up molecular dynamics assays folder path within the project directory
         self.__md_assays_folder = os.path.join(self.path, 'dynamics/md_assays')
 
@@ -2742,12 +2746,17 @@ class MolDyn:
 
         Workflow:
           1. Select a completed ligand-receptor MD assay
-          2. Collect MM-GBSA parameters interactively
-          3. Run ante-MMPBSA.py to generate gas-phase receptor/ligand/complex topologies
-          4. Write the MMPBSA.py input namelist
-          5. Write run_mmgbsa.sh execution script
-          6. Query user: run now (fg/bg) or leave for manual execution
-          7. If fg: parse, store, and display results immediately after completion
+          2. Resolve which run folder to use (new run / overwrite / parse existing --
+             see _resolve_mmgbsa_computation_folder(), supports multiple MM-GBSA
+             runs per trajectory)
+          3. Obtain MM-GBSA parameters -- either a saved computation condition
+             (create_mmgbsa_computation_conditions()) plus execution parameters,
+             or the fully manual wizard (see _resolve_mmgbsa_run_parameters())
+          4. Run ante-MMPBSA.py to generate gas-phase receptor/ligand/complex topologies
+          5. Write the MMPBSA.py input namelist
+          6. Write run_mmgbsa.sh execution script
+          7. Query user: run now (fg/bg) or leave for manual execution
+          8. If fg: parse, store, and display results immediately after completion
         """
         import traceback
 
@@ -2782,7 +2791,9 @@ class MolDyn:
             if mmgbsa_folder == 'handled':
                 return
 
-            mmgbsa_params = self._collect_mmgbsa_parameters(ligand_name)
+            # Either apply a saved computation condition (create_mmgbsa_computation_
+            # conditions()) or fall back to the fully manual wizard when none exist.
+            mmgbsa_params = self._resolve_mmgbsa_run_parameters(ligand_name)
             if mmgbsa_params is None:
                 # Clean up the (empty) run folder just created/cleared above so a
                 # cancelled parameter collection doesn't leave stray empty folders
@@ -3089,6 +3100,797 @@ class MolDyn:
             print(f"❌ Error selecting MD assay: {e}")
             return None
 
+    # ------------------------------------------------------------------
+    # MM-GBSA computation conditions: named, reusable parameter presets
+    # covering exactly the AMBER MMPBSA.py namelist parameters (&general/
+    # &gb/&decomp) -- handled the same way MolDock handles docking methods
+    # (create/list/export/import/delete against a dedicated *_methods.db-
+    # style SQLite file, one row per named preset).
+    # ------------------------------------------------------------------
+
+    def _get_parameter_choice(self, param_name, choices, default):
+        """
+        Prompt the user to pick one of a fixed set of choices, with a marked
+        default. Ported from MolDock._get_parameter_choice() (this codebase
+        duplicates small interactive-wizard helpers per class rather than sharing
+        a base class -- see MolDock/MolDyn's duplicated tleap bond-line helpers).
+        """
+        print(f"\n📋 {param_name}:")
+        for i, choice in enumerate(choices, 1):
+            marker = " (default)" if choice == default else ""
+            print(f"  {i}. {choice}{marker}")
+
+        while True:
+            try:
+                selection = input(
+                    f"Select {param_name.lower()} (1-{len(choices)} or press Enter for default): "
+                ).strip()
+
+                if not selection:
+                    return default
+
+                try:
+                    idx = int(selection) - 1
+                    if 0 <= idx < len(choices):
+                        return choices[idx]
+                    print(f"❌ Please enter 1-{len(choices)}")
+                    continue
+                except ValueError:
+                    print("❌ Please enter a number")
+                    continue
+
+            except KeyboardInterrupt:
+                raise
+
+    def _input_parameter_choice(self, param_name, default=None):
+        """
+        Prompt the user to type a parameter value directly (no predefined options).
+        Ported from MolDock._input_parameter_choice().
+        """
+        while True:
+            try:
+                print(f"\n📋 {param_name}:")
+                prompt = f"Enter value for {param_name}"
+                if default is not None:
+                    prompt += f" (default: {default})"
+                prompt += ": "
+                value = input(prompt).strip()
+                if not value:
+                    return default
+                return value
+            except KeyboardInterrupt:
+                print("\n❌ Parameter input cancelled.")
+                return None
+
+    def create_mmgbsa_computation_conditions(self):
+        """
+        Interactively create (or update) a named MM-GBSA computation condition --
+        a reusable preset of the AMBER MMPBSA.py namelist parameters listed in
+        mmgbsa_parameters.txt, grouped by namelist section:
+          &general : startframe, endframe, interval, receptor_mask, ligand_mask
+          &gb      : igb, saltcon
+          &decomp  : idecomp, print_res, dec_verbose
+
+        Stored in dynamics/md_registers/mmgbsa_conditions.db (mmgbsa_conditions
+        table), one row per condition_name -- handled the same way
+        MolDock.create_docking_method() handles docking methods (name validation,
+        overwrite confirmation on a clash, JSON-serialized parameters, summary
+        printout on success).
+
+        Returns:
+            Optional[Dict[str, Any]]: {'condition_id', 'condition_name',
+                'description', 'parameters', 'database_path'}, or None if
+                cancelled/failed.
+        """
+        import sqlite3
+        import json
+
+        try:
+            print(f"\n🧪 CREATE MM-GBSA COMPUTATION CONDITION")
+            print("=" * 60)
+
+            conditions_dir = os.path.dirname(self.__mmgbsa_conditions_db)
+            os.makedirs(conditions_dir, exist_ok=True)
+
+            # Show existing conditions first, in the same format as
+            # list_mmgbsa_computation_conditions() (minus its 'details <n>' prompt
+            # loop, which would otherwise block here), so the user can see what's
+            # already registered before naming a new one.
+            existing_conditions = self.list_mmgbsa_computation_conditions(verbose=False)
+            if existing_conditions:
+                self._print_mmgbsa_conditions_listing(existing_conditions)
+            else:
+                print(f"\n📋 No existing MM-GBSA conditions found -- this will be the first one.")
+
+            # --- condition name ---
+            while True:
+                try:
+                    condition_name = self._prompt("\n📝 Enter condition name (or 'cancel'): ")
+
+                    if condition_name.lower() in ['cancel', 'quit', 'exit']:
+                        print("❌ MM-GBSA condition creation cancelled")
+                        return None
+
+                    if not condition_name:
+                        print("❌ Condition name cannot be empty")
+                        continue
+
+                    if not condition_name.replace('_', '').replace('-', '').replace(' ', '').isalnum():
+                        print("❌ Condition name can only contain letters, numbers, spaces, hyphens, and underscores")
+                        continue
+
+                    break
+
+                except KeyboardInterrupt:
+                    print("\n❌ MM-GBSA condition creation cancelled")
+                    return None
+
+            description = self._prompt("\n📄 Enter condition description (optional): ")
+            if not description:
+                description = f"MM-GBSA computation condition '{condition_name}'"
+
+            # --- &general ---
+            print("\n⚙️  &general PARAMETERS")
+            print("-" * 60)
+            try:
+                startframe = int(self._input_parameter_choice(
+                    "startframe (first trajectory frame analyzed)", default='1'))
+                endframe = int(self._input_parameter_choice(
+                    "endframe (last trajectory frame analyzed)", default='9999'))
+                interval = int(self._input_parameter_choice(
+                    "interval (sampling interval between frames)", default='1'))
+            except (TypeError, ValueError):
+                print("⚠️  Invalid frame selection, defaulting to 1/9999/1")
+                startframe, endframe, interval = 1, 9999, 1
+
+            receptor_mask = self._input_parameter_choice(
+                "receptor_mask (only needed if automatic receptor definition isn't appropriate; "
+                "leave blank for automatic)",
+                default=''
+            ) or None
+
+            ligand_mask = self._input_parameter_choice(
+                "ligand_mask (defines the ligand residue, e.g. :UNL, :LIG)",
+                default=':UNL'
+            )
+
+            # --- &gb ---
+            print("\n⚙️  &gb PARAMETERS")
+            print("-" * 60)
+            igb = int(self._get_parameter_choice(
+                "igb (GB model)", [1, 2, 5, 7, 8], default=5))
+
+            saltcon_str = self._input_parameter_choice(
+                "saltcon (ionic strength in M)", default='0.15')
+            try:
+                saltcon = float(saltcon_str)
+            except (TypeError, ValueError):
+                print("⚠️  Invalid salt concentration, defaulting to 0.15")
+                saltcon = 0.15
+
+            # --- &decomp ---
+            print("\n⚙️  &decomp PARAMETERS")
+            print("-" * 60)
+            idecomp = int(self._get_parameter_choice(
+                "idecomp (activates per-residue decomposition; 0 = disabled)",
+                [0, 1, 2, 3, 4], default=2))
+
+            print_res = None
+            dec_verbose = None
+            if idecomp:
+                print_res = self._input_parameter_choice(
+                    "print_res (residues included in decomposition output -- "
+                    "'all', or a comma-separated list/range of residue numbers "
+                    "in topology numbering, e.g. '1-10,15,20-30'; NOT a cpptraj-style "
+                    "'within X' selection, which MMPBSA.py rejects with "
+                    "'SelectionError: Invalid selection! Integers expected.')",
+                    default='all'
+                )
+                dec_verbose = int(self._get_parameter_choice(
+                    "dec_verbose (amount of decomposition information printed)",
+                    [0, 1, 2, 3], default=0))
+
+            parameters = {
+                'general': {
+                    'startframe': startframe,
+                    'endframe': endframe,
+                    'interval': interval,
+                    'receptor_mask': receptor_mask,
+                    'ligand_mask': ligand_mask,
+                },
+                'gb': {
+                    'igb': igb,
+                    'saltcon': saltcon,
+                },
+                'decomp': {
+                    'idecomp': idecomp,
+                    'print_res': print_res,
+                    'dec_verbose': dec_verbose,
+                },
+            }
+
+            conn = sqlite3.connect(self.__mmgbsa_conditions_db)
+            cursor = conn.cursor()
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS mmgbsa_conditions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    condition_name TEXT UNIQUE NOT NULL,
+                    description TEXT,
+                    parameters TEXT,
+                    created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
+            cursor.execute(
+                "SELECT COUNT(*) FROM mmgbsa_conditions WHERE condition_name = ?",
+                (condition_name,)
+            )
+            if cursor.fetchone()[0] > 0:
+                print(f"⚠️  Condition name '{condition_name}' already exists")
+                while True:
+                    overwrite = input("Overwrite existing condition? (y/n): ").strip().lower()
+                    if overwrite in ['y', 'yes']:
+                        cursor.execute('''
+                            UPDATE mmgbsa_conditions
+                            SET description = ?, parameters = ?, created_date = CURRENT_TIMESTAMP
+                            WHERE condition_name = ?
+                        ''', (description, json.dumps(parameters), condition_name))
+                        print(f"✅ Updated existing MM-GBSA condition '{condition_name}'")
+                        break
+                    elif overwrite in ['n', 'no']:
+                        print("❌ Condition creation cancelled - name already exists")
+                        conn.close()
+                        return None
+                    else:
+                        print("❌ Please answer 'y' or 'n'")
+                        continue
+            else:
+                cursor.execute('''
+                    INSERT INTO mmgbsa_conditions (condition_name, description, parameters)
+                    VALUES (?, ?, ?)
+                ''', (condition_name, description, json.dumps(parameters)))
+                print(f"✅ Created new MM-GBSA condition '{condition_name}'")
+
+            condition_id = cursor.lastrowid or cursor.execute(
+                "SELECT id FROM mmgbsa_conditions WHERE condition_name = ?", (condition_name,)
+            ).fetchone()[0]
+
+            conn.commit()
+            conn.close()
+
+            print(f"\n{'═' * 60}")
+            print(f"🧪 MM-GBSA CONDITION SUMMARY: '{condition_name}'")
+            print(f"{'═' * 60}")
+            print(f"   📋 ID: {condition_id}")
+            print(f"   📝 Description: {description}")
+            for section, values in parameters.items():
+                print(f"   &{section}:")
+                for key, value in values.items():
+                    print(f"      • {key}: {value}")
+            print(f"{'═' * 60}")
+
+            return {
+                'condition_id': condition_id,
+                'condition_name': condition_name,
+                'description': description,
+                'parameters': parameters,
+                'database_path': self.__mmgbsa_conditions_db,
+            }
+
+        except Exception as e:
+            print(f"❌ Error in create_mmgbsa_computation_conditions: {e}")
+            return None
+
+    def _print_mmgbsa_conditions_listing(self, conditions_list):
+        """
+        Print the standard MM-GBSA conditions listing block (header, per-condition
+        summary, footer) shared by list_mmgbsa_computation_conditions() and the
+        preview shown at the start of create_mmgbsa_computation_conditions().
+        """
+        print(f"\n🧪 AVAILABLE MM-GBSA COMPUTATION CONDITIONS")
+        print("=" * 80)
+        print(f"   Found {len(conditions_list)} condition(s) in database")
+        print(f"   Database: {self.__mmgbsa_conditions_db}")
+        print("=" * 80)
+
+        for idx, cond in enumerate(conditions_list, 1):
+            print(f"\n{idx}. 🏷️  {cond['condition_name']}")
+            print(f"   {'─' * 76}")
+            print(f"   📋 ID: {cond['id']}")
+            print(f"   📝 Description: {cond['description'] or 'No description'}")
+            print(f"   📅 Created: {cond['created_date']}")
+            print(f"   {'─' * 76}")
+
+        print("=" * 80)
+
+    def list_mmgbsa_computation_conditions(self, verbose=True):
+        """
+        Read mmgbsa_conditions.db and list registered MM-GBSA computation
+        conditions. Mirrors MolDock.list_docking_methods(), including the
+        'details <number>' interactive drill-down when verbose.
+
+        Args:
+            verbose (bool): Whether to print the listing and offer the
+                'details <number>' prompt. False is used internally (e.g. by
+                _resolve_mmgbsa_run_parameters()) to fetch the list quietly.
+
+        Returns:
+            Optional[List[Dict[str, Any]]]: Condition dicts, or None if the
+                database/table doesn't exist yet or contains no conditions.
+        """
+        import sqlite3
+        import json
+
+        try:
+            if not os.path.exists(self.__mmgbsa_conditions_db):
+                if verbose:
+                    print(f"❌ No MM-GBSA conditions database found")
+                    print(f"   Expected location: {self.__mmgbsa_conditions_db}")
+                    print(f"\n💡 Create a condition first using create_mmgbsa_computation_conditions()")
+                return None
+
+            conn = sqlite3.connect(self.__mmgbsa_conditions_db)
+            cursor = conn.cursor()
+
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='mmgbsa_conditions'")
+            if not cursor.fetchone():
+                conn.close()
+                if verbose:
+                    print(f"❌ mmgbsa_conditions table not found in database")
+                return None
+
+            cursor.execute('''
+                SELECT id, condition_name, description, parameters, created_date
+                FROM mmgbsa_conditions
+                ORDER BY created_date ASC
+            ''')
+            rows = cursor.fetchall()
+            conn.close()
+
+            if not rows:
+                if verbose:
+                    print(f"📋 NO MM-GBSA CONDITIONS FOUND")
+                    print(f"\n💡 Create one using create_mmgbsa_computation_conditions()")
+                return None
+
+            conditions_list = []
+            for condition_id, condition_name, description, params_json, created_date in rows:
+                try:
+                    parameters = json.loads(params_json) if params_json else {}
+                except json.JSONDecodeError:
+                    parameters = {}
+                conditions_list.append({
+                    'id': condition_id,
+                    'condition_name': condition_name,
+                    'description': description,
+                    'parameters': parameters,
+                    'created_date': created_date,
+                })
+
+            if not verbose:
+                return conditions_list
+
+            self._print_mmgbsa_conditions_listing(conditions_list)
+
+            print(f"\n💡 Type 'details <number>' to view namelist parameters")
+            print(f"💡 Example: details 1")
+
+            while True:
+                try:
+                    user_input = input(f"\nEnter command (or press Enter to exit): ").strip()
+
+                    if not user_input:
+                        break
+
+                    if user_input.lower().startswith('details'):
+                        parts = user_input.split()
+                        if len(parts) < 2:
+                            print(f"❌ Please specify a condition number. Example: details 1")
+                            continue
+
+                        try:
+                            condition_number = int(parts[1])
+                            if condition_number < 1 or condition_number > len(conditions_list):
+                                print(f"❌ Invalid condition number. Choose between 1 and {len(conditions_list)}")
+                                continue
+
+                            selected = conditions_list[condition_number - 1]
+                            print(f"\n{'═' * 80}")
+                            print(f"🔍 DETAILED PARAMETERS FOR: {selected['condition_name']}")
+                            print(f"{'═' * 80}")
+                            for section, values in selected['parameters'].items():
+                                print(f"\n&{section}:")
+                                print(f"   {'─' * 76}")
+                                for key, value in values.items():
+                                    print(f"   • {key}: {value}")
+                            print(f"{'═' * 80}")
+
+                        except ValueError:
+                            print(f"❌ Invalid number format. Please use: details <number>")
+                            continue
+                    else:
+                        print(f"❌ Unknown command. Use 'details <number>' to view parameters")
+
+                except KeyboardInterrupt:
+                    print(f"\n\n👋 Exiting condition list")
+                    break
+
+            return conditions_list
+
+        except sqlite3.Error as e:
+            if verbose:
+                print(f"❌ Database error: {e}")
+            return None
+        except Exception as e:
+            if verbose:
+                print(f"❌ Error listing MM-GBSA conditions: {e}")
+            return None
+
+    def export_mmgbsa_computation_conditions(self):
+        """
+        Export an MM-GBSA computation condition as a JSON file suitable for
+        recreating it with import_mmgbsa_computation_conditions(). Mirrors
+        MolDock.export_docking_method().
+        """
+        import json
+
+        print(f"\n📤 EXPORT MM-GBSA COMPUTATION CONDITION")
+        print("=" * 50)
+
+        conditions_list = self.list_mmgbsa_computation_conditions()
+        if not conditions_list:
+            return None
+
+        while True:
+            try:
+                selection = input(
+                    f"\nEnter the number of the condition to export (1-{len(conditions_list)}) or 'cancel': "
+                ).strip()
+
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    print("❌ Export cancelled.")
+                    return None
+
+                idx = int(selection)
+                if 1 <= idx <= len(conditions_list):
+                    selected = conditions_list[idx - 1]
+                    break
+                else:
+                    print(f"❌ Invalid selection. Choose between 1 and {len(conditions_list)}.")
+            except ValueError:
+                print("❌ Please enter a valid number or 'cancel'.")
+
+        export_data = {
+            "condition_name": selected['condition_name'],
+            "description": selected['description'],
+            "parameters": selected['parameters'],
+        }
+
+        conditions_dir = os.path.dirname(self.__mmgbsa_conditions_db)
+        default_output = os.path.join(conditions_dir, f"{selected['condition_name']}.json")
+
+        output_path = self._prompt(f"\n📁 Enter output file path\n   (default: {default_output}): ")
+        if not output_path:
+            output_path = default_output
+
+        if not output_path.endswith('.json'):
+            output_path += '.json'
+
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+            with open(output_path, 'w', encoding='utf-8') as f:
+                json.dump(export_data, f, indent=2, ensure_ascii=False)
+
+            print(f"\n✅ Condition '{selected['condition_name']}' exported successfully.")
+            print(f"📍 File: {output_path}")
+            return output_path
+
+        except Exception as e:
+            print(f"❌ Error writing export file: {e}")
+            return None
+
+    def import_mmgbsa_computation_conditions(self):
+        """
+        Import an MM-GBSA computation condition from a JSON file previously
+        exported with export_mmgbsa_computation_conditions(). Mirrors
+        MolDock.import_docking_method().
+        """
+        import sqlite3
+        import json
+
+        print(f"\n📥 IMPORT MM-GBSA COMPUTATION CONDITION")
+        print("=" * 50)
+
+        while True:
+            json_path = self._prompt("📁 Enter path to the JSON file (or 'cancel'): ")
+
+            if json_path.lower() in ['cancel', 'quit', 'exit']:
+                print("❌ Import cancelled.")
+                return None
+
+            if not json_path:
+                print("❌ Path cannot be empty.")
+                continue
+
+            if not os.path.exists(json_path):
+                print(f"❌ File not found: {json_path}")
+                continue
+
+            break
+
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except json.JSONDecodeError as e:
+            print(f"❌ Invalid JSON file: {e}")
+            return None
+        except Exception as e:
+            print(f"❌ Error reading file: {e}")
+            return None
+
+        required_keys = {'condition_name', 'description', 'parameters'}
+        missing = required_keys - set(data.keys())
+        if missing:
+            print(f"❌ JSON is missing required fields: {', '.join(sorted(missing))}")
+            return None
+
+        condition_name = data['condition_name']
+        description = data['description']
+        parameters = data['parameters']
+
+        print(f"\n📋 CONDITION TO IMPORT:")
+        print(f"   {'─' * 46}")
+        print(f"   🏷️  Name: {condition_name}")
+        print(f"   📝 Desc: {description or 'None'}")
+        print(f"   {'─' * 46}")
+
+        confirm = input("\nProceed with import? (y/n): ").strip().lower()
+        if confirm not in ['y', 'yes']:
+            print("❌ Import cancelled.")
+            return None
+
+        conditions_dir = os.path.dirname(self.__mmgbsa_conditions_db)
+        os.makedirs(conditions_dir, exist_ok=True)
+
+        try:
+            conn = sqlite3.connect(self.__mmgbsa_conditions_db)
+            cursor = conn.cursor()
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS mmgbsa_conditions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    condition_name TEXT UNIQUE NOT NULL,
+                    description TEXT,
+                    parameters TEXT,
+                    created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
+            cursor.execute(
+                "SELECT COUNT(*) FROM mmgbsa_conditions WHERE condition_name = ?",
+                (condition_name,)
+            )
+            if cursor.fetchone()[0] > 0:
+                overwrite = input(
+                    f"⚠️  Condition '{condition_name}' already exists. Overwrite? (y/n): "
+                ).strip().lower()
+                if overwrite not in ['y', 'yes']:
+                    print("❌ Import cancelled - name already exists.")
+                    conn.close()
+                    return None
+                cursor.execute('''
+                    UPDATE mmgbsa_conditions
+                    SET description = ?, parameters = ?, created_date = CURRENT_TIMESTAMP
+                    WHERE condition_name = ?
+                ''', (description, json.dumps(parameters), condition_name))
+            else:
+                cursor.execute('''
+                    INSERT INTO mmgbsa_conditions (condition_name, description, parameters)
+                    VALUES (?, ?, ?)
+                ''', (condition_name, description, json.dumps(parameters)))
+
+            condition_id = cursor.lastrowid or cursor.execute(
+                "SELECT id FROM mmgbsa_conditions WHERE condition_name = ?", (condition_name,)
+            ).fetchone()[0]
+
+            conn.commit()
+            conn.close()
+
+            print(f"✅ Condition '{condition_name}' imported successfully (ID {condition_id}).")
+            return {
+                'condition_id': condition_id,
+                'condition_name': condition_name,
+                'description': description,
+                'parameters': parameters,
+                'database_path': self.__mmgbsa_conditions_db,
+            }
+
+        except Exception as e:
+            print(f"❌ Error importing MM-GBSA condition: {e}")
+            return None
+
+    def delete_mmgbsa_computation_conditions(self):
+        """
+        Delete an MM-GBSA computation condition registry, as created using
+        create_mmgbsa_computation_conditions(). Mirrors
+        MolDock.delete_docking_method().
+        """
+        import sqlite3
+
+        try:
+            if not os.path.exists(self.__mmgbsa_conditions_db):
+                print(f"❌ MM-GBSA conditions database not found at {self.__mmgbsa_conditions_db}")
+                return
+
+            conn = sqlite3.connect(self.__mmgbsa_conditions_db)
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, condition_name FROM mmgbsa_conditions")
+            conditions = cursor.fetchall()
+
+            if not conditions:
+                print("❌ No MM-GBSA conditions found in the database.")
+                conn.close()
+                return
+
+            print("\nAvailable MM-GBSA Conditions:")
+            for idx, (condition_id, condition_name) in enumerate(conditions, 1):
+                print(f"  {idx}. {condition_name} (ID: {condition_id})")
+
+            while True:
+                try:
+                    selection = input("\nEnter the number of the condition to delete (or 'q' to cancel): ").strip()
+                    if selection.lower() == 'q':
+                        print("❌ Deletion cancelled by user.")
+                        conn.close()
+                        return
+                    selection = int(selection)
+                    if 1 <= selection <= len(conditions):
+                        condition_id = conditions[selection - 1][0]
+                        break
+                    else:
+                        print(f"❌ Invalid selection. Choose a number between 1 and {len(conditions)}.")
+                except ValueError:
+                    print("❌ Please enter a valid number or 'q' to cancel.")
+
+            confirm = self._prompt(
+                f"⚠️  Are you sure you want to delete MM-GBSA condition ID {condition_id}? (yes/no): "
+            ).lower()
+            if confirm != 'yes':
+                print("❌ Deletion cancelled by user.")
+                conn.close()
+                return
+
+            cursor.execute("DELETE FROM mmgbsa_conditions WHERE id = ?", (condition_id,))
+            conn.commit()
+            print(f"✅ MM-GBSA condition ID {condition_id} deleted successfully.")
+            conn.close()
+        except Exception as e:
+            print(f"❌ Error deleting MM-GBSA condition: {e}")
+
+    def _prompt_select_mmgbsa_condition(self, conditions_list):
+        """Prompt the user to pick one condition from conditions_list. Returns the
+        chosen dict, or None if cancelled."""
+        print("\nSelect a saved MM-GBSA computation condition:")
+        for i, cond in enumerate(conditions_list, 1):
+            print(f"  [{i}] {cond['condition_name']} — {cond['description'] or 'no description'}")
+        while True:
+            selection = input("Condition number (or 'cancel'): ").strip()
+            if selection.lower() in ['cancel', 'quit', 'exit']:
+                return None
+            try:
+                idx = int(selection) - 1
+                if 0 <= idx < len(conditions_list):
+                    return conditions_list[idx]
+            except ValueError:
+                pass
+            print("❌ Invalid selection.")
+
+    def _collect_mmgbsa_execution_parameters(self):
+        """
+        Collect the run-specific MM-GBSA parameters that are NOT part of a saved
+        computation condition (mmgbsa_parameters.txt's 10 namelist parameters):
+        the solvent/ion strip mask, whether to keep MMPBSA.py intermediate files,
+        and MPI parallelization. These concern how the run is executed rather than
+        what is computed, so they're asked every run regardless of whether a saved
+        condition supplies the rest.
+        """
+        try:
+            strip_mask = input(
+                "Mask for residues to strip (solvent/ions) [default: :WAT,:Na+,:Cl-]: "
+            ).strip() or ':WAT,:Na+,:Cl-'
+
+            keep_str = input(
+                "\nKeep MMPBSA.py intermediate files? (yes/no) [default: no]: "
+            ).strip().lower() or 'no'
+            keep_files = keep_str in ['yes', 'y']
+
+            mpi_str = input(
+                "\nParallelize using MMPBSA.py.MPI (mpirun)? (yes/no) [default: yes]: "
+            ).strip().lower() or 'yes'
+            use_mpi = mpi_str in ['yes', 'y']
+
+            n_processors = 1
+            if use_mpi:
+                nproc_str = input("Number of processors to use [default: 8]: ").strip() or '8'
+                try:
+                    n_processors = int(nproc_str)
+                    if n_processors < 1:
+                        print("⚠️  Invalid processor count, defaulting to 8")
+                        n_processors = 8
+                except ValueError:
+                    print("⚠️  Invalid processor count, defaulting to 8")
+                    n_processors = 8
+
+            return {
+                'strip_mask': strip_mask,
+                'keep_files': keep_files,
+                'use_mpi': use_mpi,
+                'n_processors': n_processors,
+            }
+        except KeyboardInterrupt:
+            print("\n❌ Parameter collection cancelled.")
+            return None
+
+    def _resolve_mmgbsa_run_parameters(self, ligand_name):
+        """
+        Decide how to obtain this run's MM-GBSA parameters: apply a saved
+        computation condition (mmgbsa_conditions.db) plus freshly-collected
+        execution parameters, or fall back to the fully manual
+        _collect_mmgbsa_parameters() wizard when no conditions exist yet (or the
+        user prefers manual entry).
+
+        Returns a flat mmgbsa_params dict in the same shape
+        _collect_mmgbsa_parameters() returns (plus, when a condition is used,
+        the additional 'receptor_mask'/'idecomp'/'print_res'/'dec_verbose' keys
+        consumed by _write_mmgbsa_input_file()), or None if cancelled.
+        """
+        conditions_list = self.list_mmgbsa_computation_conditions(verbose=False)
+        if not conditions_list:
+            return self._collect_mmgbsa_parameters(ligand_name)
+
+        print("\nHow would you like to set the MM-GBSA parameters for this run?")
+        print("  [s] Use a saved computation condition")
+        print("  [m] Enter parameters manually")
+        choice = input("Choice (s/m) [default: s], or 'cancel': ").strip().lower() or 's'
+
+        if choice in ['cancel', 'quit', 'exit']:
+            return None
+        if choice in ['m', 'manual']:
+            return self._collect_mmgbsa_parameters(ligand_name)
+
+        chosen = self._prompt_select_mmgbsa_condition(conditions_list)
+        if chosen is None:
+            return None
+
+        general = chosen['parameters'].get('general', {})
+        gb = chosen['parameters'].get('gb', {})
+        decomp = chosen['parameters'].get('decomp', {})
+
+        exec_params = self._collect_mmgbsa_execution_parameters()
+        if exec_params is None:
+            return None
+
+        idecomp = decomp.get('idecomp', 0) or 0
+        mmgbsa_params = {
+            'ligand_mask': general.get('ligand_mask') or ':UNL',
+            'receptor_mask': general.get('receptor_mask') or None,
+            'startframe': general.get('startframe', 1),
+            'endframe': general.get('endframe', 9999),
+            'interval': general.get('interval', 1),
+            'igb': gb.get('igb', 5),
+            'saltcon': gb.get('saltcon', 0.15),
+            'idecomp': idecomp,
+            'print_res': decomp.get('print_res'),
+            'dec_verbose': decomp.get('dec_verbose'),
+            'per_residue': bool(idecomp),
+        }
+        mmgbsa_params.update(exec_params)  # strip_mask, keep_files, use_mpi, n_processors
+
+        print(f"\n✅ Using saved condition '{chosen['condition_name']}' "
+              f"(igb={mmgbsa_params['igb']}, saltcon={mmgbsa_params['saltcon']}, "
+              f"idecomp={mmgbsa_params['idecomp']})")
+        return mmgbsa_params
+
     def _collect_mmgbsa_parameters(self, ligand_name):
         """
         Interactively collect MM-GBSA parameters from the user.
@@ -3327,7 +4129,18 @@ class MolDyn:
         return None
 
     def _write_mmgbsa_input_file(self, mmgbsa_folder, mmgbsa_params):
-        """Write the MMPBSA.py input namelist file and return its path."""
+        """
+        Write the MMPBSA.py input namelist file and return its path.
+
+        mmgbsa_params may come either from the plain manual wizard
+        (_collect_mmgbsa_parameters(), which only sets a boolean 'per_residue') or
+        from a saved computation condition applied via _resolve_mmgbsa_run_parameters()
+        (which additionally carries 'receptor_mask', 'idecomp', 'print_res' and
+        'dec_verbose'). Both shapes are handled: when the richer keys are absent, the
+        previous hardcoded idecomp=2 / csv_format=0 behaviour is used unchanged.
+        """
+        import re
+
         mmgbsa_in = os.path.join(mmgbsa_folder, 'mmgbsa.in')
         with open(mmgbsa_in, 'w') as f:
             f.write("MM-GBSA calculation\n")
@@ -3335,6 +4148,9 @@ class MolDyn:
             f.write(f"  startframe={mmgbsa_params['startframe']},\n")
             f.write(f"  endframe={mmgbsa_params['endframe']},\n")
             f.write(f"  interval={mmgbsa_params['interval']},\n")
+            receptor_mask = mmgbsa_params.get('receptor_mask')
+            if receptor_mask:
+                f.write(f"  receptor_mask={receptor_mask},\n")
             f.write("  verbose=2,\n")
             f.write("  netcdf=1,\n")
             f.write("/\n")
@@ -3342,13 +4158,35 @@ class MolDyn:
             f.write(f"  igb={mmgbsa_params['igb']},\n")
             f.write(f"  saltcon={mmgbsa_params['saltcon']},\n")
             f.write("/\n")
-            # Per-residue energy decomposition. idecomp=2 / csv_format=0 mirrors
-            # MolDock._compute_mmgbsa_fingerprint() so the resulting decomposition
-            # table can be parsed by the same logic and renumbered to the original
-            # receptor numbering.
-            if mmgbsa_params.get('per_residue', False):
+            # Per-residue energy decomposition. Mirrors
+            # MolDock._compute_mmgbsa_fingerprint() (idecomp=2 / csv_format=0) so the
+            # resulting decomposition table can be parsed by the same logic and
+            # renumbered to the original receptor numbering, unless a saved condition
+            # specifies its own idecomp/print_res/dec_verbose values.
+            idecomp = mmgbsa_params.get('idecomp')
+            if idecomp is None:
+                idecomp = 2 if mmgbsa_params.get('per_residue', False) else 0
+            if idecomp:
                 f.write("&decomp\n")
-                f.write("  idecomp=2, csv_format=0,\n")
+                f.write(f"  idecomp={idecomp}, csv_format=0,\n")
+                print_res = mmgbsa_params.get('print_res')
+                if print_res:
+                    # MMPBSA.py's print_res only accepts 'all' or a comma-separated
+                    # list/range of residue numbers (e.g. '1-10,15,20-30') -- NOT a
+                    # cpptraj-style 'within X' selection, which fails at runtime with
+                    # "SelectionError: Invalid selection! Integers expected." Guard
+                    # against stale/imported conditions that still carry that mistake
+                    # (an earlier version of this wizard suggested 'within 6' as the
+                    # default) by falling back to 'all' instead of writing it out.
+                    if not re.fullmatch(r'all|[\d,\-\s]+', print_res.strip(), re.IGNORECASE):
+                        print(f"⚠️  Ignoring invalid print_res value '{print_res}' "
+                              f"(MMPBSA.py requires 'all' or a residue number/range "
+                              f"list, e.g. '1-10,15'); using 'all' instead.")
+                        print_res = 'all'
+                    f.write(f"  print_res=\"{print_res}\",\n")
+                dec_verbose = mmgbsa_params.get('dec_verbose')
+                if dec_verbose is not None:
+                    f.write(f"  dec_verbose={dec_verbose},\n")
                 f.write("/\n")
         print(f"   ✓ MM-GBSA input file written: {os.path.basename(mmgbsa_in)}")
         return mmgbsa_in
@@ -3371,13 +4209,28 @@ class MolDyn:
         """
         import shutil as _shutil
 
-        amber_bin = os.path.expanduser('~/Programas/Amber26/ambertools26/bin')
-        amber_path_export = f"export PATH={amber_bin}:$PATH"
-
         # MMPBSA.py / MMPBSA.py.MPI are pulled from the 'tidyscreen' conda env when
         # present there, since that is the environment whose Python (and mpi4py, for
         # the MPI variant) they are meant to run under; fall back to PATH / AmberTools.
         tidyscreen_conda_bin = os.path.expanduser('~/anaconda3/envs/tidyscreen/bin')
+
+        # AMBERHOME/PATH for the script as a whole (used for cpptraj, resolved as a
+        # bare name below, and for any AMBERHOME-relative lookups MMPBSA.py/
+        # MMPBSA.py.MPI/ante-MMPBSA.py make internally): prefer the tidyscreen conda
+        # env's own AmberTools -- for a conda-installed ambertools package, AMBERHOME
+        # is that env's prefix, i.e. os.path.dirname(tidyscreen_conda_bin), with
+        # binaries at tidyscreen_conda_bin itself -- since that's the build
+        # MMPBSA.py.MPI/mpi4py need to be compatible with. Fall back to the system
+        # AmberTools installation only if AmberTools isn't actually present in the
+        # tidyscreen conda env.
+        if os.path.exists(os.path.join(tidyscreen_conda_bin, 'tleap')):
+            amberhome = os.path.dirname(tidyscreen_conda_bin)
+            amber_bin = tidyscreen_conda_bin
+        else:
+            amberhome = os.path.expanduser('~/Programas/Amber26/ambertools26')
+            amber_bin = os.path.join(amberhome, 'bin')
+
+        amber_path_export = f"export AMBERHOME={amberhome}\nexport PATH={amber_bin}:$PATH"
 
         def _resolve_mmpbsa_bin(name):
             conda_path = os.path.join(tidyscreen_conda_bin, name)
@@ -3385,7 +4238,7 @@ class MolDyn:
                 return conda_path
             return _shutil.which(name) or os.path.join(amber_bin, name)
 
-        ante_bin = _shutil.which('ante-MMPBSA.py') or os.path.join(amber_bin, 'ante-MMPBSA.py')
+        ante_bin = _resolve_mmpbsa_bin('ante-MMPBSA.py')
         mmpbsa_bin = _resolve_mmpbsa_bin('MMPBSA.py')
         mmpbsa_mpi_bin = _resolve_mmpbsa_bin('MMPBSA.py.MPI')
 
@@ -4085,6 +4938,234 @@ class MolDyn:
             print(f"⚠️  Error storing per-residue MM-GBSA decomposition in database: {e}")
 
         return csv_path
+
+    def _select_md_assay_with_mmgbsa_runs(self):
+        """
+        List ligand-receptor MD assays that have at least one MM-GBSA run folder
+        on disk, and prompt the user to pick one. Mirrors
+        _select_completed_md_assay_for_mmgbsa(), but scoped to assays that
+        actually have something to delete.
+
+        Returns a dict {'assay_id', 'md_assay', 'description', 'assay_folder_path',
+        'ligand_name', 'pose_id', 'run_folders'}, or None if cancelled / none found.
+        """
+        import sqlite3
+
+        try:
+            conn = sqlite3.connect(self.__md_registers_db)
+            cursor = conn.cursor()
+
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='md_assays';")
+            if not cursor.fetchone():
+                print("❌ No MD assays found (md_assays table does not exist).")
+                conn.close()
+                return None
+
+            cursor.execute("""
+                SELECT assay_id, md_assay, description, assay_folder_path, ligand_name, pose_id
+                FROM md_assays
+                WHERE ligand_name IS NOT NULL
+                ORDER BY assay_id ASC
+            """)
+            rows = cursor.fetchall()
+            conn.close()
+
+            if not rows:
+                print("❌ No ligand-receptor MD assays found.")
+                return None
+
+            candidates = []
+            for assay_id, md_assay, description, folder, ligname, pose_id in rows:
+                folder = self._remap_project_path(folder)
+                if not folder or not os.path.isdir(folder):
+                    continue
+                run_folders = self._list_existing_mmgbsa_run_folders(folder)
+                if not run_folders:
+                    continue
+                candidates.append({
+                    'assay_id': assay_id,
+                    'md_assay': md_assay,
+                    'description': description,
+                    'assay_folder_path': folder,
+                    'ligand_name': ligname,
+                    'pose_id': pose_id,
+                    'run_folders': run_folders,
+                })
+
+            if not candidates:
+                print("❌ No MD assays with MM-GBSA runs found.")
+                return None
+
+            print(f"\n🧬 MD ASSAYS WITH MM-GBSA RUNS:")
+            print("=" * 70)
+            for a in candidates:
+                print(f"  Assay ID    : {a['assay_id']}")
+                print(f"  Name        : {a['md_assay']}")
+                print(f"  Ligand      : {a['ligand_name']}  (pose {a['pose_id']})")
+                print(f"  Description : {a['description']}")
+                print(f"  MM-GBSA runs: {len(a['run_folders'])} "
+                      f"({', '.join(os.path.basename(rf) for rf in a['run_folders'])})")
+                print("-" * 70)
+
+            assay_ids = [str(a['assay_id']) for a in candidates]
+            while True:
+                selection = input(
+                    "\n🔎 Enter the Assay ID to manage MM-GBSA deletions (or 'cancel'): "
+                ).strip()
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    print("❌ Operation cancelled.")
+                    return None
+                if selection in assay_ids:
+                    return next(a for a in candidates if str(a['assay_id']) == selection)
+                print("❌ Invalid Assay ID. Please try again.")
+
+        except Exception as e:
+            print(f"❌ Error selecting MD assay: {e}")
+            return None
+
+    def delete_mmgbsa_on_trajectory(self):
+        """
+        Delete an MM-GBSA computation created by compute_mmgbsa_on_trajectory():
+        the run's results folder on disk, plus its associated database registries.
+
+        For each selected run this removes:
+          - The on-disk run folder ('mmgbsa', 'mmgbsa_2', ...) under the assay
+            folder (complex/receptor/ligand topologies, stripped trajectory,
+            mmgbsa_results.dat, mmgbsa_decomp.dat, CSVs, logs, run_mmgbsa.sh).
+          - Its row in md_mmgbsa_runs (md_registers.db).
+          - Its row in md_mmgbsa_decomposition (md_registers.db), if any.
+          - If the run being deleted is the base 'mmgbsa' folder, also clears the
+            legacy mmgbsa_results column on md_assays, since _store_mmgbsa_results()
+            only ever mirrors that one run into it.
+
+        A single run or all runs for the chosen assay can be deleted in one pass.
+        """
+        import sqlite3
+        import shutil as _shutil
+
+        try:
+            print("\n🗑️  DELETE MM-GBSA COMPUTATION")
+            print("=" * 60)
+
+            assay_info = self._select_md_assay_with_mmgbsa_runs()
+            if assay_info is None:
+                return
+
+            run_folders = assay_info['run_folders']
+            assay_id = assay_info['assay_id']
+
+            print(f"\n📁 MM-GBSA runs for assay '{assay_info['md_assay']}' (ID {assay_id}):")
+            for i, rf in enumerate(run_folders, 1):
+                has_results = os.path.exists(os.path.join(rf, 'mmgbsa_results.dat'))
+                status = "✅ results available" if has_results else "⏳ no results (incomplete/pending)"
+                print(f"  [{i}] {os.path.basename(rf):<14} {status}")
+            print(f"  [a] ALL runs for this assay")
+
+            while True:
+                selection = input(
+                    "\nSelect run to delete (number, 'a' for all, or 'cancel'): "
+                ).strip().lower()
+                if selection in ['cancel', 'quit', 'exit']:
+                    print("❌ Deletion cancelled.")
+                    return
+                if selection == 'a':
+                    to_delete = list(run_folders)
+                    break
+                try:
+                    idx = int(selection) - 1
+                    if 0 <= idx < len(run_folders):
+                        to_delete = [run_folders[idx]]
+                        break
+                except ValueError:
+                    pass
+                print("❌ Invalid selection.")
+
+            print(f"\n⚠️  This will permanently delete {len(to_delete)} MM-GBSA run(s) "
+                  f"and their database records:")
+            for rf in to_delete:
+                print(f"   - {rf}")
+            confirm = input("🗑️  Confirm deletion? (yes/no) [default: no]: ").strip().lower() or 'no'
+            if confirm not in ['yes', 'y']:
+                print("❌ Deletion cancelled.")
+                return
+
+            conn = sqlite3.connect(self.__md_registers_db)
+            cursor = conn.cursor()
+
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='md_mmgbsa_runs'")
+            has_runs_table = cursor.fetchone() is not None
+
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='md_mmgbsa_decomposition'")
+            has_decomp_table = cursor.fetchone() is not None
+            decomp_has_folder_col = False
+            if has_decomp_table:
+                cursor.execute("PRAGMA table_info(md_mmgbsa_decomposition)")
+                decomp_has_folder_col = 'mmgbsa_folder' in {row[1] for row in cursor.fetchall()}
+
+            deleted = []
+            for rf in to_delete:
+                folder_name = os.path.basename(rf.rstrip(os.sep))
+                # Match the DB rows loosely (exact path, or same folder name under
+                # any path) as well, in case the project was relocated since the
+                # run was stored -- see the path-remapping note in CLAUDE.md.
+                folder_like = f"%{os.sep}{folder_name}"
+
+                try:
+                    if os.path.isdir(rf):
+                        _shutil.rmtree(rf)
+                except OSError as e:
+                    print(f"⚠️  Could not remove folder {rf}: {e}")
+                    continue
+
+                if has_runs_table:
+                    try:
+                        cursor.execute(
+                            "DELETE FROM md_mmgbsa_runs "
+                            "WHERE assay_id = ? AND (mmgbsa_folder = ? OR mmgbsa_folder LIKE ?)",
+                            (assay_id, rf, folder_like),
+                        )
+                    except Exception as e:
+                        print(f"⚠️  Could not remove md_mmgbsa_runs row for {folder_name}: {e}")
+
+                if has_decomp_table:
+                    try:
+                        if decomp_has_folder_col:
+                            cursor.execute(
+                                "DELETE FROM md_mmgbsa_decomposition "
+                                "WHERE assay_id = ? AND (mmgbsa_folder = ? OR mmgbsa_folder LIKE ?)",
+                                (assay_id, rf, folder_like),
+                            )
+                        elif folder_name == 'mmgbsa':
+                            # Legacy pre-migration schema (assay_id-only PK) has no
+                            # per-run folder to match against -- only safe to drop
+                            # when the base run itself is what's being deleted.
+                            cursor.execute(
+                                "DELETE FROM md_mmgbsa_decomposition WHERE assay_id = ?",
+                                (assay_id,),
+                            )
+                    except Exception as e:
+                        print(f"⚠️  Could not remove md_mmgbsa_decomposition row for {folder_name}: {e}")
+
+                if folder_name == 'mmgbsa':
+                    try:
+                        cursor.execute(
+                            "UPDATE md_assays SET mmgbsa_results = NULL WHERE assay_id = ?",
+                            (assay_id,),
+                        )
+                    except Exception as e:
+                        print(f"⚠️  Could not clear legacy mmgbsa_results column: {e}")
+
+                deleted.append(folder_name)
+                print(f"   ✓ Deleted run '{folder_name}'")
+
+            conn.commit()
+            conn.close()
+
+            print(f"\n✅ Deleted {len(deleted)}/{len(to_delete)} MM-GBSA run(s) "
+                  f"for assay '{assay_info['md_assay']}'.")
+
+        except Exception as e:
+            print(f"❌ Error deleting MM-GBSA computation: {e}")
 
     def list_md_assays(self):
         """List all MD assays registered in the project."""
