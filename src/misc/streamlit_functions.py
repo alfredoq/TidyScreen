@@ -275,16 +275,19 @@ def get_md_assay_status(assay_folder_path):
     return "🔄 Running"
 
 
-def get_md_mmgbsa_status(folder, mmgbsa_results_json):
+def get_md_mmgbsa_status(folder, mmgbsa_results_json, n_runs=0):
     """
     Return an emoji string indicating MM-GBSA computation status for an MD assay.
 
     Priority:
+      - n_runs > 1 (from md_mmgbsa_runs) → completed, reporting the run count
       - DB column populated → completed (parsed and stored)
       - mmgbsa_results.dat exists → background run finished, pending parse
       - mmgbsa/ folder exists → running in background
       - otherwise → not computed
     """
+    if n_runs and n_runs > 1:
+        return f'✅ Completed ({n_runs} runs)'
     if mmgbsa_results_json is not None and str(mmgbsa_results_json).strip():
         return '✅ Completed'
     if folder and os.path.isdir(folder):
@@ -294,6 +297,61 @@ def get_md_mmgbsa_status(folder, mmgbsa_results_json):
                 return '✅ Completed'
             return '🔄 Running'
     return '⬜ Not computed'
+
+
+def get_md_mmgbsa_runs(db_path, assay_id):
+    """
+    Retrieve all MM-GBSA runs recorded for a given MD assay from the md_mmgbsa_runs
+    table (one row per run/folder -- supports multiple MM-GBSA computations, with
+    different parameters, on the same trajectory).
+
+    Args:
+        db_path (str): Path to md_registers.db.
+        assay_id: The assay_id to look up.
+
+    Returns:
+        List[dict]: Runs ordered oldest first, each with keys run_id, mmgbsa_folder,
+            run_name, parameters (dict), results (dict), created_date. Empty list if
+            the table doesn't exist yet or has no rows for this assay.
+    """
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='md_mmgbsa_runs'"
+        )
+        if not cursor.fetchone():
+            conn.close()
+            return []
+        cursor.execute(
+            "SELECT run_id, mmgbsa_folder, parameters, results, created_date "
+            "FROM md_mmgbsa_runs WHERE assay_id = ? ORDER BY run_id ASC",
+            (assay_id,),
+        )
+        rows = cursor.fetchall()
+        conn.close()
+    except Exception:
+        return []
+
+    runs = []
+    for run_id, folder, params_json, results_json, created_date in rows:
+        try:
+            parameters = json.loads(params_json) if params_json else {}
+        except Exception:
+            parameters = {}
+        try:
+            results = json.loads(results_json) if results_json else {}
+        except Exception:
+            results = {}
+        runs.append({
+            'run_id': run_id,
+            'mmgbsa_folder': folder,
+            'run_name': os.path.basename(folder) if folder else '',
+            'parameters': parameters,
+            'results': results,
+            'created_date': created_date,
+        })
+    return runs
 
 
 def get_md_assay_registers(db_path):
@@ -323,6 +381,28 @@ def get_md_assay_registers(db_path):
     if 'mmgbsa_results' not in df.columns:
         df['mmgbsa_results'] = None
 
+    # Per-assay MM-GBSA run count, from the (possibly absent) md_mmgbsa_runs table --
+    # lets the status column report "N runs" instead of just "Completed" once a
+    # trajectory has been re-analyzed with more than one set of parameters.
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='md_mmgbsa_runs'"
+        )
+        if cursor.fetchone():
+            runs_df = pd.read_sql_query(
+                "SELECT assay_id, COUNT(*) as n_mmgbsa_runs FROM md_mmgbsa_runs GROUP BY assay_id",
+                conn,
+            )
+            df = df.merge(runs_df, on='assay_id', how='left')
+        conn.close()
+    except Exception:
+        pass
+    if 'n_mmgbsa_runs' not in df.columns:
+        df['n_mmgbsa_runs'] = 0
+    df['n_mmgbsa_runs'] = df['n_mmgbsa_runs'].fillna(0).astype(int)
+
     try:
         df['status'] = df['assay_folder_path'].apply(get_md_assay_status)
     except Exception:
@@ -330,7 +410,7 @@ def get_md_assay_registers(db_path):
 
     try:
         df['mmgbsa'] = df.apply(
-            lambda r: get_md_mmgbsa_status(r['assay_folder_path'], r['mmgbsa_results']),
+            lambda r: get_md_mmgbsa_status(r['assay_folder_path'], r['mmgbsa_results'], r['n_mmgbsa_runs']),
             axis=1,
         )
     except Exception:

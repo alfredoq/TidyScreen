@@ -2770,34 +2770,29 @@ class MolDyn:
                     print(f"❌ Required file not found: {req_file}")
                     return
 
-            mmgbsa_folder = os.path.join(assay_folder, 'mmgbsa')
-
-            # If a previous run already produced results (e.g. it was launched in the
-            # background), offer to parse and store them instead of recomputing.
-            existing_results_dat = os.path.join(mmgbsa_folder, 'mmgbsa_results.dat')
-            if os.path.exists(existing_results_dat):
-                print(f"\n📄 Found existing MM-GBSA results: {existing_results_dat}")
-                parse_existing = input(
-                    "🔎 Parse and store these existing results (instead of recomputing)? (yes/no) [default: yes]: "
-                ).strip().lower() or 'yes'
-                if parse_existing in ['yes', 'y']:
-                    self._collect_and_store_existing_mmgbsa(assay_id, mmgbsa_folder, assay_info)
-                    return
+            # Resolve which run folder this computation should use. A trajectory can
+            # have multiple MM-GBSA runs with different parameters: the first run
+            # always uses the base 'mmgbsa' folder, and subsequent runs are numbered
+            # 'mmgbsa_2', 'mmgbsa_3', ... (see _next_mmgbsa_run_folder()). If prior
+            # run(s) already exist, the user can instead parse an existing completed
+            # run, or overwrite one of them.
+            mmgbsa_folder = self._resolve_mmgbsa_computation_folder(assay_folder, assay_id, assay_info)
+            if mmgbsa_folder is None:
+                return
+            if mmgbsa_folder == 'handled':
+                return
 
             mmgbsa_params = self._collect_mmgbsa_parameters(ligand_name)
             if mmgbsa_params is None:
+                # Clean up the (empty) run folder just created/cleared above so a
+                # cancelled parameter collection doesn't leave stray empty folders
+                # behind to confuse the next run-numbering pass.
+                try:
+                    if os.path.isdir(mmgbsa_folder) and not os.listdir(mmgbsa_folder):
+                        os.rmdir(mmgbsa_folder)
+                except OSError:
+                    pass
                 return
-
-            if os.path.exists(mmgbsa_folder):
-                print(f"\n⚠️  MM-GBSA folder already exists: {mmgbsa_folder}")
-                confirm = input("🗑️  Delete existing folder and continue? (yes/no) [default: no]: ").strip().lower() or 'no'
-                if confirm not in ['yes', 'y']:
-                    print("❌ MM-GBSA computation cancelled.")
-                    return
-                import shutil as _shutil
-                _shutil.rmtree(mmgbsa_folder)
-            os.makedirs(mmgbsa_folder)
-            print(f"\n📂 MM-GBSA output folder: {mmgbsa_folder}")
 
             print(f"\n⚙️  Running ante-MMPBSA.py to generate gas-phase topologies...")
             com_prmtop, rec_prmtop, lig_prmtop = self._run_ante_mmpbsa(
@@ -2832,6 +2827,151 @@ class MolDyn:
         except Exception as e:
             print(f"\n❌ Error computing MM-GBSA: {e}")
             traceback.print_exc()
+
+    def _list_existing_mmgbsa_run_folders(self, assay_folder):
+        """
+        Return existing MM-GBSA run folders under assay_folder, sorted by run number:
+        the base 'mmgbsa' folder (run 1, if present) first, then 'mmgbsa_2',
+        'mmgbsa_3', ... in ascending order.
+        """
+        import re
+
+        found = []
+        base = os.path.join(assay_folder, 'mmgbsa')
+        if os.path.isdir(base):
+            found.append((1, base))
+        try:
+            for entry in os.listdir(assay_folder):
+                m = re.fullmatch(r'mmgbsa_(\d+)', entry)
+                if m:
+                    full = os.path.join(assay_folder, entry)
+                    if os.path.isdir(full):
+                        found.append((int(m.group(1)), full))
+        except OSError:
+            pass
+        found.sort(key=lambda x: x[0])
+        return [path for _, path in found]
+
+    def _next_mmgbsa_run_folder(self, assay_folder, existing_run_folders=None):
+        """
+        Return the path for the next unused MM-GBSA run folder: 'mmgbsa' if none
+        exist yet, otherwise 'mmgbsa_N' where N is one more than the highest run
+        number already present.
+        """
+        import re
+
+        if existing_run_folders is None:
+            existing_run_folders = self._list_existing_mmgbsa_run_folders(assay_folder)
+
+        max_n = 0
+        for path in existing_run_folders:
+            name = os.path.basename(path.rstrip(os.sep))
+            if name == 'mmgbsa':
+                max_n = max(max_n, 1)
+                continue
+            m = re.fullmatch(r'mmgbsa_(\d+)', name)
+            if m:
+                max_n = max(max_n, int(m.group(1)))
+
+        next_n = max_n + 1
+        return os.path.join(assay_folder, 'mmgbsa' if next_n == 1 else f'mmgbsa_{next_n}')
+
+    def _prompt_select_mmgbsa_run_folder(self, candidate_folders):
+        """
+        Prompt the user to pick one folder from candidate_folders. Returns the chosen
+        path, the only candidate directly if there is just one, or None if cancelled.
+        """
+        if not candidate_folders:
+            return None
+        if len(candidate_folders) == 1:
+            return candidate_folders[0]
+
+        print("\nSelect a run:")
+        for i, rf in enumerate(candidate_folders, 1):
+            print(f"  [{i}] {os.path.basename(rf)}")
+        while True:
+            selection = input("Run number (or 'cancel'): ").strip()
+            if selection.lower() in ['cancel', 'quit', 'exit']:
+                return None
+            try:
+                idx = int(selection) - 1
+                if 0 <= idx < len(candidate_folders):
+                    return candidate_folders[idx]
+            except ValueError:
+                pass
+            print("❌ Invalid selection.")
+
+    def _resolve_mmgbsa_computation_folder(self, assay_folder, assay_id, assay_info):
+        """
+        Decide (and prepare) which MM-GBSA run folder a fresh computation should use,
+        taking into account any run(s) already present for this assay. This is what
+        allows multiple MM-GBSA computations -- with different parameters -- to be
+        performed on the same MD trajectory, each kept in its own numbered folder
+        ('mmgbsa', 'mmgbsa_2', 'mmgbsa_3', ...).
+
+        Returns:
+            - 'handled' if the user chose to parse/store an existing completed run
+              instead -- the caller should just return, no fresh computation needed.
+            - the path of a freshly prepared (existing, empty) folder to compute into.
+            - None if the user cancelled.
+        """
+        import shutil as _shutil
+
+        existing_runs = self._list_existing_mmgbsa_run_folders(assay_folder)
+
+        if not existing_runs:
+            mmgbsa_folder = os.path.join(assay_folder, 'mmgbsa')
+            os.makedirs(mmgbsa_folder)
+            print(f"\n📂 MM-GBSA output folder: {mmgbsa_folder}")
+            return mmgbsa_folder
+
+        print(f"\n📁 Found {len(existing_runs)} existing MM-GBSA run(s) for this assay:")
+        for rf in existing_runs:
+            has_results = os.path.exists(os.path.join(rf, 'mmgbsa_results.dat'))
+            status = "✅ results available" if has_results else "⏳ no results (incomplete/pending)"
+            print(f"   - {os.path.basename(rf):<14} {status}")
+
+        print("\nWhat would you like to do?")
+        print("  [p] Parse/store results from one of the existing runs above")
+        print("  [o] Overwrite an existing run (delete its folder, recompute there)")
+        print("  [n] Start a NEW run in a new folder (keeps all existing runs intact)")
+        action = input("Choice (p/o/n) [default: n], or 'cancel': ").strip().lower() or 'n'
+
+        if action in ['cancel', 'quit', 'exit']:
+            print("❌ MM-GBSA computation cancelled.")
+            return None
+
+        if action in ['p', 'parse']:
+            with_results = [rf for rf in existing_runs
+                             if os.path.exists(os.path.join(rf, 'mmgbsa_results.dat'))]
+            if not with_results:
+                print("❌ None of the existing runs have results to parse yet.")
+                return None
+            chosen = self._prompt_select_mmgbsa_run_folder(with_results)
+            if chosen is None:
+                return None
+            self._collect_and_store_existing_mmgbsa(assay_id, chosen, assay_info)
+            return 'handled'
+
+        if action in ['o', 'overwrite']:
+            chosen = self._prompt_select_mmgbsa_run_folder(existing_runs)
+            if chosen is None:
+                return None
+            print(f"\n⚠️  This will delete: {chosen}")
+            confirm = input("🗑️  Confirm deletion and recompute? (yes/no) [default: no]: ").strip().lower() or 'no'
+            if confirm not in ['yes', 'y']:
+                print("❌ MM-GBSA computation cancelled.")
+                return None
+            _shutil.rmtree(chosen)
+            os.makedirs(chosen)
+            print(f"\n📂 MM-GBSA output folder: {chosen}")
+            return chosen
+
+        # default / 'n': start a brand-new run alongside the existing ones.
+        new_folder = self._next_mmgbsa_run_folder(assay_folder, existing_runs)
+        os.makedirs(new_folder)
+        print(f"\n📂 New MM-GBSA run folder: {new_folder}")
+        return new_folder
 
     def _select_completed_md_assay_for_mmgbsa(self):
         """
@@ -3481,13 +3621,39 @@ class MolDyn:
             print(f"⚠️  Error parsing MMPBSA.py output: {e}")
             return None
 
+    def _ensure_mmgbsa_runs_table(self, cursor):
+        """
+        Ensure md_mmgbsa_runs exists: one row per MM-GBSA run (assay_id +
+        mmgbsa_folder), so multiple runs with different parameters can coexist for
+        the same MD assay.
+        """
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS md_mmgbsa_runs (
+                run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                assay_id INTEGER NOT NULL,
+                mmgbsa_folder TEXT NOT NULL,
+                parameters TEXT,
+                results TEXT,
+                created_date TEXT,
+                UNIQUE(assay_id, mmgbsa_folder)
+            )
+        """)
+
     def _store_mmgbsa_results(self, assay_id, results, mmgbsa_params, mmgbsa_folder):
         """
-        Store MM-GBSA results as a JSON blob in the mmgbsa_results column of md_assays.
-        The column is created if it does not yet exist.
+        Store MM-GBSA results for one run in the md_mmgbsa_runs table (one row per
+        run, keyed by (assay_id, mmgbsa_folder)), so multiple MM-GBSA computations
+        with different parameters can be kept side by side for the same trajectory.
+
+        For the base 'mmgbsa' run folder (the original, single-run behaviour) the
+        same payload is also mirrored into the legacy mmgbsa_results column of
+        md_assays, so existing consumers that only look at that column (e.g. the
+        Streamlit GUI's MD assay status/detail view) keep working unchanged for the
+        common single-run case. The column is created if it does not yet exist.
         """
         import sqlite3
         import json
+        from datetime import datetime
 
         try:
             payload = {
@@ -3497,17 +3663,35 @@ class MolDyn:
             }
             conn = sqlite3.connect(self.__md_registers_db)
             cursor = conn.cursor()
-            try:
-                cursor.execute("ALTER TABLE md_assays ADD COLUMN mmgbsa_results TEXT")
-            except Exception:
-                pass  # column already exists
+
+            self._ensure_mmgbsa_runs_table(cursor)
             cursor.execute(
-                "UPDATE md_assays SET mmgbsa_results = ? WHERE assay_id = ?",
-                (json.dumps(payload, indent=2), assay_id),
+                "INSERT INTO md_mmgbsa_runs (assay_id, mmgbsa_folder, parameters, results, created_date) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(assay_id, mmgbsa_folder) DO UPDATE SET "
+                "parameters = excluded.parameters, results = excluded.results, "
+                "created_date = excluded.created_date",
+                (
+                    assay_id, mmgbsa_folder,
+                    json.dumps(mmgbsa_params), json.dumps(results),
+                    datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                ),
             )
+
+            if os.path.basename(mmgbsa_folder.rstrip(os.sep)) == 'mmgbsa':
+                try:
+                    cursor.execute("ALTER TABLE md_assays ADD COLUMN mmgbsa_results TEXT")
+                except Exception:
+                    pass  # column already exists
+                cursor.execute(
+                    "UPDATE md_assays SET mmgbsa_results = ? WHERE assay_id = ?",
+                    (json.dumps(payload, indent=2), assay_id),
+                )
+
             conn.commit()
             conn.close()
-            print(f"   ✓ MM-GBSA results stored in database (assay_id={assay_id})")
+            print(f"   ✓ MM-GBSA results stored in database "
+                  f"(assay_id={assay_id}, run={os.path.basename(mmgbsa_folder)})")
         except Exception as e:
             print(f"⚠️  Error storing MM-GBSA results in database: {e}")
 
@@ -3808,16 +3992,65 @@ class MolDyn:
                   f"'{receptor_template_name}': {e}")
         return {}
 
+    def _ensure_mmgbsa_decomposition_table(self, cursor):
+        """
+        Ensure md_mmgbsa_decomposition supports multiple runs per assay (one row per
+        (assay_id, mmgbsa_folder) pair, instead of the legacy one-row-per-assay
+        schema). Migrates an existing legacy table -- where assay_id alone was the
+        PRIMARY KEY -- by renaming it aside and copying its rows into the new
+        per-run schema, tagging them with whatever mmgbsa_folder they already
+        recorded (defaulting to 'mmgbsa' if that column itself predates this).
+        """
+        cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='md_mmgbsa_decomposition'"
+        )
+        exists = cursor.fetchone() is not None
+
+        needs_migration = False
+        if exists:
+            cursor.execute("PRAGMA table_info(md_mmgbsa_decomposition)")
+            pk_cols = [row[1] for row in cursor.fetchall() if row[5] > 0]
+            needs_migration = pk_cols == ['assay_id']
+
+        if needs_migration:
+            cursor.execute(
+                "ALTER TABLE md_mmgbsa_decomposition RENAME TO md_mmgbsa_decomposition_legacy"
+            )
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS md_mmgbsa_decomposition (
+                run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                assay_id INTEGER NOT NULL,
+                mmgbsa_folder TEXT NOT NULL,
+                data TEXT NOT NULL,
+                created_date TEXT,
+                UNIQUE(assay_id, mmgbsa_folder)
+            )
+        """)
+
+        if needs_migration:
+            cursor.execute("PRAGMA table_info(md_mmgbsa_decomposition_legacy)")
+            legacy_cols = {row[1] for row in cursor.fetchall()}
+            folder_expr = "mmgbsa_folder" if 'mmgbsa_folder' in legacy_cols else "'mmgbsa'"
+            cursor.execute(f"""
+                INSERT OR IGNORE INTO md_mmgbsa_decomposition (assay_id, mmgbsa_folder, data, created_date)
+                SELECT assay_id, COALESCE({folder_expr}, 'mmgbsa'), data, created_date
+                FROM md_mmgbsa_decomposition_legacy
+            """)
+            cursor.execute("DROP TABLE md_mmgbsa_decomposition_legacy")
+            print("   ℹ️  Migrated md_mmgbsa_decomposition to per-run schema")
+
     def _store_mmgbsa_decomposition(self, assay_id, decomp_df, mmgbsa_folder):
         """
         Store the renumbered per-residue MM-GBSA decomposition table as a JSON blob in
-        the `md_mmgbsa_decomposition` table of md_registers.db (keyed by assay_id), and
-        also write it as a CSV inside the mmgbsa folder. Returns the CSV path (or None).
+        the `md_mmgbsa_decomposition` table of md_registers.db, keyed by
+        (assay_id, mmgbsa_folder) so multiple runs on the same assay each keep their
+        own decomposition, and also write it as a CSV inside the mmgbsa run folder.
+        Returns the CSV path (or None).
 
         Mirrors MolDock._store_processed_mmgbsa_df_in_db() / _write_mmgbsa_fps().
         """
         import sqlite3
-        import json
         from datetime import datetime
 
         csv_path = None
@@ -3831,27 +4064,23 @@ class MolDyn:
         try:
             conn = sqlite3.connect(self.__md_registers_db)
             cursor = conn.cursor()
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS md_mmgbsa_decomposition (
-                    assay_id INTEGER PRIMARY KEY,
-                    data TEXT NOT NULL,
-                    mmgbsa_folder TEXT,
-                    created_date TEXT
-                )
-            """)
+            self._ensure_mmgbsa_decomposition_table(cursor)
             cursor.execute(
-                "INSERT OR REPLACE INTO md_mmgbsa_decomposition "
-                "(assay_id, data, mmgbsa_folder, created_date) VALUES (?, ?, ?, ?)",
+                "INSERT INTO md_mmgbsa_decomposition (assay_id, mmgbsa_folder, data, created_date) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(assay_id, mmgbsa_folder) DO UPDATE SET "
+                "data = excluded.data, created_date = excluded.created_date",
                 (
                     assay_id,
-                    decomp_df.to_json(orient='split'),
                     mmgbsa_folder,
+                    decomp_df.to_json(orient='split'),
                     datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                 ),
             )
             conn.commit()
             conn.close()
-            print(f"   ✓ Per-residue decomposition stored in database (assay_id={assay_id})")
+            print(f"   ✓ Per-residue decomposition stored in database "
+                  f"(assay_id={assay_id}, run={os.path.basename(mmgbsa_folder)})")
         except Exception as e:
             print(f"⚠️  Error storing per-residue MM-GBSA decomposition in database: {e}")
 

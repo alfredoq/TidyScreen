@@ -3535,19 +3535,45 @@ elif page == "MolDyn analysis":
                         with st.expander("🔬 Display MMGBSA results", expanded=False):
                             import json as _json, re as _re_mmgbsa
 
-                            # --- source 1: DB JSON blob ---
-                            _mmgbsa_json = _assay_row.get('mmgbsa_results')
+                            # --- Multiple runs: let the user pick which one to view ---
+                            # A trajectory can have several MM-GBSA runs (different
+                            # parameters) recorded in md_mmgbsa_runs; fall back to the
+                            # single-run sources below when that table has no rows yet
+                            # for this assay (e.g. it predates multi-run support).
+                            _mmgbsa_runs = st_funcs.get_md_mmgbsa_runs(
+                                md_registers_db_path, _assay_row.get('assay_id')
+                            )
+
                             _mmgbsa_results = None
                             _mmgbsa_params  = None
-                            if _mmgbsa_json:
-                                try:
-                                    _payload = _json.loads(_mmgbsa_json)
-                                    _mmgbsa_results = _payload.get('results', {})
-                                    _mmgbsa_params  = _payload.get('parameters', {})
-                                except Exception:
-                                    pass
 
-                            # --- source 2: mmgbsa_results.dat file ---
+                            if _mmgbsa_runs:
+                                _run_labels = [
+                                    f"{r['run_name']} — {r['created_date'] or 'unknown date'}"
+                                    for r in _mmgbsa_runs
+                                ]
+                                _run_choice = st.selectbox(
+                                    "MM-GBSA run:",
+                                    options=range(len(_mmgbsa_runs)),
+                                    format_func=lambda i: _run_labels[i],
+                                    index=len(_mmgbsa_runs) - 1,  # default to the most recent run
+                                    key=f"mmgbsa_run_select_{_selected_md_assay}",
+                                )
+                                _mmgbsa_results = _mmgbsa_runs[_run_choice]['results']
+                                _mmgbsa_params  = _mmgbsa_runs[_run_choice]['parameters']
+
+                            # --- source 1 (legacy, single-run): DB JSON blob ---
+                            if not _mmgbsa_results:
+                                _mmgbsa_json = _assay_row.get('mmgbsa_results')
+                                if _mmgbsa_json:
+                                    try:
+                                        _payload = _json.loads(_mmgbsa_json)
+                                        _mmgbsa_results = _payload.get('results', {})
+                                        _mmgbsa_params  = _payload.get('parameters', {})
+                                    except Exception:
+                                        pass
+
+                            # --- source 2 (legacy, single-run): mmgbsa_results.dat file ---
                             if not _mmgbsa_results:
                                 _dat_path = os.path.join(_assay_folder, 'mmgbsa', 'mmgbsa_results.dat')
                                 if os.path.exists(_dat_path):
