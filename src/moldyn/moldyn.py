@@ -3279,11 +3279,8 @@ class MolDyn:
             dec_verbose = None
             if idecomp:
                 print_res = self._input_parameter_choice(
-                    "print_res (residues included in decomposition output -- "
-                    "'all', or a comma-separated list/range of residue numbers "
-                    "in topology numbering, e.g. '1-10,15,20-30'; NOT a cpptraj-style "
-                    "'within X' selection, which MMPBSA.py rejects with "
-                    "'SelectionError: Invalid selection! Integers expected.')",
+                    "print_res ('all', or a comma-separated list/range of "
+                    "residue numbers in topology numbering, e.g. '1-10,15,20-30')",
                     default='all'
                 )
                 dec_verbose = int(self._get_parameter_choice(
