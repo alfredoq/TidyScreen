@@ -2792,9 +2792,10 @@ class MolDyn:
           2. Resolve which run folder to use (new run / overwrite / parse existing --
              see _resolve_mmgbsa_computation_folder(), supports multiple MM-GBSA
              runs per trajectory)
-          3. Obtain MM-GBSA parameters -- either a saved computation condition
-             (create_mmgbsa_computation_conditions()) plus execution parameters,
-             or the fully manual wizard (see _resolve_mmgbsa_run_parameters())
+          3. Obtain MM-GBSA parameters from a saved computation condition
+             (create_mmgbsa_computation_conditions()) plus execution parameters
+             (see _resolve_mmgbsa_run_parameters()). A saved condition is
+             mandatory: the method aborts if none exist.
           4. Run ante-MMPBSA.py to generate gas-phase receptor/ligand/complex topologies
           5. Write the MMPBSA.py input namelist
           6. Write run_mmgbsa.sh execution script
@@ -2822,6 +2823,13 @@ class MolDyn:
                     print(f"❌ Required file not found: {req_file}")
                     return
 
+            # A saved computation condition is mandatory. Check before resolving the
+            # run folder, since the 'overwrite' option deletes a run folder up front.
+            if not self.list_mmgbsa_computation_conditions(verbose=False):
+                print("❌ No saved MM-GBSA computation conditions found.")
+                print("💡 Create one first using create_mmgbsa_computation_conditions()")
+                return
+
             # Resolve which run folder this computation should use. A trajectory can
             # have multiple MM-GBSA runs with different parameters: the first run
             # always uses the base 'mmgbsa' folder, and subsequent runs are numbered
@@ -2834,8 +2842,7 @@ class MolDyn:
             if mmgbsa_folder == 'handled':
                 return
 
-            # Either apply a saved computation condition (create_mmgbsa_computation_
-            # conditions()) or fall back to the fully manual wizard when none exist.
+            # Apply a saved computation condition (create_mmgbsa_computation_conditions()).
             mmgbsa_params = self._resolve_mmgbsa_run_parameters(ligand_name)
             if mmgbsa_params is None:
                 # Clean up the (empty) run folder just created/cleared above so a
@@ -3882,30 +3889,20 @@ class MolDyn:
 
     def _resolve_mmgbsa_run_parameters(self, ligand_name):
         """
-        Decide how to obtain this run's MM-GBSA parameters: apply a saved
-        computation condition (mmgbsa_conditions.db) plus freshly-collected
-        execution parameters, or fall back to the fully manual
-        _collect_mmgbsa_parameters() wizard when no conditions exist yet (or the
-        user prefers manual entry).
+        Obtain this run's MM-GBSA parameters from a saved computation condition
+        (mmgbsa_conditions.db) plus freshly-collected execution parameters. Using a
+        saved condition is mandatory -- there is no manual parameter entry.
 
-        Returns a flat mmgbsa_params dict in the same shape
-        _collect_mmgbsa_parameters() returns (plus, when a condition is used,
-        the additional 'receptor_mask'/'idecomp'/'print_res'/'dec_verbose' keys
-        consumed by _write_mmgbsa_input_file()), or None if cancelled.
+        Returns a flat mmgbsa_params dict (the keys consumed by
+        _write_mmgbsa_input_file() and _prepare_mmgbsa_execution_script(), plus the
+        condition's id/name/description for provenance), or None if no condition
+        exists or the user cancels.
         """
         conditions_list = self.list_mmgbsa_computation_conditions(verbose=False)
         if not conditions_list:
-            return self._collect_mmgbsa_parameters(ligand_name)
-
-        print("\nHow would you like to set the MM-GBSA parameters for this run?")
-        print("  [s] Use a saved computation condition")
-        print("  [m] Enter parameters manually")
-        choice = input("Choice (s/m) [default: s], or 'cancel': ").strip().lower() or 's'
-
-        if choice in ['cancel', 'quit', 'exit']:
+            print("❌ No saved MM-GBSA computation conditions found.")
+            print("💡 Create one first using create_mmgbsa_computation_conditions()")
             return None
-        if choice in ['m', 'manual']:
-            return self._collect_mmgbsa_parameters(ligand_name)
 
         chosen = self._prompt_select_mmgbsa_condition(conditions_list)
         if chosen is None:
@@ -3944,130 +3941,6 @@ class MolDyn:
               f"(igb={mmgbsa_params['igb']}, saltcon={mmgbsa_params['saltcon']}, "
               f"idecomp={mmgbsa_params['idecomp']})")
         return mmgbsa_params
-
-    def _collect_mmgbsa_parameters(self, ligand_name):
-        """
-        Interactively collect MM-GBSA parameters from the user.
-        Returns a dict of parameters, or None if the user cancels.
-        """
-        try:
-            print(f"\n⚙️  MM-GBSA CONFIGURATION")
-            print("-" * 60)
-
-            params = {}
-
-            # Ligand residue mask in the AMBER topology.
-            # antechamber preserves the residue name from the input PDB (usually 'LIG'
-            # for AutoDock-derived poses or whatever moldf wrote).  Ask the user to
-            # confirm, defaulting to :LIG.
-            default_lig_mask = ':UNL'
-            print(f"\nThe ligand residue name in the AMBER topology is set by antechamber")
-            print(f"from the input PDB residue name (commonly 'UNL' for docked poses).")
-            lig_mask = input(
-                "Ligand residue mask (e.g. :UNL, :LIG) [default: " + default_lig_mask + "]: "
-            ).strip() or default_lig_mask
-            params['ligand_mask'] = lig_mask
-
-            # Residues to strip — must include water and ions but NOT the ligand.
-            # Every residue name needs its own : prefix so ante-MMPBSA.py identifies
-            # each as a residue selector (e.g. :WAT,:Na+,:Cl-).
-            strip_mask = input(
-                "Mask for residues to strip (solvent/ions) [default: :WAT,:Na+,:Cl-]: "
-            ).strip() or ':WAT,:Na+,:Cl-'
-            params['strip_mask'] = strip_mask
-
-            # GB model
-            print("\nGB model options:")
-            print("  2 = Onufriev et al. (2000) model I")
-            print("  5 = Onufriev et al. (2000) model II  (recommended for proteins)")
-            print("  7 = Mongan et al. (2007)")
-            print("  8 = Nguyen et al. (2013)")
-            igb_str = input("GB model (igb) [default: 5]: ").strip() or '5'
-            try:
-                igb = int(igb_str)
-                if igb not in [1, 2, 5, 7, 8]:
-                    print("⚠️  Unsupported igb value, defaulting to 5")
-                    igb = 5
-            except ValueError:
-                igb = 5
-            params['igb'] = igb
-
-            # Salt concentration
-            saltcon_str = input("\nSalt concentration (M) [default: 0.15]: ").strip() or '0.15'
-            try:
-                params['saltcon'] = float(saltcon_str)
-            except ValueError:
-                params['saltcon'] = 0.15
-
-            # Frame selection
-            print("\nTrajectory frame selection:")
-            try:
-                params['startframe'] = int(input("  Start frame [default: 1]: ").strip() or '1')
-                params['endframe'] = int(input("  End frame [default: 9999]: ").strip() or '9999')
-                params['interval'] = int(input("  Interval (every Nth frame) [default: 1]: ").strip() or '1')
-            except ValueError:
-                params['startframe'] = 1
-                params['endframe'] = 9999
-                params['interval'] = 1
-
-            # Per-residue energy decomposition (idecomp=2, mirrors the docking
-            # MMGBSA fingerprint pipeline in MolDock.compute_fingerprints()).
-            # The resulting per-residue table is renumbered back to the original
-            # receptor numbering before being stored.
-            perres_str = input(
-                "\nCompute per-residue energy decomposition? (yes/no) [default: yes]: "
-            ).strip().lower() or 'yes'
-            params['per_residue'] = perres_str in ['yes', 'y']
-
-            # Whether to keep MMPBSA.py temporary files
-            keep_str = input(
-                "\nKeep MMPBSA.py intermediate files? (yes/no) [default: no]: "
-            ).strip().lower() or 'no'
-            params['keep_files'] = keep_str in ['yes', 'y']
-
-            # Parallel execution via MMPBSA.py.MPI (mpirun). A multi-frame trajectory
-            # benefits from splitting frames across MPI ranks; MMPBSA.py.MPI mirrors
-            # the serial MMPBSA.py CLI and is invoked as `mpirun -np N MMPBSA.py.MPI ...`.
-            mpi_str = input(
-                "\nParallelize using MMPBSA.py.MPI (mpirun)? (yes/no) [default: yes]: "
-            ).strip().lower() or 'yes'
-            params['use_mpi'] = mpi_str in ['yes', 'y']
-
-            if params['use_mpi']:
-                nproc_str = input(
-                    "Number of processors to use [default: 8]: "
-                ).strip() or '8'
-                try:
-                    n_processors = int(nproc_str)
-                    if n_processors < 1:
-                        print("⚠️  Invalid processor count, defaulting to 8")
-                        n_processors = 8
-                except ValueError:
-                    print("⚠️  Invalid processor count, defaulting to 8")
-                    n_processors = 8
-                params['n_processors'] = n_processors
-            else:
-                params['n_processors'] = 1
-
-            print(f"\n✅ MM-GBSA parameters configured:")
-            print(f"   Ligand mask : {params['ligand_mask']}")
-            print(f"   Strip mask  : {params['strip_mask']}")
-            print(f"   GB model    : igb={params['igb']}")
-            print(f"   Salt conc.  : {params['saltcon']} M")
-            print(f"   Frames      : {params['startframe']} to {params['endframe']}, every {params['interval']}")
-            print(f"   Per-residue : {'yes' if params['per_residue'] else 'no'}")
-            if params['use_mpi']:
-                print(f"   Execution   : parallel (MMPBSA.py.MPI, {params['n_processors']} processors)")
-            else:
-                print(f"   Execution   : serial (MMPBSA.py)")
-            return params
-
-        except KeyboardInterrupt:
-            print("\n❌ MM-GBSA parameter collection cancelled.")
-            return None
-        except Exception as e:
-            print(f"❌ Error collecting MM-GBSA parameters: {e}")
-            return None
 
     def _run_ante_mmpbsa(self, prmtop_file, mmgbsa_folder, mmgbsa_params):
         """
@@ -4186,12 +4059,10 @@ class MolDyn:
         """
         Write the MMPBSA.py input namelist file and return its path.
 
-        mmgbsa_params may come either from the plain manual wizard
-        (_collect_mmgbsa_parameters(), which only sets a boolean 'per_residue') or
-        from a saved computation condition applied via _resolve_mmgbsa_run_parameters()
-        (which additionally carries 'receptor_mask', 'idecomp', 'print_res' and
-        'dec_verbose'). Both shapes are handled: when the richer keys are absent, the
-        previous hardcoded idecomp=2 / csv_format=0 behaviour is used unchanged.
+        mmgbsa_params comes from a saved computation condition applied via
+        _resolve_mmgbsa_run_parameters() ('receptor_mask', 'idecomp', 'print_res',
+        'dec_verbose', ...). If 'idecomp' is absent, a boolean 'per_residue' falls
+        back to the hardcoded idecomp=2 / csv_format=0 behaviour.
         """
         import re
 

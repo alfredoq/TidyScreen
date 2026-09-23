@@ -2,6 +2,7 @@ from io import StringIO, BytesIO
 import sqlite3
 import os
 import json
+import re
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -485,6 +486,307 @@ def get_mmgbsa_condition_mismatches(run_parameters, condition):
             if _normalize_mmgbsa_value(flat.get(k)) != _normalize_mmgbsa_value(run_parameters.get(k)):
                 mismatches.append((k, run_parameters.get(k), flat.get(k)))
     return mismatches
+
+
+# --- MM-GBSA energy decomposition (mmgbsa_decomp.dat) -----------------------
+
+# idecomp semantics, as written by MMPBSA.py in the decomposition file header.
+MMGBSA_IDECOMP_DESCRIPTIONS = {
+    1: "Per-residue decomposition, 1-4 interactions added to Internal",
+    2: "Per-residue decomposition, 1-4 interactions added to EEL and VDW",
+    3: "Pairwise decomposition, 1-4 interactions added to Internal",
+    4: "Pairwise decomposition, 1-4 interactions added to EEL and VDW",
+}
+
+# Energy terms of the decomposition table: (column, display label)
+MMGBSA_DECOMP_TERMS = [
+    ('total', 'TOTAL'),
+    ('vdw', 'van der Waals'),
+    ('ele', 'Electrostatic'),
+    ('polar_solvation', 'Polar solvation'),
+    ('nonpolar_solvation', 'Non-polar solvation'),
+    ('ele_polar', 'Electrostatic + Polar solvation'),
+    ('vdw_nonpolar', 'van der Waals + Non-polar solvation'),
+    ('internal', 'Internal'),
+]
+
+# Derived terms: column -> the two terms summed. Their SD is propagated assuming
+# the two terms are independent, sqrt(sd1^2 + sd2^2) -- MMPBSA.py does not report
+# the covariance, so this is an approximation (electrostatics and polar solvation
+# are typically anti-correlated, so the true SD of the sum is usually smaller).
+MMGBSA_DECOMP_COMBINED_TERMS = {
+    'ele_polar': ('ele', 'polar_solvation'),
+    'vdw_nonpolar': ('vdw', 'nonpolar_solvation'),
+}
+
+_DECOMP_ENERGY_RE = re.compile(r'(-?\d+\.\d+)\s*\+/-\s*(-?\d+\.\d+)')
+
+
+def _decomp_residue_label(field):
+    """'THR  25' -> 'THR25' (waters normalised to HOH, as MolDyn does)."""
+    parts = field.split()
+    if len(parts) < 2:
+        return field.strip()
+    resname, resnum = parts[0], parts[1]
+    if resname == 'WAT':
+        resname = 'HOH'
+    return f"{resname}{resnum}"
+
+
+def parse_mmgbsa_decomp_dat(decomp_file):
+    """
+    Parse an MMPBSA.py decomposition output file (`-do`, csv_format=0) into
+    DataFrames, keeping every table it contains.
+
+    Unlike MolDyn._parse_mmgbsa_decomposition_output() (which keeps only the first
+    table and drops the Internal term and the standard deviations), this reads:
+
+    - every block: 'Complex:', 'Receptor:', 'Ligand:' (only with dec_verbose 1/3)
+      and 'DELTAS:' (always);
+    - every component: 'Total', 'Sidechain' and 'Backbone' Energy Decomposition
+      (the latter two only with dec_verbose 2/3);
+    - both layouts: per-residue (idecomp 1/2: 'Residue | Location | ...') and
+      pairwise (idecomp 3/4: 'Resid 1 | Resid 2 | ...');
+    - avg and std for each energy term (Internal, vdW, EEL, polar, non-polar, TOTAL),
+      plus the derived sums in MMGBSA_DECOMP_COMBINED_TERMS (EEL + polar solvation,
+      vdW + non-polar solvation).
+
+    Residues are labelled with the topology (sequential) numbering of the first
+    column, e.g. 'THR25'; the ligand keeps its topology number, e.g. 'UNL303'.
+
+    Returns:
+        dict with keys:
+          'idecomp'     : int or None (from the 'idecomp = N:' header line)
+          'layout'      : 'per_residue' | 'pairwise' | None
+          'tables'      : {(block, component): DataFrame}, in file order
+        or None if the file is missing/unreadable.
+        Per-residue DataFrames have columns residue, location, is_ligand, then
+        <term>, <term>_sd for each term; pairwise ones residue1, residue2 instead.
+    """
+    if not decomp_file or not os.path.exists(decomp_file):
+        return None
+    try:
+        with open(decomp_file, 'r') as f:
+            lines = f.readlines()
+    except Exception:
+        return None
+
+    idecomp = None
+    layout = None
+    tables = {}
+    block = 'DELTAS'
+    component = 'Total'
+    rows = None  # rows of the table currently being read
+
+    term_cols = ['internal', 'vdw', 'ele', 'polar_solvation', 'nonpolar_solvation', 'total']
+
+    def _flush():
+        if rows:
+            tables[(block, component)] = pd.DataFrame(rows)
+
+    for line in lines:
+        stripped = line.strip()
+        m = re.match(r'idecomp\s*=\s*(\d)', stripped)
+        if m:
+            idecomp = int(m.group(1))
+            continue
+        m = re.match(r'^(Complex|Receptor|Ligand|DELTAS):', stripped)
+        if m:
+            block = m.group(1)
+            continue
+        m = re.match(r'^(Total|Sidechain|Backbone) Energy Decomposition:', stripped)
+        if m:
+            component = m.group(1)
+            continue
+        if stripped.startswith('Residue') and '|' in stripped:
+            layout, rows = 'per_residue', []
+            continue
+        if stripped.startswith('Resid 1') and '|' in stripped:
+            layout, rows = 'pairwise', []
+            continue
+        if rows is None or stripped.startswith('---'):
+            continue
+        if not stripped:
+            _flush()
+            rows = None
+            continue
+
+        fields = line.split('|')
+        if len(fields) < 8:
+            continue
+        energies = [_DECOMP_ENERGY_RE.search(f) for f in fields[2:8]]
+        if not all(energies):
+            continue
+        if layout == 'per_residue':
+            location = fields[1].strip()
+            row = {
+                'residue': _decomp_residue_label(fields[0]),
+                'location': location,
+                'is_ligand': location.startswith('L'),
+            }
+        else:
+            row = {
+                'residue1': _decomp_residue_label(fields[0]),
+                'residue2': _decomp_residue_label(fields[1]),
+            }
+        for col, e in zip(term_cols, energies):
+            row[col] = float(e.group(1))
+            row[f'{col}_sd'] = float(e.group(2))
+        for col, (a, b) in MMGBSA_DECOMP_COMBINED_TERMS.items():
+            row[col] = round(row[a] + row[b], 3)
+            row[f'{col}_sd'] = round(float(np.hypot(row[f'{a}_sd'], row[f'{b}_sd'])), 3)
+        rows.append(row)
+
+    _flush()  # file ending without a trailing blank line
+    return {'idecomp': idecomp, 'layout': layout, 'tables': tables}
+
+
+def get_md_receptor_renumbering_dict(project_path, receptor_template_name=None,
+                                     docking_assay_id=None):
+    """
+    Sequential -> original residue renumbering dict (e.g. {'THR25': 'THR25_A'})
+    stored in pdb_templates.renumbering_dict (pdbs.db) for an MD assay's receptor.
+
+    Mirrors MolDyn._get_receptor_renumbering_dict(): when the MD assay did not
+    record receptor_template_name (older ligand-receptor assays), it is recovered
+    from the linked docking assay's receptor_info, as in
+    MolDyn._resolve_template_from_docking_assay().
+
+    Returns an empty dict when nothing can be resolved.
+    """
+    if not receptor_template_name and docking_assay_id is not None:
+        m = re.search(r'(\d+)', str(docking_assay_id))
+        dock_db = os.path.join(project_path, 'docking', 'docking_registers', 'docking_assays.db')
+        if m and os.path.exists(dock_db):
+            try:
+                conn = sqlite3.connect(dock_db)
+                row = conn.execute(
+                    "SELECT receptor_info FROM docking_assays WHERE assay_id = ?",
+                    (int(m.group(1)),),
+                ).fetchone()
+                conn.close()
+                if row and row[0]:
+                    info = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+                    if isinstance(info, dict):
+                        receptor_template_name = info.get('template_name')
+            except Exception:
+                pass
+
+    if not receptor_template_name:
+        return {}
+
+    pdbs_db = os.path.join(project_path, 'docking', 'receptors', 'pdbs.db')
+    if not os.path.exists(pdbs_db):
+        return {}
+    try:
+        conn = sqlite3.connect(pdbs_db)
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(pdb_templates)")
+        if not any(r[1] == 'renumbering_dict' for r in cursor.fetchall()):
+            conn.close()
+            return {}
+        row = cursor.execute(
+            "SELECT renumbering_dict FROM pdb_templates WHERE pdb_template_name = ?",
+            (str(receptor_template_name),),
+        ).fetchone()
+        conn.close()
+        if row and row[0]:
+            return json.loads(row[0])
+    except Exception:
+        pass
+    return {}
+
+
+def renumber_mmgbsa_decomp_table(df, renumbering_dict):
+    """Return a copy of a decomposition table with receptor residues mapped to the
+    original numbering (ligand/unmapped residues are kept as-is)."""
+    if not renumbering_dict:
+        return df
+    df = df.copy()
+    for col in ('residue', 'residue1', 'residue2'):
+        if col in df.columns:
+            df[col] = df[col].map(lambda x: renumbering_dict.get(x, x))
+    return df
+
+
+# Diverging encoding for energies: favorable (negative) = blue, unfavorable
+# (positive) = red, neutral gray midpoint at 0 kcal/mol.
+_DECOMP_FAVORABLE = '#2a78d6'
+_DECOMP_UNFAVORABLE = '#e34948'
+_DECOMP_NEUTRAL = '#f0efec'
+
+
+def create_mmgbsa_decomp_bar_plot(df, label_col, value_col, title, xlabel, sd_col=None):
+    """
+    Horizontal bar chart of a decomposition energy term per residue (or per residue
+    pair partner), sorted so the most favorable contribution is on top. Bars are
+    colored by sign (blue = favorable, red = unfavorable) with std-dev whiskers.
+    """
+    plot_df = df.sort_values(value_col, ascending=False)
+    n = len(plot_df)
+    fig, ax = plt.subplots(figsize=(8, max(2.0, 0.28 * n + 1.0)))
+    values = plot_df[value_col].values
+    colors = [_DECOMP_FAVORABLE if v < 0 else _DECOMP_UNFAVORABLE for v in values]
+    ax.barh(
+        range(n), values, color=colors, height=0.7,
+        xerr=plot_df[sd_col].values if sd_col and sd_col in plot_df.columns else None,
+        error_kw={'elinewidth': 1, 'ecolor': '#555555', 'capsize': 2},
+    )
+    ax.set_yticks(range(n))
+    ax.set_yticklabels(plot_df[label_col].astype(str).values, fontsize=8)
+    ax.axvline(0, color='#888888', linewidth=0.8)
+    ax.set_xlabel(xlabel)
+    ax.set_title(title, fontsize=10)
+    ax.grid(axis='x', color='#e5e5e5', linewidth=0.6)
+    ax.set_axisbelow(True)
+    for spine in ('top', 'right'):
+        ax.spines[spine].set_visible(False)
+    fig.tight_layout()
+    return fig
+
+
+def create_mmgbsa_pairwise_heatmap(df, value_col, title, residue_order=None, mask_diagonal=True):
+    """
+    Residue x residue heatmap of a pairwise decomposition term (rows = Resid 1,
+    columns = Resid 2), on a diverging blue-gray-red scale centered at 0 and
+    symmetric in magnitude. The diagonal (self terms, not interactions) is masked
+    by default.
+    """
+    from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm
+
+    matrix = df.pivot_table(index='residue1', columns='residue2', values=value_col, aggfunc='first')
+    if residue_order:
+        order = [r for r in residue_order if r in matrix.index or r in matrix.columns]
+        matrix = matrix.reindex(index=order, columns=order)
+    if mask_diagonal:
+        for r in matrix.index:
+            if r in matrix.columns:
+                matrix.loc[r, r] = np.nan
+
+    vmax = np.nanmax(np.abs(matrix.values)) if np.isfinite(matrix.values).any() else 1.0
+    vmax = vmax or 1.0
+    cmap = LinearSegmentedColormap.from_list(
+        'decomp_diverging', [_DECOMP_FAVORABLE, _DECOMP_NEUTRAL, _DECOMP_UNFAVORABLE]
+    )
+    cmap.set_bad('#ffffff')
+
+    n = len(matrix)
+    size = min(14, max(5, 0.18 * n + 2))
+    fig, ax = plt.subplots(figsize=(size + 1.5, size))
+    im = ax.imshow(matrix.values, cmap=cmap, norm=TwoSlopeNorm(vcenter=0, vmin=-vmax, vmax=vmax),
+                   aspect='equal', interpolation='nearest')
+    tick_fs = 8 if n <= 40 else 6
+    ax.set_xticks(range(n))
+    ax.set_xticklabels(matrix.columns, rotation=90, fontsize=tick_fs)
+    ax.set_yticks(range(n))
+    ax.set_yticklabels(matrix.index, fontsize=tick_fs)
+    ax.set_xlabel('Resid 2')
+    ax.set_ylabel('Resid 1')
+    ax.set_title(title, fontsize=10)
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label('kcal/mol  (blue = favorable, red = unfavorable)')
+    fig.tight_layout()
+    return fig
 
 
 def get_md_assay_registers(db_path):

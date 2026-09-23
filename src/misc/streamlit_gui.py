@@ -3546,6 +3546,7 @@ elif page == "MolDyn analysis":
 
                             _mmgbsa_results = None
                             _mmgbsa_params  = None
+                            _mmgbsa_run_name = 'mmgbsa'  # legacy single-run folder
 
                             if _mmgbsa_runs:
                                 _run_labels = [
@@ -3561,6 +3562,7 @@ elif page == "MolDyn analysis":
                                 )
                                 _mmgbsa_results = _mmgbsa_runs[_run_choice]['results']
                                 _mmgbsa_params  = _mmgbsa_runs[_run_choice]['parameters']
+                                _mmgbsa_run_name = _mmgbsa_runs[_run_choice]['run_name'] or 'mmgbsa'
 
                             # --- source 1 (legacy, single-run): DB JSON blob ---
                             if not _mmgbsa_results:
@@ -3684,6 +3686,218 @@ elif page == "MolDyn analysis":
                                 if _dg:
                                     st.markdown(
                                         f"**ΔG binding = {_dg['average']:.3f} ± {_dg['std_dev']:.3f} kcal/mol**"
+                                    )
+
+                                # --- Energy decomposition (mmgbsa_decomp.dat) ---
+                                # Layout depends on idecomp: 1/2 -> per-residue table,
+                                # 3/4 -> pairwise (Resid 1 x Resid 2) table.
+                                _decomp_idecomp = (_mmgbsa_params or {}).get('idecomp')
+                                if _decomp_idecomp is None and (_mmgbsa_params or {}).get('per_residue'):
+                                    _decomp_idecomp = 2  # manual wizard only records per_residue
+                                _decomp_dat = os.path.join(_assay_folder, _mmgbsa_run_name, 'mmgbsa_decomp.dat')
+                                _decomp = st_funcs.parse_mmgbsa_decomp_dat(_decomp_dat)
+
+                                if _decomp and _decomp['tables']:
+                                    _decomp_idecomp = _decomp['idecomp'] or _decomp_idecomp
+                                    _k = f"{_selected_md_assay}_{_mmgbsa_run_name}"
+                                    with st.expander(
+                                        f"🧩 Energy decomposition (idecomp={_decomp_idecomp})", expanded=False
+                                    ):
+                                        st.caption(
+                                            st_funcs.MMGBSA_IDECOMP_DESCRIPTIONS.get(
+                                                _decomp_idecomp, "Energy decomposition"
+                                            ) + f"  |  Source: `{_decomp_dat}`"
+                                        )
+
+                                        # Blocks (Complex/Receptor/Ligand/DELTAS) and components
+                                        # (Total/Sidechain/Backbone) present depend on dec_verbose.
+                                        _tbl_keys = list(_decomp['tables'].keys())
+                                        _blocks = list(dict.fromkeys(b for b, _ in _tbl_keys))
+                                        _dc1, _dc2, _dc3 = st.columns(3)
+                                        with _dc1:
+                                            _dec_block = st.selectbox(
+                                                "Energy set:", _blocks,
+                                                index=_blocks.index('DELTAS') if 'DELTAS' in _blocks else 0,
+                                                key=f"decomp_block_{_k}",
+                                                help="DELTAS = complex − receptor − ligand (binding contribution). "
+                                                     "Complex/Receptor/Ligand sets are only written with dec_verbose 1 or 3.",
+                                            )
+                                        _components = [c for b, c in _tbl_keys if b == _dec_block]
+                                        with _dc2:
+                                            _dec_comp = st.selectbox(
+                                                "Component:", _components, index=0,
+                                                key=f"decomp_comp_{_k}",
+                                                help="Sidechain/Backbone tables are only written with dec_verbose 2 or 3.",
+                                            )
+                                        # Internal carries the 1-4 terms only for idecomp 1/3.
+                                        _terms = [
+                                            (c, lbl) for c, lbl in st_funcs.MMGBSA_DECOMP_TERMS
+                                            if c != 'internal' or _decomp_idecomp in (1, 3)
+                                        ]
+                                        with _dc3:
+                                            _dec_term = st.selectbox(
+                                                "Energy term:", range(len(_terms)),
+                                                format_func=lambda i: _terms[i][1],
+                                                key=f"decomp_term_{_k}",
+                                            )
+                                        _term_col, _term_lbl = _terms[_dec_term]
+                                        if _term_col in st_funcs.MMGBSA_DECOMP_COMBINED_TERMS:
+                                            st.caption(
+                                                f"{_term_lbl} is summed per residue; its SD is approximated as "
+                                                "√(SD₁² + SD₂²), assuming independent terms (MMPBSA.py does not "
+                                                "report their covariance)."
+                                            )
+
+                                        _renum = st_funcs.get_md_receptor_renumbering_dict(
+                                            project_path,
+                                            _assay_row.get('receptor_template_name'),
+                                            _assay_row.get('docking_assay_id'),
+                                        )
+                                        _ddf = st_funcs.renumber_mmgbsa_decomp_table(
+                                            _decomp['tables'][(_dec_block, _dec_comp)], _renum
+                                        )
+                                        if not _renum:
+                                            st.caption("⚠️ No receptor renumbering available — residues use topology numbering.")
+
+                                        _energy_cols = []
+                                        for _c, _ in _terms:
+                                            _energy_cols += [_c, f"{_c}_sd"]
+                                        _col_cfg = {
+                                            f"{_c}": st.column_config.NumberColumn(_lbl, format="%.3f")
+                                            for _c, _lbl in _terms
+                                        }
+                                        _col_cfg.update({
+                                            f"{_c}_sd": st.column_config.NumberColumn(f"{_lbl} SD", format="%.3f")
+                                            for _c, _lbl in _terms
+                                        })
+
+                                        if _decomp['layout'] == 'per_residue':
+                                            # ---------- idecomp 1/2: per-residue ----------
+                                            _pc1, _pc2 = st.columns(2)
+                                            with _pc1:
+                                                _top_n = st.number_input(
+                                                    "Residues shown (top N by |value|):",
+                                                    min_value=1, max_value=len(_ddf),
+                                                    value=min(20, len(_ddf)), step=1,
+                                                    key=f"decomp_topn_{_k}",
+                                                )
+                                            with _pc2:
+                                                _excl_lig = st.checkbox(
+                                                    "Exclude ligand residue", value=True,
+                                                    key=f"decomp_excl_lig_{_k}",
+                                                    help="The ligand's own contribution usually dwarfs "
+                                                         "individual receptor residues.",
+                                                )
+                                            _plot_df = _ddf[~_ddf['is_ligand']] if _excl_lig else _ddf
+                                            _plot_df = _plot_df.reindex(
+                                                _plot_df[_term_col].abs().sort_values(ascending=False).index
+                                            ).head(int(_top_n))
+                                            if _plot_df.empty:
+                                                st.info("No residues to plot.")
+                                            else:
+                                                _fig = st_funcs.create_mmgbsa_decomp_bar_plot(
+                                                    _plot_df, 'residue', _term_col,
+                                                    title=f"Per-residue {_term_lbl} ({_dec_block}, {_dec_comp}) — top {len(_plot_df)}",
+                                                    xlabel=f"{_term_lbl} (kcal/mol)",
+                                                    sd_col=f"{_term_col}_sd",
+                                                )
+                                                st.pyplot(_fig, use_container_width=True, clear_figure=True)
+
+                                            _show_df = _ddf[['residue', 'location'] + _energy_cols]
+                                            st.dataframe(
+                                                _show_df, use_container_width=True, hide_index=True,
+                                                column_config={
+                                                    'residue': st.column_config.TextColumn("Residue"),
+                                                    'location': st.column_config.TextColumn("Location"),
+                                                    **_col_cfg,
+                                                },
+                                            )
+                                        else:
+                                            # ---------- idecomp 3/4: pairwise ----------
+                                            _residues = list(dict.fromkeys(
+                                                list(_ddf['residue1']) + list(_ddf['residue2'])
+                                            ))
+                                            _lig_resname = str(
+                                                (_mmgbsa_params or {}).get('ligand_mask') or ':UNL'
+                                            ).lstrip(':').split(',')[0].strip()
+                                            _lig_res = [r for r in _residues if _lig_resname and r.startswith(_lig_resname)]
+                                            _pc1, _pc2 = st.columns(2)
+                                            with _pc1:
+                                                _focus = st.selectbox(
+                                                    "Residue (Resid 1):", _residues,
+                                                    index=_residues.index(_lig_res[0]) if _lig_res else 0,
+                                                    key=f"decomp_focus_{_k}",
+                                                    help="Shows the pairwise energy between this residue and "
+                                                         "every other residue in print_res (defaults to the ligand).",
+                                                )
+                                            _pair_df = _ddf[(_ddf['residue1'] == _focus) & (_ddf['residue2'] != _focus)]
+                                            with _pc2:
+                                                _top_n = st.number_input(
+                                                    "Partners shown (top N by |value|):",
+                                                    min_value=1, max_value=max(1, len(_pair_df)),
+                                                    value=min(20, max(1, len(_pair_df))), step=1,
+                                                    key=f"decomp_topn_{_k}",
+                                                )
+                                            if _pair_df.empty:
+                                                st.info(f"No pairs with {_focus} as Resid 1 (only its self term was computed).")
+                                            else:
+                                                _plot_df = _pair_df.reindex(
+                                                    _pair_df[_term_col].abs().sort_values(ascending=False).index
+                                                ).head(int(_top_n))
+                                                _fig = st_funcs.create_mmgbsa_decomp_bar_plot(
+                                                    _plot_df, 'residue2', _term_col,
+                                                    title=f"Pairwise {_term_lbl} with {_focus} ({_dec_block}, {_dec_comp}) — top {len(_plot_df)}",
+                                                    xlabel=f"{_term_lbl} (kcal/mol)",
+                                                    sd_col=f"{_term_col}_sd",
+                                                )
+                                                st.pyplot(_fig, use_container_width=True, clear_figure=True)
+                                                _self = _ddf[(_ddf['residue1'] == _focus) & (_ddf['residue2'] == _focus)]
+                                                st.caption(
+                                                    f"Sum of {_term_lbl} over all partners of {_focus}: "
+                                                    f"{_pair_df[_term_col].sum():.3f} kcal/mol"
+                                                    + (f"  |  Self term ({_focus}–{_focus}): {_self[_term_col].iloc[0]:.3f} kcal/mol"
+                                                       if not _self.empty else "")
+                                                )
+
+                                            if len(_residues) > 1 and st.checkbox(
+                                                "Show pairwise matrix heatmap", value=False,
+                                                key=f"decomp_heatmap_{_k}",
+                                            ):
+                                                _fig_hm = st_funcs.create_mmgbsa_pairwise_heatmap(
+                                                    _ddf, _term_col,
+                                                    title=f"Pairwise {_term_lbl} ({_dec_block}, {_dec_comp}) — diagonal (self terms) masked",
+                                                    residue_order=_residues,
+                                                )
+                                                st.pyplot(_fig_hm, use_container_width=True, clear_figure=True)
+
+                                            _only_focus = st.checkbox(
+                                                f"Table: only pairs involving {_focus}", value=True,
+                                                key=f"decomp_table_focus_{_k}",
+                                            )
+                                            _show_df = _ddf[(_ddf['residue1'] == _focus) | (_ddf['residue2'] == _focus)] \
+                                                if _only_focus else _ddf
+                                            st.dataframe(
+                                                _show_df[['residue1', 'residue2'] + _energy_cols],
+                                                use_container_width=True, hide_index=True,
+                                                column_config={
+                                                    'residue1': st.column_config.TextColumn("Resid 1"),
+                                                    'residue2': st.column_config.TextColumn("Resid 2"),
+                                                    **_col_cfg,
+                                                },
+                                            )
+
+                                        st.download_button(
+                                            "⬇️ Download decomposition table (CSV)",
+                                            data=_ddf.to_csv(index=False).encode(),
+                                            file_name=f"{_assay_row.get('md_assay', 'md_assay')}_{_mmgbsa_run_name}_"
+                                                      f"decomp_{_dec_block}_{_dec_comp}.csv".replace(' ', '_'),
+                                            mime="text/csv",
+                                            key=f"decomp_download_{_k}",
+                                        )
+                                elif _decomp_idecomp:
+                                    st.caption(
+                                        f"Decomposition was requested (idecomp={_decomp_idecomp}) but "
+                                        f"`{_decomp_dat}` was not found or contains no table."
                                     )
 
                         with st.expander("⚙️ Execute custom analysis", expanded=False):
