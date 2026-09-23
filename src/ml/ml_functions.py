@@ -1059,15 +1059,512 @@ class MachineLearning:
         print(f"\n✅ Fingerprints exported to: {output_path}")
 
     # -------------------------------------------------------------------------
+    # Copying training set snapshots between projects
+    # -------------------------------------------------------------------------
+
+    def copy_training_set_snapshots_between_projects(self, source_project_name: Optional[str] = None,
+                                                     training_set_ids: Optional[list] = None,
+                                                     copy_models: Optional[bool] = None) -> Optional[list]:
+        """
+        Copy one or more training set snapshots, and all their associated data, from
+        another project into the active project. Works like
+        ChemSpace.copy_tables_within_projects(): first the source project is selected,
+        then the snapshot(s) to copy, and the copy is written into the active project.
+
+        For each snapshot, the following is copied into the active project:
+          - training_set_snapshots row (notes get a provenance line appended)
+          - training_set_entries rows (the positive/negative binder poses)
+          - training_set_fingerprints rows (precomputed ProLIF fingerprints)
+          - the pose PDB files referenced by the entries, placed under
+            ml/training_sets/snapshot_poses/<training_set_id>/<assay>/<directory>/
+            (docking assay names such as 'assay_24' are project-specific, so poses are
+            NOT placed into the docking/docking_assays tree); entries' pose_full_path
+            points to the copied file
+          - the ProLIF conditions the fingerprints were computed with: reused if an
+            identical condition already exists in docking/params/params.db, otherwise
+            registered there; prolif_conditions_id is remapped accordingly
+          - optionally, RF models trained on the snapshot (ml/models/rf_trained_models.db)
+
+        The copied snapshot is self-contained for inspection, 3D viewing, fingerprint
+        export and model training. It keeps the source docking assay names, so
+        recomputing its fingerprints (which re-restores poses from the docking
+        results) is not supported.
+
+        If a snapshot ID already exists in the active project, the user can overwrite
+        it, save the copy under a different ID, or skip it.
+
+        Args:
+            source_project_name (Optional[str]): Project to copy from. If None, prompts
+                an interactive project selection.
+            training_set_ids (Optional[list]): IDs of the snapshots to copy. If None,
+                prompts an interactive snapshot selection.
+            copy_models (Optional[bool]): Also copy RF models trained on the snapshots.
+                If None, asks when such models exist.
+
+        Returns:
+            list of per-snapshot summary dicts, or None if cancelled / nothing copied.
+        """
+        from tidyscreen.projects.projects_management import ProjectsManagement
+
+        try:
+            print("\n📦 COPY TRAINING SET SNAPSHOTS FROM ANOTHER PROJECT")
+            print("=" * 60)
+            print(f"   Destination (active project): {self.name}")
+
+            # --- Select source project ---
+            all_projects = ProjectsManagement().list_all_projects(print_output=False) or []
+            if not all_projects:
+                print("❌ No projects found in the projects database.")
+                return None
+
+            if source_project_name is None:
+                print("\n📋 Available projects:")
+                for idx, proj in enumerate(all_projects, 1):
+                    marker = " (active)" if proj['name'] == self.name else ""
+                    print(f"  [{idx}] {proj['name']}{marker}")
+                while True:
+                    selection = input("Select source project by number or name (or 'cancel' to abort): ").strip()
+                    if selection.lower() == 'cancel':
+                        print("❌ Operation cancelled by user.")
+                        return None
+                    if selection.isdigit():
+                        idx = int(selection) - 1
+                        if 0 <= idx < len(all_projects):
+                            source_project_name = all_projects[idx]['name']
+                            break
+                        print("⚠️ Invalid selection. Try again.")
+                    else:
+                        if any(p['name'] == selection for p in all_projects):
+                            source_project_name = selection
+                            break
+                        print("⚠️ Invalid selection. Try again.")
+
+            source_project = ActivateProject(source_project_name)
+            if not source_project.project_exists():
+                print(f"❌ Project '{source_project_name}' not found.")
+                return None
+            if os.path.realpath(source_project.path) == os.path.realpath(self.path):
+                print("❌ The source project is the active project. Select a different source project.")
+                return None
+
+            source_snapshots_db = os.path.join(source_project.path, 'ml', 'training_sets',
+                                               'training_sets_snapshots.db')
+
+            # --- Select snapshot(s) ---
+            snapshots = self._list_training_set_snapshots(source_snapshots_db)
+            if not snapshots:
+                print(f"❌ No training set snapshots found in project '{source_project_name}'.")
+                return None
+            available_ids = [s['training_set_id'] for s in snapshots]
+
+            if training_set_ids is None:
+                print(f"\n📋 Training set snapshots in project '{source_project_name}':")
+                for i, snap in enumerate(snapshots, 1):
+                    print(f"  [{i}] {snap['training_set_id']}  "
+                          f"(+{snap['n_positives']} / -{snap['n_negatives']}, {snap['created_at'][:10]})")
+                while True:
+                    sel = input("Select snapshot(s) to copy (e.g. 1,3 or 'all'), or 'cancel' to abort: ").strip().lower()
+                    if sel == 'cancel':
+                        print("❌ Operation cancelled by user.")
+                        return None
+                    if sel == 'all':
+                        training_set_ids = available_ids
+                        break
+                    try:
+                        idxs = [int(x) - 1 for x in sel.split(',') if x.strip()]
+                        if idxs and all(0 <= i < len(snapshots) for i in idxs):
+                            training_set_ids = list(dict.fromkeys(available_ids[i] for i in idxs))
+                            break
+                    except ValueError:
+                        pass
+                    print("⚠️ Invalid selection. Try again.")
+            else:
+                unknown = [t for t in training_set_ids if t not in available_ids]
+                if unknown:
+                    print(f"❌ Snapshot(s) not found in project '{source_project_name}': {', '.join(unknown)}")
+                    return None
+
+            # --- Optional: RF models trained on the selected snapshots ---
+            source_models_db = os.path.join(source_project.path, 'ml', 'models', 'rf_trained_models.db')
+            n_models = self._count_rf_models_for_training_sets(source_models_db, training_set_ids)
+            if copy_models is None:
+                copy_models = False
+                if n_models:
+                    ans = input(f"\n🤖 {n_models} RF model(s) were trained on the selected snapshot(s). "
+                                f"Copy them too? (yes/no) [default: yes]: ").strip().lower() or 'yes'
+                    copy_models = ans in ['yes', 'y']
+
+            # --- Resolve destination IDs (collisions) and copy ---
+            summaries = []
+            for ts_id in training_set_ids:
+                dest_id, overwrite = self._resolve_dest_training_set_id(ts_id)
+                if dest_id is None:
+                    print(f"   ⏭️  Skipped '{ts_id}'")
+                    continue
+                summary = self._copy_single_training_set_snapshot(
+                    source_project, ts_id, dest_id, copy_models, overwrite
+                )
+                if summary:
+                    summaries.append(summary)
+
+            if not summaries:
+                print("\n⚠️  No snapshots were copied.")
+                return None
+
+            print(f"\n{'=' * 60}")
+            print(f"✅ Copied {len(summaries)} snapshot(s) from '{source_project_name}' into '{self.name}'")
+            for s in summaries:
+                renamed = (f" (as '{s['new_training_set_id']}')"
+                           if s['new_training_set_id'] != s['training_set_id'] else "")
+                print(f"   • {s['training_set_id']}{renamed}: {s['n_entries']} entries, "
+                      f"{s['n_fingerprints']} fingerprints, {s['n_pose_files']} pose files, "
+                      f"{s['n_models']} model(s)")
+                for src_cid, dst_cid in s['prolif_condition_map'].items():
+                    print(f"       ProLIF condition {src_cid} (source) → {dst_cid} (active project)")
+                if s['missing_pose_files']:
+                    print(f"       ⚠️  {len(s['missing_pose_files'])} pose file(s) not found in the source "
+                          f"project; entries kept, 3D view unavailable for them")
+                if s['skipped_fingerprints']:
+                    print(f"       ⚠️  {s['skipped_fingerprints']} fingerprint(s) skipped: their ProLIF "
+                          f"condition no longer exists in the source project")
+            print(f"{'=' * 60}")
+            return summaries
+
+        except KeyboardInterrupt:
+            print("\n❌ Operation cancelled by user.")
+            return None
+        except Exception as e:
+            print(f"❌ Error copying training set snapshots: {e}")
+            return None
+
+    def _resolve_dest_training_set_id(self, training_set_id: str) -> tuple:
+        """
+        Pick the ID the copied snapshot gets in the active project. On a collision,
+        offers overwrite / rename / skip (as copy_tables_within_projects() does).
+        Returns (dest_id, overwrite) or (None, False) to skip.
+        """
+        dest_id = training_set_id
+        while self._training_set_id_exists(self.__training_sets_db, dest_id):
+            print(f"\n⚠️  Snapshot '{dest_id}' already exists in the active project '{self.name}'.")
+            print("Choose an action:")
+            print("  [1] Overwrite the existing snapshot")
+            print("  [2] Save the copy under a different ID")
+            print("  [3] Skip this snapshot")
+            action = input("Select action (1/2/3): ").strip()
+            if action == '1':
+                confirm = input(
+                    f"⚠️  This will permanently delete the existing '{dest_id}' snapshot (entries and "
+                    f"fingerprints) in '{self.name}'. Continue? (yes/no): "
+                ).strip().lower()
+                if confirm not in ['yes', 'y']:
+                    print("Overwrite cancelled.")
+                    continue
+                return dest_id, True
+            elif action == '2':
+                new_id = input(f"Enter a new ID for the copied snapshot (was '{dest_id}'): ").strip()
+                if not new_id:
+                    print("❌ No ID provided.")
+                    continue
+                dest_id = new_id
+            elif action == '3':
+                return None, False
+            else:
+                print("⚠️ Invalid selection. Try again.")
+        return dest_id, False
+
+    @staticmethod
+    def _training_set_id_exists(db_path: str, training_set_id: str) -> bool:
+        if not os.path.exists(db_path):
+            return False
+        conn = sqlite3.connect(db_path)
+        try:
+            if not conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='training_set_snapshots'").fetchone():
+                return False
+            return conn.execute(
+                "SELECT 1 FROM training_set_snapshots WHERE training_set_id = ?", (training_set_id,)
+            ).fetchone() is not None
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _count_rf_models_for_training_sets(models_db: str, training_set_ids: list) -> int:
+        if not os.path.exists(models_db) or not training_set_ids:
+            return 0
+        conn = sqlite3.connect(models_db)
+        try:
+            if not conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='rf_trained_models'").fetchone():
+                return 0
+            placeholders = ','.join('?' * len(training_set_ids))
+            return conn.execute(
+                f"SELECT COUNT(*) FROM rf_trained_models WHERE training_set_id IN ({placeholders})",
+                list(training_set_ids),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _ensure_tables_like_source(src_conn: sqlite3.Connection, dst_conn: sqlite3.Connection, tables: list):
+        """Create each table in dst with the exact schema it has in src (if absent),
+        so columns added over time (e.g. rf_trained_models) are carried over."""
+        for table in tables:
+            row = src_conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            ).fetchone()
+            if not row or not row[0]:
+                continue
+            exists = dst_conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            ).fetchone()
+            if exists:
+                # Add any column the source has but the (older) destination table lacks.
+                dst_cols = {r[1] for r in dst_conn.execute(f"PRAGMA table_info({table})")}
+                for _, name, col_type, *_ in src_conn.execute(f"PRAGMA table_info({table})"):
+                    if name not in dst_cols:
+                        dst_conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {col_type}")
+            else:
+                dst_conn.execute(row[0])
+
+    def _resolve_prolif_condition_from_source(self, source_project, src_condition_id: int) -> Optional[int]:
+        """
+        Return the ProLIF_Conditions id in the active project holding the same
+        conditions as src_condition_id in source_project: an identical existing record
+        is reused, otherwise the source record is registered here. Returns None if the
+        source record doesn't exist.
+        """
+        source_params_db = os.path.join(source_project.path, 'docking', 'params', 'params.db')
+        if not os.path.exists(source_params_db):
+            return None
+        conn = sqlite3.connect(source_params_db)
+        try:
+            if not conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='ProLIF_Conditions'").fetchone():
+                return None
+            row = conn.execute(
+                "SELECT description, conditions FROM ProLIF_Conditions WHERE id = ?", (int(src_condition_id),)
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row:
+            return None
+        description, conditions = row
+        try:
+            src_conditions = json.loads(conditions)
+        except Exception:
+            src_conditions = conditions
+
+        os.makedirs(os.path.dirname(self.__docking_params_db), exist_ok=True)
+        conn = sqlite3.connect(self.__docking_params_db)
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS ProLIF_Conditions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    description TEXT,
+                    conditions TEXT
+                )
+            """)
+            for dst_id, dst_conditions in conn.execute("SELECT id, conditions FROM ProLIF_Conditions"):
+                try:
+                    if json.loads(dst_conditions) == src_conditions:
+                        return dst_id
+                except Exception:
+                    if dst_conditions == conditions:
+                        return dst_id
+            cur = conn.execute(
+                "INSERT INTO ProLIF_Conditions (description, conditions) VALUES (?, ?)",
+                (f"{description} [copied from project '{source_project.name}', condition {src_condition_id}]",
+                 conditions),
+            )
+            conn.commit()
+            print(f"   ➕ Registered ProLIF condition {src_condition_id} from '{source_project.name}' "
+                  f"as ID {cur.lastrowid}")
+            return cur.lastrowid
+        finally:
+            conn.close()
+
+    def _copy_single_training_set_snapshot(self, source_project, training_set_id: str,
+                                           new_training_set_id: str, copy_models: bool,
+                                           overwrite: bool) -> Optional[dict]:
+        """Copy one snapshot from source_project into the active project
+        (see copy_training_set_snapshots_between_projects)."""
+        import shutil
+        from datetime import datetime
+
+        print(f"\n⚙️  Copying '{training_set_id}' from '{source_project.name}'"
+              + (f" as '{new_training_set_id}'" if new_training_set_id != training_set_id else "") + "...")
+
+        source_db = os.path.join(source_project.path, 'ml', 'training_sets', 'training_sets_snapshots.db')
+        src_conn = sqlite3.connect(source_db)
+        src_conn.row_factory = sqlite3.Row
+        try:
+            snap = src_conn.execute(
+                "SELECT * FROM training_set_snapshots WHERE training_set_id = ?", (training_set_id,)
+            ).fetchone()
+            entries = src_conn.execute(
+                "SELECT * FROM training_set_entries WHERE training_set_id = ? ORDER BY id", (training_set_id,)
+            ).fetchall()
+            has_fp_table = src_conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='training_set_fingerprints'"
+            ).fetchone() is not None
+            fingerprints = src_conn.execute(
+                "SELECT * FROM training_set_fingerprints WHERE training_set_id = ? ORDER BY id", (training_set_id,)
+            ).fetchall() if has_fp_table else []
+        except Exception as e:
+            src_conn.close()
+            print(f"❌ Could not read snapshot '{training_set_id}': {e}")
+            return None
+        if snap is None:
+            src_conn.close()
+            print(f"❌ Snapshot '{training_set_id}' not found.")
+            return None
+
+        # 1. ProLIF conditions used by the fingerprints → active-project ids
+        condition_map = {}
+        for cid in sorted({fp['prolif_conditions_id'] for fp in fingerprints}):
+            dst_cid = self._resolve_prolif_condition_from_source(source_project, cid)
+            if dst_cid is None:
+                print(f"   ⚠️  ProLIF condition {cid} not found in the source params.db; its fingerprints are skipped")
+            else:
+                condition_map[cid] = dst_cid
+
+        # 2. Pose files, staged next to their final folder so an overwrite only
+        #    replaces the old poses once the database write has succeeded.
+        safe_dir = new_training_set_id.replace(os.sep, '_').replace(' ', '_')
+        poses_root = os.path.join(self.path, 'ml', 'training_sets', 'snapshot_poses', safe_dir)
+        staging_root = poses_root + '.copying'
+        shutil.rmtree(staging_root, ignore_errors=True)
+        new_pose_paths, missing = [], []
+        for e in entries:
+            src_pose = e['pose_full_path']
+            if not os.path.exists(src_pose):
+                src_pose = os.path.join(source_project.path, 'docking', 'docking_assays', e['assay_name'],
+                                        'results', e['directory'], e['pose_file'])
+            if os.path.exists(src_pose):
+                rel = os.path.join(e['assay_name'], e['directory'], e['pose_file'])
+                os.makedirs(os.path.dirname(os.path.join(staging_root, rel)), exist_ok=True)
+                shutil.copy2(src_pose, os.path.join(staging_root, rel))
+                new_pose_paths.append(os.path.join(poses_root, rel))
+            else:
+                missing.append(e['pose_file'])
+                new_pose_paths.append(e['pose_full_path'])
+
+        # 3. Snapshot + entries + fingerprints, in one transaction
+        os.makedirs(os.path.dirname(self.__training_sets_db), exist_ok=True)
+        dst_conn = sqlite3.connect(self.__training_sets_db)
+        provenance = (f"[Copied from project '{source_project.name}' (training_set_id '{training_set_id}') "
+                      f"on {datetime.now().strftime('%Y-%m-%d %H:%M')}]")
+        notes = f"{snap['notes']}\n{provenance}" if snap['notes'] else provenance
+        try:
+            self._ensure_tables_like_source(
+                src_conn, dst_conn,
+                ['training_set_snapshots', 'training_set_entries', 'training_set_fingerprints'],
+            )
+            if overwrite:
+                for table in ('training_set_fingerprints', 'training_set_entries', 'training_set_snapshots'):
+                    dst_conn.execute(f"DELETE FROM {table} WHERE training_set_id = ?", (new_training_set_id,))
+            dst_conn.execute(
+                "INSERT INTO training_set_snapshots (training_set_id, created_at, n_positives, n_negatives, notes) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (new_training_set_id, snap['created_at'], snap['n_positives'], snap['n_negatives'], notes),
+            )
+            dst_conn.executemany(
+                "INSERT INTO training_set_entries (training_set_id, binder_type, assay_name, pose_file, "
+                "directory, pose_full_path, flagged_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [(new_training_set_id, e['binder_type'], e['assay_name'], e['pose_file'],
+                  e['directory'], p, e['flagged_at']) for e, p in zip(entries, new_pose_paths)],
+            )
+            fp_rows = [
+                (new_training_set_id, fp['assay_name'], fp['pose_file'], fp['directory'],
+                 fp['binder_type'], fp['label'], condition_map[fp['prolif_conditions_id']],
+                 fp['minimized'], fp['fingerprint_json'], fp['computed_at'])
+                for fp in fingerprints if fp['prolif_conditions_id'] in condition_map
+            ]
+            dst_conn.executemany(
+                "INSERT INTO training_set_fingerprints (training_set_id, assay_name, pose_file, directory, "
+                "binder_type, label, prolif_conditions_id, minimized, fingerprint_json, computed_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                fp_rows,
+            )
+            dst_conn.commit()
+        except Exception as e:
+            dst_conn.rollback()
+            print(f"❌ Failed to write snapshot '{new_training_set_id}' to the active project: {e}")
+            shutil.rmtree(staging_root, ignore_errors=True)
+            return None
+        finally:
+            dst_conn.close()
+            src_conn.close()
+
+        shutil.rmtree(poses_root, ignore_errors=True)
+        if os.path.isdir(staging_root):
+            os.rename(staging_root, poses_root)
+
+        # 4. RF models trained on this snapshot
+        n_models = 0
+        if copy_models:
+            n_models = self._copy_rf_models_for_training_set(source_project, training_set_id, new_training_set_id)
+
+        print(f"   ✓ {len(entries)} entries, {len(fp_rows)} fingerprints, "
+              f"{len(entries) - len(missing)} pose files, {n_models} model(s)")
+        return {
+            'training_set_id': training_set_id,
+            'new_training_set_id': new_training_set_id,
+            'source_project': source_project.name,
+            'n_entries': len(entries),
+            'n_fingerprints': len(fp_rows),
+            'skipped_fingerprints': len(fingerprints) - len(fp_rows),
+            'n_pose_files': len(entries) - len(missing),
+            'missing_pose_files': missing,
+            'prolif_condition_map': condition_map,
+            'n_models': n_models,
+            'poses_folder': poses_root,
+        }
+
+    def _copy_rf_models_for_training_set(self, source_project, training_set_id: str,
+                                         new_training_set_id: str) -> int:
+        """Copy rf_trained_models rows trained on training_set_id in source_project into
+        the active project's models DB (new model_id, training_set_id renamed if needed)."""
+        src_db = os.path.join(source_project.path, 'ml', 'models', 'rf_trained_models.db')
+        if not os.path.exists(src_db):
+            return 0
+        dst_db = os.path.join(self.__ml_models_path, 'rf_trained_models.db')
+        os.makedirs(os.path.dirname(dst_db), exist_ok=True)
+        src_conn = sqlite3.connect(src_db)
+        dst_conn = sqlite3.connect(dst_db)
+        try:
+            if not src_conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='rf_trained_models'").fetchone():
+                return 0
+            self._ensure_tables_like_source(src_conn, dst_conn, ['rf_trained_models'])
+            cols = [r[1] for r in src_conn.execute("PRAGMA table_info(rf_trained_models)") if r[1] != 'model_id']
+            rows = src_conn.execute(
+                f"SELECT {', '.join(cols)} FROM rf_trained_models WHERE training_set_id = ?", (training_set_id,)
+            ).fetchall()
+            ts_idx = cols.index('training_set_id')
+            rows = [tuple(new_training_set_id if i == ts_idx else v for i, v in enumerate(r)) for r in rows]
+            dst_conn.executemany(
+                f"INSERT INTO rf_trained_models ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
+                rows,
+            )
+            dst_conn.commit()
+            return len(rows)
+        except Exception as e:
+            dst_conn.rollback()
+            print(f"   ⚠️  Could not copy RF models for '{training_set_id}': {e}")
+            return 0
+        finally:
+            src_conn.close()
+            dst_conn.close()
+
+    # -------------------------------------------------------------------------
     # Private helpers for fingerprint computation
     # -------------------------------------------------------------------------
 
-    def _list_training_set_snapshots(self) -> list:
-        """Return a list of snapshot dicts from training_sets_snapshots.db."""
-        if not os.path.exists(self.__training_sets_db):
+    def _list_training_set_snapshots(self, db_path: Optional[str] = None) -> list:
+        """Return a list of snapshot dicts from training_sets_snapshots.db (this
+        project's, or the one at db_path -- e.g. another project's)."""
+        db_path = db_path or self.__training_sets_db
+        if not os.path.exists(db_path):
             return []
         try:
-            conn = sqlite3.connect(self.__training_sets_db)
+            conn = sqlite3.connect(db_path)
             cursor = conn.cursor()
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='training_set_snapshots'")
             if not cursor.fetchone():
