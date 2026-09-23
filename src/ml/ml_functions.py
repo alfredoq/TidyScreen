@@ -30,8 +30,9 @@ def _predict_pose_worker(task: dict) -> dict:
     MachineLearning._classify_poses_parallel) and are passed in read-only, since
     concurrent workers preparing the same ligand would race on its files.
 
-    Each pose gets its own scratch subdirectory (temp_restored_poses/pose_<id>/)
-    because MolDock's private helpers write fixed-name tleap/sander input files
+    Each pose gets its own scratch subdirectory
+    (temp_restored_poses/<run_subdir>/pose_<id>/, run_subdir being this prediction
+    run's directory — see moldock.new_scratch_run_subdir) because MolDock's private helpers write fixed-name tleap/sander input files
     (complex.in, min.in, minimize.in, ...) into the directory they're given —
     fine when one pose is processed at a time, but colliding if two poses shared
     a directory concurrently.
@@ -60,7 +61,7 @@ def _predict_pose_worker(task: dict) -> dict:
         moldock = MolDock.from_path(task['project_name'], task['project_path'])
 
         shared_dir, restored_pdb = moldock._restore_single_docked_pose(
-            task['results_db'], ligname, task['run_number']
+            task['results_db'], ligname, task['run_number'], work_subdir=task['scratch_subdir']
         )
         pose_dir = os.path.join(shared_dir, f"pose_{pose_id}")
         work_dir = os.path.join(pose_dir, "work")
@@ -150,7 +151,7 @@ def _compute_training_fp_worker(task: dict) -> dict:
         moldock = MolDock.from_path(task['project_name'], task['project_path'])
 
         shared_dir, restored_pdb = moldock._restore_single_docked_pose(
-            task['results_db'], ligname, run_number
+            task['results_db'], ligname, run_number, work_subdir=task['scratch_subdir']
         )
         pose_dir = os.path.join(shared_dir, f"pose_{ligname}_{run_number}")
         work_dir = os.path.join(pose_dir, "work")
@@ -765,6 +766,10 @@ class MachineLearning:
         n_chunks = len(chunks)
         chunks_done = 0
         shared_dirs_used = set()
+        # This run's own subdirectory under each assay's temp_restored_poses/, so
+        # concurrent jobs on the same assays never touch each other's files.
+        from moldock.moldock import new_scratch_run_subdir, remove_scratch_run_dir
+        run_subdir = new_scratch_run_subdir("training_fps")
 
         pbar = tqdm(total=len(entries_df), desc="Computing fingerprints (parallel)", disable=verbose)
         pbar.set_postfix(computed=n_computed, failed=n_failed, chunks=f"{chunks_done}/{n_chunks}")
@@ -775,7 +780,8 @@ class MachineLearning:
                     assay_name = chunk_df.iloc[0]['assay_name']
                     assay_info = chunk_df.iloc[0]['assay_info']
                     results_db = chunk_df.iloc[0]['results_db']
-                    shared_output_dir = os.path.join(os.path.dirname(results_db), 'temp_restored_poses')
+                    shared_output_dir = os.path.join(os.path.dirname(os.path.abspath(results_db)),
+                                                     'temp_restored_poses', run_subdir)
                     shared_dirs_used.add(shared_output_dir)
                     os.makedirs(shared_output_dir, exist_ok=True)
 
@@ -840,6 +846,7 @@ class MachineLearning:
                             'frcmod_file': frcmod_file,
                             'verbose': verbose,
                             'clean_files': clean_files,
+                            'scratch_subdir': run_subdir,
                         })
 
                     futures = [executor.submit(_compute_training_fp_worker, task) for task in tasks]
@@ -879,7 +886,7 @@ class MachineLearning:
             pbar.close()
             if clean_files:
                 for d in shared_dirs_used:
-                    shutil.rmtree(d, ignore_errors=True)
+                    remove_scratch_run_dir(d)
                 if verbose:
                     print("\n✅ Temporary files cleaned up.")
 
@@ -1831,8 +1838,14 @@ class MachineLearning:
         for the whole run — millions of entries in one directory for a 1M-pose
         assay, which degrades filesystem performance badly. Instead, each chunk
         prepares only its own ligands, submits its own pose tasks to the shared
-        pool, and wipes temp_restored_poses/ before the next chunk starts, so
+        pool, and wipes its run directory before the next chunk starts, so
         the directory only ever holds one chunk's worth of files.
+
+        All files live in this run's own subdirectory,
+        temp_restored_poses/<run_subdir>/ (see moldock.new_scratch_run_subdir):
+        several prediction runs (e.g. two models) or fingerprint computations on
+        the same assay can then run concurrently without deleting or overwriting
+        each other's ligand/pose files.
 
         Ligand-specific tleap files (prepin/frcmod) are prepared once per unique
         ligand within a chunk, sequentially, so concurrent workers never race to
@@ -1845,8 +1858,11 @@ class MachineLearning:
         """
         import shutil
         from concurrent.futures import ProcessPoolExecutor, as_completed
+        from moldock.moldock import new_scratch_run_subdir, remove_scratch_run_dir
 
-        shared_output_dir = os.path.join(os.path.dirname(results_db), 'temp_restored_poses')
+        run_subdir = new_scratch_run_subdir("rf_predict")
+        shared_output_dir = os.path.join(os.path.dirname(os.path.abspath(results_db)),
+                                         'temp_restored_poses', run_subdir)
 
         if chunk_size is None:
             chunk_size = max(max_workers * 4, 1)
@@ -1925,6 +1941,7 @@ class MachineLearning:
                             'prepin_file': prepin_file,
                             'frcmod_file': frcmod_file,
                             'verbose': verbose,
+                            'scratch_subdir': run_subdir,
                         })
 
                     futures = [executor.submit(_predict_pose_worker, task) for task in tasks]
@@ -1943,8 +1960,9 @@ class MachineLearning:
                                           chunks=f"{chunks_done}/{n_chunks}")
 
                     # Wipe this chunk's ligand-prep + restored-pose scratch files before
-                    # the next chunk starts, so temp_restored_poses/ never accumulates
-                    # entries for the whole (potentially million-pose) run.
+                    # the next chunk starts, so the run directory never accumulates
+                    # entries for the whole (potentially million-pose) run. Only this
+                    # run's directory is removed; other runs on the assay are untouched.
                     shutil.rmtree(shared_output_dir, ignore_errors=True)
 
                     chunks_done += 1
@@ -1952,7 +1970,7 @@ class MachineLearning:
                                       chunks=f"{chunks_done}/{n_chunks}")
         finally:
             pbar.close()
-            shutil.rmtree(shared_output_dir, ignore_errors=True)
+            remove_scratch_run_dir(shared_output_dir)
             if verbose:
                 print("\n✅ Temporary files cleaned up.")
 
@@ -2303,8 +2321,10 @@ class MachineLearning:
                 receptor_file, renumbering_dict, minimize, max_workers, verbose
             )
         else:
-            import shutil
+            from moldock.moldock import new_scratch_run_subdir, remove_scratch_run_dir
 
+            # This run's own scratch directory (see _classify_poses_parallel).
+            run_subdir = new_scratch_run_subdir("rf_predict")
             processed_ligands = {}   # {ligname: (prepin_file, frcmod_file)}
             fp_records = []           # [{pose_id, lig_name, docking_score, **fp_dict}, ...]
             output_dir = None
@@ -2335,7 +2355,7 @@ class MachineLearning:
                     try:
                         with suppress:
                             output_dir, output_file = moldock._restore_single_docked_pose(
-                                results_db, ligname, run_number
+                                results_db, ligname, run_number, work_subdir=run_subdir
                             )
 
                             if ligname not in processed_ligands:
@@ -2398,7 +2418,7 @@ class MachineLearning:
                 if not verbose:
                     original_stdout.close()
                 if output_dir:
-                    shutil.rmtree(output_dir, ignore_errors=True)
+                    remove_scratch_run_dir(output_dir)
                     if verbose:
                         print("\n✅ Temporary files cleaned up.")
 

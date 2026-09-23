@@ -13595,7 +13595,10 @@ class MolDock:
         from multiprocessing import Manager
 
         assay_dir = os.path.dirname(os.path.abspath(results_db))
-        temp_poses_root = os.path.join(assay_dir, "temp_restored_poses")
+        # Run-scoped scratch root, so other jobs on this assay (another
+        # fingerprint run, RF predictions) never touch this run's files.
+        run_subdir = new_scratch_run_subdir("fps")
+        temp_poses_root = os.path.join(assay_dir, "temp_restored_poses", run_subdir)
         os.makedirs(temp_poses_root, exist_ok=True)
 
         # Precompute ligand parameter files once per unique ligand (among poses that
@@ -13655,7 +13658,7 @@ class MolDock:
                 'fps_tleap_config': fps_tleap_config,
                 'minimize': minimize,
                 'renumbering_dict': renumbering_dict,
-                'work_subdir': f"{ligname}_{pose_id}",
+                'work_subdir': os.path.join(run_subdir, f"{ligname}_{pose_id}"),
                 'clean_files': clean_files,
                 'do_prolif': do_prolif,
                 'do_mmgbsa': do_mmgbsa,
@@ -13745,9 +13748,9 @@ class MolDock:
 
         if clean_files:
             # Per-pose subdirectories are already removed by each worker as it
-            # finishes; this clears the shared per-ligand parameter files and the
-            # now-empty top-level directory.
-            shutil.rmtree(temp_poses_root, ignore_errors=True)
+            # finishes; this clears this run's per-ligand parameter files and its
+            # run directory (plus temp_restored_poses/ itself if no other run uses it).
+            remove_scratch_run_dir(temp_poses_root)
             print("✅ Temporary files cleaned up.")
 
     def _launch_fingerprints_background(self, **exec_kwargs):
@@ -13881,10 +13884,11 @@ class MolDock:
         Uses the same logic as extract_docked_poses: the per-ligand run_number matches the
         suffix that was used when PDB files were written during pose extraction.
 
-        work_subdir: optional name of a subdirectory under temp_restored_poses/ to isolate
-        this pose's files from every other pose (used by the parallel MMGBSA path so
-        concurrent poses never share fixed-name scratch files). None (default) keeps the
-        original shared temp_restored_poses/ directory.
+        work_subdir: optional (relative) subdirectory under temp_restored_poses/ to
+        isolate this pose's files — e.g. a run directory from new_scratch_run_subdir(),
+        optionally followed by a per-pose directory — so concurrent poses and concurrent
+        jobs on the same assay never share fixed-name scratch files. None (default)
+        writes directly into the shared temp_restored_poses/ directory.
         """
 
         # Retrieve input_model and pose_coords_json using (ligname, run_number) so that
@@ -13918,7 +13922,12 @@ class MolDock:
             print(f"[ERROR] Could not convert ligand {ligname} SDF to PDB")
             sys.exit(1)
             
-        # Prepare the .prepin and .frcmod files using antechamber and parmchk2
+        # Prepare the .prepin and .frcmod files using antechamber and parmchk2.
+        # Both run with cwd=output_dir: they write fixed-name intermediates
+        # (ANTECHAMBER_*.AC, ATOMTYPE.INF, ...) into their working directory, which
+        # would collide between concurrent jobs sharing a CWD.
+        output_dir = os.path.abspath(output_dir)
+        pdb_file = os.path.abspath(pdb_file)
         prepin_file = os.path.join(output_dir, f"{ligname}.prepin")
         frcmod_file = os.path.join(output_dir, f"{ligname}.frcmod")
       
@@ -13934,7 +13943,7 @@ class MolDock:
         antechamber_command = f"antechamber -i {pdb_file} -fi pdb -o {prepin_file} -fo prepc -c rc -cf {espaloma_output_file} "
 
         try:
-            subprocess.run(antechamber_command, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(antechamber_command, shell=True, check=True, cwd=output_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         except Exception as e:
             print(f"[ERROR] Failed to run antechamber: {e}")
@@ -13942,7 +13951,7 @@ class MolDock:
 
         parmchk2_command = f"parmchk2 -i {prepin_file} -f prepc -o {frcmod_file}"
         try:
-            subprocess.run(parmchk2_command, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(parmchk2_command, shell=True, check=True, cwd=output_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         except Exception as e:
             print(f"[ERROR] Failed to run parmchk2: {e}")
@@ -13963,6 +13972,9 @@ class MolDock:
             print(f"[ERROR] Could not convert ligand {ligname} SDF to PDB")
             return None, None
 
+        # antechamber/parmchk2 run with cwd=output_dir (see _prepare_ligand_tleap_files).
+        output_dir = os.path.abspath(output_dir)
+        pdb_file = os.path.abspath(pdb_file)
         mol2_file = os.path.join(output_dir, f"{ligname}.mol2")
         frcmod_file = os.path.join(output_dir, f"{ligname}.frcmod")
 
@@ -13974,7 +13986,7 @@ class MolDock:
 
         antechamber_command = f"antechamber -i {pdb_file} -fi pdb -o {mol2_file} -fo mol2 -c rc -cf {espaloma_output_file}"
         try:
-            subprocess.run(antechamber_command, shell=True, check=True,
+            subprocess.run(antechamber_command, shell=True, check=True, cwd=output_dir,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception as e:
             print(f"[ERROR] Failed to run antechamber: {e}")
@@ -13982,7 +13994,7 @@ class MolDock:
 
         parmchk2_command = f"parmchk2 -i {mol2_file} -f mol2 -o {frcmod_file}"
         try:
-            subprocess.run(parmchk2_command, shell=True, check=True,
+            subprocess.run(parmchk2_command, shell=True, check=True, cwd=output_dir,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception as e:
             print(f"[ERROR] Failed to run parmchk2: {e}")
@@ -18209,6 +18221,35 @@ Example — cyclodextrin receptor:
 # convention for parallel worker functions.
 
 _gpu_lock = None
+
+
+def new_scratch_run_subdir(prefix):
+    """
+    Unique name for one run's scratch subdirectory under an assay's
+    results/temp_restored_poses/. Every job that restores poses there (MolDock
+    fingerprints, RF predictions, training-set fingerprints) works inside its own
+    run subdirectory, so concurrent jobs on the same assay never share, overwrite
+    or delete each other's ligand/pose files.
+    """
+    import uuid
+    from datetime import datetime
+    return f"{prefix}_{datetime.now():%Y%m%d_%H%M%S}_{os.getpid()}_{uuid.uuid4().hex[:6]}"
+
+
+def remove_scratch_run_dir(run_dir):
+    """
+    Delete one run's scratch subdirectory, then the parent temp_restored_poses/
+    directory only if no other run is still using it (os.rmdir fails on a
+    non-empty directory).
+    """
+    import shutil
+    if not run_dir:
+        return
+    shutil.rmtree(run_dir, ignore_errors=True)
+    try:
+        os.rmdir(os.path.dirname(os.path.abspath(run_dir)))
+    except OSError:
+        pass
 
 
 def _init_fps_worker(lock):
