@@ -326,7 +326,9 @@ def get_md_mmgbsa_runs(db_path, assay_id):
         cursor.execute(
             "SELECT run_id, mmgbsa_folder, parameters, results, created_date "
             "FROM md_mmgbsa_runs WHERE assay_id = ? ORDER BY run_id ASC",
-            (assay_id,),
+            # assay_id usually comes from a pandas row (numpy.int64), which sqlite3
+            # cannot bind -- cast to a plain int.
+            (int(assay_id),),
         )
         rows = cursor.fetchall()
         conn.close()
@@ -352,6 +354,137 @@ def get_md_mmgbsa_runs(db_path, assay_id):
             'created_date': created_date,
         })
     return runs
+
+
+# MM-GBSA namelist parameters, grouped as in create_mmgbsa_computation_conditions()
+# (&general / &gb / &decomp), plus the per-run execution parameters collected by
+# MolDyn._collect_mmgbsa_execution_parameters().
+MMGBSA_PARAMETER_SECTIONS = {
+    '&general': ['startframe', 'endframe', 'interval', 'receptor_mask', 'ligand_mask'],
+    '&gb': ['igb', 'saltcon'],
+    '&decomp': ['idecomp', 'print_res', 'dec_verbose'],
+    'Execution': ['strip_mask', 'keep_files', 'use_mpi', 'n_processors'],
+}
+
+
+def get_mmgbsa_conditions(db_path):
+    """
+    Read the saved MM-GBSA computation conditions from mmgbsa_conditions.db.
+
+    Returns:
+        List[dict]: each with keys id, condition_name, description, parameters
+            (nested {'general': {...}, 'gb': {...}, 'decomp': {...}}), created_date.
+            Empty list if the database/table doesn't exist.
+    """
+    if not os.path.exists(db_path):
+        return []
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='mmgbsa_conditions'"
+        )
+        if not cursor.fetchone():
+            conn.close()
+            return []
+        cursor.execute(
+            "SELECT id, condition_name, description, parameters, created_date "
+            "FROM mmgbsa_conditions ORDER BY id ASC"
+        )
+        rows = cursor.fetchall()
+        conn.close()
+    except Exception:
+        return []
+
+    conditions = []
+    for condition_id, name, description, params_json, created_date in rows:
+        try:
+            parameters = json.loads(params_json) if params_json else {}
+        except Exception:
+            parameters = {}
+        conditions.append({
+            'id': condition_id,
+            'condition_name': name,
+            'description': description,
+            'parameters': parameters,
+            'created_date': created_date,
+        })
+    return conditions
+
+
+def _flatten_mmgbsa_condition(condition_parameters):
+    """Flatten a condition's nested {'general', 'gb', 'decomp'} dict into the flat
+    key space used by md_mmgbsa_runs.parameters."""
+    flat = {}
+    for section in ('general', 'gb', 'decomp'):
+        flat.update(condition_parameters.get(section, {}) or {})
+    return flat
+
+
+def _normalize_mmgbsa_value(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return ''.join(value.split()) or None  # print_res '1, 2' == '1,2'
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return value
+
+
+def find_mmgbsa_condition_for_run(run_parameters, conditions):
+    """
+    Identify the saved condition a run was computed with.
+
+    Runs stored after condition provenance was added carry 'condition_id' in their
+    parameters; older runs are matched by comparing the &general/&gb/&decomp values
+    against every saved condition (exact match on all of them).
+
+    Returns:
+        (condition_dict or None, how) where how is 'recorded' (condition_id stored
+        with the run), 'matched' (inferred from parameter values), 'deleted'
+        (condition_id recorded but no longer in the conditions DB) or None.
+    """
+    if not run_parameters:
+        return None, None
+
+    by_id = {c['id']: c for c in conditions}
+    condition_id = run_parameters.get('condition_id')
+    if condition_id is not None:
+        if condition_id in by_id:
+            return by_id[condition_id], 'recorded'
+        return {
+            'id': condition_id,
+            'condition_name': run_parameters.get('condition_name'),
+            'description': run_parameters.get('condition_description'),
+            'parameters': {},
+        }, 'deleted'
+
+    namelist_keys = [k for section in ('&general', '&gb', '&decomp')
+                     for k in MMGBSA_PARAMETER_SECTIONS[section]]
+    for cond in conditions:
+        flat = _flatten_mmgbsa_condition(cond['parameters'])
+        if all(
+            _normalize_mmgbsa_value(flat.get(k)) == _normalize_mmgbsa_value(run_parameters.get(k))
+            for k in namelist_keys
+        ):
+            return cond, 'matched'
+    return None, None
+
+
+def get_mmgbsa_condition_mismatches(run_parameters, condition):
+    """Return [(key, run_value, condition_value)] for namelist parameters where the
+    run differs from the condition's current definition (e.g. the condition was
+    overwritten after the run was computed)."""
+    flat = _flatten_mmgbsa_condition(condition.get('parameters', {}) or {})
+    if not flat:
+        return []
+    mismatches = []
+    for section in ('&general', '&gb', '&decomp'):
+        for k in MMGBSA_PARAMETER_SECTIONS[section]:
+            if _normalize_mmgbsa_value(flat.get(k)) != _normalize_mmgbsa_value(run_parameters.get(k)):
+                mismatches.append((k, run_parameters.get(k), flat.get(k)))
+    return mismatches
 
 
 def get_md_assay_registers(db_path):

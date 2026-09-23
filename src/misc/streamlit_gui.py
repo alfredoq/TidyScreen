@@ -3610,16 +3610,53 @@ elif page == "MolDyn analysis":
                             if not _mmgbsa_results:
                                 st.info("No MMGBSA results found for this assay.")
                             else:
-                                # Parameters summary
+                                # Saved condition used for this run + all its parameters
                                 if _mmgbsa_params:
-                                    st.caption(
-                                        f"GB model: igb={_mmgbsa_params.get('igb', '?')}  |  "
-                                        f"Salt: {_mmgbsa_params.get('saltcon', '?')} M  |  "
-                                        f"Ligand mask: {_mmgbsa_params.get('ligand_mask', '?')}  |  "
-                                        f"Frames: {_mmgbsa_params.get('startframe', '?')}–"
-                                        f"{_mmgbsa_params.get('endframe', '?')} "
-                                        f"(every {_mmgbsa_params.get('interval', '?')})"
+                                    _conditions = st_funcs.get_mmgbsa_conditions(os.path.join(
+                                        project_path, "dynamics", "md_registers", "mmgbsa_conditions.db"
+                                    ))
+                                    _cond, _cond_how = st_funcs.find_mmgbsa_condition_for_run(
+                                        _mmgbsa_params, _conditions
                                     )
+                                    if _cond is not None:
+                                        _how_note = {
+                                            'recorded': "",
+                                            'matched': " _(identified by matching parameters)_",
+                                            'deleted': " _(no longer in mmgbsa_conditions.db)_",
+                                        }[_cond_how]
+                                        st.markdown(
+                                            f"**Saved condition:** {_cond['condition_name']} "
+                                            f"(ID {_cond['id']}){_how_note}"
+                                        )
+                                        if _cond.get('description'):
+                                            st.caption(_cond['description'])
+                                        _mismatches = st_funcs.get_mmgbsa_condition_mismatches(
+                                            _mmgbsa_params, _cond
+                                        ) if _cond_how == 'recorded' else []
+                                        if _mismatches:
+                                            st.warning(
+                                                "The saved condition has changed since this run was computed; "
+                                                "the values below are the ones actually used. Differences: "
+                                                + ", ".join(f"{k} (run: {rv}, condition now: {cv})"
+                                                            for k, rv, cv in _mismatches)
+                                            )
+                                    else:
+                                        st.markdown("**Saved condition:** none (manual parameters)")
+
+                                    _param_rows = [
+                                        {
+                                            'Section': _section,
+                                            'Parameter': _key,
+                                            'Value': "—" if _mmgbsa_params.get(_key) is None
+                                                     else str(_mmgbsa_params.get(_key)),
+                                        }
+                                        for _section, _keys in st_funcs.MMGBSA_PARAMETER_SECTIONS.items()
+                                        for _key in _keys
+                                        if _key in _mmgbsa_params
+                                    ]
+                                    if _param_rows:
+                                        with st.expander("⚙️ MM-GBSA parameters", expanded=False):
+                                            st.table(pd.DataFrame(_param_rows).set_index('Section'))
 
                                 # Energy components table
                                 _component_order = [

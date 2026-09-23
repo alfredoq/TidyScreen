@@ -3932,6 +3932,11 @@ class MolDyn:
             'print_res': decomp.get('print_res'),
             'dec_verbose': decomp.get('dec_verbose'),
             'per_residue': bool(idecomp),
+            # Provenance: which saved condition produced this run (stored in
+            # md_mmgbsa_runs.parameters and shown by the Streamlit GUI).
+            'condition_id': chosen.get('id'),
+            'condition_name': chosen.get('condition_name'),
+            'condition_description': chosen.get('description'),
         }
         mmgbsa_params.update(exec_params)  # strip_mask, keep_files, use_mpi, n_processors
 
