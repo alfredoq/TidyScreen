@@ -2788,7 +2788,9 @@ class MolDyn:
         using AMBER's MMPBSA.py (single-trajectory approach).
 
         Workflow:
-          1. Select a completed ligand-receptor MD assay
+          1. Select a completed ligand-receptor MD assay, then the trajectory (.nc)
+             to process -- any .nc in the assay folder, including renamed or
+             solvent-stripped ones -- and the topology whose atom count matches it
           2. Resolve which run folder to use (new run / overwrite / parse existing --
              see _resolve_mmgbsa_computation_folder(), supports multiple MM-GBSA
              runs per trajectory)
@@ -2816,12 +2818,18 @@ class MolDyn:
             assay_id = assay_info['assay_id']
             ligand_name = assay_info.get('ligand_name', '')
 
-            prmtop_file = os.path.join(assay_folder, 'complex.prmtop')
-            trajectory_file = os.path.join(assay_folder, 'production.nc')
-            for req_file in [prmtop_file, trajectory_file]:
-                if not os.path.exists(req_file):
-                    print(f"❌ Required file not found: {req_file}")
-                    return
+            # The trajectory may have been renamed and/or stripped of solvent after
+            # the MD run (e.g. prod_strip.nc), so let the user pick among all .nc
+            # files in the assay folder, then pair it with a topology whose atom
+            # count matches (e.g. complex.prmtop or complex_strip.prmtop).
+            trajectory_file, traj_natom = self._select_md_trajectory_for_mmgbsa(assay_folder)
+            if trajectory_file is None:
+                return
+            prmtop_file, is_periodic = self._select_md_topology_for_trajectory(
+                assay_folder, trajectory_file, traj_natom
+            )
+            if prmtop_file is None:
+                return
 
             # A saved computation condition is mandatory. Check before resolving the
             # run folder, since the 'overwrite' option deletes a run folder up front.
@@ -2854,6 +2862,10 @@ class MolDyn:
                 except OSError:
                     pass
                 return
+            # Record which trajectory/topology this run used (stored with the
+            # results as part of the parameters JSON).
+            mmgbsa_params['trajectory_file'] = trajectory_file
+            mmgbsa_params['topology_file'] = prmtop_file
 
             print(f"\n⚙️  Running ante-MMPBSA.py to generate gas-phase topologies...")
             com_prmtop, rec_prmtop, lig_prmtop = self._run_ante_mmpbsa(
@@ -2869,7 +2881,8 @@ class MolDyn:
             script_path = self._prepare_mmgbsa_execution_script(
                 mmgbsa_folder, com_prmtop, rec_prmtop, lig_prmtop,
                 trajectory_file, mmgbsa_in_file,
-                prmtop_file, mmgbsa_params
+                prmtop_file, mmgbsa_params,
+                is_periodic=is_periodic,
             )
             print(f"✅ MM-GBSA assay prepared successfully.")
             print(f"   Script: {script_path}")
@@ -3034,11 +3047,176 @@ class MolDyn:
         print(f"\n📂 New MM-GBSA run folder: {new_folder}")
         return new_folder
 
+    def _find_completed_production_output(self, folder):
+        """
+        Return the path of a completed production output file in folder, or None.
+
+        production.out is checked first; renamed variants (production_10ns.out,
+        prod.out, ...) matching 'prod*.out' are checked next. A file counts as
+        completed when it contains 'Total wall time:' (pmemd) or 'FINAL RESULTS'
+        (sander).
+        """
+        import glob
+
+        preferred = os.path.join(folder, 'production.out')
+        candidates = [preferred] if os.path.isfile(preferred) else []
+        candidates += sorted(c for c in glob.glob(os.path.join(folder, 'prod*.out'))
+                             if c != preferred)
+        for out_file in candidates:
+            try:
+                with open(out_file, 'r', errors='replace') as fh:
+                    content = fh.read()
+            except OSError:
+                continue
+            if 'Total wall time:' in content or 'FINAL RESULTS' in content:
+                return out_file
+        return None
+
+    def _get_netcdf_traj_info(self, nc_file):
+        """
+        Return (n_atoms, n_frames) for an AMBER NetCDF trajectory, or
+        (None, None) if it cannot be read (e.g. scipy unavailable or a
+        NetCDF4/HDF5 file, which scipy.io.netcdf_file does not support).
+        """
+        try:
+            from scipy.io import netcdf_file
+            with netcdf_file(nc_file, 'r', mmap=True) as nc:
+                n_atoms = nc.dimensions.get('atom')
+                n_frames = None
+                if 'coordinates' in nc.variables:
+                    n_frames = nc.variables['coordinates'].shape[0]
+                return (int(n_atoms) if n_atoms else None), n_frames
+        except Exception:
+            return None, None
+
+    def _get_prmtop_ifbox(self, prmtop_file):
+        """
+        Read IFBOX (28th entry of %FLAG POINTERS) from an AMBER prmtop file:
+        0 = no periodic box (dry/stripped or implicit-solvent topology),
+        >0 = periodic box. Returns None if it cannot be read.
+        """
+        pointers = self._get_prmtop_pointers(prmtop_file)
+        return pointers[27] if pointers and len(pointers) > 27 else None
+
+    def _select_md_trajectory_for_mmgbsa(self, assay_folder):
+        """
+        List all .nc files in the assay folder (production.nc, renamed and/or
+        solvent-stripped trajectories such as prod_strip.nc, ...) and prompt the
+        user to pick the one to process.
+        Returns (trajectory_path, n_atoms) -- n_atoms may be None if unreadable --
+        or (None, None) if there are no .nc files or the user cancels.
+        """
+        import glob
+
+        nc_files = sorted(glob.glob(os.path.join(assay_folder, '*.nc')))
+        if not nc_files:
+            print(f"❌ No trajectory (.nc) files found in: {assay_folder}")
+            return None, None
+
+        print(f"\n🎞️  AVAILABLE TRAJECTORIES in {os.path.basename(assay_folder)}:")
+        print("=" * 70)
+        infos = []
+        for idx, nc_file in enumerate(nc_files, 1):
+            n_atoms, n_frames = self._get_netcdf_traj_info(nc_file)
+            infos.append(n_atoms)
+            size_mb = os.path.getsize(nc_file) / (1024 * 1024)
+            atoms_str = f"{n_atoms} atoms" if n_atoms is not None else "atoms: unknown"
+            frames_str = f"{n_frames} frames" if n_frames is not None else "frames: unknown"
+            print(f"  {idx}. {os.path.basename(nc_file):<35} {atoms_str:<16} {frames_str:<16} {size_mb:,.1f} MB")
+
+        default_idx = None
+        production_nc = os.path.join(assay_folder, 'production.nc')
+        if production_nc in nc_files:
+            default_idx = nc_files.index(production_nc) + 1
+        elif len(nc_files) == 1:
+            default_idx = 1
+
+        prompt = f"\n🔎 Select the trajectory to process (1-{len(nc_files)}"
+        prompt += f", Enter for {default_idx})" if default_idx else ")"
+        prompt += " or 'cancel': "
+        while True:
+            selection = input(prompt).strip()
+            if selection.lower() in ['cancel', 'quit', 'exit']:
+                print("❌ Operation cancelled.")
+                return None, None
+            if not selection and default_idx:
+                selection = str(default_idx)
+            if selection.isdigit() and 1 <= int(selection) <= len(nc_files):
+                chosen = nc_files[int(selection) - 1]
+                print(f"✅ Selected trajectory: {os.path.basename(chosen)}")
+                return chosen, infos[int(selection) - 1]
+            print("❌ Invalid selection. Please try again.")
+
+    def _select_md_topology_for_trajectory(self, assay_folder, trajectory_file, traj_natom):
+        """
+        Pick the .prmtop in the assay folder matching the selected trajectory: a
+        solvated trajectory pairs with complex.prmtop, a solvent-stripped one with
+        its stripped topology (e.g. complex_strip.prmtop). A single atom-count match
+        is selected automatically; otherwise the user is prompted.
+        Returns (prmtop_path, is_periodic) or (None, None) on failure/cancel.
+        is_periodic is False when the topology has no periodic box (IFBOX=0), i.e.
+        the trajectory is already stripped and must not be re-imaged/stripped.
+        """
+        import glob
+
+        prmtops = sorted(glob.glob(os.path.join(assay_folder, '*.prmtop')))
+        if not prmtops:
+            print(f"❌ No topology (.prmtop) files found in: {assay_folder}")
+            return None, None
+
+        natoms = {p: self._get_prmtop_natom(p) for p in prmtops}
+
+        if traj_natom is not None:
+            candidates = [p for p in prmtops if natoms[p] == traj_natom]
+            if not candidates:
+                print(f"❌ No topology matches the atom count of "
+                      f"{os.path.basename(trajectory_file)} ({traj_natom} atoms):")
+                for p in prmtops:
+                    print(f"     {os.path.basename(p):<30} {natoms[p]} atoms")
+                return None, None
+        else:
+            print(f"⚠️  Could not read the atom count of {os.path.basename(trajectory_file)}; "
+                  f"make sure the topology you select matches it.")
+            candidates = prmtops
+
+        if len(candidates) == 1:
+            chosen = candidates[0]
+            print(f"✅ Using topology: {os.path.basename(chosen)} ({natoms[chosen]} atoms)")
+        else:
+            print(f"\n🧾 CANDIDATE TOPOLOGIES:")
+            for idx, p in enumerate(candidates, 1):
+                print(f"  {idx}. {os.path.basename(p):<30} {natoms[p]} atoms")
+            complex_prmtop = os.path.join(assay_folder, 'complex.prmtop')
+            default_idx = candidates.index(complex_prmtop) + 1 if complex_prmtop in candidates else None
+            prompt = f"🔎 Select the topology (1-{len(candidates)}"
+            prompt += f", Enter for {default_idx})" if default_idx else ")"
+            prompt += " or 'cancel': "
+            while True:
+                selection = input(prompt).strip()
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    print("❌ Operation cancelled.")
+                    return None, None
+                if not selection and default_idx:
+                    selection = str(default_idx)
+                if selection.isdigit() and 1 <= int(selection) <= len(candidates):
+                    chosen = candidates[int(selection) - 1]
+                    print(f"✅ Selected topology: {os.path.basename(chosen)}")
+                    break
+                print("❌ Invalid selection. Please try again.")
+
+        is_periodic = (self._get_prmtop_ifbox(chosen) or 0) > 0
+        if not is_periodic:
+            print("ℹ️  Topology has no periodic box: the trajectory is treated as already "
+                  "stripped (no imaging/stripping step).")
+        return chosen, is_periodic
+
     def _select_completed_md_assay_for_mmgbsa(self):
         """
         List completed ligand-receptor MD assays and prompt the user to pick one.
         Completion is determined by the presence of 'Total wall time:' or
-        'FINAL RESULTS' in production.out.
+        'FINAL RESULTS' in a production output file -- production.out or a
+        renamed variant such as production_10ns.out (see
+        _find_completed_production_output()).
         Returns a dict with assay metadata or None if the user cancels.
         """
         import sqlite3
@@ -3099,15 +3277,8 @@ class MolDyn:
                 folder = self._remap_project_path(folder)
                 if not folder or not os.path.exists(folder):
                     continue
-                prod_out = os.path.join(folder, 'production.out')
-                if not os.path.exists(prod_out):
-                    continue
-                try:
-                    with open(prod_out, 'r') as fh:
-                        content = fh.read()
-                except OSError:
-                    continue
-                if 'Total wall time:' not in content and 'FINAL RESULTS' not in content:
+                prod_out = self._find_completed_production_output(folder)
+                if prod_out is None:
                     continue
                 completed.append({
                     'assay_id': assay_id,
@@ -3117,11 +3288,13 @@ class MolDyn:
                     'ligand_name': ligname,
                     'pose_id': pose_id,
                     'receptor_template_name': receptor_template_name,
+                    'production_output': prod_out,
                 })
 
             if not completed:
                 print("❌ No completed ligand-receptor MD assays found.")
-                print("   (production.out must contain 'Total wall time:' or 'FINAL RESULTS')")
+                print("   (a production output file, e.g. production.out or production_10ns.out,")
+                print("    must contain 'Total wall time:' or 'FINAL RESULTS')")
                 return None
 
             print(f"\n🧬 COMPLETED LIGAND-RECEPTOR MD ASSAYS:")
@@ -3132,6 +3305,7 @@ class MolDyn:
                 print(f"  Ligand      : {a['ligand_name']}  (pose {a['pose_id']})")
                 print(f"  Description : {a['description']}")
                 print(f"  Folder      : {a['assay_folder_path']}")
+                print(f"  Production  : {os.path.basename(a['production_output'])}")
                 print("-" * 70)
 
             assay_ids = [str(a['assay_id']) for a in completed]
@@ -4038,22 +4212,31 @@ class MolDyn:
 
         return com_prmtop, rec_prmtop, lig_prmtop
 
-    def _get_prmtop_natom(self, prmtop_file):
-        """Read NATOM from the %FLAG NATOM section of an AMBER prmtop file."""
+    def _get_prmtop_pointers(self, prmtop_file):
+        """
+        Return the integer values of the %FLAG POINTERS section of an AMBER prmtop
+        file (NATOM is entry 0, IFBOX entry 27), or None if it cannot be read.
+        """
         try:
+            values = []
+            in_pointers = False
             with open(prmtop_file, 'r') as fh:
-                lines = fh.readlines()
-            for i, line in enumerate(lines):
-                if '%FLAG NATOM' in line:
-                    for j in range(i + 1, min(i + 4, len(lines))):
-                        if lines[j].startswith('%FORMAT'):
-                            continue
-                        stripped = lines[j].strip()
-                        if stripped:
-                            return int(stripped.split()[0])
+                for line in fh:
+                    if line.startswith('%FLAG'):
+                        if in_pointers:
+                            break
+                        in_pointers = 'POINTERS' in line
+                        continue
+                    if in_pointers and not line.startswith('%FORMAT'):
+                        values.extend(int(v) for v in line.split())
+            return values or None
         except Exception:
-            pass
-        return None
+            return None
+
+    def _get_prmtop_natom(self, prmtop_file):
+        """Read NATOM (first %FLAG POINTERS entry) from an AMBER prmtop file."""
+        pointers = self._get_prmtop_pointers(prmtop_file)
+        return pointers[0] if pointers else None
 
     def _write_mmgbsa_input_file(self, mmgbsa_folder, mmgbsa_params):
         """
@@ -4126,7 +4309,8 @@ class MolDyn:
 
     def _prepare_mmgbsa_execution_script(self, mmgbsa_folder, com_prmtop, rec_prmtop,
                                            lig_prmtop, traj_file, mmgbsa_in,
-                                           solvated_prmtop, mmgbsa_params):
+                                           solvated_prmtop, mmgbsa_params,
+                                           is_periodic=True):
         """
         Write run_mmgbsa.sh inside mmgbsa_folder and return its path.
 
@@ -4139,6 +4323,11 @@ class MolDyn:
 
         Including ante-MMPBSA.py in the script means the script can be re-run
         from scratch without needing any Python setup step.
+
+        If is_periodic is False, solvated_prmtop is a dry topology (IFBOX=0) and
+        traj_file is an already-stripped trajectory (e.g. complex_strip.prmtop +
+        prod_strip.nc): the cpptraj autoimage/center/strip step is skipped and
+        traj_file is passed to MMPBSA.py directly.
         """
         import shutil as _shutil
 
@@ -4234,21 +4423,28 @@ class MolDyn:
                 # autoimage fixes molecules broken across periodic boundaries.
                 # center translates the solute (everything that is NOT stripped) to the
                 # origin by center of mass before stripping the solvent.
-                solute_mask = '!(' + strip_mask + ')'
-                f.write('echo "--- Step 2: cpptraj (autoimage, center, strip trajectory) ---"\n')
-                f.write(f"cat > {cpptraj_in} << 'CPPTRAJ_EOF'\n")
-                f.write(f"parm {solvated_prmtop}\n")
-                f.write(f"trajin {traj_file}\n")
-                f.write("autoimage\n")
-                f.write(f"center {solute_mask} mass origin\n")
-                f.write("image origin center familiar\n")
-                f.write(f"strip {strip_mask}\n")
-                f.write(f"trajout {stripped_traj} netcdf\n")
-                f.write("run\n")
-                f.write("quit\n")
-                f.write("CPPTRAJ_EOF\n\n")
-                f.write(f"cpptraj -i {cpptraj_in} > {cpptraj_log} 2>&1\n")
-                f.write('echo "   cpptraj trajectory processing done"\n\n')
+                if is_periodic:
+                    solute_mask = '!(' + strip_mask + ')'
+                    f.write('echo "--- Step 2: cpptraj (autoimage, center, strip trajectory) ---"\n')
+                    f.write(f"cat > {cpptraj_in} << 'CPPTRAJ_EOF'\n")
+                    f.write(f"parm {solvated_prmtop}\n")
+                    f.write(f"trajin {traj_file}\n")
+                    f.write("autoimage\n")
+                    f.write(f"center {solute_mask} mass origin\n")
+                    f.write("image origin center familiar\n")
+                    f.write(f"strip {strip_mask}\n")
+                    f.write(f"trajout {stripped_traj} netcdf\n")
+                    f.write("run\n")
+                    f.write("quit\n")
+                    f.write("CPPTRAJ_EOF\n\n")
+                    f.write(f"cpptraj -i {cpptraj_in} > {cpptraj_log} 2>&1\n")
+                    f.write('echo "   cpptraj trajectory processing done"\n\n')
+                else:
+                    # Dry topology: the trajectory was already stripped (and
+                    # presumably imaged) after the MD run, so its frames already
+                    # match com.prmtop and can be fed to MMPBSA.py as-is.
+                    stripped_traj = traj_file
+                    f.write('echo "--- Step 2: skipped (trajectory already stripped) ---"\n\n')
 
                 # --- Step 3: MMPBSA.py (serial) or MMPBSA.py.MPI (parallel) ---
                 use_mpi = mmgbsa_params.get('use_mpi', False)
