@@ -15324,6 +15324,214 @@ fig.savefig(OUTPUT_PATH, dpi=300, bbox_inches='tight')
             print(f"❌ Error in similarity analysis: {e}")
             return pd.DataFrame()
 
+    def find_similar_to_reference(self, fingerprint_type: str = 'morgan') -> pd.DataFrame:
+        """
+        Find molecules in a table that are chemically similar to a single reference molecule.
+
+        The user is prompted to select the table to screen, the reference table and the
+        minimum Tanimoto similarity threshold (0.0 to 1.0). The reference table must contain
+        exactly one molecule.
+
+        Args:
+            fingerprint_type (str): Type of fingerprint ('morgan', 'rdkit', 'maccs')
+
+        Returns:
+            pd.DataFrame: DataFrame with the molecules similar to the reference, sorted by
+                similarity (highest first). Empty DataFrame if none found or on error.
+        """
+        try:
+            # Import required libraries
+            try:
+                from rdkit import Chem
+                from rdkit.Chem import rdMolDescriptors, DataStructs
+                from rdkit import RDLogger
+                RDLogger.DisableLog('rdApp.*')
+            except ImportError:
+                print("❌ RDKit not installed. Cannot perform similarity analysis.")
+                return pd.DataFrame()
+
+            if fingerprint_type not in ('morgan', 'rdkit', 'maccs'):
+                print(f"❌ Invalid fingerprint type '{fingerprint_type}'. Use 'morgan', 'rdkit' or 'maccs'")
+                return pd.DataFrame()
+
+            available_tables = self.get_all_tables()
+            if len(available_tables) < 2:
+                print("❌ At least two tables are required (target and reference)")
+                return pd.DataFrame()
+
+            # Select tables
+            print(f"\n📋 Select the TARGET table (molecules to screen):")
+            target_table = self._select_single_table(available_tables, "target")
+            if not target_table:
+                return pd.DataFrame()
+
+            print(f"\n📋 Select the REFERENCE table (must contain a single molecule):")
+            remaining_tables = [t for t in available_tables if t != target_table]
+            reference_table = self._select_single_table(remaining_tables, "reference")
+            if not reference_table:
+                return pd.DataFrame()
+
+            # Verify the reference table contains exactly one molecule
+            reference_df = self._get_table_as_dataframe(reference_table)
+            if len(reference_df) != 1:
+                print(f"❌ Reference table '{reference_table}' must contain exactly one molecule "
+                      f"(found {len(reference_df)})")
+                return pd.DataFrame()
+
+            reference = reference_df.iloc[0]
+
+            # Ask for the similarity threshold
+            while True:
+                try:
+                    threshold_input = input("\nEnter minimum Tanimoto similarity threshold (0.0-1.0) [0.8]: ").strip()
+                except KeyboardInterrupt:
+                    print("\n❌ Similarity analysis cancelled")
+                    return pd.DataFrame()
+
+                if threshold_input.lower() in ['cancel', 'quit', 'exit']:
+                    return pd.DataFrame()
+                if not threshold_input:
+                    similarity_threshold = 0.8
+                    break
+                try:
+                    similarity_threshold = float(threshold_input)
+                except ValueError:
+                    print("❌ Invalid value. Please enter a number between 0.0 and 1.0")
+                    continue
+                if 0.0 <= similarity_threshold <= 1.0:
+                    break
+                print("❌ Threshold must be between 0.0 and 1.0")
+
+            compounds_df = self._get_table_as_dataframe(target_table)
+            if compounds_df.empty:
+                print(f"❌ No compounds found in table '{target_table}'")
+                return pd.DataFrame()
+
+            def _compute_fp(smiles):
+                mol = Chem.MolFromSmiles(smiles)
+                if mol is None:
+                    return None
+                if fingerprint_type == 'morgan':
+                    return rdMolDescriptors.GetMorganFingerprintAsBitVect(mol, 2, nBits=2048)
+                elif fingerprint_type == 'rdkit':
+                    return Chem.RDKFingerprint(mol)
+                return rdMolDescriptors.GetMACCSKeysFingerprint(mol)
+
+            reference_fp = _compute_fp(reference['smiles'])
+            if reference_fp is None:
+                print(f"❌ Invalid SMILES in reference molecule: {reference['smiles']}")
+                return pd.DataFrame()
+
+            print(f"🧬 Analyzing similarity to reference molecule '{reference.get('name', 'N/A')}'")
+            print(f"   📋 Target table: '{target_table}'")
+            print(f"   📊 Compounds: {len(compounds_df):,}")
+            print(f"   🎯 Similarity threshold: {similarity_threshold:.2f}")
+            print(f"   🔬 Fingerprint type: {fingerprint_type}")
+
+            # Generate molecular fingerprints for the target table
+            print("🔬 Computing molecular fingerprints...")
+            fingerprints = []
+            valid_molecules = []
+
+            rows = compounds_df.iterrows()
+            if TQDM_AVAILABLE:
+                rows = tqdm(rows, total=len(compounds_df), desc="Computing fingerprints", unit="mol")
+
+            for _, row in rows:
+                try:
+                    fp = _compute_fp(row['smiles'])
+                    if fp is not None:
+                        fingerprints.append(fp)
+                        valid_molecules.append(row)
+                except Exception:
+                    continue
+
+            invalid_count = len(compounds_df) - len(fingerprints)
+            print(f"   ✅ Generated {len(fingerprints)} valid fingerprints")
+            if invalid_count:
+                print(f"   ⚠️  Skipped {invalid_count} molecules with invalid SMILES")
+
+            # Compare every target molecule against the reference
+            print("🔍 Comparing molecules against reference...")
+            similarities = DataStructs.BulkTanimotoSimilarity(reference_fp, fingerprints)
+
+            similar_molecules = []
+            for mol, similarity in zip(valid_molecules, similarities):
+                if similarity >= similarity_threshold:
+                    similar_molecules.append({
+                        'reference_id': reference.get('id', 'N/A'),
+                        'reference_name': reference.get('name', 'N/A'),
+                        'reference_smiles': reference['smiles'],
+                        'molecule_id': mol.get('id', 'N/A'),
+                        'molecule_name': mol.get('name', 'N/A'),
+                        'molecule_smiles': mol['smiles'],
+                        'similarity': similarity,
+                        'fingerprint_type': fingerprint_type
+                    })
+
+            # Create results DataFrame
+            results_df = pd.DataFrame(similar_molecules)
+
+            if not results_df.empty:
+                # Sort by similarity (highest first)
+                results_df = results_df.sort_values('similarity', ascending=False)
+
+                print(f"\n✅ Similarity analysis completed!")
+                print(f"   🎯 Similar molecules found: {len(results_df):,}")
+                print(f"   📈 Highest similarity: {results_df['similarity'].max():.4f}")
+                print(f"   📉 Lowest similarity: {results_df['similarity'].min():.4f}")
+
+                # Show top 5 most similar molecules
+                print(f"\n🔝 Top 5 most similar molecules:")
+                for i, (_, hit) in enumerate(results_df.head(5).iterrows(), 1):
+                    print(f"   {i}. {hit['molecule_name']}")
+                    print(f"      Similarity: {hit['similarity']:.4f}")
+            else:
+                print(f"\n📊 No molecules found above threshold {similarity_threshold:.2f}")
+
+            # Save results to a log file
+            try:
+                logs_dir = os.path.join(os.path.dirname(self.__chemspace_db), 'logs')
+                os.makedirs(logs_dir, exist_ok=True)
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                log_file_path = os.path.join(
+                    logs_dir, f'similarity_{target_table}_vs_{reference_table}_{timestamp}.log'
+                )
+
+                with open(log_file_path, 'w') as f:
+                    f.write("SIMILARITY TO REFERENCE ANALYSIS\n")
+                    f.write("=" * 60 + "\n")
+                    f.write(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    f.write(f"Target table: {target_table}\n")
+                    f.write(f"Reference table: {reference_table}\n")
+                    f.write(f"Reference molecule: {reference.get('name', 'N/A')} "
+                            f"(id: {reference.get('id', 'N/A')})\n")
+                    f.write(f"Reference SMILES: {reference['smiles']}\n")
+                    f.write(f"Fingerprint type: {fingerprint_type}\n")
+                    f.write(f"Similarity threshold: {similarity_threshold:.2f}\n")
+                    f.write(f"Compounds in target table: {len(compounds_df)}\n")
+                    f.write(f"Valid fingerprints: {len(fingerprints)}\n")
+                    f.write(f"Skipped (invalid SMILES): {invalid_count}\n")
+                    f.write(f"Similar molecules found: {len(results_df)}\n")
+                    f.write("=" * 60 + "\n\n")
+
+                    if not results_df.empty:
+                        f.write(results_df[['molecule_id', 'molecule_name', 'similarity', 'molecule_smiles']]
+                                .to_string(index=False, float_format='{:.4f}'.format))
+                        f.write("\n")
+                    else:
+                        f.write("No molecules found above threshold.\n")
+
+                print(f"\n📝 Results saved to log: {log_file_path}")
+            except Exception as e:
+                print(f"⚠️  Could not write results log: {e}")
+
+            return results_df
+
+        except Exception as e:
+            print(f"❌ Error in similarity analysis: {e}")
+            return pd.DataFrame()
+
     def generate_duplicate_report(self, table_name: str, output_path: Optional[str] = None) -> bool:
         """
         Generate a comprehensive duplicate analysis report.
