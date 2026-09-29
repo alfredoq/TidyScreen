@@ -2426,7 +2426,8 @@ class MolDyn:
 
     def list_md_queue(self, all_projects=False):
         """
-        Show jobs on the shared, machine-wide MD queue (see md_queue.py).
+        Show jobs on the shared, machine-wide MD queue (see md_queue.py) —
+        MD simulations ('gpu' lane) and MM-GBSA computations ('cpu' lane).
         Defaults to this project's own jobs; pass all_projects=True to see
         every project's jobs.
         """
@@ -2444,7 +2445,9 @@ class MolDyn:
         print("=" * 70)
         for job in jobs:
             glyph = status_glyphs.get(job['status'], '❔')
-            print(f"{glyph} Queue ID: {job['queue_id']}  |  Project: {job['project_name']}  |  "
+            job_label = 'MM-GBSA' if job['job_type'] == 'mmgbsa' else 'MD'
+            print(f"{glyph} Queue ID: {job['queue_id']}  |  {job_label} ({job['resource'] or 'gpu'})  |  "
+                  f"Project: {job['project_name']}  |  "
                   f"Assay: {job['md_assay_label']} (assay_id={job['assay_id']})")
             print(f"   Status: {job['status']}  |  Enqueued: {job['enqueued_at']}  |  "
                   f"Started: {job['started_at'] or '-'}  |  Finished: {job['finished_at'] or '-'}")
@@ -2801,8 +2804,11 @@ class MolDyn:
           4. Run ante-MMPBSA.py to generate gas-phase receptor/ligand/complex topologies
           5. Write the MMPBSA.py input namelist
           6. Write run_mmgbsa.sh execution script
-          7. Query user: run now (fg/bg) or leave for manual execution
-          8. If fg: parse, store, and display results immediately after completion
+          7. Query user: run now (fg/bg/queue) or leave for manual execution
+          8. If fg: parse, store, and display results immediately after completion.
+             If queue: the job runs on the shared queue's 'cpu' lane (see md_queue.py),
+             independently of queued MD simulations, and the queue worker parses and
+             stores the results when it finishes.
         """
         import traceback
 
@@ -2888,8 +2894,8 @@ class MolDyn:
             print(f"   Script: {script_path}")
 
             start_now = input(
-                "\n▶️  Do you want to start the MM-GBSA computation now? (yes/no) [default: no]: "
-            ).strip().lower() or 'no'
+                "\n▶️  Do you want to start the MM-GBSA computation now? (yes/no) [default: yes]: "
+            ).strip().lower() or 'yes'
             if start_now in ['yes', 'y']:
                 self._start_mmgbsa_computation(
                     mmgbsa_folder, script_path, assay_id, mmgbsa_params, assay_info
@@ -4479,58 +4485,77 @@ class MolDyn:
     def _start_mmgbsa_computation(self, mmgbsa_folder, script_path, assay_id,
                                    mmgbsa_params, assay_info):
         """
-        Ask the user whether to run the MM-GBSA script in the foreground or background,
-        then launch it accordingly.
+        Ask the user how to run the MM-GBSA script, then launch it accordingly.
 
         Foreground: blocks until completion, then parses mmgbsa_results.dat and stores
-        results in the database.
-        Background: launches the script detached; results must be collected manually.
+        results in the database. Occupies the shared queue's 'cpu' lane while it runs
+        (see md_queue.py), so it never overlaps a queued MM-GBSA job.
+        Background: launches the script detached and untracked; results must be
+        collected manually.
+        Queue: enqueues the script on the shared queue's 'cpu' lane — MM-GBSA jobs run
+        one at a time, independently of the 'gpu' lane that runs MD simulations. The
+        worker parses and stores the results itself once the run finishes.
         """
         import subprocess
 
         run_mode = input(
-            "\n⚙️  Run in foreground or background? (fg/bg) [default: fg]: "
-        ).strip().lower() or 'fg'
+            "\n⚙️  Run in the foreground, in the background, or enqueue it on the shared "
+            "MD queue? (fg/bg/queue) [default: queue]: "
+        ).strip().lower() or 'queue'
 
         results_dat  = os.path.join(mmgbsa_folder, 'mmgbsa_results.dat')
-        energies_csv = os.path.join(mmgbsa_folder, 'mmgbsa_energies.csv')
         decomp_dat   = os.path.join(mmgbsa_folder, 'mmgbsa_decomp.dat')
+        mmpbsa_log   = os.path.join(mmgbsa_folder, 'mmpbsa.log')
+        queue_label  = (f"{assay_info.get('md_assay') or f'assay_{assay_id}'} / "
+                        f"{os.path.basename(mmgbsa_folder.rstrip(os.sep))}")
+        # Everything the queue worker needs to store the results (see
+        # md_queue._store_mmgbsa_job_results()).
+        job_params = {'mmgbsa_params': mmgbsa_params, 'assay_info': assay_info}
 
         if run_mode in ['fg', 'foreground']:
+            can_start, why_not = md_queue.can_start_foreground('cpu')
+            if not can_start:
+                print(f"❌ {why_not}")
+                print("   Choose 'queue' instead, or wait for the current run to finish.")
+                return
+
             print("\n▶️  Starting MM-GBSA computation in the foreground...")
             try:
-                proc = subprocess.run([script_path], cwd=mmgbsa_folder)
+                proc = subprocess.Popen([script_path], cwd=mmgbsa_folder)
             except Exception as e:
                 print(f"❌ Error running MM-GBSA script: {e}")
                 return
 
-            if proc.returncode != 0:
-                print(f"❌ MM-GBSA script exited with code {proc.returncode}.")
-                mmpbsa_log = os.path.join(mmgbsa_folder, 'mmpbsa.log')
-                print(f"   Inspect the log for details: {mmpbsa_log}")
-                return
+            queue_id, err = md_queue.register_foreground_run(
+                self.name, self.path, assay_id, assay_info['assay_folder_path'],
+                queue_label, proc.pid,
+                job_type='mmgbsa', resource='cpu', script_path=script_path, job_params=job_params,
+            )
+            if queue_id is None:
+                # Same tiny race as in _start_md_simulation(): the run already started,
+                # so let it continue untracked rather than kill it.
+                print(f"⚠️  {err} (this run was already started and will continue; "
+                      f"it is not tracked by the shared MD queue).")
 
-            if not os.path.exists(results_dat):
-                print(f"❌ MM-GBSA results file not found after run: {results_dat}")
-                return
-
-            # Parse, store, and display results only available after fg completion
-            parsed = self._parse_mmpbsa_output(results_dat)
-            if parsed is None:
-                print(f"⚠️  Could not parse MMPBSA.py output — raw results in: {results_dat}")
-                return
-
-            parsed['results_file'] = results_dat
-            parsed['energies_file'] = energies_csv if os.path.exists(energies_csv) else None
-            self._store_mmgbsa_results(assay_id, parsed, mmgbsa_params, mmgbsa_folder)
-            self._display_mmgbsa_results(parsed, assay_info)
-
-            # Per-residue energy decomposition — parse, renumber to the original
-            # receptor numbering, and store (mirrors MolDock.compute_fingerprints()).
-            if mmgbsa_params.get('per_residue', False):
-                self._process_mmgbsa_decomposition(
-                    assay_id, decomp_dat, mmgbsa_folder, assay_info
-                )
+            status, error_message = 'failed', None
+            try:
+                returncode = proc.wait()
+                if returncode != 0:
+                    error_message = f'run_mmgbsa.sh exited with code {returncode}'
+                    print(f"❌ MM-GBSA script exited with code {returncode}.")
+                    print(f"   Inspect the log for details: {mmpbsa_log}")
+                elif not os.path.exists(results_dat):
+                    error_message = f'MMPBSA.py produced no results file ({results_dat})'
+                    print(f"❌ MM-GBSA results file not found after run: {results_dat}")
+                else:
+                    status = 'completed'
+                    if not self._finalize_mmgbsa_run(assay_id, mmgbsa_folder, mmgbsa_params, assay_info):
+                        error_message = 'MM-GBSA finished but results could not be parsed/stored'
+            finally:
+                if queue_id is not None:
+                    md_queue.finish_foreground_run(
+                        queue_id, self.path, assay_id, status, error_message, job_type='mmgbsa',
+                    )
 
         elif run_mode in ['bg', 'background']:
             print("\n▶️  Starting MM-GBSA computation in the background...")
@@ -4548,12 +4573,61 @@ class MolDyn:
             print(f"   Results will be written to: {results_dat}")
             if mmgbsa_params.get('per_residue', False):
                 print(f"   Per-residue decomposition : {decomp_dat}")
-            print(f"   Log: {os.path.join(mmgbsa_folder, 'mmpbsa.log')}")
+            print(f"   Log: {mmpbsa_log}")
             print(f"   Re-run compute_mmgbsa_on_trajectory() after completion to parse and store results")
             print(f"   (it will detect the finished output and offer to parse it without recomputing).")
 
+        elif run_mode in ['queue', 'q']:
+            try:
+                queue_id = md_queue.enqueue_job(
+                    self.name, self.path, assay_id, assay_info['assay_folder_path'], queue_label,
+                    job_type='mmgbsa', resource='cpu', script_path=script_path, job_params=job_params,
+                )
+                started = md_queue.ensure_worker_running('cpu')
+                pos = md_queue.queue_position(queue_id)
+            except Exception as e:
+                print(f"❌ Error enqueuing MM-GBSA computation: {e}")
+                return
+            if started or pos <= 1:
+                print(f"▶️  Enqueued (queue_id={queue_id}) — worker started, will begin immediately.")
+            else:
+                print(f"📥 Enqueued (queue_id={queue_id}); {pos - 1} MM-GBSA job(s) ahead of it "
+                      f"in the shared queue (MD simulations run separately and don't block it).")
+            print(f"   Results will be parsed and stored automatically when the run finishes.")
+            print(f"   Log: {os.path.join(mmgbsa_folder, 'run_mmgbsa_queue.log')}")
+            print("   Use MolDyn.list_md_queue() to check progress.")
+
         else:
-            print("❌ Invalid option. Please choose 'fg' or 'bg'.")
+            print("❌ Invalid option. Please choose 'fg', 'bg' or 'queue'.")
+
+    def _finalize_mmgbsa_run(self, assay_id, mmgbsa_folder, mmgbsa_params, assay_info):
+        """
+        Parse, store, and display the results of a finished MM-GBSA run (plus the
+        per-residue decomposition when requested). Shared by the foreground path of
+        _start_mmgbsa_computation() and the md_queue worker (see
+        md_queue._store_mmgbsa_job_results()). Returns True if the results were stored.
+        """
+        results_dat  = os.path.join(mmgbsa_folder, 'mmgbsa_results.dat')
+        energies_csv = os.path.join(mmgbsa_folder, 'mmgbsa_energies.csv')
+        decomp_dat   = os.path.join(mmgbsa_folder, 'mmgbsa_decomp.dat')
+
+        parsed = self._parse_mmpbsa_output(results_dat)
+        if parsed is None:
+            print(f"⚠️  Could not parse MMPBSA.py output — raw results in: {results_dat}")
+            return False
+
+        parsed['results_file'] = results_dat
+        parsed['energies_file'] = energies_csv if os.path.exists(energies_csv) else None
+        stored = self._store_mmgbsa_results(assay_id, parsed, mmgbsa_params, mmgbsa_folder)
+        self._display_mmgbsa_results(parsed, assay_info)
+
+        # Per-residue energy decomposition — parse, renumber to the original
+        # receptor numbering, and store (mirrors MolDock.compute_fingerprints()).
+        if mmgbsa_params.get('per_residue', False):
+            self._process_mmgbsa_decomposition(
+                assay_id, decomp_dat, mmgbsa_folder, assay_info
+            )
+        return stored
 
     def _parse_mmpbsa_output(self, results_file):
         """
@@ -4674,8 +4748,10 @@ class MolDyn:
             conn.close()
             print(f"   ✓ MM-GBSA results stored in database "
                   f"(assay_id={assay_id}, run={os.path.basename(mmgbsa_folder)})")
+            return True
         except Exception as e:
             print(f"⚠️  Error storing MM-GBSA results in database: {e}")
+            return False
 
     def _display_mmgbsa_results(self, results, assay_info):
         """Print a formatted MM-GBSA results summary to the terminal."""
