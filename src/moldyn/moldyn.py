@@ -947,7 +947,253 @@ class MolDyn:
             
         except Exception as e:
             print(f"❌ Error deleting MD method: {e}")
-            
+
+    def copy_md_method_between_projects(self, source_project_name=None, source_method_name=None,
+                                        dest_method_name=None):
+        """
+        Copy an MD method from another project's md_methods.db into the active project's
+        md_methods.db. Mirrors MolDock.copy_docking_method_between_projects(). Works for
+        methods created with create_md_method() and create_md_method_using_tleap_template()
+        (the tleap template and custom .lib/.frcmod files are embedded in the parameters JSON,
+        so they travel with the method).
+
+        Engine, description and parameters are copied verbatim as stored; the only change
+        applied to the parameters JSON is updating its 'method_name' key when the copy is
+        saved under a different name.
+
+        Args:
+            source_project_name (Optional[str]): Project to copy from. If None, prompts an
+                interactive project selection.
+            source_method_name (Optional[str]): Method to copy from the source project. If None,
+                prompts an interactive method selection.
+            dest_method_name (Optional[str]): Name for the copied method in the active project.
+                If None, defaults to the source method name.
+
+        Returns:
+            Optional[dict]: {'method_id', 'method_name', 'engine', 'description', 'parameters',
+                'database_path'} for the method in the active project, or None if failed or
+                cancelled.
+        """
+        import sqlite3
+        import json
+        from tidyscreen.projects.projects_management import ProjectsManagement
+
+        def _valid_name(name):
+            return bool(name) and name.replace('_', '').replace('-', '').replace(' ', '').isalnum()
+
+        try:
+            print(f"\n📋 COPY MD METHOD BETWEEN PROJECTS")
+            print("=" * 50)
+
+            # --- Select source project ---
+            all_projects = ProjectsManagement().list_all_projects(print_output=False) or []
+            if not all_projects:
+                print("❌ No projects found in the projects database.")
+                return None
+
+            if source_project_name is None:
+                print("\n📋 Available projects:")
+                for idx, proj in enumerate(all_projects, 1):
+                    marker = " (active)" if proj['name'] == self.name else ""
+                    print(f"  [{idx}] {proj['name']}{marker}")
+                while True:
+                    selection = input("Select source project by number or name (or 'cancel' to abort): ").strip()
+                    if selection.lower() in ['cancel', 'quit', 'exit']:
+                        print("❌ Operation cancelled by user.")
+                        return None
+                    if selection.isdigit() and 0 <= int(selection) - 1 < len(all_projects):
+                        source_project_name = all_projects[int(selection) - 1]['name']
+                        break
+                    if any(p['name'] == selection for p in all_projects):
+                        source_project_name = selection
+                        break
+                    print("⚠️ Invalid selection. Try again.")
+
+            source_project = ActivateProject(source_project_name)
+            if not source_project.project_exists():
+                print(f"❌ Project '{source_project_name}' not found.")
+                return None
+
+            source_db = os.path.join(source_project.path, 'dynamics', 'md_registers', 'md_methods.db')
+            if not os.path.exists(source_db):
+                print(f"❌ No MD methods database found for project '{source_project_name}' at {source_db}")
+                return None
+
+            # --- Read source methods ---
+            src_conn = sqlite3.connect(source_db)
+            try:
+                src_cursor = src_conn.cursor()
+                src_cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='md_methods'")
+                if not src_cursor.fetchone():
+                    print(f"❌ MD methods table not found in project '{source_project_name}'.")
+                    return None
+                src_cursor.execute('''
+                    SELECT method_id, method_name, engine, description, parameters
+                    FROM md_methods ORDER BY method_id ASC
+                ''')
+                source_methods = src_cursor.fetchall()
+            finally:
+                src_conn.close()
+
+            if not source_methods:
+                print(f"❌ No MD methods found in project '{source_project_name}'.")
+                return None
+
+            # --- Select source method ---
+            # md_methods.method_name is not UNIQUE, so selection by name picks the first match.
+            if source_method_name is None:
+                print(f"\n🧬 MD methods in project '{source_project_name}':")
+                for idx, (mid, name, engine, desc, params_text) in enumerate(source_methods, 1):
+                    try:
+                        method_type = json.loads(params_text).get('method_type', 'wizard') if params_text else 'wizard'
+                    except (json.JSONDecodeError, AttributeError):
+                        method_type = 'wizard'
+                    print(f"  [{idx}] {name}  |  {engine}  |  {method_type}  |  {desc or 'No description'}")
+                while True:
+                    selection = input("Select method to copy by number or name (or 'cancel' to abort): ").strip()
+                    if selection.lower() in ['cancel', 'quit', 'exit']:
+                        print("❌ Operation cancelled by user.")
+                        return None
+                    if selection.isdigit() and 0 <= int(selection) - 1 < len(source_methods):
+                        selected = source_methods[int(selection) - 1]
+                        break
+                    matching = [m for m in source_methods if m[1] == selection]
+                    if matching:
+                        selected = matching[0]
+                        break
+                    print("⚠️ Invalid selection. Try again.")
+            else:
+                matching = [m for m in source_methods if m[1] == source_method_name]
+                if not matching:
+                    print(f"❌ Method '{source_method_name}' not found in project '{source_project_name}'.")
+                    return None
+                if len(matching) > 1:
+                    print(f"⚠️  {len(matching)} methods named '{source_method_name}' in project "
+                          f"'{source_project_name}'; copying the first one (Method ID {matching[0][0]}).")
+                selected = matching[0]
+
+            src_id, src_name, engine, description, params_text = selected
+
+            # --- Resolve destination ---
+            dest_db = self.__md_methods_db
+            os.makedirs(os.path.dirname(dest_db), exist_ok=True)
+
+            same_database = os.path.abspath(source_db) == os.path.abspath(dest_db)
+            dest_name = (dest_method_name if dest_method_name is not None else src_name).strip()
+
+            if not _valid_name(dest_name):
+                print("❌ Method name can only contain letters, numbers, spaces, hyphens, and underscores")
+                return None
+
+            conn = sqlite3.connect(dest_db)
+            try:
+                cursor = conn.cursor()
+
+                # Same schema handling as _save_parameters_to_db()
+                columns_dict = {
+                    'method_id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
+                    'method_name': 'TEXT',
+                    'description': 'TEXT',
+                    'engine': 'TEXT',
+                    'parameters': 'TEXT',
+                }
+                dbm.create_table_from_columns_dict(cursor, 'md_methods', columns_dict)
+                dbm.update_legacy_table_columns(cursor, 'md_methods', columns_dict)
+                dbm.remove_legacy_table_columns(cursor, 'md_methods', columns_dict)
+
+                overwrite_id = None
+                while True:
+                    if same_database and dest_name == src_name:
+                        print("⚠️  Source and destination are the same method; choose a different name.")
+                        existing = None
+                        can_overwrite = False
+                    else:
+                        cursor.execute(
+                            "SELECT method_id FROM md_methods WHERE method_name = ? ORDER BY method_id ASC",
+                            (dest_name,)
+                        )
+                        existing = cursor.fetchone()
+                        can_overwrite = True
+                        if existing is None:
+                            break
+
+                    if can_overwrite:
+                        print(f"\n⚠️  Method '{dest_name}' already exists in the active project '{self.name}' "
+                              f"(Method ID {existing[0]}).")
+                    print("Choose an action:")
+                    if can_overwrite:
+                        print("  [1] Overwrite the existing method")
+                    print("  [2] Save the copy under a different name")
+                    print("  [3] Cancel")
+                    action = input("Select action: ").strip()
+
+                    if action == '1' and can_overwrite:
+                        confirm = input(
+                            f"⚠️  This will replace the existing method '{dest_name}' in '{self.name}'. Continue? (yes/no): "
+                        ).strip().lower()
+                        if confirm not in ['yes', 'y']:
+                            print("Overwrite cancelled.")
+                            continue
+                        overwrite_id = existing[0]
+                        break
+                    elif action == '2':
+                        new_name = input(f"Enter a new name for the copied method (was '{dest_name}'): ").strip()
+                        if not _valid_name(new_name):
+                            print("❌ Method name can only contain letters, numbers, spaces, hyphens, and underscores")
+                            continue
+                        dest_name = new_name
+                    elif action == '3':
+                        print("❌ Copy cancelled by user.")
+                        return None
+                    else:
+                        print("⚠️ Invalid selection. Try again.")
+
+                # The parameters JSON embeds 'method_name' (it is passed on to md_assays.md_parameters),
+                # so keep it consistent with the column when the copy is renamed.
+                try:
+                    parameters = json.loads(params_text) if params_text else {}
+                except json.JSONDecodeError:
+                    parameters = None
+                if isinstance(parameters, dict) and dest_name != src_name:
+                    parameters['method_name'] = dest_name
+                    params_text = self._serialize_parameters(parameters)
+
+                # --- Perform the copy ---
+                if overwrite_id is not None:
+                    cursor.execute('''
+                        UPDATE md_methods
+                        SET method_name = ?, description = ?, engine = ?, parameters = ?
+                        WHERE method_id = ?
+                    ''', (dest_name, description, engine, params_text, overwrite_id))
+                    method_id = overwrite_id
+                else:
+                    cursor.execute('''
+                        INSERT INTO md_methods (method_name, description, engine, parameters)
+                        VALUES (?, ?, ?, ?)
+                    ''', (dest_name, description, engine, params_text))
+                    method_id = cursor.lastrowid
+                conn.commit()
+            finally:
+                conn.close()
+
+            print(f"✅ Copied MD method '{src_name}' (Method ID {src_id}) from project '{source_project_name}' "
+                  f"to '{dest_name}' in project '{self.name}'.")
+            print(f"📋 Method ID: {method_id}")
+            print(f"🗂️  Database:  {dest_db}")
+
+            return {
+                'method_id': method_id,
+                'method_name': dest_name,
+                'engine': engine,
+                'description': description,
+                'parameters': parameters if isinstance(parameters, dict) else {},
+                'database_path': dest_db,
+            }
+
+        except Exception as e:
+            print(f"❌ Error copying MD method between projects: {e}")
+            return None
+
     def perform_md_assay(self):
         """
         Will connect to the docking registers database and list available docking assays.
