@@ -14309,6 +14309,7 @@ class MolDock:
         overwrites via ambpdb using the generated prmtop/inpcrd.
         """
         import subprocess
+        from tidyscreen.molecule_management import ligand_management as lm
 
         template_content = fps_tleap_config.get('template_content', '')
         if not template_content:
@@ -14328,6 +14329,13 @@ class MolDock:
             with open(dest, 'w') as fh:
                 fh.write(cf['content'])
             print(f"   ✓ Restored custom parameter file: {cf['filename']}")
+
+        # antechamber upper-cases atom names in the mol2 (e.g. Cl19 -> CL19);
+        # align the pose names to it, since tleap matches them case-sensitively.
+        try:
+            lm.match_pose_atom_names_to_mol2(ligand_pdb, mol2_file)
+        except ValueError as e:
+            raise RuntimeError(f"Docked pose does not match the ligand template: {e}") from e
 
         content = template_content
         content = content.replace("'{{RECEPTOR_PDB}}'", receptor_pdb)
@@ -14350,6 +14358,10 @@ class MolDock:
             if result.stderr:
                 lf.write("\n--- STDERR ---\n")
                 lf.write(result.stderr)
+
+        # Checked before the exit code: a pose/template name mismatch otherwise
+        # surfaces only as a cryptic "atom does not have a type" FATAL.
+        lm.check_tleap_ligand_atoms(result.stdout, ligand_pdb, tleap_log_file)
 
         if result.returncode != 0:
             tail = result.stdout[-3000:] if len(result.stdout) > 3000 else result.stdout

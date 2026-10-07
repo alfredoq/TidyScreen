@@ -1272,6 +1272,15 @@ class MolDyn:
             if mol2_file is None or frcmod_file is None:
                 raise RuntimeError("Failed to prepare ligand tleap input files — prepare_ligand_tleap_input_files returned None")
 
+            # antechamber upper-cases atom names in the mol2 (e.g. Cl19 -> CL19);
+            # align the pose names to it, since tleap matches them case-sensitively.
+            try:
+                n_renamed = lm.match_pose_atom_names_to_mol2(selected_pose_pdb, mol2_file)
+            except ValueError as e:
+                raise RuntimeError(f"Docked pose does not match the ligand template: {e}") from e
+            if n_renamed:
+                print(f"   ✓ Renamed {n_renamed} pose atom name(s) to match the ligand mol2 template")
+
             # Create complex .prmtop and .inpcrd files
             print(f"⚙️  Preparing topology and coordinate files with tleap...")
 
@@ -2008,6 +2017,10 @@ class MolDyn:
         except OSError:
             pass
 
+        # Checked before the exit code: a pose/template name mismatch otherwise
+        # surfaces only as a cryptic "atom does not have a type" FATAL.
+        lm.check_tleap_ligand_atoms(result.stdout, pdb_file, tleap_log_file)
+
         if result.returncode != 0:
             tail = result.stdout[-3000:] if len(result.stdout) > 3000 else result.stdout
             print(f"   tleap output (last lines):\n{tail}")
@@ -2131,6 +2144,10 @@ class MolDyn:
                     lf.write(result.stderr)
         except OSError:
             pass
+
+        # Receptor-only (apo) runs have no pose to check.
+        if selected_pose_pdb:
+            lm.check_tleap_ligand_atoms(result.stdout, selected_pose_pdb, tleap_log_file)
 
         if result.returncode != 0:
             tail = result.stdout[-3000:] if len(result.stdout) > 3000 else result.stdout
