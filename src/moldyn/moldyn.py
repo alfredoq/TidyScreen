@@ -4208,6 +4208,235 @@ class MolDyn:
             print(f"❌ Error importing MM-GBSA condition: {e}")
             return None
 
+    def copy_mmgbsa_computation_conditions_between_projects(self, source_project_name=None,
+                                                            source_condition_name=None,
+                                                            dest_condition_name=None):
+        """
+        Copy an MM-GBSA computation condition from another project's mmgbsa_conditions.db
+        into the active project's mmgbsa_conditions.db. Mirrors
+        copy_md_method_between_projects().
+
+        Description and parameters are copied verbatim as stored (the parameters JSON
+        does not embed the condition name, so renaming the copy needs no JSON rewrite).
+
+        Args:
+            source_project_name (Optional[str]): Project to copy from. If None, prompts an
+                interactive project selection.
+            source_condition_name (Optional[str]): Condition to copy from the source project.
+                If None, prompts an interactive condition selection.
+            dest_condition_name (Optional[str]): Name for the copied condition in the active
+                project. If None, defaults to the source condition name.
+
+        Returns:
+            Optional[dict]: {'condition_id', 'condition_name', 'description', 'parameters',
+                'database_path'} for the condition in the active project, or None if failed
+                or cancelled.
+        """
+        import sqlite3
+        import json
+        from tidyscreen.projects.projects_management import ProjectsManagement
+
+        def _valid_name(name):
+            return bool(name) and name.replace('_', '').replace('-', '').replace(' ', '').isalnum()
+
+        try:
+            print(f"\n📋 COPY MM-GBSA COMPUTATION CONDITION BETWEEN PROJECTS")
+            print("=" * 50)
+
+            # --- Select source project ---
+            all_projects = ProjectsManagement().list_all_projects(print_output=False) or []
+            if not all_projects:
+                print("❌ No projects found in the projects database.")
+                return None
+
+            if source_project_name is None:
+                print("\n📋 Available projects:")
+                for idx, proj in enumerate(all_projects, 1):
+                    marker = " (active)" if proj['name'] == self.name else ""
+                    print(f"  [{idx}] {proj['name']}{marker}")
+                while True:
+                    selection = input("Select source project by number or name (or 'cancel' to abort): ").strip()
+                    if selection.lower() in ['cancel', 'quit', 'exit']:
+                        print("❌ Operation cancelled by user.")
+                        return None
+                    if selection.isdigit() and 0 <= int(selection) - 1 < len(all_projects):
+                        source_project_name = all_projects[int(selection) - 1]['name']
+                        break
+                    if any(p['name'] == selection for p in all_projects):
+                        source_project_name = selection
+                        break
+                    print("⚠️ Invalid selection. Try again.")
+
+            source_project = ActivateProject(source_project_name)
+            if not source_project.project_exists():
+                print(f"❌ Project '{source_project_name}' not found.")
+                return None
+
+            source_db = os.path.join(source_project.path, 'dynamics', 'md_registers', 'mmgbsa_conditions.db')
+            if not os.path.exists(source_db):
+                print(f"❌ No MM-GBSA conditions database found for project '{source_project_name}' at {source_db}")
+                return None
+
+            # --- Read source conditions ---
+            src_conn = sqlite3.connect(source_db)
+            try:
+                src_cursor = src_conn.cursor()
+                src_cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='mmgbsa_conditions'")
+                if not src_cursor.fetchone():
+                    print(f"❌ MM-GBSA conditions table not found in project '{source_project_name}'.")
+                    return None
+                src_cursor.execute('''
+                    SELECT id, condition_name, description, parameters
+                    FROM mmgbsa_conditions ORDER BY id ASC
+                ''')
+                source_conditions = src_cursor.fetchall()
+            finally:
+                src_conn.close()
+
+            if not source_conditions:
+                print(f"❌ No MM-GBSA conditions found in project '{source_project_name}'.")
+                return None
+
+            # --- Select source condition (condition_name is UNIQUE) ---
+            if source_condition_name is None:
+                print(f"\n🧪 MM-GBSA conditions in project '{source_project_name}':")
+                for idx, (cid, name, desc, _params) in enumerate(source_conditions, 1):
+                    print(f"  [{idx}] {name}  |  {desc or 'No description'}")
+                while True:
+                    selection = input("Select condition to copy by number or name (or 'cancel' to abort): ").strip()
+                    if selection.lower() in ['cancel', 'quit', 'exit']:
+                        print("❌ Operation cancelled by user.")
+                        return None
+                    if selection.isdigit() and 0 <= int(selection) - 1 < len(source_conditions):
+                        selected = source_conditions[int(selection) - 1]
+                        break
+                    matching = [c for c in source_conditions if c[1] == selection]
+                    if matching:
+                        selected = matching[0]
+                        break
+                    print("⚠️ Invalid selection. Try again.")
+            else:
+                matching = [c for c in source_conditions if c[1] == source_condition_name]
+                if not matching:
+                    print(f"❌ Condition '{source_condition_name}' not found in project '{source_project_name}'.")
+                    return None
+                selected = matching[0]
+
+            src_id, src_name, description, params_text = selected
+
+            # --- Resolve destination ---
+            dest_db = self.__mmgbsa_conditions_db
+            os.makedirs(os.path.dirname(dest_db), exist_ok=True)
+
+            same_database = os.path.abspath(source_db) == os.path.abspath(dest_db)
+            dest_name = (dest_condition_name if dest_condition_name is not None else src_name).strip()
+
+            if not _valid_name(dest_name):
+                print("❌ Condition name can only contain letters, numbers, spaces, hyphens, and underscores")
+                return None
+
+            conn = sqlite3.connect(dest_db)
+            try:
+                cursor = conn.cursor()
+
+                # Same schema as create_mmgbsa_computation_conditions()
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS mmgbsa_conditions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        condition_name TEXT UNIQUE NOT NULL,
+                        description TEXT,
+                        parameters TEXT,
+                        created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+
+                overwrite_id = None
+                while True:
+                    if same_database and dest_name == src_name:
+                        print("⚠️  Source and destination are the same condition; choose a different name.")
+                        existing = None
+                        can_overwrite = False
+                    else:
+                        cursor.execute(
+                            "SELECT id FROM mmgbsa_conditions WHERE condition_name = ?",
+                            (dest_name,)
+                        )
+                        existing = cursor.fetchone()
+                        can_overwrite = True
+                        if existing is None:
+                            break
+
+                    if can_overwrite:
+                        print(f"\n⚠️  Condition '{dest_name}' already exists in the active project '{self.name}' "
+                              f"(ID {existing[0]}).")
+                    print("Choose an action:")
+                    if can_overwrite:
+                        print("  [1] Overwrite the existing condition")
+                    print("  [2] Save the copy under a different name")
+                    print("  [3] Cancel")
+                    action = input("Select action: ").strip()
+
+                    if action == '1' and can_overwrite:
+                        confirm = input(
+                            f"⚠️  This will replace the existing condition '{dest_name}' in '{self.name}'. Continue? (yes/no): "
+                        ).strip().lower()
+                        if confirm not in ['yes', 'y']:
+                            print("Overwrite cancelled.")
+                            continue
+                        overwrite_id = existing[0]
+                        break
+                    elif action == '2':
+                        new_name = input(f"Enter a new name for the copied condition (was '{dest_name}'): ").strip()
+                        if not _valid_name(new_name):
+                            print("❌ Condition name can only contain letters, numbers, spaces, hyphens, and underscores")
+                            continue
+                        dest_name = new_name
+                    elif action == '3':
+                        print("❌ Copy cancelled by user.")
+                        return None
+                    else:
+                        print("⚠️ Invalid selection. Try again.")
+
+                # --- Perform the copy ---
+                if overwrite_id is not None:
+                    cursor.execute('''
+                        UPDATE mmgbsa_conditions
+                        SET condition_name = ?, description = ?, parameters = ?, created_date = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                    ''', (dest_name, description, params_text, overwrite_id))
+                    condition_id = overwrite_id
+                else:
+                    cursor.execute('''
+                        INSERT INTO mmgbsa_conditions (condition_name, description, parameters)
+                        VALUES (?, ?, ?)
+                    ''', (dest_name, description, params_text))
+                    condition_id = cursor.lastrowid
+                conn.commit()
+            finally:
+                conn.close()
+
+            try:
+                parameters = json.loads(params_text) if params_text else {}
+            except json.JSONDecodeError:
+                parameters = {}
+
+            print(f"✅ Copied MM-GBSA condition '{src_name}' (ID {src_id}) from project '{source_project_name}' "
+                  f"to '{dest_name}' in project '{self.name}'.")
+            print(f"📋 Condition ID: {condition_id}")
+            print(f"🗂️  Database:     {dest_db}")
+
+            return {
+                'condition_id': condition_id,
+                'condition_name': dest_name,
+                'description': description,
+                'parameters': parameters,
+                'database_path': dest_db,
+            }
+
+        except Exception as e:
+            print(f"❌ Error copying MM-GBSA condition between projects: {e}")
+            return None
+
     def delete_mmgbsa_computation_conditions(self):
         """
         Delete an MM-GBSA computation condition registry, as created using
