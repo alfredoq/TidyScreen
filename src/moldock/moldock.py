@@ -11539,14 +11539,15 @@ class MolDock:
 
     def delete_receptor_model(self):
         """
-        List available receptor models from the receptors database and prompt the user to select one for deletion.
+        List available receptor models from the receptors database and prompt the user to select
+        one or more for deletion ('3', '1,3,5', '1-5', '1,3-5' or 'all').
         Related docking assays will also be deleted along with their associated folders.
 
         Returns:
-            Optional[Dict]: Dictionary with deletion details or None if cancelled
+            Optional[Dict]: Dictionary with deletion details ('receptors' holds one entry per
+            deleted receptor model) or None if cancelled
         """
         import sqlite3
-        import shutil
         import json
 
         receptors_db_path = os.path.join(self.path, 'docking', 'receptors', 'receptors.db')
@@ -11556,13 +11557,14 @@ class MolDock:
 
         try:
             conn = sqlite3.connect(receptors_db_path)
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT id, receptor_model_name, template_name, pdb_model_name, pdb_to_convert, pdbqt_file, configs, notes
-                FROM receptor_models
-                ORDER BY id ASC
-            ''')
-            rows = cursor.fetchall()
+            try:
+                rows = conn.execute('''
+                    SELECT id, receptor_model_name, template_name, pdb_model_name, pdb_to_convert, pdbqt_file, configs, notes
+                    FROM receptor_models
+                    ORDER BY id ASC
+                ''').fetchall()
+            finally:
+                conn.close()
         except Exception as e:
             print(f"❌ Error reading receptors.db: {e}")
             return None
@@ -11571,7 +11573,7 @@ class MolDock:
             print("📋 No receptor models found in the database.")
             return None
 
-        print("\n🗑️  DELETE RECEPTOR MODEL FROM DATABASE")
+        print("\n🗑️  DELETE RECEPTOR MODEL(S) FROM DATABASE")
         print("=" * 80)
         print("📋 Available Receptor Models:")
         print("=" * 80)
@@ -11584,182 +11586,212 @@ class MolDock:
 
         try:
             while True:
-                selection = input("Select a receptor model to delete by number (or 'cancel'): ").strip()
+                selection = input("Select receptor model(s) to delete (e.g. 2, 1,3, 1-3, all; or 'cancel'): ").strip()
                 if selection.lower() in ['cancel', 'quit', 'exit']:
                     print("❌ Deletion cancelled by user")
-                    conn.close()
                     return None
-                try:
-                    idx = int(selection) - 1
-                    if 0 <= idx < len(rows):
-                        break
-                    print(f"❌ Invalid selection. Enter a number between 1 and {len(rows)}.")
-                except ValueError:
-                    print("❌ Please enter a valid number.")
+                indices = self._parse_selection_numbers(selection, len(rows))
+                if indices is not None:
+                    break
+                print(f"❌ Invalid selection. Use numbers between 1 and {len(rows)} (e.g. 2, 1,3, 1-3, all).")
         except KeyboardInterrupt:
             print("\n❌ Deletion cancelled by user")
-            conn.close()
             return None
 
-        selected_row = rows[idx]
+        selected_receptors = []
+        for idx in indices:
+            row = rows[idx]
+            configs_dict = {}
+            grids_path = None
+            if row[6]:
+                try:
+                    configs_dict = json.loads(row[6])
+                    grids_path = configs_dict.get('grids_path')
+                except json.JSONDecodeError:
+                    print(f"⚠️  Warning: Could not parse configs for receptor model '{row[1]}'")
+            selected_receptors.append({
+                'id': row[0],
+                'receptor_model_name': row[1],
+                'template_name': row[2],
+                'pdb_model_name': row[3],
+                'pdb_to_convert': row[4],
+                'pdbqt_file': row[5],
+                'configs': configs_dict,
+                'grids_path': grids_path,
+                'notes': row[7],
+            })
 
-        # Parse configs to extract grids_path
-        configs_dict = {}
-        grids_path = None
-        if selected_row[6]:
-            try:
-                configs_dict = json.loads(selected_row[6])
-                grids_path = configs_dict.get('grids_path')
-            except json.JSONDecodeError:
-                print(f"⚠️  Warning: Could not parse configs for receptor model")
-
-        selected_receptor = {
-            'id': selected_row[0],
-            'receptor_model_name': selected_row[1],
-            'template_name': selected_row[2],
-            'pdb_model_name': selected_row[3],
-            'pdb_to_convert': selected_row[4],
-            'pdbqt_file': selected_row[5],
-            'configs': configs_dict,
-            'grids_path': grids_path,
-            'notes': selected_row[7],
-        }
-
-        # Check related docking assays
-        docking_assays = []
+        # Check related docking assays of each selected receptor
         docking_assays_db_path = os.path.join(self.path, 'docking', 'docking_registers', 'docking_assays.db')
-        if os.path.exists(docking_assays_db_path):
+        for receptor in selected_receptors:
+            receptor['docking_assays'] = []
+            if os.path.exists(docking_assays_db_path):
+                try:
+                    conn_assays = sqlite3.connect(docking_assays_db_path)
+                    try:
+                        receptor['docking_assays'] = conn_assays.execute(
+                            "SELECT assay_id, assay_name, assay_folder_path FROM docking_assays WHERE receptor_info LIKE ?",
+                            (f'%"receptor_model_name": "{receptor["receptor_model_name"]}"%',)
+                        ).fetchall()
+                    finally:
+                        conn_assays.close()
+                except sqlite3.Error as e:
+                    print(f"❌ Database error while checking docking assays: {e}")
+                    return None
+
+        # Confirm deletion
+        print(f"\n⚠️  CONFIRM DELETION OF {len(selected_receptors)} RECEPTOR MODEL(S)")
+        print("=" * 80)
+        for receptor in selected_receptors:
+            print(f"   Receptor Model: {receptor['receptor_model_name']} (ID: {receptor['id']})")
+            print(f"   Template: {receptor['template_name']}")
+            print(f"   PDB Model: {receptor['pdb_model_name']}")
+            print(f"   Notes: {receptor['notes'] or 'None'}")
+            if receptor['pdbqt_file']:
+                print(f"   📄 PDBQT file to be deleted: {receptor['pdbqt_file']}")
+            if receptor['grids_path']:
+                print(f"   🗺️  Grids folder to be deleted: {receptor['grids_path']}")
+            if receptor['docking_assays']:
+                print(f"   ⚠️  Related docking assays to be deleted: {len(receptor['docking_assays'])}")
+                for _, assay_name, _ in receptor['docking_assays']:
+                    print(f"       - {assay_name}")
+            print("-" * 80)
+
+        noun = "this receptor model" if len(selected_receptors) == 1 else f"these {len(selected_receptors)} receptor models"
+        confirm = input(f"Are you sure you want to delete {noun}? (yes/no, default: no): ").strip().lower()
+        if confirm != 'yes':
+            print("❌ Deletion cancelled by user")
+            return None
+
+        # Extra safeguard: type the receptor model name (single) or the number of models (multiple)
+        if len(selected_receptors) == 1:
+            expected = selected_receptors[0]['receptor_model_name']
+            name_check = input(
+                f"Type the receptor model name '{expected}' to confirm deletion (or press Enter to cancel): "
+            ).strip()
+        else:
+            expected = str(len(selected_receptors))
+            name_check = input(
+                f"Type the number of receptor models to delete ({expected}) to confirm (or press Enter to cancel): "
+            ).strip()
+        if name_check != expected:
+            print("❌ Deletion cancelled (confirmation failed)")
+            return None
+
+        results = []
+        for receptor in selected_receptors:
+            result = self._delete_single_receptor_model(receptor, receptors_db_path, docking_assays_db_path)
+            if result is not None:
+                results.append(result)
+
+        if len(selected_receptors) > 1:
+            print(f"\n📊 Deleted {len(results)}/{len(selected_receptors)} receptor models.")
+
+        if not results:
+            return None
+        totals_keys = ('receptor_deleted', 'pdbqt_file_deleted', 'grids_folder_deleted',
+                       'docking_assays_deleted', 'assay_folders_deleted')
+        summary = {'status': 'deleted', 'receptors': results}
+        summary.update({key: sum(r[key] for r in results) for key in totals_keys})
+        return summary
+
+    def _delete_single_receptor_model(self, receptor: Dict[str, Any], receptors_db_path: str,
+                                      docking_assays_db_path: str) -> Optional[Dict[str, Any]]:
+        """
+        Delete one receptor model (as built by delete_receptor_model()): its receptor_models
+        record, PDBQT file, grids folder and related docking assays with their folders.
+        Returns the deletion details, or None on a database error.
+        """
+        import sqlite3
+        import shutil
+
+        print(f"\n🗑️  Deleting receptor model '{receptor['receptor_model_name']}'...")
+        try:
+            conn = sqlite3.connect(receptors_db_path)
+            try:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM receptor_models WHERE id = ?", (receptor['id'],))
+                receptor_deleted = cursor.rowcount
+                conn.commit()
+            finally:
+                conn.close()
+        except sqlite3.Error as e:
+            print(f"❌ Database error while deleting receptor model '{receptor['receptor_model_name']}': {e}")
+            return None
+
+        # Delete grids folder if present
+        grids_folder_deleted = 0
+        if receptor['grids_path'] and os.path.exists(receptor['grids_path']):
+            try:
+                shutil.rmtree(receptor['grids_path'])
+                grids_folder_deleted = 1
+                print(f"   ✓ Deleted grids folder: {receptor['grids_path']}")
+            except Exception as e:
+                print(f"   ⚠️  Warning: Could not delete grids folder {receptor['grids_path']}: {e}")
+        elif receptor['grids_path']:
+            print(f"   ⚠️  Grids folder not found (already deleted?): {receptor['grids_path']}")
+
+        # Delete PDBQT file if present
+        pdbqt_file_deleted = 0
+        if receptor['pdbqt_file'] and os.path.exists(receptor['pdbqt_file']):
+            try:
+                os.remove(receptor['pdbqt_file'])
+                pdbqt_file_deleted = 1
+                print(f"   ✓ Deleted PDBQT file: {receptor['pdbqt_file']}")
+            except Exception as e:
+                print(f"   ⚠️  Warning: Could not delete PDBQT file {receptor['pdbqt_file']}: {e}")
+        elif receptor['pdbqt_file']:
+            print(f"   ⚠️  PDBQT file not found (already deleted?): {receptor['pdbqt_file']}")
+
+        # Delete related docking assays and folders
+        docking_assays_deleted = 0
+        assay_folders_deleted = 0
+        if receptor['docking_assays']:
             try:
                 conn_assays = sqlite3.connect(docking_assays_db_path)
                 cur_assays = conn_assays.cursor()
-                cur_assays.execute(
-                    "SELECT assay_id, assay_name, assay_folder_path FROM docking_assays WHERE receptor_info LIKE ?",
-                    (f'%"receptor_model_name": "{selected_receptor["receptor_model_name"]}"%',)
-                )
-                docking_assays = cur_assays.fetchall()
+                for assay_id, _, assay_folder_path in receptor['docking_assays']:
+                    cur_assays.execute("DELETE FROM docking_assays WHERE assay_id = ?", (assay_id,))
+                    docking_assays_deleted += cur_assays.rowcount
+                    if assay_folder_path and os.path.exists(assay_folder_path):
+                        try:
+                            shutil.rmtree(assay_folder_path)
+                            assay_folders_deleted += 1
+                            print(f"   ✓ Deleted assay folder: {assay_folder_path}")
+                        except Exception as e:
+                            print(f"   ⚠️  Warning: Could not delete assay folder {assay_folder_path}: {e}")
+                    elif assay_folder_path:
+                        print(f"   ⚠️  Assay folder not found (already deleted?): {assay_folder_path}")
+
+                conn_assays.commit()
                 conn_assays.close()
             except sqlite3.Error as e:
-                print(f"❌ Database error while checking docking assays: {e}")
-                conn.close()
-                return None
+                print(f"⚠️  Warning: Error deleting docking assays: {e}")
 
-        # Confirm deletion
-        print("\n⚠️  CONFIRM RECEPTOR MODEL DELETION")
-        print("=" * 80)
-        print(f"   Receptor Model: {selected_receptor['receptor_model_name']}")
-        print(f"   Template: {selected_receptor['template_name']}")
-        print(f"   PDB Model: {selected_receptor['pdb_model_name']}")
-        print(f"   Notes: {selected_receptor['notes'] or 'None'}")
-        if selected_receptor['pdbqt_file']:
-            print(f"   📄 PDBQT file to be deleted: {selected_receptor['pdbqt_file']}")
-        if selected_receptor['grids_path']:
-            print(f"   🗺️  Grids folder to be deleted: {selected_receptor['grids_path']}")
-        if docking_assays:
-            print(f"   ⚠️  Related docking assays to be deleted: {len(docking_assays)}")
-            for _, assay_name, _ in docking_assays:
-                print(f"       - {assay_name}")
-        print("=" * 80)
+        print(f"✓ Receptor model '{receptor['receptor_model_name']}' deleted")
+        print(f"   Database: {receptors_db_path}")
+        if receptor_deleted:
+            print(f"   Receptor model records deleted: {receptor_deleted}")
+        if pdbqt_file_deleted:
+            print(f"   PDBQT files deleted: {pdbqt_file_deleted}")
+        if grids_folder_deleted:
+            print(f"   Grids folders deleted: {grids_folder_deleted}")
+        if docking_assays_deleted:
+            print(f"   Related docking assays deleted: {docking_assays_deleted}")
+        if assay_folders_deleted:
+            print(f"   Assay folders deleted: {assay_folders_deleted}")
 
-        confirm = input("Are you sure you want to delete this receptor model? (yes/no, default: no): ").strip().lower()
-        if confirm != 'yes':
-            print("❌ Deletion cancelled by user")
-            conn.close()
-            return None
+        return {
+            'status': 'deleted',
+            'receptor_model_name': receptor['receptor_model_name'],
+            'receptor_id': receptor['id'],
+            'receptor_deleted': receptor_deleted,
+            'pdbqt_file_deleted': pdbqt_file_deleted,
+            'grids_folder_deleted': grids_folder_deleted,
+            'docking_assays_deleted': docking_assays_deleted,
+            'assay_folders_deleted': assay_folders_deleted,
+        }
 
-        # Extra safeguard: require typing the receptor model name
-        name_check = input(
-            f"Type the receptor model name '{selected_receptor['receptor_model_name']}' to confirm deletion (or press Enter to cancel): "
-        ).strip()
-        if name_check != selected_receptor['receptor_model_name']:
-            print("❌ Deletion cancelled (name confirmation failed)")
-            conn.close()
-            return None
-
-        # Delete receptor model and related records
-        try:
-            # Delete receptor model
-            cursor.execute("DELETE FROM receptor_models WHERE id = ?", (selected_receptor['id'],))
-            receptor_deleted = cursor.rowcount
-            conn.commit()
-            conn.close()
-
-            # Delete grids folder if present
-            grids_folder_deleted = 0
-            if selected_receptor['grids_path'] and os.path.exists(selected_receptor['grids_path']):
-                try:
-                    shutil.rmtree(selected_receptor['grids_path'])
-                    grids_folder_deleted = 1
-                    print(f"   ✓ Deleted grids folder: {selected_receptor['grids_path']}")
-                except Exception as e:
-                    print(f"   ⚠️  Warning: Could not delete grids folder {selected_receptor['grids_path']}: {e}")
-            elif selected_receptor['grids_path']:
-                print(f"   ⚠️  Grids folder not found (already deleted?): {selected_receptor['grids_path']}")
-
-            # Delete PDBQT file if present
-            pdbqt_file_deleted = 0
-            if selected_receptor['pdbqt_file'] and os.path.exists(selected_receptor['pdbqt_file']):
-                try:
-                    os.remove(selected_receptor['pdbqt_file'])
-                    pdbqt_file_deleted = 1
-                    print(f"   ✓ Deleted PDBQT file: {selected_receptor['pdbqt_file']}")
-                except Exception as e:
-                    print(f"   ⚠️  Warning: Could not delete PDBQT file {selected_receptor['pdbqt_file']}: {e}")
-            elif selected_receptor['pdbqt_file']:
-                print(f"   ⚠️  PDBQT file not found (already deleted?): {selected_receptor['pdbqt_file']}")
-
-            # Delete related docking assays and folders
-            docking_assays_deleted = 0
-            assay_folders_deleted = 0
-            if docking_assays:
-                try:
-                    conn_assays = sqlite3.connect(docking_assays_db_path)
-                    cur_assays = conn_assays.cursor()
-                    for assay_id, _, assay_folder_path in docking_assays:
-                        cur_assays.execute("DELETE FROM docking_assays WHERE assay_id = ?", (assay_id,))
-                        docking_assays_deleted += 1
-                        if assay_folder_path and os.path.exists(assay_folder_path):
-                            try:
-                                shutil.rmtree(assay_folder_path)
-                                assay_folders_deleted += 1
-                                print(f"   ✓ Deleted assay folder: {assay_folder_path}")
-                            except Exception as e:
-                                print(f"   ⚠️  Warning: Could not delete assay folder {assay_folder_path}: {e}")
-                        elif assay_folder_path:
-                            print(f"   ⚠️  Assay folder not found (already deleted?): {assay_folder_path}")
-
-                    conn_assays.commit()
-                    conn_assays.close()
-                except sqlite3.Error as e:
-                    print(f"⚠️  Warning: Error deleting docking assays: {e}")
-
-            print(f"\n✓ Receptor model '{selected_receptor['receptor_model_name']}' deleted")
-            print(f"   Database: {receptors_db_path}")
-            if receptor_deleted:
-                print(f"   Receptor model records deleted: {receptor_deleted}")
-            if pdbqt_file_deleted:
-                print(f"   PDBQT files deleted: {pdbqt_file_deleted}")
-            if grids_folder_deleted:
-                print(f"   Grids folders deleted: {grids_folder_deleted}")
-            if docking_assays_deleted:
-                print(f"   Related docking assays deleted: {docking_assays_deleted}")
-            if assay_folders_deleted:
-                print(f"   Assay folders deleted: {assay_folders_deleted}")
-
-            return {
-                'status': 'deleted',
-                'receptor_model_name': selected_receptor['receptor_model_name'],
-                'receptor_id': selected_receptor['id'],
-                'receptor_deleted': receptor_deleted,
-                'pdbqt_file_deleted': pdbqt_file_deleted,
-                'grids_folder_deleted': grids_folder_deleted,
-                'docking_assays_deleted': docking_assays_deleted,
-                'assay_folders_deleted': assay_folders_deleted,
-            }
-
-        except sqlite3.Error as e:
-            print(f"❌ Database error while deleting receptor model: {e}")
-            return None
-        
     def _get_ligand_preparation_parameters(self):
         """
         Get ligand preparation parameters to be used for Meeko procedures
