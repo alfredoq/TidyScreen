@@ -17716,7 +17716,9 @@ Example — cyclodextrin receptor:
         return config
 
     def import_receptor_model(self, input_folder_path=None, receptor_model_name=None,
-                              charge_model='gasteiger', notes=None):
+                              charge_model='gasteiger', notes=None, receptor_pdb=None,
+                              setup_tleap_template=None, tleap_template_path=None,
+                              custom_parameter_files=None, non_interactive=False):
         """
         Import a precomputed receptor model (PDBQT + grid files) directly into the project.
 
@@ -17736,6 +17738,18 @@ Example — cyclodextrin receptor:
             charge_model (str): Charge model label used to name the grid-files subfolder
                 (default: 'gasteiger').
             notes (str, optional): Notes to store in the receptor_models record.
+            receptor_pdb (str, optional): Receptor PDB to store as receptor_checked.pdb.
+                Absolute path, or a file name inside input_folder_path. When given, the
+                .pdb auto-detection/prompt is skipped. In non-interactive mode None means
+                'skip' unless the folder contains exactly one .pdb.
+            setup_tleap_template (bool, optional): Whether to store a tleap template.
+                None → ask interactively (or False in non-interactive mode).
+            tleap_template_path (str, optional): tleap template file. When given, the
+                template prompt is skipped.
+            custom_parameter_files (list[str], optional): .lib/.frcmod files required by
+                the template. When given (even empty), the custom-file prompt is skipped.
+            non_interactive (bool): Never call input(); ambiguous situations are treated
+                as errors (used by import_receptor_models_in_batch()).
 
         Returns:
             int or None: The new receptor model ID on success, None on failure.
@@ -17745,6 +17759,13 @@ Example — cyclodextrin receptor:
         import shutil
 
         # --- Step 1: Resolve and validate input folder ---
+        if non_interactive:
+            if not input_folder_path or not os.path.isdir(input_folder_path):
+                print(f"  Error: input folder not found: {input_folder_path}")
+                return None
+            if not receptor_model_name:
+                print("  Error: receptor_model_name is required in non-interactive mode.")
+                return None
         while not input_folder_path:
             raw = input("\nEnter the full path to the folder containing the receptor files: ").strip().strip('"').strip("'")
             if not raw:
@@ -17785,7 +17806,21 @@ Example — cyclodextrin receptor:
         # receptor_checked.pdb is required for both docking (ProLIF fingerprints) and
         # MD assay preparation (perform_md_assay() tleap setup).
         # If a single .pdb is present in the folder use it; otherwise ask the user.
-        if len(pdb_files) == 1:
+        if receptor_pdb:
+            pdb_src = receptor_pdb if os.path.isabs(receptor_pdb) \
+                else os.path.join(input_folder_path, receptor_pdb)
+            pdb_src = os.path.abspath(os.path.expanduser(pdb_src))
+            if not os.path.isfile(pdb_src):
+                print(f"  Error: receptor PDB not found: {pdb_src}")
+                return None
+            print(f"  Using receptor PDB: {pdb_src}")
+        elif non_interactive and len(pdb_files) > 1:
+            print(f"  Error: multiple .pdb files found {pdb_files} and no receptor_pdb given.")
+            return None
+        elif non_interactive and not pdb_files:
+            pdb_src = None
+            print("  Warning: no receptor PDB stored — docking fingerprints and perform_md_assay() will fail for this receptor.")
+        elif len(pdb_files) == 1:
             pdb_src = os.path.join(input_folder_path, pdb_files[0])
             print(f"  Found receptor PDB: {pdb_files[0]}")
         elif len(pdb_files) > 1:
@@ -18038,11 +18073,33 @@ Example — cyclodextrin receptor:
         print("Solvation commands in the template are stripped automatically for")
         print("fingerprints/MMGBSA and kept intact for molecular dynamics.")
         print()
-        setup_now = input("Set up tleap template now? (yes/skip) [yes]: ").strip().lower()
-        if setup_now not in ('skip', 'no', 'n'):
-            self._show_tleap_template_guide_for_fps()
+        if setup_tleap_template is None and tleap_template_path:
+            setup_tleap_template = True
+        if setup_tleap_template is None:
+            if non_interactive:
+                setup_tleap_template = False
+            else:
+                setup_now = input("Set up tleap template now? (yes/skip) [yes]: ").strip().lower()
+                setup_tleap_template = setup_now not in ('skip', 'no', 'n')
+        if setup_tleap_template and non_interactive and not tleap_template_path:
+            print("⚠️  setup_tleap_template is set but no tleap_template_path given — template skipped.")
+            setup_tleap_template = False
+        if not setup_tleap_template:
+            print("⚠️  Template skipped — will be requested on first use.")
+        if setup_tleap_template:
             template_content = None
-            while True:
+            if tleap_template_path:
+                tpath = os.path.abspath(os.path.expanduser(tleap_template_path))
+                if not os.path.isfile(tpath):
+                    print(f"❌ tleap template not found: {tpath} — template skipped.")
+                else:
+                    with open(tpath, 'r') as fh:
+                        template_content = fh.read()
+                    n_lines = len(template_content.splitlines())
+                    print(f"✅ Template loaded: {os.path.basename(tpath)} ({n_lines} lines)")
+            else:
+                self._show_tleap_template_guide_for_fps()
+            while not tleap_template_path:
                 tpath = self._prompt("\n📂 Path to tleap template file (or 'skip'): ")
                 if tpath.lower() in ('skip', ''):
                     print("⚠️  Template skipped — will be requested on first use.")
@@ -18057,7 +18114,20 @@ Example — cyclodextrin receptor:
                 print(f"✅ Template loaded: {os.path.basename(tpath)} ({n_lines} lines)")
                 break
 
-            if template_content is not None:
+            if template_content is not None and custom_parameter_files is not None:
+                attached = []
+                for raw in custom_parameter_files:
+                    raw = os.path.abspath(os.path.expanduser(raw))
+                    if not os.path.isfile(raw):
+                        print(f"  ❌ Custom parameter file not found: {raw}")
+                        print("  Aborting tleap template storage — the receptor model was imported without it.")
+                        template_content = None
+                        break
+                    with open(raw, 'r') as fh:
+                        attached.append({'filename': os.path.basename(raw), 'content': fh.read()})
+                    print(f"  ✓ Attached: {os.path.basename(raw)}")
+                custom_parameter_files = attached
+            elif template_content is not None:
                 print("\nAttach any custom .lib or .frcmod files required by the template.")
                 print("Enter 'done' when finished.")
                 custom_parameter_files = []
@@ -18075,6 +18145,7 @@ Example — cyclodextrin receptor:
                     custom_parameter_files.append({'filename': filename, 'content': content})
                     print(f"  ✓ Attached: {filename}")
 
+            if template_content is not None:
                 tleap_config_to_store = {
                     'template_content': template_content,
                     'custom_parameter_files': custom_parameter_files,
@@ -18105,6 +18176,225 @@ Example — cyclodextrin receptor:
         print(f"  Note: ProLIF residue labels will use the imported PDBQT numbering directly.")
         print(f"{'=' * 80}")
         return new_id
+
+    def import_receptor_models_in_batch(self, json_path=None, confirm=True):
+        """
+        Import many precomputed receptor models with import_receptor_model(), reading all
+        parameters from a JSON file instead of interactive prompts.
+
+        JSON layout ('defaults' is optional; any key there can be overridden per receptor):
+
+            {
+              "defaults": {
+                "charge_model": "gasteiger",
+                "notes": null,
+                "setup_tleap_template": true,
+                "tleap_template_path": "/abs/path/template.tleap",
+                "custom_parameter_files": ["/abs/path/X.frcmod", "/abs/path/X.lib"],
+                "on_existing": "skip"
+              },
+              "receptors": [
+                {"input_folder_path": "/abs/path/folder_1",
+                 "receptor_model_name": "Rec_1",
+                 "receptor_pdb": "/abs/path/rec_1.pdb"}
+              ]
+            }
+
+        receptor_pdb may be an absolute path, a file name inside input_folder_path, or null
+        (skip; only allowed when the folder has no single .pdb to auto-detect).
+        on_existing: 'skip' (report as skipped) or 'error' (report as failed) when the
+        receptor_model_name is already registered.
+
+        Every entry is validated before anything is imported; invalid entries are reported
+        and not imported, the rest proceed.
+
+        Args:
+            json_path (str, optional): Path to the JSON file. Prompted if None.
+            confirm (bool): Ask for confirmation before importing (default True).
+
+        Returns:
+            dict or None: {'imported': {name: id}, 'skipped': [names], 'failed': {name: reason}},
+            or None if the JSON could not be read or the user cancelled.
+        """
+        import sqlite3
+        import json
+
+        while not json_path:
+            raw = input("\nEnter the full path to the batch JSON file: ").strip().strip('"').strip("'")
+            if not raw:
+                print("Operation cancelled.")
+                return None
+            json_path = raw
+        json_path = os.path.abspath(os.path.expanduser(json_path))
+
+        try:
+            with open(json_path, 'r') as fh:
+                batch_cfg = json.load(fh)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"❌ Could not read batch JSON {json_path}: {e}")
+            return None
+
+        defaults = batch_cfg.get('defaults', {}) or {}
+        entries = batch_cfg.get('receptors')
+        if not isinstance(entries, list) or not entries:
+            print("❌ The batch JSON must contain a non-empty 'receptors' list.")
+            return None
+
+        allowed_keys = {'input_folder_path', 'receptor_model_name', 'charge_model', 'notes',
+                        'receptor_pdb', 'setup_tleap_template', 'tleap_template_path',
+                        'custom_parameter_files', 'on_existing'}
+
+        # Names already registered in this project
+        existing_names = set()
+        receptors_db_path = os.path.join(self.path, 'docking', 'receptors', 'receptors.db')
+        if os.path.isfile(receptors_db_path):
+            conn = sqlite3.connect(receptors_db_path)
+            try:
+                existing_names = {r[0] for r in conn.execute(
+                    "SELECT receptor_model_name FROM receptor_models")}
+            except sqlite3.OperationalError:
+                pass
+            finally:
+                conn.close()
+
+        # --- Validate every entry before importing anything ---
+        report = {'imported': {}, 'skipped': [], 'failed': {}}
+        to_import = []
+        seen_names = set()
+        print(f"\n{'=' * 80}")
+        print(f"BATCH RECEPTOR IMPORT — validating {len(entries)} entries from {json_path}")
+        print(f"{'=' * 80}")
+        for idx, entry in enumerate(entries):
+            e = {**defaults, **entry}
+            name = e.get('receptor_model_name')
+            tag = name or f"entry #{idx}"
+            errors, warnings = [], []
+
+            unknown = set(e) - allowed_keys
+            if unknown:
+                warnings.append(f"unknown keys ignored: {sorted(unknown)}")
+            if not name:
+                errors.append("missing receptor_model_name")
+            elif name in seen_names:
+                errors.append("receptor_model_name duplicated in the JSON")
+            seen_names.add(name)
+
+            on_existing = e.get('on_existing', 'skip')
+            if on_existing not in ('skip', 'error'):
+                errors.append(f"on_existing must be 'skip' or 'error', got {on_existing!r}")
+            if name in existing_names:
+                if on_existing == 'skip':
+                    print(f"  ⏭  {tag}: already registered — skipped")
+                    report['skipped'].append(name)
+                    continue
+                errors.append("receptor_model_name already registered in the project")
+
+            folder = e.get('input_folder_path')
+            folder = os.path.abspath(os.path.expanduser(folder)) if folder else None
+            e['input_folder_path'] = folder
+            if not folder or not os.path.isdir(folder):
+                errors.append(f"input_folder_path not found: {folder}")
+            else:
+                files = os.listdir(folder)
+                n_pdbqt = sum(f.lower().endswith('.pdbqt') for f in files)
+                if n_pdbqt != 1:
+                    errors.append(f"expected exactly 1 .pdbqt, found {n_pdbqt}")
+                if not any(f.lower().endswith('.fld') for f in files):
+                    errors.append("no .fld file")
+                if not any(f.lower().endswith('.map') for f in files):
+                    errors.append("no .map files")
+                pdbs = [f for f in files if f.lower().endswith('.pdb')]
+                pdb = e.get('receptor_pdb')
+                if pdb:
+                    pdb_path = pdb if os.path.isabs(pdb) else os.path.join(folder, pdb)
+                    if not os.path.isfile(os.path.expanduser(pdb_path)):
+                        errors.append(f"receptor_pdb not found: {pdb_path}")
+                elif len(pdbs) > 1:
+                    errors.append(f"multiple .pdb files {pdbs} and no receptor_pdb given")
+                elif not pdbs:
+                    warnings.append("no receptor PDB — fingerprints and MD will fail for this receptor")
+
+            if e.get('setup_tleap_template', bool(e.get('tleap_template_path'))):
+                tpath = e.get('tleap_template_path')
+                if not tpath or not os.path.isfile(os.path.expanduser(tpath)):
+                    errors.append(f"tleap_template_path not found: {tpath}")
+                cpf = e.get('custom_parameter_files') or []
+                if not isinstance(cpf, list):
+                    errors.append("custom_parameter_files must be a list")
+                    cpf = []
+                missing = [p for p in cpf if not os.path.isfile(os.path.expanduser(p))]
+                for p in missing:
+                    errors.append(f"custom parameter file not found: {p}")
+                # Files loaded by name in the template should be among the attached ones
+                if tpath and os.path.isfile(os.path.expanduser(tpath)):
+                    attached = {os.path.basename(p) for p in cpf}
+                    with open(os.path.expanduser(tpath), 'r') as fh:
+                        for line in fh:
+                            parts = line.split()
+                            if (len(parts) >= 2 and parts[0].lower() in ('loadamberparams', 'loadoff')
+                                    and '{{' not in parts[1]
+                                    and os.path.basename(parts[1]) not in attached):
+                                warnings.append(f"template loads '{parts[1]}' but it is not in custom_parameter_files")
+                e['custom_parameter_files'] = cpf
+
+            for w in warnings:
+                print(f"  ⚠️  {tag}: {w}")
+            if errors:
+                for err in errors:
+                    print(f"  ❌ {tag}: {err}")
+                report['failed'][tag] = '; '.join(errors)
+            else:
+                print(f"  ✓ {tag}")
+                to_import.append(e)
+
+        print(f"\n  Valid: {len(to_import)}   Skipped: {len(report['skipped'])}   Invalid: {len(report['failed'])}")
+        if not to_import:
+            print("Nothing to import.")
+            return report
+        if confirm:
+            answer = input(f"\nImport {len(to_import)} receptor model(s)? (y/n): ").strip().lower()
+            if answer not in ('y', 'yes'):
+                print("Operation cancelled.")
+                return None
+
+        # --- Import ---
+        for i, e in enumerate(to_import, 1):
+            name = e['receptor_model_name']
+            print(f"\n{'#' * 80}\n# [{i}/{len(to_import)}] {name}\n{'#' * 80}")
+            try:
+                new_id = self.import_receptor_model(
+                    input_folder_path=e['input_folder_path'],
+                    receptor_model_name=name,
+                    charge_model=e.get('charge_model', 'gasteiger'),
+                    notes=e.get('notes'),
+                    receptor_pdb=e.get('receptor_pdb'),
+                    setup_tleap_template=e.get('setup_tleap_template', bool(e.get('tleap_template_path'))),
+                    tleap_template_path=e.get('tleap_template_path'),
+                    custom_parameter_files=e.get('custom_parameter_files'),
+                    non_interactive=True,
+                )
+            except Exception as ex:
+                new_id = None
+                print(f"❌ Unexpected error importing {name}: {type(ex).__name__}: {ex}")
+            if new_id is None:
+                report['failed'][name] = 'import_receptor_model() failed (see log above)'
+            else:
+                report['imported'][name] = new_id
+
+        print(f"\n{'=' * 80}")
+        print("BATCH RECEPTOR IMPORT SUMMARY")
+        print(f"{'=' * 80}")
+        print(f"  Imported: {len(report['imported'])}")
+        for name, rid in report['imported'].items():
+            print(f"    ✓ {name} (ID: {rid})")
+        print(f"  Skipped (already registered): {len(report['skipped'])}")
+        for name in report['skipped']:
+            print(f"    ⏭  {name}")
+        print(f"  Failed: {len(report['failed'])}")
+        for name, reason in report['failed'].items():
+            print(f"    ❌ {name}: {reason}")
+        print(f"{'=' * 80}")
+        return report
 
     def _parse_gpf_box_params(self, gpf_path):
         """Parse gridcenter, npts, and spacing from an AutoGrid .gpf file."""
