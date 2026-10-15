@@ -21803,7 +21803,8 @@ fig.savefig(OUTPUT_PATH, dpi=300, bbox_inches='tight')
                 'inchi_computed': 0,
                 'inchi_failed': 0,
                 'predefined_kept': 0,
-                'predefined_enumerated': 0
+                'predefined_enumerated': 0,
+                'no_stereo_kept': 0
             }
             
             # Use progress bar if available (reuse existing pattern)
@@ -21966,6 +21967,33 @@ fig.savefig(OUTPUT_PATH, dpi=300, bbox_inches='tight')
                             except Exception as e:
                                 processing_stats['failed_enumeration'] += 1
                                 continue
+                    
+                    elif not include_original:
+                        # No stereoisomers to enumerate (achiral or fully defined):
+                        # keep the molecule as-is so it is not silently dropped.
+                        # When include_original is True it was already added above.
+                        original_inchi_key = self._compute_single_inchi_key(original_smiles)
+                        if original_inchi_key and original_inchi_key not in ['INVALID_SMILES', 'ERROR']:
+                            processing_stats['inchi_computed'] += 1
+                        else:
+                            processing_stats['inchi_failed'] += 1
+                        
+                        all_stereoisomers.append({
+                            'parent_name': compound_name,
+                            'parent_smiles': original_smiles,
+                            'stereoisomer_smiles': original_smiles,
+                            'stereoisomer_name': compound_name,
+                            'stereoisomer_type': 'no_stereo',
+                            'stereoisomer_index': 0,
+                            'flag': compound.get('flag', 'nd'),
+                            'inchi_key': original_inchi_key,
+                            'total_stereoisomers': stereo_info['total_stereoisomers'],
+                            'stereochemical_config': stereo_info['original_config'],
+                            'num_stereocenters': stereo_info['num_stereocenters'],
+                            'stereocenter_atoms': ','.join(map(str, stereo_info['stereocenter_atoms']))
+                        })
+                        processing_stats['no_stereo_kept'] += 1
+                        processing_stats['total_stereoisomers'] += 1
                 
                 except Exception as e:
                     processing_stats['failed_enumeration'] += 1
@@ -21987,6 +22015,7 @@ fig.savefig(OUTPUT_PATH, dpi=300, bbox_inches='tight')
             print(f"\n✅ Stereoisomer enumeration completed!")
             print(f"   📊 Molecules processed: {processing_stats['processed']:,}")
             print(f"   🎯 Molecules with stereocenters: {processing_stats['with_stereocenters']:,}")
+            print(f"   ➖ Kept as-is (no stereoisomers to enumerate): {processing_stats['no_stereo_kept']:,}")
             print(f"   🧪 Total stereoisomers generated: {processing_stats['total_stereoisomers']:,}")
             print(f"   ❌ Invalid SMILES: {processing_stats['invalid_smiles']:,}")
             print(f"   ⚠️  Failed enumerations: {processing_stats['failed_enumeration']:,}")
@@ -22013,6 +22042,8 @@ fig.savefig(OUTPUT_PATH, dpi=300, bbox_inches='tight')
                         stereo_type = "Original"
                     elif row['stereoisomer_type'] == 'predefined':
                         stereo_type = "Predefined"
+                    elif row['stereoisomer_type'] == 'no_stereo':
+                        stereo_type = "No stereo (kept as-is)"
                     else:
                         stereo_type = f"Stereo {row['stereoisomer_index']}"
                     
