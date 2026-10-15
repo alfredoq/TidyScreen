@@ -908,6 +908,90 @@ def clear_project_actions(project_name=None, older_than_days=None, confirm=True)
     return removed
 
 
+def list_all_queues(queue_type=None, project_name=None, active_only=False):
+    """
+    Show the status of every job on the shared, machine-wide queue (md_queue),
+    across all projects on this computer, in three sections: docking,
+    fingerprints and MD (MD simulations + MM-GBSA). Same information as
+    MolDock.list_docking_queue(), MolDock.list_fingerprints_queue() and
+    MolDyn.list_md_queue() with all_projects=True, but no project needs to be
+    activated and each job is shown only once.
+
+    Args:
+        queue_type (str, optional): which queue to show: 'all', 'docking',
+            'fingerprints' or 'md'; prompted if omitted.
+        project_name (str, optional): restrict the listing to one project
+            (default: every project).
+        active_only (bool): show only queued/held/running jobs (default False).
+
+    Returns:
+        dict: {'docking': [...], 'fingerprints': [...], 'md': [...]} with the
+        queue job dicts of each section shown (empty dict on invalid queue_type).
+    """
+    # Imported here: md_queue's package imports ActivateProject from this module
+    from tidyscreen.moldyn import md_queue
+
+    queue_options = {'1': 'all', '2': 'docking', '3': 'fingerprints', '4': 'md'}
+    if queue_type is None:
+        print("Which queue do you want to see?")
+        print("1. All queues (default)")
+        print("2. Docking")
+        print("3. Fingerprints")
+        print("4. MD (MD / MM-GBSA)")
+        queue_type = input("Select an option (1-4 or name): ").strip().lower() or 'all'
+    queue_type = queue_options.get(queue_type, queue_type)
+    if queue_type not in queue_options.values():
+        print(f"❌ Invalid queue type '{queue_type}'. Use 'all', 'docking', 'fingerprints' or 'md'.")
+        return {}
+
+    md_queue.ensure_worker_running()  # self-heal stale state before showing it
+    jobs = md_queue.list_jobs(project_name)
+    if active_only:
+        jobs = [job for job in jobs if job['status'] not in md_queue.FINISHED_STATUSES]
+
+    sections = {
+        'docking': ("DOCKING QUEUE", [job for job in jobs if job['job_type'] == 'docking']),
+        'fingerprints': ("FINGERPRINTS QUEUE", [job for job in jobs if job['job_type'] == 'fingerprints']),
+        'md': ("MD QUEUE (MD / MM-GBSA)", [job for job in jobs
+                                          if job['job_type'] not in ('docking', 'fingerprints')]),
+    }
+    if queue_type != 'all':
+        sections = {queue_type: sections[queue_type]}
+
+    scope_label = f" — project '{project_name}'" if project_name else " (all projects)"
+    if active_only:
+        scope_label += " — active jobs only"
+    status_glyphs = {
+        'queued': '⏳', 'held': '⏸', 'running': '🔄', 'completed': '✅',
+        'failed': '❌', 'cancelled': '🚫', 'crashed': '💥',
+    }
+
+    for section_key, (title, section_jobs) in sections.items():
+        print(f"\n🧬 {title}{scope_label}:")
+        print("=" * 70)
+        if not section_jobs:
+            print(f"📭 No {section_key} jobs on the shared queue.")
+            continue
+        for job in section_jobs:
+            glyph = status_glyphs.get(job['status'], '❔')
+            job_label = {'mmgbsa': 'MM-GBSA', 'docking': 'Docking',
+                         'fingerprints': 'Fingerprints'}.get(job['job_type'], 'MD')
+            print(f"{glyph} Queue ID: {job['queue_id']}  |  {job_label} ({job['resource'] or 'gpu'})  |  "
+                  f"Project: {job['project_name']}  |  "
+                  f"Assay: {job['md_assay_label']} (assay_id={job['assay_id']})")
+            print(f"   Status: {job['status']}  |  Enqueued: {job['enqueued_at']}  |  "
+                  f"Started: {job['started_at'] or '-'}  |  Finished: {job['finished_at'] or '-'}")
+            if job['error_message']:
+                print(f"   ⚠️  {job['error_message']}")
+            print("-" * 70)
+        counts = {}
+        for job in section_jobs:
+            counts[job['status']] = counts.get(job['status'], 0) + 1
+        print("   " + "  |  ".join(f"{status}: {n}" for status, n in counts.items()))
+
+    return {section_key: section_jobs for section_key, (_, section_jobs) in sections.items()}
+
+
 class ActivateProject:
     
     def __init__(self, name):
