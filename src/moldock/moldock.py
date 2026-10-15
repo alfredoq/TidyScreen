@@ -3046,29 +3046,47 @@ class MolDock:
                 tables_to_display, filter_by_type, show_all_tables, ready_count, not_ready_count
             )
 
-            ## Step 3: select receptor for docking studies:
+            ## Step 3: select receptor(s) for docking studies:
+            ## Several receptors may be selected; one docking assay is created per receptor.
 
-            print(f"\n🧬 Selecting receptor for docking...")
-            receptor_info = self._select_receptor_from_db()
-            
-            ## Check consistency between ligands and receptor charge model
-            self._check_charges_consistency(selected_method, receptor_info)
-            
-            if not receptor_info:
+            print(f"\n🧬 Selecting receptor(s) for docking...")
+            selected_receptors = self._select_receptors_from_db()
+
+            if not selected_receptors:
                 print("❌ No receptor selected. Docking cancelled.")
                 return None
+
+            ## Check consistency between ligands and receptor charge model — once per
+            ## distinct receptor charge model, so a multi-receptor selection prompts only once.
+            checked_charge_models = set()
+            for rec in selected_receptors:
+                charge_model = (rec.get('configs') or {}).get('receptor_charge_model', 'unknown')
+                if charge_model not in checked_charge_models:
+                    checked_charge_models.add(charge_model)
+                    self._check_charges_consistency(selected_method, rec)
 
             ## Fail fast if the receptor PDBQT is missing: docking with the 'ad4' scoring
             ## function never reads this file (it only uses the AutoGrid4 maps), so a
             ## missing/stale path would otherwise only surface after the full docking run,
             ## when Ringtail's results processing needs it for save_receptor/add_interactions.
-            if selected_method['docking_engine'] == 'Vina' and not self._resolve_receptor_pdbqt_file(receptor_info):
-                print("❌ Receptor PDBQT file could not be located on disk (neither in 'processed/' nor alongside the grid maps).")
-                print("   Docking cancelled before running, since results processing would fail on this receptor later.")
-                return None
+            if selected_method['docking_engine'] == 'Vina':
+                missing_pdbqt = [rec['receptor_model_name'] for rec in selected_receptors
+                                 if not self._resolve_receptor_pdbqt_file(rec)]
+                if missing_pdbqt:
+                    print("❌ Receptor PDBQT file could not be located on disk (neither in 'processed/' nor alongside the grid maps) for:")
+                    for name in missing_pdbqt:
+                        print(f"   • {name}")
+                    print("   Docking cancelled before running, since results processing would fail on these receptors later.")
+                    return None
 
-            print(f"✅ Selected receptor: '{receptor_info['template_name']}'")
+            if len(selected_receptors) == 1:
+                print(f"✅ Selected receptor: '{selected_receptors[0]['template_name']}'")
+            else:
+                print(f"✅ Selected {len(selected_receptors)} receptors — one docking assay will be created for each:")
+                for rec in selected_receptors:
+                    print(f"   • {rec['receptor_model_name']} (receptor ID: {rec['id']})")
 
+            user_choice = None
             if selected_table:
                 print(f"\n✅ Selected table for docking: '{selected_table}'")
                 
@@ -3090,55 +3108,76 @@ class MolDock:
                 # Get selected table info for registry
                 selected_table_info = next((t for t in tables_to_display if t['name'] == selected_table), None)
 
-                # Create assay registry
-                assay_registry = self._create_docking_assay_registry(
-                    selected_table, 
-                    selected_method, 
-                    selected_table_info,
-                    receptor_info,
-                    user_choice,
-                    note_text
-                )
-                
-                if not assay_registry:
-                        print("⚠️  Warning: Could not create docking assay registry, but continuing...")
-                else:
-                    print(f"✅ Docking assay registry created with ID: {assay_registry['assay_id']}")
+                # Create one assay registry per receptor
+                assays = []  # list of (assay_registry, receptor_info)
+                for receptor_info in selected_receptors:
+                    assay_note = note_text
+                    if len(selected_receptors) > 1:
+                        receptor_tag = f"Receptor: {receptor_info['receptor_model_name']}"
+                        assay_note = f"{note_text} | {receptor_tag}" if note_text else receptor_tag
 
-                if user_choice == 1:
-                    # Load SMILES and return complete setup
-                    print(f"\n🧪 Loading SMILES from table '{selected_table}'...")
-                    smiles_data = self._get_smiles_from_table(selected_table)
-                    
-                    if smiles_data:
-                        print(f"✅ Loaded {len(smiles_data)} compounds with SMILES")
-                        
-                        # Update registry with loaded compound count
-                        if assay_registry:
-                            self._update_assay_registry_compound_count(assay_registry['assay_id'], len(smiles_data))
-                        
+                    assay_registry = self._create_docking_assay_registry(
+                        selected_table, 
+                        selected_method, 
+                        selected_table_info,
+                        receptor_info,
+                        user_choice,
+                        assay_note
+                    )
+
+                    if not assay_registry:
+                        print(f"⚠️  Warning: Could not create docking assay registry for receptor "
+                              f"'{receptor_info['receptor_model_name']}' — it will not be docked.")
                     else:
-                        print("❌ No valid SMILES found in selected table")
-                        
-                        # Update registry status to indicate failure
-                        if assay_registry:
-                            self._update_assay_registry_status(assay_registry['assay_id'], 'failed', 'No valid SMILES found')
-                        
-                        return None
+                        print(f"✅ Docking assay registry created with ID: {assay_registry['assay_id']}"
+                              f" (receptor: {receptor_info['receptor_model_name']})")
+                        assays.append((assay_registry, receptor_info))
+
+                if not assays:
+                    print("❌ No docking assay registry could be created. Docking cancelled.")
+                    return None
+
+                # Load SMILES once (shared by every assay of this table)
+                print(f"\n🧪 Loading SMILES from table '{selected_table}'...")
+                smiles_data = self._get_smiles_from_table(selected_table)
+                
+                if smiles_data:
+                    print(f"✅ Loaded {len(smiles_data)} compounds with SMILES")
+                    
+                    # Update registries with loaded compound count
+                    for assay_registry, _ in assays:
+                        self._update_assay_registry_compound_count(assay_registry['assay_id'], len(smiles_data))
+                    
+                else:
+                    print("❌ No valid SMILES found in selected table")
+                    
+                    # Update registry status to indicate failure
+                    for assay_registry, _ in assays:
+                        self._update_assay_registry_status(assay_registry['assay_id'], 'failed', 'No valid SMILES found')
+                    
+                    return None
 
                 ## Prompt user for execution mode
-                execution_mode = self._prompt_execution_mode()
+                execution_mode = self._prompt_execution_mode(n_assays=len(assays))
                 if execution_mode is None:
                     print("❌ Docking preparation cancelled")
                     return None
 
                 # Execute docking based on execution mode
                 if execution_mode == 'foreground':
-                    # Run directly in current console
-                    self._run_docking_foreground(selected_table, selected_method, assay_registry, clean_ligand_files, receptor_info)
+                    # Run directly in current console, one assay after another
+                    for i, (assay_registry, receptor_info) in enumerate(assays, 1):
+                        if len(assays) > 1:
+                            print(f"\n{'#' * 70}\n# [{i}/{len(assays)}] Assay {assay_registry['assay_id']} — "
+                                  f"receptor '{receptor_info['receptor_model_name']}'\n{'#' * 70}")
+                        self._run_docking_foreground(selected_table, selected_method, assay_registry, clean_ligand_files, receptor_info)
+                elif execution_mode == 'queue':
+                    # Enqueue every assay on the shared, machine-wide queue (see md_queue.py)
+                    self._enqueue_docking_assays(selected_table, selected_method, assays, clean_ligand_files)
                 else:
-                    # Run as background/detached process
-                    self._run_docking_background(selected_table, selected_method, assay_registry, clean_ligand_files, receptor_info)
+                    # Run as background/detached process(es)
+                    for assay_registry, receptor_info in assays:
+                        self._run_docking_background(selected_table, selected_method, assay_registry, clean_ligand_files, receptor_info)
 
             else:
                 print(f"❌ Canceling docking assay.")
@@ -3149,44 +3188,75 @@ class MolDock:
             traceback.print_exc()
             return None
 
-    def _prompt_execution_mode(self) -> Optional[str]:
+    def _prompt_execution_mode(self, n_assays: int = 1) -> Optional[str]:
         """
-        Prompt user to choose between foreground (current console) or background (detached) execution.
-        
+        Prompt user to choose between foreground (current console), background (detached)
+        or queue (shared machine-wide queue, see md_queue.py) execution.
+
+        Args:
+            n_assays (int): Number of docking assays to run (one per selected receptor).
+                With more than one, an empty answer defaults to 'queue'.
+
         Returns:
-            Optional[str]: 'foreground', 'background', or None if cancelled
+            Optional[str]: 'foreground', 'background', 'queue', or None if cancelled
         """
+        multi = n_assays > 1
         print(f"\n🚀 EXECUTION MODE SELECTION")
         print("=" * 70)
-        print(f"How would you like to run the docking process?")
+        if multi:
+            print(f"How would you like to run the {n_assays} docking assays?")
+        else:
+            print(f"How would you like to run the docking process?")
         print(f"\nOptions:")
         print(f"   1. FOREGROUND: Run in current console")
         print(f"      - Process will stop if SSH connection is closed")
         print(f"      - Real-time output and progress visible")
         print(f"      - Easier to debug if issues occur")
+        if multi:
+            print(f"      - Assays run one after another, blocking the console")
         print(f"")
         print(f"   2. BACKGROUND: Run as detached process")
         print(f"      - Process continues even if SSH connection is closed")
         print(f"      - Output redirected to log file")
         print(f"      - Better for long-running jobs over SSH")
         print(f"      - Free up console for other work")
+        if multi:
+            print(f"      - ⚠️  All {n_assays} assays start at the same time and compete for GPU/CPU")
+        print(f"")
+        print(f"   3. QUEUE: Enqueue on the shared machine-wide queue{' [default]' if multi else ''}")
+        print(f"      - Detached, survives SSH disconnect (like BACKGROUND)")
+        print(f"      - One job at a time per lane: GPU engines share the lane with MD runs,")
+        print(f"        Vina shares the CPU lane with MM-GBSA runs")
+        print(f"      - Monitor with MolDock.list_docking_queue()")
         print("=" * 70)
-        
+
         while True:
             try:
-                choice = self._prompt(f"\n🧬 Choose execution mode (1/2, or 'cancel'): ").lower()
-                
+                prompt_text = "(1/2/3, or 'cancel')" + (" [default: 3]" if multi else "")
+                choice = self._prompt(f"\n🧬 Choose execution mode {prompt_text}: ").lower()
+                if not choice and multi:
+                    choice = '3'
+
                 if choice in ['1', 'foreground', 'fg']:
                     print(f"✅ Selected: FOREGROUND execution")
                     return 'foreground'
                 elif choice in ['2', 'background', 'bg']:
+                    if multi:
+                        confirm = self._prompt(
+                            f"⚠️  {n_assays} background processes will run simultaneously. Continue? (y/n): "
+                        ).lower()
+                        if confirm not in ['y', 'yes']:
+                            continue
                     print(f"✅ Selected: BACKGROUND execution")
                     return 'background'
+                elif choice in ['3', 'queue', 'q']:
+                    print(f"✅ Selected: QUEUE execution")
+                    return 'queue'
                 elif choice in ['cancel', 'quit', 'exit', 'c']:
                     print(f"❌ Execution mode selection cancelled")
                     return None
                 else:
-                    print(f"❌ Invalid choice. Please enter 1, 2, or 'cancel'")
+                    print(f"❌ Invalid choice. Please enter 1, 2, 3, or 'cancel'")
                     continue
                     
             except KeyboardInterrupt:
@@ -3199,19 +3269,29 @@ class MolDock:
                                 assay_registry: Dict[str, Any], 
                                 clean_ligand_files: bool,
                                 receptor_info: Dict[str, Any]
-        ) -> None:
+        ) -> bool:
         """
         Run docking in foreground (current console).
+
+        Also used by the scripts that run an assay in background or on the shared
+        queue (see _write_docking_process_script()). Records the outcome in the
+        assay registry: 'running' while docking, then 'completed' or 'failed'.
         
         Args:
             selected_table (str): Name of the selected table
             selected_method (Dict): Docking method information
             assay_registry (Dict): Assay registry information
             clean_ligand_files (bool): Whether to clean ligand files
+
+        Returns:
+            bool: True if docking and results processing finished successfully
         """
+        assay_id = assay_registry['assay_id'] if assay_registry else None
         try:
             print(f"\n💻 Running docking in FOREGROUND mode...")
             print(f"   Process will run in current console")
+            if assay_id is not None:
+                self._update_assay_registry_status(assay_id, 'running')
             
             ## Dock using AutoDockGPU if selected    
             if selected_method['docking_engine'] == 'AutoDockGPU':
@@ -3237,18 +3317,111 @@ class MolDock:
                 
             else:
                 print(f"❌ Docking engine '{selected_method['docking_engine']}' not yet implemented")
-                return
+                if assay_id is not None:
+                    self._update_assay_registry_status(
+                        assay_id, 'failed', f"Docking engine '{selected_method['docking_engine']}' not implemented")
+                return False
 
             ## After the docking run has been completed, execute the corresponding analysis
                  
             results_db_file = self._process_docking_assay_results(assay_registry, docking_mode, clean_ligand_files, selected_method, max_poses=10)
             
+            if not results_db_file:
+                print(f"❌ Docking results could not be processed.")
+                if assay_id is not None:
+                    self._update_assay_registry_status(assay_id, 'failed', 'Docking results could not be processed')
+                return False
+
             print(f"✅ Docking results saved to: {results_db_file}")
+            if assay_id is not None:
+                self._update_assay_registry_status(assay_id, 'completed')
+            return True
             
         except Exception as e:
             print(f"❌ Error during foreground docking execution: {e}")
             import traceback
             traceback.print_exc()
+            if assay_id is not None:
+                self._update_assay_registry_status(assay_id, 'failed', f'Error during docking execution: {e}')
+            return False
+
+    def _write_docking_process_script(self,
+                                      selected_table: str,
+                                      selected_method: Dict[str, Any],
+                                      assay_registry: Dict[str, Any],
+                                      clean_ligand_files: bool,
+                                      receptor_info: Dict[str, Any],
+                                      timestamp: str
+            ) -> str:
+        """
+        Write the standalone Python script that runs one docking assay via
+        _run_docking_foreground() in a fresh process. Shared by the background
+        (_run_docking_background()) and queue (_enqueue_docking_assays()) execution
+        modes. The script exits with code 0 only if the docking finished successfully,
+        which is what the queue worker uses to mark the job completed/failed.
+
+        Returns:
+            str: Path of the written script
+        """
+        import textwrap
+
+        python_script = textwrap.dedent(f"""
+            import sys
+            import os
+            import time
+            sys.path.insert(0, '{self.path}')
+
+            from tidyscreen import tidyscreen
+            from tidyscreen.moldock.moldock import MolDock
+
+            start_time = time.time()
+
+            try:
+                # Recreate the project and MolDock objects
+                project = tidyscreen.ActivateProject('{self.name}')
+                moldock = MolDock(project)
+
+                # Retrieve method info from assay registry
+                assay_id = {assay_registry['assay_id']}
+
+                # Prepare parameters
+                selected_table = '{selected_table}'
+                selected_method = {selected_method}
+                assay_registry = {assay_registry}
+                clean_ligand_files = {clean_ligand_files}
+                receptor_info = {receptor_info}
+
+                # Run docking
+                success = moldock._run_docking_foreground(selected_table, selected_method, assay_registry, clean_ligand_files, receptor_info)
+
+                elapsed = time.time() - start_time
+                if success:
+                    print(f'✅ Docking process completed successfully')
+                    print(f'⏱️  Elapsed time: {{elapsed:.2f}} seconds')
+                    sys.exit(0)
+                print(f'❌ Docking process finished with errors (see log above)')
+                print(f'⏱️  Elapsed time (with error): {{elapsed:.2f}} seconds')
+                sys.exit(1)
+
+            except Exception as e:
+                elapsed = time.time() - start_time
+                print(f'❌ Error in docking process: {{e}}')
+                print(f'⏱️  Elapsed time (with error): {{elapsed:.2f}} seconds')
+                import traceback
+                traceback.print_exc()
+                sys.exit(1)
+            """)
+
+        script_file = os.path.join(
+            self.path,
+            f'docking/scripts/docking_process_{assay_registry["assay_id"]}_{timestamp}.py'
+        )
+        os.makedirs(os.path.dirname(script_file), exist_ok=True)
+
+        with open(script_file, 'w') as f:
+            f.write(python_script)
+
+        return script_file
 
     def _run_docking_background(self, 
                                 selected_table: str, 
@@ -3269,7 +3442,6 @@ class MolDock:
         """
         import subprocess
         import sys
-        import textwrap
         from datetime import datetime
         
         try:
@@ -3283,59 +3455,10 @@ class MolDock:
             )
             os.makedirs(os.path.dirname(log_file), exist_ok=True)
             
-            # Build Python command to run docking
-            python_script = textwrap.dedent(f"""
-                import sys
-                import os
-                import time
-                sys.path.insert(0, '{self.path}')
-
-                from tidyscreen import tidyscreen
-                from tidyscreen.moldock.moldock import MolDock
-
-                start_time = time.time()
-
-                try:
-                    # Recreate the project and MolDock objects
-                    project = tidyscreen.ActivateProject('{self.name}')
-                    moldock = MolDock(project)
-
-                    # Retrieve method info from assay registry
-                    assay_id = {assay_registry['assay_id']}
-
-                    # Prepare parameters
-                    selected_table = '{selected_table}'
-                    selected_method = {selected_method}
-                    assay_registry = {assay_registry}
-                    clean_ligand_files = {clean_ligand_files}
-                    receptor_info = {receptor_info}
-
-                    # Run docking
-                    moldock._run_docking_foreground(selected_table, selected_method, assay_registry, clean_ligand_files, receptor_info)
-
-                    elapsed = time.time() - start_time
-                    print(f'✅ Background docking process completed successfully')
-                    print(f'⏱️  Elapsed time: {{elapsed:.2f}} seconds')
-                    sys.exit(0)
-
-                except Exception as e:
-                    elapsed = time.time() - start_time
-                    print(f'❌ Error in background docking process: {{e}}')
-                    print(f'⏱️  Elapsed time (with error): {{elapsed:.2f}} seconds')
-                    import traceback
-                    traceback.print_exc()
-                    sys.exit(1)
-                """)
-            
-            # Write script to temporary file
-            script_file = os.path.join(
-                self.path,
-                f'docking/scripts/docking_process_{assay_registry["assay_id"]}_{timestamp}.py'
+            # Write the Python script that runs the docking
+            script_file = self._write_docking_process_script(
+                selected_table, selected_method, assay_registry, clean_ligand_files, receptor_info, timestamp
             )
-            os.makedirs(os.path.dirname(script_file), exist_ok=True)
-            
-            with open(script_file, 'w') as f:
-                f.write(python_script)
             
             # Launch process using nohup (survives SSH disconnect)
             with open(log_file, 'w') as logf:
@@ -3363,6 +3486,167 @@ class MolDock:
             print(f"❌ Error launching background docking process: {e}")
             import traceback
             traceback.print_exc()
+
+    @staticmethod
+    def _docking_queue_lane(docking_engine: str) -> str:
+        """
+        Shared-queue lane (see md_queue.py) for a docking engine: GPU engines
+        (AutoDockGPU, UniDock) share the 'gpu' lane with MD runs since they use
+        the same physical GPU; Vina runs on CPU and shares the 'cpu' lane with
+        MM-GBSA runs.
+        """
+        return 'cpu' if docking_engine == 'Vina' else 'gpu'
+
+    def _enqueue_docking_assays(self,
+                                selected_table: str,
+                                selected_method: Dict[str, Any],
+                                assays: List[Tuple[Dict[str, Any], Dict[str, Any]]],
+                                clean_ligand_files: bool
+            ) -> List[int]:
+        """
+        Enqueue docking assays on the shared machine-wide queue (md_queue.py),
+        one job per (assay_registry, receptor_info) pair. Each job runs the same
+        standalone script used for background execution; the queue worker marks
+        it completed/failed from the script's exit code.
+
+        Returns:
+            List[int]: queue_ids of the enqueued jobs
+        """
+        from datetime import datetime
+        from tidyscreen.moldyn import md_queue
+
+        lane = self._docking_queue_lane(selected_method['docking_engine'])
+
+        # Never enqueue an assay that already has an active job on the queue
+        active_jobs = [job for job in md_queue.list_jobs()
+                       if job['status'] in ('queued', 'running') and (job['resource'] or 'gpu') == lane]
+        active_assay_ids = {
+            job['assay_id'] for job in active_jobs
+            if job['job_type'] == 'docking' and job['project_name'] == self.name
+        }
+
+        queue_ids = []
+        print(f"\n📥 Enqueuing {len(assays)} docking assay(s) on the shared queue ('{lane}' lane)...")
+        for assay_registry, receptor_info in assays:
+            assay_id = assay_registry['assay_id']
+            if assay_id in active_assay_ids:
+                print(f"   ⏭  Assay {assay_id} already has an active queue job — skipped")
+                continue
+            try:
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                script_file = self._write_docking_process_script(
+                    selected_table, selected_method, assay_registry, clean_ligand_files, receptor_info, timestamp
+                )
+                log_file = os.path.join(self.path, f'docking/logs/docking_assay_{assay_id}_{timestamp}.log')
+                os.makedirs(os.path.dirname(log_file), exist_ok=True)
+                queue_id = md_queue.enqueue_job(
+                    self.name, self.path, assay_id,
+                    assay_registry.get('assay_folder_path') or '',
+                    md_assay_label=f"assay_{assay_id} / {receptor_info['receptor_model_name']}",
+                    job_type='docking', resource=lane, script_path=script_file,
+                    job_params={'log_file': log_file},
+                )
+            except Exception as e:
+                print(f"   ❌ Could not enqueue assay {assay_id}: {e}")
+                self._update_assay_registry_status(assay_id, 'failed', f'Could not enqueue docking job: {e}')
+                continue
+            self._update_assay_registry_status(assay_id, 'queued')
+            queue_ids.append(queue_id)
+            print(f"   ✓ Assay {assay_id} ({receptor_info['receptor_model_name']}) → queue_id={queue_id}")
+
+        if not queue_ids:
+            print("❌ No docking job was enqueued.")
+            return queue_ids
+
+        started = md_queue.ensure_worker_running(lane)
+        if started:
+            print(f"▶️  {len(queue_ids)} job(s) enqueued — worker started, the first one begins immediately.")
+        else:
+            print(f"📥 {len(queue_ids)} job(s) enqueued; {len(active_jobs)} job(s) ahead of them in the '{lane}' lane.")
+        print(f"   Logs: {os.path.join(self.path, 'docking', 'logs')}")
+        print(f"\n💡 You can safely close this SSH connection.")
+        print(f"   Use MolDock.list_docking_queue() to check progress.")
+        return queue_ids
+
+    def list_docking_queue(self, all_projects: bool = False) -> List[Dict[str, Any]]:
+        """
+        Show docking jobs on the shared, machine-wide queue (see md_queue.py).
+        Defaults to this project's own jobs; pass all_projects=True to see every
+        project's docking jobs. Use MolDyn.list_md_queue() to see MD and MM-GBSA
+        jobs, which share the same lanes.
+        """
+        from tidyscreen.moldyn import md_queue
+
+        md_queue.ensure_worker_running()  # self-heal stale state before showing it
+        jobs = [job for job in md_queue.list_jobs(None if all_projects else self.name)
+                if job['job_type'] == 'docking']
+        scope_label = " (all projects)" if all_projects else f" — project '{self.name}'"
+        if not jobs:
+            print(f"📭 No docking jobs on the shared queue{scope_label}.")
+            return jobs
+
+        status_glyphs = {
+            'queued': '⏳', 'running': '🔄', 'completed': '✅',
+            'failed': '❌', 'cancelled': '🚫', 'crashed': '💥',
+        }
+        print(f"\n🧬 DOCKING QUEUE{scope_label}:")
+        print("=" * 70)
+        for job in jobs:
+            glyph = status_glyphs.get(job['status'], '❔')
+            print(f"{glyph} Queue ID: {job['queue_id']}  |  lane: {job['resource']}  |  "
+                  f"Project: {job['project_name']}  |  {job['md_assay_label']} (assay_id={job['assay_id']})")
+            print(f"   Status: {job['status']}  |  Enqueued: {job['enqueued_at']}  |  "
+                  f"Started: {job['started_at'] or '-'}  |  Finished: {job['finished_at'] or '-'}")
+            if job['error_message']:
+                print(f"   ⚠️  {job['error_message']}")
+            print("-" * 70)
+        counts = {}
+        for job in jobs:
+            counts[job['status']] = counts.get(job['status'], 0) + 1
+        print("   " + "  |  ".join(f"{status}: {n}" for status, n in counts.items()))
+        return jobs
+
+    def cancel_docking_queue_job(self, queue_id: int) -> bool:
+        """Cancel a docking job on the shared queue that has not started running yet."""
+        from tidyscreen.moldyn import md_queue
+
+        success, error = md_queue.cancel_job(queue_id)
+        if success:
+            print(f"✅ Queue job {queue_id} cancelled.")
+            assay_id = self._docking_queue_job_assay_id(queue_id)
+            if assay_id is not None:
+                self._update_assay_registry_status(assay_id, 'cancelled')
+        else:
+            print(f"❌ Could not cancel queue job {queue_id}: {error}")
+        return success
+
+    def requeue_docking_queue_job(self, queue_id: int) -> bool:
+        """
+        Re-queue a failed/crashed/cancelled docking job on the shared queue.
+        Never automatic: the job re-runs the whole assay in its existing assay folder,
+        so check what the failed run left there first.
+        """
+        from tidyscreen.moldyn import md_queue
+
+        success, error = md_queue.requeue_job(queue_id)
+        if success:
+            print(f"✅ Queue job {queue_id} re-queued.")
+            assay_id = self._docking_queue_job_assay_id(queue_id)
+            if assay_id is not None:
+                self._update_assay_registry_status(assay_id, 'queued')
+            md_queue.ensure_worker_running()
+        else:
+            print(f"❌ Could not re-queue job {queue_id}: {error}")
+        return success
+
+    def _docking_queue_job_assay_id(self, queue_id: int) -> Optional[int]:
+        """assay_id of a docking job of this project on the shared queue, or None."""
+        from tidyscreen.moldyn import md_queue
+
+        for job in md_queue.list_jobs(self.name):
+            if job['queue_id'] == queue_id and job['job_type'] == 'docking':
+                return job['assay_id']
+        return None
 
     def _create_docking_assay_registry(self, table_name: str, docking_method: Dict[str, Any], 
                                 table_info: Optional[Dict[str, Any]], receptor_info: Dict[str, Any], setup_type: int,
@@ -10171,6 +10455,135 @@ class MolDock:
                 print("\n❌ Receptor selection cancelled.")
                 return None
     
+    def _load_receptor_models(self) -> Optional[List[dict]]:
+        """
+        Load every receptor_models row from the project's receptors database, as dicts
+        with the receptor_info shape (configs parsed from JSON). Returns None (after
+        printing why) if the database is missing, unreadable or empty.
+        """
+        import sqlite3
+        import json
+
+        receptors_db_path = os.path.join(self.path, 'docking', 'receptors', 'receptors.db')
+        if not os.path.exists(receptors_db_path):
+            print(f"❌ No receptors database found at {receptors_db_path}")
+            return None
+
+        try:
+            conn = sqlite3.connect(receptors_db_path)
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT id, pdb_id, receptor_model_name, template_name, pdb_model_name, pdbqt_file, configs, notes
+                FROM receptor_models
+                ORDER BY id ASC
+            ''')
+            raw_results = cursor.fetchall()
+            conn.close()
+        except Exception as e:
+            print(f"❌ Error loading receptors database: {e}")
+            return None
+
+        receptors = []
+        for row in raw_results:
+            configs_dict = None
+            if row[6]:
+                try:
+                    configs_dict = json.loads(row[6])
+                except json.JSONDecodeError:
+                    configs_dict = None
+            receptors.append({
+                'id': row[0],
+                'pdb_id': row[1],
+                'receptor_model_name': row[2],
+                'template_name': row[3],
+                'pdb_model_name': row[4],
+                'pdbqt_file': row[5],
+                'configs': configs_dict,
+                'notes': row[7],
+            })
+
+        if not receptors:
+            print("❌ No receptors found in the database.")
+            return None
+        return receptors
+
+    @staticmethod
+    def _parse_selection_numbers(text: str, n_items: int) -> Optional[List[int]]:
+        """
+        Parse a 1-based selection like '3', '1,3,5', '1-5', '1,3-5' or 'all' into a list
+        of 0-based indices (order preserved, duplicates removed). Returns None if the text
+        is invalid or any number is out of range.
+        """
+        text = text.strip().lower()
+        if text == 'all':
+            return list(range(n_items))
+        indices = []
+        try:
+            for part in text.split(','):
+                part = part.strip()
+                if not part:
+                    continue
+                if '-' in part:
+                    start, end = (int(x) for x in part.split('-', 1))
+                    if start > end:
+                        return None
+                    numbers = range(start, end + 1)
+                else:
+                    numbers = [int(part)]
+                for number in numbers:
+                    if not 1 <= number <= n_items:
+                        return None
+                    if number - 1 not in indices:
+                        indices.append(number - 1)
+        except ValueError:
+            return None
+        return indices or None
+
+    def _select_receptors_from_db(self) -> Optional[List[dict]]:
+        """
+        Prompt the user to select one or several receptors from the receptors database.
+
+        Shows a compact one-line-per-receptor list and accepts a single number, a
+        comma-separated list, ranges, or 'all' (e.g. '3', '1,3,5', '1-47', '1,3-5').
+
+        Returns:
+            Optional[List[dict]]: Selected receptors (receptor_info dicts, in selection
+            order), or None if cancelled / no receptors available.
+        """
+        receptors = self._load_receptor_models()
+        if not receptors:
+            return None
+
+        print("\n📋 Available Receptors:")
+        print("=" * 70)
+        for i, rec in enumerate(receptors, 1):
+            charge_model = (rec['configs'] or {}).get('receptor_charge_model', '?')
+            notes = (rec['notes'] or '').replace('\n', ' ')
+            if len(notes) > 60:
+                notes = notes[:57] + '...'
+            print(f"{i:>3}. {rec['receptor_model_name']}  (receptor ID: {rec['id']}, charges: {charge_model})")
+            if notes:
+                print(f"     {notes}")
+        print("=" * 70)
+
+        while True:
+            try:
+                selection = input(
+                    "Select receptor(s) by number — e.g. 3, 1,3,5, 1-5 or 'all' (or 'cancel'): "
+                ).strip()
+                if selection.lower() in ['cancel', 'quit', 'exit']:
+                    print("❌ Receptor selection cancelled.")
+                    return None
+                indices = self._parse_selection_numbers(selection, len(receptors))
+                if indices is None:
+                    print(f"❌ Invalid selection. Use numbers between 1 and {len(receptors)}, "
+                          f"lists (1,3,5), ranges (1-5) or 'all'.")
+                    continue
+                return [receptors[idx] for idx in indices]
+            except KeyboardInterrupt:
+                print("\n❌ Receptor selection cancelled.")
+                return None
+
     def _get_receptor_conditions(self, receptor_id):
         """
         Retrieve receptor configuration and metadata from the receptors database.

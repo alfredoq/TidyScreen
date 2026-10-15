@@ -2690,7 +2690,9 @@ class MolDyn:
     def list_md_queue(self, all_projects=False):
         """
         Show jobs on the shared, machine-wide MD queue (see md_queue.py) —
-        MD simulations ('gpu' lane) and MM-GBSA computations ('cpu' lane).
+        MD simulations ('gpu' lane), MM-GBSA computations ('cpu' lane) and
+        docking assays enqueued by MolDock.dock_table() (GPU engines on the
+        'gpu' lane, Vina on the 'cpu' lane).
         Defaults to this project's own jobs; pass all_projects=True to see
         every project's jobs.
         """
@@ -2708,7 +2710,7 @@ class MolDyn:
         print("=" * 70)
         for job in jobs:
             glyph = status_glyphs.get(job['status'], '❔')
-            job_label = 'MM-GBSA' if job['job_type'] == 'mmgbsa' else 'MD'
+            job_label = {'mmgbsa': 'MM-GBSA', 'docking': 'Docking'}.get(job['job_type'], 'MD')
             print(f"{glyph} Queue ID: {job['queue_id']}  |  {job_label} ({job['resource'] or 'gpu'})  |  "
                   f"Project: {job['project_name']}  |  "
                   f"Assay: {job['md_assay_label']} (assay_id={job['assay_id']})")

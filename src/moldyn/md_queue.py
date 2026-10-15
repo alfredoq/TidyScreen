@@ -35,11 +35,14 @@ codebase:
 
 Lanes: every job belongs to one resource lane (the `resource` column), and
 each lane has its own worker process and lock file:
-  - 'gpu' — MD runs (`job_type='md'`, `run_md.sh`, pmemd.cuda).
+  - 'gpu' — MD runs (`job_type='md'`, `run_md.sh`, pmemd.cuda), and
+    docking assays with GPU engines (`job_type='docking'`, AutoDockGPU /
+    UniDock), which use the same physical GPU.
   - 'cpu' — MM-GBSA runs (`job_type='mmgbsa'`, `run_mmgbsa.sh`,
-    MMPBSA.py[.MPI]), which don't touch the GPU. Keeping them in their own
+    MMPBSA.py[.MPI]), which don't touch the GPU, and docking assays run
+    with Vina (`job_type='docking'`). Keeping them in their own
     lane means a minutes-long MM-GBSA job never waits behind a days-long MD
-    run, while two (possibly MPI, many-core) MM-GBSA jobs still never
+    run, while two (possibly MPI, many-core) CPU jobs still never
     compete with each other for the CPU.
 Within a lane only one job runs at a time, machine-wide, FIFO by enqueue
 time; the lanes run independently of each other. Rows predating the lane
@@ -57,6 +60,12 @@ An MM-GBSA job's results are parsed and stored into the project's
 md_registers.db by the worker itself once the run finishes (see
 `_store_mmgbsa_job_results()`), exactly as a foreground run of
 `MolDyn.compute_mmgbsa_on_trajectory()` would.
+
+A docking job runs the standalone Python script written by
+`MolDock._write_docking_process_script()` (the same one used for background
+docking), which exits non-zero on failure; the job's final status is
+mirrored into the project's `docking_assays` table (docking_assays.db, see
+`_mirror_docking_status_to_project_db()`) rather than into `md_assays`.
 """
 
 import json
@@ -83,7 +92,7 @@ _LOCK_FILES = {
     'gpu': LOCK_FILE,
     'cpu': os.path.join(GLOBAL_QUEUE_DIR, 'md_queue_worker_cpu.lock'),
 }
-_LANE_LABELS = {'gpu': 'MD (GPU)', 'cpu': 'MM-GBSA (CPU)'}
+_LANE_LABELS = {'gpu': 'GPU (MD/docking)', 'cpu': 'CPU (MM-GBSA/Vina docking)'}
 
 # Legacy rows (enqueued before the lane columns were added) are GPU/MD jobs.
 _RESOURCE_SQL = "COALESCE(resource, 'gpu')"
@@ -112,14 +121,16 @@ COLUMNS_DICT = {
     'worker_pid': 'INTEGER',
     'run_log_file': 'TEXT',
     'error_message': 'TEXT',
-    'job_type': "TEXT DEFAULT 'md'",   # md|mmgbsa
+    'job_type': "TEXT DEFAULT 'md'",   # md|mmgbsa|docking
     'resource': "TEXT DEFAULT 'gpu'",  # gpu|cpu — the lane (see module docstring)
     # Script to run. NULL for 'md' jobs (always <assay_folder_path>/run_md.sh);
     # for 'mmgbsa' jobs the run_mmgbsa.sh inside the specific mmgbsa[_N] run
-    # folder, since one MD assay can have several MM-GBSA runs.
+    # folder, since one MD assay can have several MM-GBSA runs; for 'docking'
+    # jobs the Python script that runs the docking assay.
     'script_path': 'TEXT',
     # JSON: for 'mmgbsa' jobs, {'mmgbsa_params': ..., 'assay_info': ...} —
-    # what the worker needs to store the results once the run finishes.
+    # what the worker needs to store the results once the run finishes;
+    # for 'docking' jobs, {'log_file': ...}.
     'job_params': 'TEXT',
 }
 
@@ -353,9 +364,13 @@ def _reap_stale_state():
 
     conn, cursor = _connect()
     try:
-        cursor.execute(f"SELECT queue_id, worker_pid FROM {QUEUE_TABLE} WHERE status = 'running'")
+        cursor.execute(
+            f"SELECT queue_id, worker_pid, job_type, project_path, assay_id FROM {QUEUE_TABLE} "
+            f"WHERE status = 'running'"
+        )
         rows = cursor.fetchall()
-        for queue_id, worker_pid in rows:
+        crashed_docking = []
+        for queue_id, worker_pid, job_type, project_path, assay_id in rows:
             if not _pid_alive(worker_pid):
                 cursor.execute(
                     f"UPDATE {QUEUE_TABLE} SET status = 'crashed', finished_at = ?, error_message = ? "
@@ -363,9 +378,13 @@ def _reap_stale_state():
                     (_now(), 'Worker process no longer alive (crash or reboot); '
                              'requeue manually with MolDyn.requeue_md_queue_job() if appropriate.', queue_id),
                 )
+                if job_type == 'docking' and cursor.rowcount == 1:
+                    crashed_docking.append((project_path, assay_id))
         conn.commit()
     finally:
         conn.close()
+    for project_path, assay_id in crashed_docking:
+        _mirror_docking_status_to_project_db(project_path, assay_id, 'crashed')
 
 
 def ensure_worker_running(resource=None):
@@ -564,6 +583,9 @@ def _run_job(job):
     if (job.get('job_type') or 'md') == 'mmgbsa':
         _run_mmgbsa_job(job)
         return
+    if job.get('job_type') == 'docking':
+        _run_docking_job(job)
+        return
 
     queue_id = job['queue_id']
     assay_folder_path = job['assay_folder_path']
@@ -637,6 +659,71 @@ def _run_mmgbsa_job(job):
             error_message = f'Error launching run_mmgbsa.sh: {e}'
 
     _finish_row(queue_id, status, error_message)
+
+
+def _mirror_docking_status_to_project_db(project_path, assay_id, status):
+    """
+    Best-effort: reflect a docking job's final status into that project's
+    docking_assays table (docking/docking_registers/docking_assays.db). The
+    docking script itself already records 'completed'/'failed' through
+    MolDock._run_docking_foreground(); this covers the cases where the
+    script never got that far (launch error, crash). Never raises — a failure
+    here must not affect the authoritative md_queue row.
+    """
+    try:
+        assays_db = os.path.join(project_path, 'docking', 'docking_registers', 'docking_assays.db')
+        if not os.path.exists(assays_db):
+            return
+        conn = sqlite3.connect(assays_db, timeout=30)
+        conn.execute(
+            "UPDATE docking_assays SET status = ?, last_modified = CURRENT_TIMESTAMP WHERE assay_id = ?",
+            (status, assay_id),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
+def _run_docking_job(job):
+    """
+    Run one claimed docking job's Python script (blocking) with this
+    environment's interpreter, then record the outcome from its exit code.
+    """
+    queue_id = job['queue_id']
+    script_path = job.get('script_path')
+    try:
+        params = json.loads(job.get('job_params') or '{}')
+    except (TypeError, ValueError):
+        params = {}
+    run_log = params.get('log_file') or (
+        os.path.splitext(script_path)[0] + '.log' if script_path
+        else os.path.join(job['project_path'], 'docking', 'logs', f"docking_assay_{job['assay_id']}_queue.log")
+    )
+
+    _set_run_log(queue_id, run_log)
+
+    error_message = None
+    if not script_path or not os.path.exists(script_path):
+        status = 'failed'
+        error_message = f'docking script not found at {script_path}'
+    else:
+        try:
+            os.makedirs(os.path.dirname(run_log), exist_ok=True)
+            with open(run_log, 'w') as logf:
+                result = subprocess.run(
+                    [sys.executable, script_path], cwd=job['project_path'],
+                    stdout=logf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                )
+            status = 'completed' if result.returncode == 0 else 'failed'
+            if status == 'failed':
+                error_message = f'docking script exited with code {result.returncode}; see {run_log}'
+        except Exception as e:
+            status = 'failed'
+            error_message = f'Error launching docking script: {e}'
+
+    _finish_row(queue_id, status, error_message)
+    _mirror_docking_status_to_project_db(job['project_path'], job['assay_id'], status)
 
 
 def _store_mmgbsa_job_results(job, run_folder, run_log):
