@@ -3574,8 +3574,54 @@ class MolDock:
         Defaults to this project's own jobs; pass all_projects=True to see every
         project's docking jobs. Use MolDyn.list_md_queue() to see MD and MM-GBSA
         jobs, which share the same lanes.
+
+        Finished (completed/failed/crashed/cancelled) docking jobs of this project
+        whose assay no longer exists in docking_assays (deleted) are removed from
+        the queue first, so they are not shown.
         """
+        self._prune_docking_jobs_of_deleted_assays()
         return self._list_queue_jobs('docking', "DOCKING QUEUE", all_projects)
+
+    def _prune_docking_jobs_of_deleted_assays(self) -> int:
+        """
+        Delete the queue rows of this project's finished docking jobs (completed,
+        failed, crashed or cancelled) whose assay is no longer registered in
+        docking_assays.db. Active jobs (queued/held/running) are never touched.
+        Returns the number removed. If the registry can't be read nothing is
+        removed, so a transient read error never wipes queue history.
+        """
+        from tidyscreen.moldyn import md_queue
+
+        finished = [job for job in md_queue.list_jobs(self.name)
+                    if job['job_type'] == 'docking' and job['status'] in md_queue.FINISHED_STATUSES]
+        if not finished:
+            return 0
+
+        assays_db_path = os.path.join(os.path.dirname(self.__docking_registers_db), 'docking_assays.db')
+        existing_ids = set()
+        if os.path.exists(assays_db_path):
+            try:
+                conn = sqlite3.connect(assays_db_path)
+                try:
+                    existing_ids = {row[0] for row in conn.execute(
+                        "SELECT assay_id FROM docking_assays WHERE project_name = ?", (self.name,)
+                    )}
+                finally:
+                    conn.close()
+            except sqlite3.Error as e:
+                print(f"⚠️  Could not read docking assays registry ({e}); finished jobs not pruned.")
+                return 0
+
+        n_removed = 0
+        for job in finished:
+            if job['assay_id'] in existing_ids:
+                continue
+            success, _ = md_queue.delete_job(job['queue_id'], statuses=md_queue.FINISHED_STATUSES)
+            if success:
+                n_removed += 1
+        if n_removed:
+            print(f"🧹 Removed {n_removed} finished docking job(s) whose assay was deleted from the queue registry.")
+        return n_removed
 
     def _list_queue_jobs(self, job_type: str, title: str, all_projects: bool) -> List[Dict[str, Any]]:
         """Print and return the shared-queue jobs of one job_type ('docking'/'fingerprints')."""

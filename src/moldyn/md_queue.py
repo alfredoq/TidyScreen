@@ -930,13 +930,23 @@ def cancel_job(queue_id):
         conn.close()
 
 
-def delete_job(queue_id):
-    """Remove a cancelled job's row from the queue. Returns (success, error_message|None)."""
+FINISHED_STATUSES = ('completed', 'failed', 'cancelled', 'crashed')
+
+
+def delete_job(queue_id, statuses=('cancelled',)):
+    """
+    Remove a job's row from the queue, only if its status is in `statuses`
+    (default: cancelled only). Never pass active statuses (queued/held/running):
+    a worker may be about to claim or currently running that row.
+    Returns (success, error_message|None).
+    """
+    statuses = tuple(statuses)
     conn, cursor = _connect()
     try:
         cursor.execute(
-            f"DELETE FROM {QUEUE_TABLE} WHERE queue_id = ? AND status = 'cancelled'",
-            (queue_id,),
+            f"DELETE FROM {QUEUE_TABLE} WHERE queue_id = ? "
+            f"AND status IN ({', '.join('?' * len(statuses))})",
+            (queue_id, *statuses),
         )
         conn.commit()
         if cursor.rowcount == 1:
@@ -945,7 +955,7 @@ def delete_job(queue_id):
         row = cursor.fetchone()
         if row is None:
             return False, f"No job with queue_id={queue_id}."
-        return False, f"Job {queue_id} is '{row[0]}'; only 'cancelled' jobs can be deleted."
+        return False, f"Job {queue_id} is '{row[0]}'; only {'/'.join(statuses)} jobs can be deleted here."
     finally:
         conn.close()
 
