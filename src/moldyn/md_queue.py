@@ -838,6 +838,26 @@ def cancel_job(queue_id):
         conn.close()
 
 
+def delete_job(queue_id):
+    """Remove a cancelled job's row from the queue. Returns (success, error_message|None)."""
+    conn, cursor = _connect()
+    try:
+        cursor.execute(
+            f"DELETE FROM {QUEUE_TABLE} WHERE queue_id = ? AND status = 'cancelled'",
+            (queue_id,),
+        )
+        conn.commit()
+        if cursor.rowcount == 1:
+            return True, None
+        cursor.execute(f"SELECT status FROM {QUEUE_TABLE} WHERE queue_id = ?", (queue_id,))
+        row = cursor.fetchone()
+        if row is None:
+            return False, f"No job with queue_id={queue_id}."
+        return False, f"Job {queue_id} is '{row[0]}'; only 'cancelled' jobs can be deleted."
+    finally:
+        conn.close()
+
+
 def requeue_job(queue_id):
     """Re-queue a failed/crashed/cancelled job. Returns (success, error_message|None)."""
     conn, cursor = _connect()

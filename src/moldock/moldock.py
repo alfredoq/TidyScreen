@@ -8,7 +8,7 @@ from turtle import pd
 from io import StringIO
 from tidyscreen import tidyscreen
 import sys
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Tuple, Optional, Any, Union
 from rdkit.Chem import AllChem
 import warnings
 warnings.filterwarnings('ignore', category=DeprecationWarning)
@@ -3606,19 +3606,134 @@ class MolDock:
         print("   " + "  |  ".join(f"{status}: {n}" for status, n in counts.items()))
         return jobs
 
-    def cancel_docking_queue_job(self, queue_id: int) -> bool:
-        """Cancel a docking job on the shared queue that has not started running yet."""
+    def cancel_docking_queue_job(self, queue_id: Optional[Union[int, List[int]]] = None,
+                                 cleanup: Optional[bool] = None) -> bool:
+        """
+        Cancel one or more docking jobs on the shared queue that have not started
+        running yet. queue_id may be a single id or a list of ids. If it is not given,
+        this project's queued docking jobs are listed and the user selects one or more
+        interactively ('3', '1,3,5', '1-5', '1,3-5' or 'all').
+
+        cleanup controls what happens to the never-run assays of the cancelled jobs:
+        True deletes their docking_assays registry entry, assay folder, docking
+        script and queue row; False keeps everything (so the job can be re-queued
+        with requeue_docking_queue_job()); None (default) asks the user.
+        Returns True only if every selected job was cancelled.
+        """
         from tidyscreen.moldyn import md_queue
 
-        success, error = md_queue.cancel_job(queue_id)
-        if success:
-            print(f"✅ Queue job {queue_id} cancelled.")
-            assay_id = self._docking_queue_job_assay_id(queue_id)
-            if assay_id is not None:
-                self._update_assay_registry_status(assay_id, 'cancelled')
+        if queue_id is None:
+            queue_ids = self._select_docking_queue_jobs(('queued',), 'cancel')
+            if not queue_ids:
+                return False
+        elif isinstance(queue_id, int):
+            queue_ids = [queue_id]
         else:
-            print(f"❌ Could not cancel queue job {queue_id}: {error}")
-        return success
+            queue_ids = list(queue_id)
+
+        # Snapshot this project's docking jobs before cancelling: cleanup needs
+        # their assay_id and script_path
+        project_jobs = {job['queue_id']: job for job in md_queue.list_jobs(self.name)
+                        if job['job_type'] == 'docking'}
+
+        n_cancelled = 0
+        cancelled_jobs = []  # this project's docking jobs that were cancelled — cleanup candidates
+        for qid in queue_ids:
+            success, error = md_queue.cancel_job(qid)
+            if success:
+                n_cancelled += 1
+                print(f"✅ Queue job {qid} cancelled.")
+                job = project_jobs.get(qid)
+                if job is not None:
+                    cancelled_jobs.append(job)
+                    if job['assay_id'] is not None:
+                        self._update_assay_registry_status(job['assay_id'], 'cancelled')
+            else:
+                print(f"❌ Could not cancel queue job {qid}: {error}")
+        if len(queue_ids) > 1:
+            print(f"📊 Cancelled {n_cancelled}/{len(queue_ids)} queue jobs.")
+
+        if cancelled_jobs:
+            if cleanup is None:
+                print(f"\n🧹 The {len(cancelled_jobs)} cancelled assay(s) never ran. Their registry entry, "
+                      f"assay folder and docking script can be deleted now.")
+                print("   Keep them if you plan to re-queue with requeue_docking_queue_job().")
+                answer = input("Delete the cancelled assays? (y/n, default: n): ").strip().lower()
+                cleanup = answer in ('y', 'yes')
+            if cleanup:
+                for job in cancelled_jobs:
+                    self._cleanup_cancelled_docking_job(job)
+            else:
+                print("📁 Cancelled assays kept on disk and in the registry.")
+
+        return n_cancelled == len(queue_ids)
+
+    def _cleanup_cancelled_docking_job(self, job: Dict[str, Any]) -> None:
+        """
+        Delete everything a cancelled (never-run) docking queue job left behind: its
+        docking_assays registry entry, its assay folder, its docking script and its
+        queue row. Only paths inside this project are removed.
+        """
+        import shutil
+        from tidyscreen.moldyn import md_queue
+
+        assay_id = job['assay_id']
+        qid = job['queue_id']
+        print(f"\n🧹 Cleaning up cancelled queue job {qid} (assay {assay_id}):")
+        project_root = os.path.realpath(self.path)
+
+        def _inside_project(path: str) -> bool:
+            real = os.path.realpath(path)
+            return real != project_root and real.startswith(project_root + os.sep)
+
+        assays_db_path = os.path.join(os.path.dirname(self.__docking_registers_db), 'docking_assays.db')
+        assay_folder_path = None
+        if assay_id is not None and os.path.exists(assays_db_path):
+            try:
+                conn = sqlite3.connect(assays_db_path)
+                try:
+                    row = conn.execute(
+                        "SELECT assay_folder_path FROM docking_assays WHERE assay_id = ? AND project_name = ?",
+                        (assay_id, self.name)
+                    ).fetchone()
+                    if row is not None:
+                        assay_folder_path = self._remap_project_path(row[0]) if row[0] else None
+                        conn.execute("DELETE FROM docking_assays WHERE assay_id = ? AND project_name = ?",
+                                     (assay_id, self.name))
+                        conn.commit()
+                        print(f"   ✓ Registry entry deleted (assay_id={assay_id})")
+                    else:
+                        print(f"   ⚠️  No registry entry found for assay_id={assay_id}")
+                finally:
+                    conn.close()
+            except sqlite3.Error as e:
+                print(f"   ⚠️  Could not delete registry entry for assay_id={assay_id}: {e}")
+
+        if assay_folder_path:
+            if not os.path.exists(assay_folder_path):
+                print(f"   ⚠️  Assay folder already missing: {assay_folder_path}")
+            elif not _inside_project(assay_folder_path):
+                print(f"   ⚠️  Assay folder is outside the project, not removed: {assay_folder_path}")
+            else:
+                try:
+                    shutil.rmtree(assay_folder_path)
+                    print(f"   ✓ Removed folder: {assay_folder_path}")
+                except Exception as e:
+                    print(f"   ⚠️  Could not remove folder {assay_folder_path}: {e}")
+
+        script_path = self._remap_project_path(job.get('script_path')) if job.get('script_path') else None
+        if script_path and os.path.isfile(script_path) and _inside_project(script_path):
+            try:
+                os.remove(script_path)
+                print(f"   ✓ Removed script: {script_path}")
+            except OSError as e:
+                print(f"   ⚠️  Could not remove script {script_path}: {e}")
+
+        success, error = md_queue.delete_job(qid)
+        if success:
+            print(f"   ✓ Queue row {qid} deleted")
+        else:
+            print(f"   ⚠️  Could not delete queue row {qid}: {error}")
 
     def requeue_docking_queue_job(self, queue_id: int) -> bool:
         """
@@ -3638,6 +3753,46 @@ class MolDock:
         else:
             print(f"❌ Could not re-queue job {queue_id}: {error}")
         return success
+
+    def _select_docking_queue_jobs(self, statuses: tuple, action_label: str) -> Optional[List[int]]:
+        """
+        List this project's docking jobs on the shared queue whose status is in
+        `statuses` and let the user pick one or more ('3', '1,3,5', '1-5', 'all').
+        Returns the selected queue_ids, or None if there is nothing to select or the
+        user cancels.
+        """
+        from tidyscreen.moldyn import md_queue
+
+        jobs = [job for job in md_queue.list_jobs(self.name)
+                if job['job_type'] == 'docking' and job['status'] in statuses]
+        if not jobs:
+            print(f"📭 No docking jobs that can be {action_label}ed "
+                  f"(status: {', '.join(statuses)}) in project '{self.name}'.")
+            return None
+
+        print(f"\n🧬 Docking jobs that can be {action_label}ed — project '{self.name}':")
+        for idx, job in enumerate(jobs, 1):
+            print(f"  [{idx}] Queue ID: {job['queue_id']} | {job['md_assay_label']} "
+                  f"(assay_id={job['assay_id']}) | lane: {job['resource']} | "
+                  f"status: {job['status']} | enqueued: {job['enqueued_at']}")
+        while True:
+            selection = input(f"Select job(s) to {action_label} (e.g. 2, 1,3, 1-3, all; "
+                              f"or 'cancel' to abort): ").strip()
+            if selection.lower() in ['cancel', 'quit', 'exit']:
+                print("❌ Operation cancelled by user.")
+                return None
+            indices = self._parse_selection_numbers(selection, len(jobs))
+            if indices is None:
+                print("⚠️ Invalid selection. Try again.")
+                continue
+            selected = [jobs[i]['queue_id'] for i in indices]
+            if len(selected) > 1:
+                confirm = input(f"{action_label.capitalize()} {len(selected)} jobs "
+                                f"(queue IDs: {', '.join(map(str, selected))})? (y/n): ").strip().lower()
+                if confirm not in ('y', 'yes'):
+                    print("❌ Operation cancelled by user.")
+                    return None
+            return selected
 
     def _docking_queue_job_assay_id(self, queue_id: int) -> Optional[int]:
         """assay_id of a docking job of this project on the shared queue, or None."""
