@@ -3575,21 +3575,25 @@ class MolDock:
         project's docking jobs. Use MolDyn.list_md_queue() to see MD and MM-GBSA
         jobs, which share the same lanes.
         """
+        return self._list_queue_jobs('docking', "DOCKING QUEUE", all_projects)
+
+    def _list_queue_jobs(self, job_type: str, title: str, all_projects: bool) -> List[Dict[str, Any]]:
+        """Print and return the shared-queue jobs of one job_type ('docking'/'fingerprints')."""
         from tidyscreen.moldyn import md_queue
 
         md_queue.ensure_worker_running()  # self-heal stale state before showing it
         jobs = [job for job in md_queue.list_jobs(None if all_projects else self.name)
-                if job['job_type'] == 'docking']
+                if job['job_type'] == job_type]
         scope_label = " (all projects)" if all_projects else f" — project '{self.name}'"
         if not jobs:
-            print(f"📭 No docking jobs on the shared queue{scope_label}.")
+            print(f"📭 No {job_type} jobs on the shared queue{scope_label}.")
             return jobs
 
         status_glyphs = {
-            'queued': '⏳', 'running': '🔄', 'completed': '✅',
+            'queued': '⏳', 'held': '⏸', 'running': '🔄', 'completed': '✅',
             'failed': '❌', 'cancelled': '🚫', 'crashed': '💥',
         }
-        print(f"\n🧬 DOCKING QUEUE{scope_label}:")
+        print(f"\n🧬 {title}{scope_label}:")
         print("=" * 70)
         for job in jobs:
             glyph = status_glyphs.get(job['status'], '❔')
@@ -3754,23 +3758,24 @@ class MolDock:
             print(f"❌ Could not re-queue job {queue_id}: {error}")
         return success
 
-    def _select_docking_queue_jobs(self, statuses: tuple, action_label: str) -> Optional[List[int]]:
+    def _select_docking_queue_jobs(self, statuses: tuple, action_label: str,
+                                   job_type: str = 'docking') -> Optional[List[int]]:
         """
-        List this project's docking jobs on the shared queue whose status is in
-        `statuses` and let the user pick one or more ('3', '1,3,5', '1-5', 'all').
-        Returns the selected queue_ids, or None if there is nothing to select or the
-        user cancels.
+        List this project's jobs of job_type ('docking' or 'fingerprints') on the
+        shared queue whose status is in `statuses` and let the user pick one or more
+        ('3', '1,3,5', '1-5', 'all'). Returns the selected queue_ids, or None if there
+        is nothing to select or the user cancels.
         """
         from tidyscreen.moldyn import md_queue
 
         jobs = [job for job in md_queue.list_jobs(self.name)
-                if job['job_type'] == 'docking' and job['status'] in statuses]
+                if job['job_type'] == job_type and job['status'] in statuses]
         if not jobs:
-            print(f"📭 No docking jobs that can be {action_label}ed "
+            print(f"📭 No {job_type} jobs that can be {action_label}ed "
                   f"(status: {', '.join(statuses)}) in project '{self.name}'.")
             return None
 
-        print(f"\n🧬 Docking jobs that can be {action_label}ed — project '{self.name}':")
+        print(f"\n🧬 {job_type.capitalize()} jobs that can be {action_label}ed — project '{self.name}':")
         for idx, job in enumerate(jobs, 1):
             print(f"  [{idx}] Queue ID: {job['queue_id']} | {job['md_assay_label']} "
                   f"(assay_id={job['assay_id']}) | lane: {job['resource']} | "
@@ -13826,43 +13831,84 @@ class MolDock:
         else:
             print("   ✅ Charge methods are consistent between receptor and ligands.")
     
+    # pose_choice -> (computation_mode label, df subset method name or None)
+    _FPS_POSE_MODES = {
+        "1": ("All poses", None),
+        "2": ("Most populated", "_subset_df_for_most_populated_poses"),
+        "3": ("Lowest energy cluster", "_subset_df_for_lowest_energy_cluster_poses"),
+        "4": ("Lowest energy cluster AND Most populated", "_subset_df_for_most_populated_and_lowest_energy_poses"),
+    }
+
     def compute_fingerprints(self, minimize=True, clean_files=True, write_prolif=False, write_mmgbsa=False, selection_threshold=25, max_workers=None):
         """
-        Will compute the ProLIF fingerprints for all docked ligands in a given assay.
+        Will compute the ProLIF fingerprints and/or MMGBSA decomposition for the docked
+        ligands of one or more docking assays.
 
-        max_workers: number of parallel worker processes to use. Defaults to
-        min(cpu_count(), 8) when None. Applies to all three modes (ProLIF-only,
-        MMGBSA-only, and combined ProLIF+MMGBSA) — every mode runs through the
-        same parallel per-pose pipeline.
+        Assays are selected by ID: '3', '1,3,5', '1-5' or 'all'. Every option
+        (computation type, ligands, poses, ProLIF condition, resume/overwrite, worker
+        count) is asked once and applied to every selected assay.
 
-        After all interactive setup (assay/ligand/pose selection, resume choices,
-        worker count), prompts whether to run the computation — ligand preparation
-        followed by the parallel per-pose dispatch — in the foreground (blocks until
-        done) or background (detached process, launched before ligand preparation
-        starts; progress/errors go to a log file under the assay's logs/ folder, and
-        this call returns immediately). Defaults to foreground.
+        max_workers: number of parallel worker processes used for each assay. When
+        None, it is prompted (default min(cpu_count(), 8)). Applies to all three
+        modes (ProLIF-only, MMGBSA-only, and combined ProLIF+MMGBSA) — every mode
+        runs through the same parallel per-pose pipeline.
+
+        After all interactive setup, prompts for the execution mode:
+          - fg: assays are processed one after another in this console.
+          - bg: one detached process per assay (each one using max_workers cores);
+            progress/errors go to a log file under each assay's logs/ folder.
+          - queue: one job per assay (job_type='fingerprints') on the shared,
+            machine-wide queue (see md_queue.py). An assay whose docking job is still
+            queued or running on that queue can be selected too: its fingerprints job
+            is enqueued on the same lane as the docking job, so the lane's FIFO order
+            starts it only after the docking has finished. Every other fingerprints
+            job goes to the 'cpu' lane (shared with MM-GBSA and Vina docking).
+        Defaults to queue when more than one assay is processed or a selected
+        assay is still docking, and to fg otherwise.
         """
 
-        import os
-        import sqlite3
-        import pandas as pd
-        import json
+        from tidyscreen.moldyn import md_queue
 
-        ## Get the assay on which fps are to be computed
+        ## Get the assay(s) on which fps are to be computed
         assays = self.list_assay_folders()
-        
+
         if not assays:
             return None
 
         assay_by_id = {a['assay_id']: a for a in assays}
 
-        assay_id = self._prompt_assay("for ProLIF fingerprint computation", assay_by_id)
-        
-        # Get the receptor file used for the corresponding docking studies
-        _pdbqt = assay_by_id[assay_id].get('receptor_info', {}).get('pdbqt_file', '')
-        _pdbqt = self._remap_project_path(_pdbqt)
-        receptor_file = os.path.join(os.path.dirname(_pdbqt), 'receptor_checked.pdb')
-        
+        assay_ids = self._prompt_assays("for fingerprint computation", assay_by_id)
+        if not assay_ids:
+            return None
+
+        # Docking jobs of this project still waiting/running on the shared queue: their
+        # assays have no results yet, but fingerprint jobs can be queued behind them.
+        active_docking_lanes = {
+            job['assay_id']: (job['resource'] or 'gpu') for job in md_queue.list_jobs(self.name)
+            if job['job_type'] == 'docking' and job['status'] in ('queued', 'running')
+        }
+
+        ready_ids, pending_ids = [], []
+        for assay_id in assay_ids:
+            if assay_id in active_docking_lanes:
+                pending_ids.append(assay_id)
+                continue
+            problem = self._check_fingerprints_results_db(self._fingerprints_results_db(assay_by_id[assay_id]))
+            if problem:
+                print(f"⚠️  Assay {assay_id} skipped: {problem}")
+                if assay_by_id[assay_id].get('status') in ('running', 'queued'):
+                    print("   Its docking is running outside the shared queue, so fingerprints cannot be "
+                          "queued behind it; re-run compute_fingerprints() once it finishes.")
+                continue
+            ready_ids.append(assay_id)
+
+        if pending_ids:
+            print(f"⏳ Docking still queued/running on the shared queue for assay(s) "
+                  f"{', '.join(map(str, pending_ids))}: their fingerprints can only be computed in 'queue' mode.")
+        if not ready_ids and not pending_ids:
+            print("❌ None of the selected assays can be processed.")
+            return None
+
         # Prompt user for fingerprint/computation options
         print("\nSelect fingerprint/computation options:")
         print("1 - ProLIF fingerprints only")
@@ -13884,54 +13930,34 @@ class MolDock:
                 break
             else:
                 print("Invalid selection. Please enter 1, 2, or 3.")
-        
-        if assay_id is None:
-            return None
 
-        assay_info = assay_by_id[assay_id]
+        mode_label = "ProLIF+MMGBSA" if prolif and mmbgsa else ("ProLIF" if prolif else "MMGBSA")
 
-        # Get the path to the results database for the selected assay
-        _remapped_folder = self._remap_project_path(assay_info['assay_folder_path'])
-        results_db = os.path.join(_remapped_folder, "results", f"assay_{assay_id}.db")
-        print(f"📂 Results DB: {results_db}")
-
-        if not os.path.isfile(results_db):
-            print(f"❌ Results database not found: {results_db}")
-            print(f"   Stored assay folder : {assay_info['assay_folder_path']}")
-            print(f"   Remapped assay folder: {_remapped_folder}")
-            print("   Make sure docking has been run for this assay and the results file exists.")
-            return None
-
-        try:
-            conn = sqlite3.connect(results_db)
-            # Verify the Results table exists before querying
-            tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
-            if 'Results' not in tables:
-                print(f"❌ 'Results' table not found in {results_db}")
-                print(f"   Tables present: {tables}")
-                conn.close()
-                return None
-            query = "SELECT Pose_ID, LigName, docking_score, cluster_size, run_number FROM Results"
-            df = pd.read_sql(query, conn)
-            conn.close()
-        except Exception as e:
-            print(f"❌ Error retrieving Pose_ID and LigName from Results table: {e}")
-            return None
-        
         # Query the user if fingerprints are to be computer for all ligands or selected ones
         print("\nSelect which ligands to compute fingerprints for:")
         print("1 - All ligands")
         print("2 - Specific ligands (provide a list)")
+        ligand_names = None  # None = all ligands
         while True:
             ligand_choice = input("Enter your choice (1 or 2): ").strip()
             if ligand_choice == "1":
-                # All ligands, do nothing 
+                # All ligands, do nothing
                 break
             elif ligand_choice == "2":
                 # Specific ligands
-                df = self._select_ligands_for_fps_computation(df, selection_threshold)
+                if len(ready_ids) == 1 and not pending_ids:
+                    df = self._load_fingerprints_results_df(self._fingerprints_results_db(assay_by_id[ready_ids[0]]))
+                    if df is None:
+                        return None
+                    ligand_names = list(self._select_ligands_for_fps_computation(df, selection_threshold)['LigName'].unique())
+                else:
+                    # Several assays (or one not docked yet): no single ligand list to pick from
+                    raw = input("Enter the ligand names to process in every selected assay, separated by commas: ").strip()
+                    ligand_names = [name.strip() for name in raw.split(',') if name.strip()] or None
+                    if ligand_names is None:
+                        print("No ligand names given. All ligands will be processed.")
                 break
-        
+
         # Query the user if fingerprints are to be computed for all poses, the most populated pose, the lowest energy cluster of both
         print("\nSelect which docked poses to compute fingerprints for:")
         print("1 - All docked poses")
@@ -13940,48 +13966,215 @@ class MolDock:
         print("4 - Most populated and lowest energy cluster poses per ligand")
         while True:
             pose_choice = input("Enter your choice (1, 2, 3, or 4): ").strip()
-            if pose_choice == "1":
-                # All docked poses, do nothing 
-                computation_mode = "All poses"
-                break 
+            if pose_choice in self._FPS_POSE_MODES:
                 break
-            elif pose_choice == "2":
-                # Most populated pose per ligand
-                df = self._subset_df_for_most_populated_poses(df)
-                computation_mode = "Most populated"
-                break
-            elif pose_choice == "3":
-                # Lowest energy cluster pose per ligand
-                df = self._subset_df_for_lowest_energy_cluster_poses(df)
-                computation_mode = "Lowest energy cluster"
-                break
-            elif pose_choice == "4":
-                # Most populated and lowest energy cluster poses per ligand
-                df = self._subset_df_for_most_populated_and_lowest_energy_poses(df)
-                computation_mode = "Lowest energy cluster AND Most populated"
-                break
-        
-        # Table existence / resume-vs-overwrite prompts for whichever table(s) this
-        # run needs are handled inside _prepare_fingerprints_execution(), once it
-        # knows exactly which tables (ProLIF condition table and/or MMGBSA table)
-        # are relevant.
+
         if prolif:
             print("I will compute ProLIF FPS")
         if mmbgsa:
             print("I will compute MMGBSA FPS")
 
+        ## If ProLIF fingerprints are requested, retrieve the computation parameters.
+        prolif_params_dict, condition_selection = None, None
+        if prolif:
+            prolif_selection = self._get_prolif_params()
+            if not prolif_selection:
+                print("❌ No ProLIF condition selected. Operation cancelled.")
+                return None
+            prolif_params_dict, condition_selection = prolif_selection
+
+        # Per-assay receptor context (stub receptor tleap template, renumbering dict,
+        # receptor PDB). Resolved now — it may prompt for a stub receptor's tleap
+        # template — so that queued jobs never need to ask anything.
+        contexts = {}
+        for assay_id in ready_ids + pending_ids:
+            context = self._get_fingerprints_assay_context(assay_by_id[assay_id])
+            if context is None:
+                print(f"⚠️  Assay {assay_id} skipped: its receptor could not be prepared for {mode_label} computation.")
+                continue
+            contexts[assay_id] = context
+        ready_ids = [a for a in ready_ids if a in contexts]
+        pending_ids = [a for a in pending_ids if a in contexts]
+        if not ready_ids and not pending_ids:
+            return None
+
+        # Resume vs overwrite, asked once per requested results table and applied to
+        # every docked assay that already has it. Assays still docking have no results
+        # tables yet; 'resume' lets a re-queued job keep the poses it already computed.
+        table_names = {}
+        if prolif:
+            table_names['prolif'] = (f'processed_prolif_fps_json_condition_{condition_selection}', "ProLIF results")
+        if mmbgsa:
+            table_names['mmgbsa'] = ('processed_mmgbsa_decomposition_json', "MMGBSA results")
+        ready_policies = {}
+        for key, (table_name, item_label) in table_names.items():
+            with_table = [a for a in ready_ids if self._fps_table_exists(contexts[a]['results_db'], table_name)]
+            ready_policies[key] = 'resume'
+            if with_table:
+                policy = self._prompt_resume_policy(table_name, item_label, with_table)
+                if policy is None:
+                    return None
+                ready_policies[key] = policy
+        resume_policies = {a: dict(ready_policies) for a in ready_ids}
+        resume_policies.update({a: {key: 'resume' for key in table_names} for a in pending_ids})
+
+        if max_workers is None:
+            max_workers = self._prompt_fingerprints_workers(mode_label)
+
+        options = dict(
+            prolif=prolif, mmgbsa=mmbgsa, ligand_names=ligand_names, pose_choice=pose_choice,
+            prolif_params_dict=prolif_params_dict, condition_selection=condition_selection,
+            clean_files=clean_files, write_prolif=write_prolif, write_mmgbsa=write_mmgbsa,
+            minimize=minimize, max_workers=max_workers,
+        )
+
+        default_mode = 'queue' if (pending_ids or len(ready_ids) > 1) else 'fg'
+        run_mode = input(
+            f"\n⚙️  Run the fingerprint computation in the foreground, background or on the shared queue? "
+            f"(fg/bg/queue) [default: {default_mode}]: "
+        ).strip().lower() or default_mode
+        run_mode = {'foreground': 'fg', 'background': 'bg', 'q': 'queue'}.get(run_mode, run_mode)
+
+        if run_mode == 'queue':
+            self._enqueue_fingerprints_assays(ready_ids + pending_ids, assay_by_id, contexts, options,
+                                              resume_policies, active_docking_lanes, mode_label)
+            return None
+
+        if run_mode not in ('fg', 'bg'):
+            print("❌ Invalid option. Please choose 'fg', 'bg' or 'queue'. No computation was started.")
+            return None
+
+        if pending_ids:
+            print(f"⏭  Skipping assay(s) {', '.join(map(str, pending_ids))}: still docking (use 'queue' mode for them).")
+        if not ready_ids:
+            return None
+        if run_mode == 'bg' and len(ready_ids) > 1:
+            print(f"⚠️  {len(ready_ids)} background processes will run at the same time, "
+                  f"using up to {len(ready_ids) * max_workers} cores in total.")
+
+        for i, assay_id in enumerate(ready_ids, 1):
+            if len(ready_ids) > 1:
+                print(f"\n{'#' * 70}\n# [{i}/{len(ready_ids)}] Assay {assay_id}\n{'#' * 70}")
+            exec_kwargs, _ = self._build_fingerprints_exec_kwargs(
+                assay_by_id[assay_id], contexts[assay_id], options, resume_policies[assay_id]
+            )
+            if exec_kwargs is None:
+                continue
+            if run_mode == 'fg':
+                print(f"\n▶️  Starting {mode_label} computation in the foreground...")
+                self._run_fingerprints_computation(**exec_kwargs)
+            else:
+                self._launch_fingerprints_background(**exec_kwargs)
+
+    def _prompt_assays(self, role: str, assay_by_id) -> Optional[List[int]]:
+        """
+        Prompt for one or several docking assay IDs: '3', '1,3,5', '1-5', '1,3-5' or
+        'all'. Ranges may span IDs that no longer exist (deleted assays); those are
+        skipped. Returns the selected assay IDs in selection order, or None if cancelled.
+        """
+        while True:
+            choice = input(f"Enter assay ID(s) to use {role} (e.g. 3, 1,3,5, 1-5, all; "
+                           f"press Enter to cancel): ").strip().lower()
+            if not choice:
+                print("❌ Operation cancelled.")
+                return None
+            if choice == 'all':
+                return list(assay_by_id)
+            selected, not_found = [], []
+            try:
+                for part in choice.split(','):
+                    part = part.strip()
+                    if not part:
+                        continue
+                    if '-' in part:
+                        start, end = (int(x) for x in part.split('-', 1))
+                        if start > end:
+                            raise ValueError
+                        candidates = [aid for aid in range(start, end + 1) if aid in assay_by_id]
+                    else:
+                        candidates = [int(part)]
+                    for aid in candidates:
+                        if aid not in assay_by_id:
+                            not_found.append(aid)
+                        elif aid not in selected:
+                            selected.append(aid)
+            except ValueError:
+                print("Please enter numeric assay IDs (e.g. 3, 1,3,5, 1-5) or 'all'.")
+                continue
+            if not_found:
+                print(f"Assay ID(s) not found: {', '.join(map(str, not_found))}; choose from the list above.")
+                continue
+            if not selected:
+                print("No assay in that selection; choose from the list above.")
+                continue
+            return selected
+
+    def _fingerprints_results_db(self, assay_info) -> str:
+        """Path of an assay's docking results database (results/assay_<id>.db)."""
+        assay_folder = self._remap_project_path(assay_info['assay_folder_path'])
+        return os.path.join(assay_folder, "results", f"assay_{assay_info['assay_id']}.db")
+
+    @staticmethod
+    def _check_fingerprints_results_db(results_db) -> Optional[str]:
+        """None if results_db holds a docking Results table, else why it can't be used."""
+        if not os.path.isfile(results_db):
+            return f"results database not found ({results_db}); has docking been run for this assay?"
+        try:
+            conn = sqlite3.connect(results_db)
+            try:
+                tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+            finally:
+                conn.close()
+        except sqlite3.Error as e:
+            return f"could not read {results_db}: {e}"
+        if 'Results' not in tables:
+            return f"'Results' table not found in {results_db} (tables present: {tables})"
+        return None
+
+    @staticmethod
+    def _load_fingerprints_results_df(results_db):
+        """Docked poses (Pose_ID, LigName, docking_score, cluster_size, run_number), or None on error."""
+        import pandas as pd
+
+        try:
+            conn = sqlite3.connect(results_db)
+            try:
+                query = "SELECT Pose_ID, LigName, docking_score, cluster_size, run_number FROM Results"
+                return pd.read_sql(query, conn)
+            finally:
+                conn.close()
+        except Exception as e:
+            print(f"❌ Error retrieving Pose_ID and LigName from Results table: {e}")
+            return None
+
+    def _get_fingerprints_assay_context(self, assay_info) -> Optional[Dict[str, Any]]:
+        """
+        Receptor-dependent inputs of a fingerprint run for one assay, none of which
+        need the docking results: results DB path, receptor PDB, renumbering dict and,
+        for stub (imported) receptors, the tleap template — which may be prompted for
+        once and is then persisted (see _get_or_store_receptor_tleap_template()).
+        Returns None if a stub receptor has no tleap template.
+        """
+        import json
+
+        receptor_info = assay_info.get('receptor_info') or {}
+
+        # Get the receptor file used for the corresponding docking studies
+        _pdbqt = self._remap_project_path(receptor_info.get('pdbqt_file', ''))
+        receptor_file = os.path.join(os.path.dirname(_pdbqt), 'receptor_checked.pdb')
+
         pdbs_db_path = os.path.join(self.path, 'docking', 'receptors', 'pdbs.db')
+        template_name = receptor_info.get('template_name')
 
         # Detect whether the assay receptor is a stub (created by import_receptor_model)
         is_stub_receptor = False
         fps_tleap_config = None
-        _template_name = assay_info.get('receptor_info', {}).get('template_name')
-        if _template_name:
+        if template_name:
             try:
                 conn = sqlite3.connect(pdbs_db_path)
                 _status_row = conn.execute(
                     "SELECT status FROM pdb_templates WHERE pdb_template_name = ?",
-                    (_template_name,)
+                    (template_name,)
                 ).fetchone()
                 conn.close()
                 if _status_row and _status_row[0] == 'imported':
@@ -13990,24 +14183,14 @@ class MolDock:
                 pass
 
         if is_stub_receptor:
-            _receptor_model_name = assay_info.get('receptor_info', {}).get('receptor_model_name')
-            fps_tleap_config = self._get_or_store_receptor_tleap_template(_receptor_model_name)
+            fps_tleap_config = self._get_or_store_receptor_tleap_template(receptor_info.get('receptor_model_name'))
             if not fps_tleap_config:
                 print("❌ No tleap template available for this stub receptor. Cannot proceed.")
                 return None
 
-        ## If ProLIF fingerprints are requested, retrieve the computation parameters.
-        # The condition table's existence/resume-vs-overwrite check happens inside
-        # _prepare_fingerprints_execution(), since that's where the per-table
-        # "already computed" pose sets are needed.
-        prolif_params_dict, condition_selection = None, None
-        if prolif == True:
-            prolif_params_dict, condition_selection = self._get_prolif_params()
-
         # Retrieve renumbering_dict once for the whole assay (template_name is constant
         # across all poses in this run, so there is no need to re-query it per pose).
         renumbering_dict = {}
-        template_name = assay_info.get('receptor_info', None).get('template_name', None)
         if template_name:
             try:
                 conn = sqlite3.connect(pdbs_db_path)
@@ -14023,53 +14206,161 @@ class MolDock:
             except Exception as e:
                 print(f"Error retrieving renumbering_dict for template '{template_name}': {e}")
 
-        # All three modes (ProLIF-only, MMGBSA-only, combined) run through the same
-        # parallel per-pose pipeline. Interactive setup (resume/overwrite prompts,
-        # worker-count prompt) always happens here in the foreground. The user is
-        # then asked whether the actual computation — ligand preparation and the
-        # parallel dispatch that follows it — should run in the foreground or
-        # background, before any of that work starts.
+        return dict(
+            results_db=self._fingerprints_results_db(assay_info), receptor_file=receptor_file,
+            is_stub_receptor=is_stub_receptor, fps_tleap_config=fps_tleap_config,
+            renumbering_dict=renumbering_dict,
+        )
+
+    def _build_fingerprints_exec_kwargs(self, assay_info, context, options, resume_policies):
+        """
+        Non-interactive setup of one assay's fingerprint run, from the choices made in
+        compute_fingerprints(): loads the docked poses, applies the ligand and pose
+        selection, then the resume/overwrite policies (_prepare_fingerprints_execution()).
+        Runs in compute_fingerprints() itself for fg/bg, and inside the queue job for
+        queue mode — by which time the docking of an assay that was still running when
+        it was enqueued has finished.
+
+        Returns (exec_kwargs, ok): exec_kwargs for _run_fingerprints_computation(), or
+        None when there is nothing to run — ok tells whether that is because there is
+        nothing left to compute (True) or because of an error (False).
+        """
+        results_db = context['results_db']
+        print(f"📂 Results DB: {results_db}")
+        problem = self._check_fingerprints_results_db(results_db)
+        if problem:
+            print(f"❌ Assay {assay_info['assay_id']}: {problem}")
+            return None, False
+
+        df = self._load_fingerprints_results_df(results_db)
+        if df is None:
+            return None, False
+
+        if options['ligand_names'] is not None:
+            df = df[df['LigName'].isin(options['ligand_names'])]
+            if df.empty:
+                print(f"⚠️  None of the selected ligands is in assay {assay_info['assay_id']}. Nothing to do.")
+                return None, True
+
+        computation_mode, subset_method = self._FPS_POSE_MODES[options['pose_choice']]
+        if subset_method and not df.empty:
+            df = getattr(self, subset_method)(df)
+
+        prolif, mmgbsa = options['prolif'], options['mmgbsa']
         prep = self._prepare_fingerprints_execution(
-            df, results_db, assay_info, renumbering_dict, max_workers,
-            prolif, mmbgsa, prolif_params_dict, condition_selection,
-            write_prolif, write_mmgbsa,
+            df, results_db, assay_info, context['renumbering_dict'], options['max_workers'],
+            prolif, mmgbsa, options['prolif_params_dict'], options['condition_selection'],
+            options['write_prolif'], options['write_mmgbsa'], resume_policies,
         )
         if prep is None:
-            return None
+            return None, True
 
         pending, mode_label, resolved_max_workers = prep
-
         exec_kwargs = dict(
-            pending=pending, mode_label=mode_label, prolif=prolif, mmgbsa=mmbgsa,
-            results_db=results_db, condition_selection=condition_selection,
-            clean_files=clean_files, write_prolif=write_prolif, write_mmgbsa=write_mmgbsa,
-            assay_info=assay_info, max_workers=resolved_max_workers, computation_mode=computation_mode,
-            is_stub_receptor=is_stub_receptor, fps_tleap_config=fps_tleap_config, minimize=minimize,
-            renumbering_dict=renumbering_dict, prolif_params_dict=prolif_params_dict,
-            receptor_file=receptor_file,
+            pending=pending, mode_label=mode_label, prolif=prolif, mmgbsa=mmgbsa,
+            results_db=results_db, condition_selection=options['condition_selection'],
+            clean_files=options['clean_files'], write_prolif=options['write_prolif'],
+            write_mmgbsa=options['write_mmgbsa'], assay_info=assay_info,
+            max_workers=resolved_max_workers, computation_mode=computation_mode,
+            is_stub_receptor=context['is_stub_receptor'], fps_tleap_config=context['fps_tleap_config'],
+            minimize=options['minimize'], renumbering_dict=context['renumbering_dict'],
+            prolif_params_dict=options['prolif_params_dict'], receptor_file=context['receptor_file'],
         )
+        return exec_kwargs, True
 
-        run_mode = input(
-            "\n⚙️  Run the fingerprint computation in the foreground or background? (fg/bg) [default: fg]: "
-        ).strip().lower() or 'fg'
+    @staticmethod
+    def _fps_table_exists(results_db, table_name) -> bool:
+        try:
+            conn = sqlite3.connect(results_db)
+            try:
+                return conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table_name,)
+                ).fetchone() is not None
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            return False
 
-        if run_mode in ('fg', 'foreground'):
-            print(f"\n▶️  Starting {mode_label} computation in the foreground...")
-            self._run_fingerprints_computation(**exec_kwargs)
-        elif run_mode in ('bg', 'background'):
-            self._launch_fingerprints_background(**exec_kwargs)
-        else:
-            print("❌ Invalid option. Please choose 'fg' or 'bg'. No computation was started.")
+    @staticmethod
+    def _prompt_resume_policy(table_name, item_label, assay_ids) -> Optional[str]:
+        """
+        Ask once whether to resume or overwrite an existing results table, for every
+        assay in assay_ids that has it. Returns 'resume', 'overwrite', or None if the
+        user cancels. Nothing is dropped here: see _apply_resume_policy().
+        """
+        print(f"   ⚠️  Warning: {table_name} table already exists in assay(s) {', '.join(map(str, assay_ids))}.")
+        while True:
+            try:
+                response = input(
+                    f"   Existing {item_label} found. "
+                    "(r)esume unfinished poses, (o)verwrite all, (c)ancel? [r/o/c]: "
+                ).strip().lower()
+            except KeyboardInterrupt:
+                response = 'c'
+            if response in ('r', 'resume'):
+                return 'resume'
+            elif response in ('o', 'overwrite'):
+                return 'overwrite'
+            elif response in ('c', 'cancel'):
+                print("   ❌ Operation cancelled to avoid overwriting existing data.")
+                return None
+            else:
+                print("   ❌ Please answer 'r', 'o', or 'c'")
+
+    def _apply_resume_policy(self, results_db, table_name, policy, item_label="results"):
+        """
+        Apply a resume/overwrite policy to one results table: 'overwrite' drops it,
+        'resume' keeps it. Returns the set of Pose_IDs already computed (empty unless
+        resuming an existing table).
+        """
+        if not self._fps_table_exists(results_db, table_name):
+            return set()
+        if policy == 'overwrite':
+            conn = sqlite3.connect(results_db)
+            conn.execute(f"DROP TABLE IF EXISTS {table_name};")
+            conn.commit()
+            conn.close()
+            print(f"   ℹ️  Overwriting existing {table_name} table.")
+            return set()
+        print(f"   ℹ️  Resuming: only poses without existing {item_label} will be computed.")
+        return self._get_computed_pose_ids(results_db, table_name)
+
+    @staticmethod
+    def _prompt_fingerprints_workers(mode_label) -> int:
+        """Prompt for the number of worker processes used per assay."""
+        from multiprocessing import cpu_count
+
+        available_cores = cpu_count()
+        default_workers = min(available_cores, 8)
+        while True:
+            raw = input(
+                f"How many CPU cores should be used for parallel {mode_label} computation? "
+                f"[{default_workers}] (1-{available_cores} available): "
+            ).strip()
+            if raw == "":
+                return default_workers
+            try:
+                max_workers = int(raw)
+            except ValueError:
+                print("Please enter a valid integer.")
+                continue
+            if max_workers < 1:
+                print("Please enter a positive integer.")
+                continue
+            if max_workers > available_cores:
+                print(f"⚠️  Only {available_cores} core(s) available; using {available_cores}.")
+                max_workers = available_cores
+            return max_workers
 
     def _prepare_fingerprints_execution(self, df, results_db, assay_info, renumbering_dict,
                                         max_workers, prolif, mmgbsa, prolif_params_dict,
-                                        condition_selection, write_prolif, write_mmgbsa):
+                                        condition_selection, write_prolif, write_mmgbsa,
+                                        resume_policies):
         """
-        Interactive setup phase for compute_fingerprints(): resolves resume/overwrite
-        choices and the worker-count prompt — the only steps that call input(). This
-        phase always runs synchronously in the foreground, before the user is asked
-        whether the actual computation (ligand preparation + parallel dispatch, in
-        _run_fingerprints_computation()) should run in the foreground or background.
+        Non-interactive setup phase of one assay's fingerprint run: applies the
+        resume/overwrite policy chosen in compute_fingerprints() to each requested
+        results table (resume_policies: {'prolif'|'mmgbsa': 'resume'|'overwrite'})
+        and builds the per-pose task list.
 
         Resume support (skip poses already computed) is evaluated independently per
         requested fingerprint type: a pose done for only one of the two requested
@@ -14080,8 +14371,6 @@ class MolDock:
         _run_fingerprints_computation(), or None if there is nothing to compute (in
         which case any requested write_prolif/write_mmgbsa export has already run).
         """
-        from multiprocessing import cpu_count
-
         total_poses = len(df)
         if total_poses == 0:
             print("Nothing to do.")
@@ -14094,20 +14383,18 @@ class MolDock:
         else:
             mode_label = "MMGBSA"
 
-        # Per-table resume/overwrite prompts, only for the table(s) this run needs.
+        # Per-table resume/overwrite, only for the table(s) this run needs.
         done_prolif_ids = set()
         done_mmgbsa_ids = set()
         prolif_table_name = f'processed_prolif_fps_json_condition_{condition_selection}' if prolif else None
         mmgbsa_table_name = 'processed_mmgbsa_decomposition_json'
 
         if prolif:
-            resume_choice = self._check_table_for_resume(results_db, prolif_table_name, item_label="ProLIF results")
-            if resume_choice == 'resume':
-                done_prolif_ids = self._get_computed_pose_ids(results_db, prolif_table_name)
+            done_prolif_ids = self._apply_resume_policy(results_db, prolif_table_name,
+                                                        resume_policies.get('prolif', 'resume'), "ProLIF results")
         if mmgbsa:
-            resume_choice = self._check_table_for_resume(results_db, mmgbsa_table_name, item_label="MMGBSA results")
-            if resume_choice == 'resume':
-                done_mmgbsa_ids = self._get_computed_pose_ids(results_db, mmgbsa_table_name)
+            done_mmgbsa_ids = self._apply_resume_policy(results_db, mmgbsa_table_name,
+                                                        resume_policies.get('mmgbsa', 'resume'), "MMGBSA results")
 
         # Determine, per pose, which of the requested fingerprint types still need
         # computing; drop poses where nothing is left to do.
@@ -14135,30 +14422,6 @@ class MolDock:
             if write_mmgbsa:
                 self._write_mmgbsa_fps(results_db, assay_info)
             return None
-
-        if max_workers is None:
-            available_cores = cpu_count()
-            default_workers = min(available_cores, 8, n_poses)
-            while True:
-                raw = input(
-                    f"How many CPU cores should be used for parallel {mode_label} computation? "
-                    f"[{default_workers}] (1-{available_cores} available): "
-                ).strip()
-                if raw == "":
-                    max_workers = default_workers
-                    break
-                try:
-                    max_workers = int(raw)
-                except ValueError:
-                    print("Please enter a valid integer.")
-                    continue
-                if max_workers < 1:
-                    print("Please enter a positive integer.")
-                    continue
-                if max_workers > available_cores:
-                    print(f"⚠️  Only {available_cores} core(s) available; using {available_cores}.")
-                    max_workers = available_cores
-                break
 
         # No point spinning up more workers than there are poses to process.
         max_workers = min(max_workers, n_poses)
@@ -14353,6 +14616,9 @@ class MolDock:
             remove_scratch_run_dir(temp_poses_root)
             print("✅ Temporary files cleaned up.")
 
+        # Failed only if every requested piece failed (used as a queue job's exit code)
+        return (prolif_ok + mmgbsa_ok) > 0 or (prolif_failed + mmgbsa_failed) == 0
+
     def _launch_fingerprints_background(self, **exec_kwargs):
         """
         Launch _run_fingerprints_computation() as a fully detached background process
@@ -14434,6 +14700,201 @@ class MolDock:
         print(f"   📝 Log file: {log_file}")
         print(f"   📂 Results will be written to: {results_db}")
         print(f"   ℹ️  Re-run compute_fingerprints() later to check status/resume.")
+
+    def _enqueue_fingerprints_assays(self, assay_ids, assay_by_id, contexts, options, resume_policies,
+                                     active_docking_lanes, mode_label) -> List[int]:
+        """
+        Enqueue one fingerprints job per assay on the shared machine-wide queue
+        (md_queue.py, job_type='fingerprints'). Each job runs a standalone script that
+        unpickles the choices made in compute_fingerprints() and calls
+        _run_fingerprints_queue_job(); the queue worker marks it completed/failed from
+        the script's exit code.
+
+        Lane: an assay whose docking job is still queued/running on the shared queue
+        (active_docking_lanes: assay_id -> lane) gets the docking job's lane, so the
+        lane's FIFO order runs the fingerprints only after the docking has finished.
+        Every other assay goes to the 'cpu' lane: the per-pose work is CPU-bound
+        (tleap, ProLIF, MMPBSA.py), like the MM-GBSA jobs it shares the lane with.
+
+        Returns:
+            List[int]: queue_ids of the enqueued jobs
+        """
+        import pickle
+        import textwrap
+        from datetime import datetime
+        from tidyscreen.moldyn import md_queue
+
+        # Never enqueue an assay that already has an active fingerprints job
+        active_fps_ids = {
+            job['assay_id'] for job in md_queue.list_jobs(self.name)
+            if job['job_type'] == 'fingerprints' and job['status'] in ('queued', 'held', 'running')
+        }
+
+        # A lane worker started before the installed md_queue.py was updated doesn't
+        # know 'fingerprints' jobs (it would run them as MD jobs): hold them until it
+        # has drained its lane and exited, then a watcher releases them (md_queue.py).
+        candidate_lanes = {active_docking_lanes.get(a, 'cpu') for a in assay_ids}
+        stale_lanes = {lane for lane in candidate_lanes if md_queue.worker_runs_stale_code(lane)}
+
+        queue_ids = []
+        used_lanes = set()
+        print(f"\n📥 Enqueuing {mode_label} computation for {len(assay_ids)} assay(s) on the shared queue...")
+        for assay_id in assay_ids:
+            if assay_id in active_fps_ids:
+                print(f"   ⏭  Assay {assay_id} already has an active fingerprints queue job — skipped")
+                continue
+            lane = active_docking_lanes.get(assay_id, 'cpu')
+            try:
+                results_db = contexts[assay_id]['results_db']
+                assay_folder = os.path.dirname(os.path.dirname(results_db))
+                logs_dir = os.path.join(assay_folder, 'logs')
+                os.makedirs(logs_dir, exist_ok=True)
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+                base = os.path.join(logs_dir, f'fingerprints_queue_{timestamp}')
+                params_file, script_file, log_file = base + '.pkl', base + '.py', base + '.log'
+
+                payload = {
+                    'project_name': self.name, 'project_path': self.path,
+                    'assay_info': assay_by_id[assay_id], 'context': contexts[assay_id],
+                    'options': options, 'resume_policies': resume_policies[assay_id],
+                }
+                with open(params_file, 'wb') as f:
+                    pickle.dump(payload, f)
+
+                python_script = textwrap.dedent(f"""
+                    import pickle
+                    import sys
+
+                    from tidyscreen.moldock.moldock import MolDock
+
+                    with open({params_file!r}, 'rb') as f:
+                        payload = pickle.load(f)
+
+                    mdock = MolDock.from_path(payload['project_name'], payload['project_path'])
+                    try:
+                        ok = mdock._run_fingerprints_queue_job(payload)
+                    except Exception as e:
+                        print(f'❌ Error in queued fingerprint computation: {{e}}')
+                        import traceback
+                        traceback.print_exc()
+                        sys.exit(1)
+                    if ok:
+                        print('✅ Queued fingerprint computation completed successfully')
+                        sys.exit(0)
+                    print('❌ Queued fingerprint computation finished with errors (see log above)')
+                    sys.exit(1)
+                    """)
+                with open(script_file, 'w') as f:
+                    f.write(python_script)
+
+                queue_id = md_queue.enqueue_job(
+                    self.name, self.path, assay_id, assay_folder,
+                    md_assay_label=f"assay_{assay_id} / {mode_label} fingerprints",
+                    job_type='fingerprints', resource=lane, script_path=script_file,
+                    job_params={'log_file': log_file}, held=lane in stale_lanes,
+                )
+            except Exception as e:
+                print(f"   ❌ Could not enqueue assay {assay_id}: {e}")
+                continue
+            queue_ids.append(queue_id)
+            used_lanes.add(lane)
+            after_docking = " — after its docking job" if assay_id in active_docking_lanes else ""
+            print(f"   ✓ Assay {assay_id} → queue_id={queue_id} ('{lane}' lane{after_docking})")
+            print(f"      📝 Log: {log_file}")
+
+        if not queue_ids:
+            print("❌ No fingerprints job was enqueued.")
+            return queue_ids
+
+        for lane in sorted(used_lanes):
+            if lane in stale_lanes:
+                watcher_log = md_queue.spawn_release_watcher(lane)
+                print(f"⏸  The '{lane}' lane worker runs code older than this TidyScreen version, so the "
+                      f"fingerprints jobs are 'held' until it finishes the jobs ahead of them and exits; "
+                      f"they are then released automatically, in the same order.")
+                if watcher_log:
+                    print(f"   📝 Release watcher log: {watcher_log}")
+            elif md_queue.ensure_worker_running(lane):
+                print(f"▶️  '{lane}' lane worker started — its first job begins immediately.")
+        print(f"📥 {len(queue_ids)} fingerprints job(s) enqueued.")
+        print(f"\n💡 You can safely close this SSH connection.")
+        print(f"   Use MolDock.list_fingerprints_queue() to check progress.")
+        return queue_ids
+
+    def _run_fingerprints_queue_job(self, payload) -> bool:
+        """
+        Body of a queued fingerprints job (see _enqueue_fingerprints_assays()): builds
+        the assay's run from the stored choices — now that its docking results exist —
+        and runs it. Never prompts. Returns True on success, or when there is nothing
+        left to compute.
+        """
+        assay_id = payload['assay_info']['assay_id']
+        options = payload['options']
+        print(f"🧬 Fingerprints job — project '{self.name}', assay {assay_id}")
+        exec_kwargs, ok = self._build_fingerprints_exec_kwargs(
+            payload['assay_info'], payload['context'], options, payload['resume_policies']
+        )
+        if exec_kwargs is None:
+            return ok
+        print(f"\n▶️  Starting {exec_kwargs['mode_label']} computation ({options['max_workers']} worker(s))...")
+        return self._run_fingerprints_computation(**exec_kwargs)
+
+    def list_fingerprints_queue(self, all_projects: bool = False) -> List[Dict[str, Any]]:
+        """
+        Show fingerprints jobs (enqueued by compute_fingerprints()) on the shared,
+        machine-wide queue (see md_queue.py). Defaults to this project's own jobs;
+        pass all_projects=True to see every project's. Use MolDyn.list_md_queue() to
+        see every job sharing the lanes (MD, MM-GBSA, docking, fingerprints).
+        """
+        return self._list_queue_jobs('fingerprints', "FINGERPRINTS QUEUE", all_projects)
+
+    def cancel_fingerprints_queue_job(self, queue_id: Optional[Union[int, List[int]]] = None) -> bool:
+        """
+        Cancel one or more fingerprints jobs on the shared queue that have not started
+        running yet. queue_id may be a single id or a list of ids; if not given, this
+        project's queued fingerprints jobs are listed for interactive selection
+        ('3', '1,3,5', '1-5', 'all'). Returns True only if every selected job was
+        cancelled. A cancelled job can be re-queued with requeue_fingerprints_queue_job().
+        """
+        from tidyscreen.moldyn import md_queue
+
+        if queue_id is None:
+            queue_ids = self._select_docking_queue_jobs(('queued', 'held'), 'cancel', job_type='fingerprints')
+            if not queue_ids:
+                return False
+        elif isinstance(queue_id, int):
+            queue_ids = [queue_id]
+        else:
+            queue_ids = list(queue_id)
+
+        n_cancelled = 0
+        for qid in queue_ids:
+            success, error = md_queue.cancel_job(qid)
+            if success:
+                n_cancelled += 1
+                print(f"✅ Queue job {qid} cancelled.")
+            else:
+                print(f"❌ Could not cancel queue job {qid}: {error}")
+        if len(queue_ids) > 1:
+            print(f"📊 Cancelled {n_cancelled}/{len(queue_ids)} queue jobs.")
+        return n_cancelled == len(queue_ids)
+
+    def requeue_fingerprints_queue_job(self, queue_id: int) -> bool:
+        """
+        Re-queue a failed/crashed/cancelled fingerprints job on the shared queue. The
+        job keeps the resume/overwrite choice it was enqueued with ('resume' for
+        assays that were still docking, so already computed poses are kept); with
+        'overwrite' it starts over.
+        """
+        from tidyscreen.moldyn import md_queue
+
+        success, error = md_queue.requeue_job(queue_id)
+        if success:
+            print(f"✅ Queue job {queue_id} re-queued.")
+            md_queue.ensure_worker_running()
+        else:
+            print(f"❌ Could not re-queue job {queue_id}: {error}")
+        return success
 
     def _remap_project_path(self, stored_path: str) -> str:
         """
@@ -17094,59 +17555,6 @@ class MolDock:
                         except KeyboardInterrupt:
                             print("\n   ❌ Operation cancelled by user.")
                             return False
-
-    def _check_table_for_resume(self, results_db, table_name, item_label="results"):
-        """
-        Like _check_table_in_db(), but offers to resume an interrupted run (keep
-        existing rows, compute only the poses still missing) in addition to
-        overwriting everything or cancelling. Used for both the ProLIF condition
-        table and the MMGBSA table by _prepare_fingerprints_execution().
-
-        Returns:
-            None      - table does not exist yet, nothing to resume/overwrite.
-            'resume'  - table left intact; caller should skip already-computed poses.
-            'overwrite' - table dropped; caller should (re)compute every pose.
-        Raises SystemExit if the user cancels.
-        """
-        import sqlite3
-
-        conn = sqlite3.connect(results_db)
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table_name,)
-        )
-        table_exists = cursor.fetchone() is not None
-        conn.close()
-
-        if not table_exists:
-            return None
-
-        print(f"   ⚠️  Warning: {table_name} table already exists in the {results_db}.")
-
-        while True:
-            try:
-                response = input(
-                    f"   Existing {item_label} found. "
-                    "(r)esume unfinished poses, (o)verwrite all, (c)ancel? [r/o/c]: "
-                ).strip().lower()
-            except KeyboardInterrupt:
-                raise SystemExit("\n   ❌ Operation cancelled by user.")
-
-            if response in ('r', 'resume'):
-                print(f"   ℹ️  Resuming: only poses without existing {item_label} will be computed.")
-                return 'resume'
-            elif response in ('o', 'overwrite'):
-                conn = sqlite3.connect(results_db)
-                cursor = conn.cursor()
-                cursor.execute(f"DROP TABLE IF EXISTS {table_name};")
-                conn.commit()
-                conn.close()
-                print(f"   ℹ️  Proceeding to overwrite existing {table_name} table.")
-                return 'overwrite'
-            elif response in ('c', 'cancel'):
-                raise SystemExit("   ❌ Operation cancelled to avoid overwriting existing data.")
-            else:
-                print("   ❌ Please answer 'r', 'o', or 'c'")
 
     def _get_computed_pose_ids(self, results_db, table_name):
         """

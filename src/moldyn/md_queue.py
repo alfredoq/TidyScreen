@@ -39,8 +39,10 @@ each lane has its own worker process and lock file:
     docking assays with GPU engines (`job_type='docking'`, AutoDockGPU /
     UniDock), which use the same physical GPU.
   - 'cpu' — MM-GBSA runs (`job_type='mmgbsa'`, `run_mmgbsa.sh`,
-    MMPBSA.py[.MPI]), which don't touch the GPU, and docking assays run
-    with Vina (`job_type='docking'`). Keeping them in their own
+    MMPBSA.py[.MPI]), which don't touch the GPU, docking assays run
+    with Vina (`job_type='docking'`), and ProLIF/MM-GBSA fingerprint
+    computations on docked poses (`job_type='fingerprints'`, see
+    `MolDock.compute_fingerprints()`). Keeping them in their own
     lane means a minutes-long MM-GBSA job never waits behind a days-long MD
     run, while two (possibly MPI, many-core) CPU jobs still never
     compete with each other for the CPU.
@@ -66,6 +68,18 @@ A docking job runs the standalone Python script written by
 docking), which exits non-zero on failure; the job's final status is
 mirrored into the project's `docking_assays` table (docking_assays.db, see
 `_mirror_docking_status_to_project_db()`) rather than into `md_assays`.
+
+A fingerprints job runs the standalone Python script written by
+`MolDock._enqueue_fingerprints_assays()` the same way. It goes to the 'cpu'
+lane, except when its docking assay still had a docking job on the queue when
+it was enqueued: then it shares that docking job's lane, so FIFO order runs it
+only after the docking has finished. Its status lives only in this table.
+
+A lane worker keeps the code it was started with until the lane drains. If
+that code predates a job type it may be handed, such a job is enqueued as
+'held' instead of 'queued' (invisible to that worker), and a detached watcher
+releases it once the stale worker has exited — see `worker_runs_stale_code()`
+and `release_held_jobs_after()`.
 """
 
 import json
@@ -92,7 +106,7 @@ _LOCK_FILES = {
     'gpu': LOCK_FILE,
     'cpu': os.path.join(GLOBAL_QUEUE_DIR, 'md_queue_worker_cpu.lock'),
 }
-_LANE_LABELS = {'gpu': 'GPU (MD/docking)', 'cpu': 'CPU (MM-GBSA/Vina docking)'}
+_LANE_LABELS = {'gpu': 'GPU (MD/docking)', 'cpu': 'CPU (MM-GBSA/Vina docking/fingerprints)'}
 
 # Legacy rows (enqueued before the lane columns were added) are GPU/MD jobs.
 _RESOURCE_SQL = "COALESCE(resource, 'gpu')"
@@ -108,7 +122,7 @@ COLUMNS_DICT = {
     'assay_id': 'INTEGER NOT NULL',
     'assay_folder_path': 'TEXT NOT NULL',
     'md_assay_label': 'TEXT',
-    'status': "TEXT NOT NULL DEFAULT 'queued'",  # queued|running|completed|failed|cancelled|crashed
+    'status': "TEXT NOT NULL DEFAULT 'queued'",  # queued|held|running|completed|failed|cancelled|crashed
     'enqueued_at': 'TEXT NOT NULL',
     'started_at': 'TEXT',
     'finished_at': 'TEXT',
@@ -121,16 +135,16 @@ COLUMNS_DICT = {
     'worker_pid': 'INTEGER',
     'run_log_file': 'TEXT',
     'error_message': 'TEXT',
-    'job_type': "TEXT DEFAULT 'md'",   # md|mmgbsa|docking
+    'job_type': "TEXT DEFAULT 'md'",   # md|mmgbsa|docking|fingerprints
     'resource': "TEXT DEFAULT 'gpu'",  # gpu|cpu — the lane (see module docstring)
     # Script to run. NULL for 'md' jobs (always <assay_folder_path>/run_md.sh);
     # for 'mmgbsa' jobs the run_mmgbsa.sh inside the specific mmgbsa[_N] run
     # folder, since one MD assay can have several MM-GBSA runs; for 'docking'
-    # jobs the Python script that runs the docking assay.
+    # and 'fingerprints' jobs the Python script that runs the job.
     'script_path': 'TEXT',
     # JSON: for 'mmgbsa' jobs, {'mmgbsa_params': ..., 'assay_info': ...} —
     # what the worker needs to store the results once the run finishes;
-    # for 'docking' jobs, {'log_file': ...}.
+    # for 'docking' and 'fingerprints' jobs, {'log_file': ...}.
     'job_params': 'TEXT',
 }
 
@@ -176,8 +190,9 @@ def _connect():
 
 
 def enqueue_job(project_name, project_path, assay_id, assay_folder_path, md_assay_label=None,
-                job_type='md', resource='gpu', script_path=None, job_params=None):
-    """Insert a new 'queued' row and return its queue_id."""
+                job_type='md', resource='gpu', script_path=None, job_params=None, held=False):
+    """Insert a new 'queued' row ('held' if held=True, see release_held_jobs_after())
+    and return its queue_id."""
     conn, cursor = _connect()
     try:
         data_dict = {
@@ -186,7 +201,7 @@ def enqueue_job(project_name, project_path, assay_id, assay_folder_path, md_assa
             'assay_id': assay_id,
             'assay_folder_path': assay_folder_path,
             'md_assay_label': md_assay_label,
-            'status': 'queued',
+            'status': 'held' if held else 'queued',
             'enqueued_at': _now(),
             'job_type': job_type,
             'resource': resource,
@@ -463,6 +478,80 @@ def _ensure_lane_worker(resource):
     return True
 
 
+def worker_runs_stale_code(resource):
+    """
+    True if the lane's live worker was started before this module file was last
+    modified, i.e. it may run older code that doesn't know newer job types (it
+    would run them as MD jobs). The worker's lock file is created when it is
+    spawned, so its mtime is the worker's start time.
+    """
+    if not _worker_lock_alive(resource):
+        return False
+    try:
+        return os.path.getmtime(_LOCK_FILES[resource]) < os.path.getmtime(os.path.abspath(__file__))
+    except OSError:
+        return False
+
+
+def spawn_release_watcher(resource):
+    """
+    Launch a detached process that runs release_held_jobs_after() for the lane's
+    current worker. Returns the log file path, or None if no live worker holds the
+    lane (then 'held' rows are released right away).
+    """
+    lock_file = _LOCK_FILES[resource]
+    try:
+        with open(lock_file, 'r') as f:
+            pid = int(f.read().strip())
+    except (OSError, ValueError):
+        pid = None
+    if not _pid_alive(pid):
+        release_held_jobs_after(None, resource)
+        return None
+
+    os.makedirs(WORKER_SCRIPT_DIR, exist_ok=True)
+    os.makedirs(WORKER_LOG_DIR, exist_ok=True)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+    script_file = os.path.join(WORKER_SCRIPT_DIR, f'md_queue_release_{resource}_{timestamp}.py')
+    log_file = os.path.join(WORKER_LOG_DIR, f'md_queue_release_{resource}_{timestamp}.log')
+    with open(script_file, 'w') as f:
+        f.write(
+            "from tidyscreen.moldyn import md_queue\n"
+            f"md_queue.release_held_jobs_after({pid!r}, {resource!r})\n"
+        )
+    with open(log_file, 'w') as logf:
+        subprocess.Popen(
+            [sys.executable, script_file],
+            stdout=logf,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    return log_file
+
+
+def release_held_jobs_after(pid, resource, poll_seconds=30):
+    """
+    Wait until process `pid` (a stale lane worker) has exited, then turn the
+    lane's 'held' rows into 'queued' — keeping their enqueued_at, so FIFO order
+    is unchanged — and make sure a (fresh-code) worker drains them.
+    """
+    while _pid_alive(pid):
+        time.sleep(poll_seconds)
+    conn, cursor = _connect()
+    try:
+        cursor.execute(
+            f"UPDATE {QUEUE_TABLE} SET status = 'queued' WHERE status = 'held' AND {_RESOURCE_SQL} = ?",
+            (resource,),
+        )
+        n_released = cursor.rowcount
+        conn.commit()
+    finally:
+        conn.close()
+    print(f"[{_now()}] Released {n_released} held job(s) on the '{resource}' lane.")
+    ensure_worker_running(resource)
+
+
 def _spawn_worker(resource='gpu'):
     """
     Write a minimal bootstrap script that imports this module and runs the
@@ -583,8 +672,8 @@ def _run_job(job):
     if (job.get('job_type') or 'md') == 'mmgbsa':
         _run_mmgbsa_job(job)
         return
-    if job.get('job_type') == 'docking':
-        _run_docking_job(job)
+    if job.get('job_type') in ('docking', 'fingerprints'):
+        _run_python_script_job(job)
         return
 
     queue_id = job['queue_id']
@@ -685,12 +774,14 @@ def _mirror_docking_status_to_project_db(project_path, assay_id, status):
         pass
 
 
-def _run_docking_job(job):
+def _run_python_script_job(job):
     """
-    Run one claimed docking job's Python script (blocking) with this
-    environment's interpreter, then record the outcome from its exit code.
+    Run one claimed docking or fingerprints job's Python script (blocking) with
+    this environment's interpreter, then record the outcome from its exit code.
+    A docking job's outcome is also mirrored into the project's docking_assays.
     """
     queue_id = job['queue_id']
+    label = job['job_type']
     script_path = job.get('script_path')
     try:
         params = json.loads(job.get('job_params') or '{}')
@@ -706,7 +797,7 @@ def _run_docking_job(job):
     error_message = None
     if not script_path or not os.path.exists(script_path):
         status = 'failed'
-        error_message = f'docking script not found at {script_path}'
+        error_message = f'{label} script not found at {script_path}'
     else:
         try:
             os.makedirs(os.path.dirname(run_log), exist_ok=True)
@@ -717,13 +808,14 @@ def _run_docking_job(job):
                 )
             status = 'completed' if result.returncode == 0 else 'failed'
             if status == 'failed':
-                error_message = f'docking script exited with code {result.returncode}; see {run_log}'
+                error_message = f'{label} script exited with code {result.returncode}; see {run_log}'
         except Exception as e:
             status = 'failed'
-            error_message = f'Error launching docking script: {e}'
+            error_message = f'Error launching {label} script: {e}'
 
     _finish_row(queue_id, status, error_message)
-    _mirror_docking_status_to_project_db(job['project_path'], job['assay_id'], status)
+    if label == 'docking':
+        _mirror_docking_status_to_project_db(job['project_path'], job['assay_id'], status)
 
 
 def _store_mmgbsa_job_results(job, run_folder, run_log):
@@ -823,7 +915,7 @@ def cancel_job(queue_id):
     try:
         cursor.execute(
             f"UPDATE {QUEUE_TABLE} SET status = 'cancelled', finished_at = ? "
-            f"WHERE queue_id = ? AND status = 'queued'",
+            f"WHERE queue_id = ? AND status IN ('queued', 'held')",
             (_now(), queue_id),
         )
         conn.commit()
@@ -833,7 +925,7 @@ def cancel_job(queue_id):
         row = cursor.fetchone()
         if row is None:
             return False, f"No job with queue_id={queue_id}."
-        return False, f"Job {queue_id} is '{row[0]}'; only 'queued' jobs can be cancelled."
+        return False, f"Job {queue_id} is '{row[0]}'; only queued/held jobs can be cancelled."
     finally:
         conn.close()
 
