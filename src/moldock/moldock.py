@@ -14655,7 +14655,12 @@ class MolDock:
         if write_mmgbsa:
             self._write_mmgbsa_fps(results_db, assay_info)
 
-        if clean_files:
+        if clean_files and (failed_poses or ligand_errors):
+            # Successful poses' subdirectories were already removed by the workers;
+            # failed ones (with a fingerprints_error.txt) and the per-ligand
+            # parameter files are kept so the failure can be inspected.
+            print(f"⚠️  Temporary files of failed poses kept for inspection in: {temp_poses_root}")
+        elif clean_files:
             # Per-pose subdirectories are already removed by each worker as it
             # finishes; this clears this run's per-ligand parameter files and its
             # run directory (plus temp_restored_poses/ itself if no other run uses it).
@@ -19727,6 +19732,10 @@ def _compute_fingerprints_pose_worker(task):
                     mmgbsa_df['residue'] = mmgbsa_df['residue'].apply(lambda x: renumbering_dict.get(x, x))
                     result["total_energy"] = round(mmgbsa_df['total'].sum(), 3)
                     result["gas_energy"] = round(mmgbsa_df['gas'].sum(), 3)
+                else:
+                    # The MMPBSA.py wrappers swallow CalledProcessError, so an
+                    # empty decomposition table is the only failure signal here.
+                    result["mmgbsa_error"] = "MMPBSA.py produced no per-residue decomposition output"
                 result["mmgbsa_df"] = mmgbsa_df
             except Exception as e:
                 result["mmgbsa_error"] = str(e)
@@ -19738,5 +19747,17 @@ def _compute_fingerprints_pose_worker(task):
         return result
 
     finally:
-        if task.get('clean_files') and pose_output_dir:
-            shutil.rmtree(pose_output_dir, ignore_errors=True)
+        if pose_output_dir:
+            pose_failed = any(result[k] is not None for k in ("error", "prolif_error", "mmgbsa_error"))
+            if pose_failed:
+                # Keep the scratch files of a failed pose for inspection, plus
+                # the error messages (worker stdout/stderr are silenced).
+                try:
+                    with open(os.path.join(pose_output_dir, "fingerprints_error.txt"), "w") as fh:
+                        for k in ("error", "prolif_error", "mmgbsa_error"):
+                            if result[k] is not None:
+                                fh.write(f"{k}: {result[k]}\n")
+                except OSError:
+                    pass
+            elif task.get('clean_files'):
+                shutil.rmtree(pose_output_dir, ignore_errors=True)
