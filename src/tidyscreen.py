@@ -992,6 +992,82 @@ def list_all_queues(queue_type=None, project_name=None, active_only=False):
     return {section_key: section_jobs for section_key, (_, section_jobs) in sections.items()}
 
 
+def clear_all_queues(queue_type=None, project_name=None, confirm=True):
+    """
+    Erase the finished (completed, failed, cancelled and crashed) jobs from the
+    shared, machine-wide queue (md_queue) for the selected queue (docking,
+    fingerprints, MD or all), across all projects on this computer. Queued, held
+    and running jobs are never erased: a worker may be about to claim or
+    currently running them.
+
+    Args:
+        queue_type (str, optional): which queue to clean: 'all', 'docking',
+            'fingerprints' or 'md'; prompted if omitted.
+        project_name (str, optional): restrict the clean-up to one project
+            (default: every project).
+        confirm (bool): interactively confirm before deleting (default True).
+
+    Returns:
+        int: number of queue rows erased.
+    """
+    # Imported here: md_queue's package imports ActivateProject from this module
+    from tidyscreen.moldyn import md_queue
+
+    erasable_statuses = md_queue.FINISHED_STATUSES
+
+    queue_options = {'1': 'all', '2': 'docking', '3': 'fingerprints', '4': 'md'}
+    if queue_type is None:
+        print("Which queue do you want to clean (finished jobs)?")
+        print("1. All queues (default)")
+        print("2. Docking")
+        print("3. Fingerprints")
+        print("4. MD (MD / MM-GBSA)")
+        queue_type = input("Select an option (1-4 or name): ").strip().lower() or 'all'
+    queue_type = queue_options.get(queue_type, queue_type)
+    if queue_type not in queue_options.values():
+        print(f"❌ Invalid queue type '{queue_type}'. Use 'all', 'docking', 'fingerprints' or 'md'.")
+        return 0
+
+    def _section_of(job):
+        return job['job_type'] if job['job_type'] in ('docking', 'fingerprints') else 'md'
+
+    md_queue.ensure_worker_running()  # self-heal stale state before selecting rows
+    jobs = [job for job in md_queue.list_jobs(project_name)
+            if job['status'] in erasable_statuses
+            and (queue_type == 'all' or _section_of(job) == queue_type)]
+
+    queue_label = "all queues" if queue_type == 'all' else f"the {queue_type} queue"
+    scope_label = f" for project '{project_name}'" if project_name else " (all projects)"
+    if not jobs:
+        print(f"📭 No finished jobs to erase in {queue_label}{scope_label}.")
+        return 0
+
+    if confirm:
+        counts = {}
+        for job in jobs:
+            counts[job['status']] = counts.get(job['status'], 0) + 1
+        print(f"\nThis will permanently erase {len(jobs)} job(s) from {queue_label}{scope_label}:")
+        print("   " + "  |  ".join(f"{status}: {n}" for status, n in counts.items()))
+        print("Queued, held and running jobs are never erased.")
+        confirmation = input("Continue? (yes/no): ").strip().lower()
+        if confirmation not in ['yes', 'y']:
+            print("❌ Queue clean-up cancelled.")
+            return 0
+
+    removed = 0
+    for job in jobs:
+        # delete_job re-checks the status in its DELETE, so a row that changed
+        # since it was listed (e.g. requeued meanwhile) is left untouched
+        success, error_message = md_queue.delete_job(job['queue_id'], statuses=erasable_statuses)
+        if success:
+            removed += 1
+        else:
+            print(f"⚠️  Queue ID {job['queue_id']} not erased: {error_message}")
+
+    print(f"✅ Erased {removed} finished job(s) from {queue_label}{scope_label}.")
+    return removed
+
+
 class ActivateProject:
     
     def __init__(self, name):
