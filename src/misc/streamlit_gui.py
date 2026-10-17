@@ -220,6 +220,7 @@ def _render_python_api_section(header, obj, class_label, search_lower, include_c
             ]
 
         _all_entries = []
+        _docs_by_name = {}
         for _method_name, _method in sorted(_methods, key=lambda item: item[0]):
             try:
                 _method_signature = str(inspect.signature(_method))
@@ -228,6 +229,7 @@ def _render_python_api_section(header, obj, class_label, search_lower, include_c
             _method_doc = inspect.getdoc(_method)
             _method_summary = _method_doc.strip().split("\n")[0] if _method_doc else ""
             _all_entries.append((_method_name, _method_signature, _method_summary))
+            _docs_by_name[_method_name] = _method_doc
 
         _display_entries = _all_entries
         if search_lower:
@@ -267,6 +269,24 @@ def _render_python_api_section(header, obj, class_label, search_lower, include_c
             }
             _prior_selected = (_prior_selected - _visible_names) | _newly_selected
             st.session_state[_sel_key] = sorted(_prior_selected)
+
+            # Full docstrings can be long: hidden behind a toggle, then one compact
+            # popover button per method (expanders cannot be nested in the section's)
+            if st.toggle("📖 Show method help", key=f"python_api_help_toggle_{class_label}"):
+                with st.container(horizontal=True, gap="small"):
+                    for _method_name, _method_signature, _ in _display_entries:
+                        with st.popover(
+                            _method_name,
+                            type="tertiary",
+                            key=f"python_api_help_{class_label}_{_method_name}",
+                        ):
+                            st.code(f"{_method_name}{_method_signature}", language="python")
+                            _method_doc = _docs_by_name.get(_method_name)
+                            if _method_doc:
+                                with st.container(height=400, border=False):
+                                    st.text(_method_doc)
+                            else:
+                                st.caption("No docstring available for this method.")
 
         _selected_now = set(st.session_state.get(_sel_key, []))
         return [entry for entry in _all_entries if entry[0] in _selected_now]
