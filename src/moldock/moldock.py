@@ -11901,48 +11901,62 @@ class MolDock:
     
     def extract_docked_poses(self, assay=None, selection=None, score_column=None, overwrite=False):
         """
-        Extract docked poses from a docking assay and save them as PDB files based on user-selected criteria.
-        This method allows users to select a docking assay from the registry and extract poses based on three
-        different selection criteria: lowest energy poses, most populated poses, or a combination of both.
-        The selected poses are processed and saved as individual PDB files in an output directory.
+        Extract docked poses from one or more docking assays and save them as PDB files based on user-selected criteria.
+        This method allows users to select docking assays from the registry and extract poses based on
+        different selection criteria: lowest energy poses, most populated poses, both, or all poses.
+        The selected poses are processed and saved as individual PDB files in an output directory
+        under each assay's results folder.
         Parameters
         ----------
-        assay : int, str, or None, optional
-            The docking assay identifier to process. Can be:
-            - None (default): User is prompted to select from available assays
+        assay : int, str, list, or None, optional
+            The docking assay(s) to process. Can be:
+            - None (default): User is prompted for assay ID(s): '3', '1,3,5', '1-5' or 'all'
             - int: Assay ID to match against the registry
-            - str: Assay name to match against the registry
+            - str: Assay name to match against the registry, or an ID selection
+              such as '3', '1,3,5', '1-5' or 'all'
+            - list/tuple: several assay IDs and/or names
+        selection : str, optional
+            Pose selection code, applied to every selected assay:
+            - AutoDockGPU: '1' lowest energy, '2' most populated, '3' both, '4' all poses
+            - AutoDock Vina: '1' lowest energy, '2' all poses
+            When None it is prompted once per docking engine present among the assays.
+        score_column : str, optional
+            Column used as the lowest-energy criterion (docking_score, mmgbsa_total_energy,
+            mmgbsa_gas_energy). When None and several are available it is prompted once.
+            An assay lacking the chosen column falls back to docking_score.
         overwrite : bool, optional
-            When the target output directory already contains a previous extraction,
-            delete and recreate it without prompting. Defaults to False.
+            When a target output directory already contains a previous extraction,
+            delete and recreate it without prompting. Defaults to False. With several
+            assays, the confirmation is asked once for all of them; declining skips
+            the assays that already have an extraction.
         Returns
         -------
-        None
-            The method does not return a value. Output is written to PDB files in the designated
-            output directory based on the selection criteria.
+        str, dict, or None
+            With a single assay: the output directory, or None on failure (unchanged behaviour).
+            With several assays: {assay_id: output directory or None (skipped/failed)}.
         Raises
         ------
         FileExistsError
-            If the output directory already contains files, overwrite=False, and the call
-            is running without an attached terminal (e.g. from the Streamlit GUI), so there
-            is no safe way to prompt for confirmation.
+            Single assay only: if the output directory already contains files, overwrite=False,
+            and the call is running without an attached terminal (e.g. from the Streamlit GUI),
+            so there is no safe way to prompt for confirmation. With several assays, those
+            assays are skipped instead.
         Other errors are caught internally and reported via print statements; returns None on failure.
         Notes
         -----
         - Requires a valid docking assay registry at 'docking/docking_registers/docking_assays.db'
-        - Selection criteria options:
-            1. Lowest energy poses: Selects poses with minimum binding energy
-            2. Most populated poses: Selects poses with highest population/frequency
-            3. Both criteria: Selects poses meeting both lowest energy and highest population thresholds
         - Output directories are created automatically in the results directory with descriptive names
         - Each extracted pose is saved as a separate PDB file named with ligand name and run number
+        - With several assays, every option is asked once and the assays are processed one after another
         Examples
         --------
         >>> moldock_instance.extract_docked_poses()  # Interactive mode - prompts user selection
         >>> moldock_instance.extract_docked_poses(assay=1)  # Extract from assay with ID 1
         >>> moldock_instance.extract_docked_poses(assay="kinase_screen")  # Extract from named assay
+        >>> moldock_instance.extract_docked_poses(assay="1-5", selection="1")  # Lowest energy poses of assays 1 to 5
+        >>> moldock_instance.extract_docked_poses(assay=[2, 4], selection="2", overwrite=True)
         """
-        
+
         import os
         import sqlite3
 
@@ -11967,46 +11981,122 @@ class MolDock:
             print("❌ No docking assays found in the registry.")
             return None
 
-        # If assay is not provided, prompt user to select one
-        selected_assay = None
+        assay_by_id = {
+            aid: {'assay_id': aid, 'assay_name': name, 'docking_engine': engine,
+                  'assay_folder_path': folder, 'status': status}
+            for aid, name, engine, folder, status in assays
+        }
+
+        if selection is not None:
+            selection = str(selection).strip()
+
+        assay_ids = self._resolve_pose_extraction_assays(assay, assay_by_id)
+        if not assay_ids:
+            return None
+
+        if len(assay_ids) == 1:
+            assay_info = assay_by_id[assay_ids[0]]
+            db_path = self._pose_extraction_results_db(assay_info)
+            if db_path is None:
+                return None
+            return self._run_pose_extractor(assay_info, db_path, selection=selection,
+                                            score_column=score_column, overwrite=overwrite)
+
+        return self._extract_docked_poses_from_assays(assay_ids, assay_by_id, selection, score_column, overwrite)
+
+    # Pose extraction options per engine family: selection code ->
+    # (menu label, output folder under results/, whether it uses the lowest-energy score column)
+    _POSE_EXTRACTION_OPTIONS = {
+        "AutoDockGPU": {
+            "1": ("Select lowest energy poses", "most_stable_poses", True),
+            "2": ("Select most populated poses", "most_populated_poses", False),
+            "3": ("Select most lowest energy AND populated poses (both criteria)", "most_populated_and_stable_poses", True),
+            "4": ("Select ALL poses", "all_poses", False),
+        },
+        "Vina": {
+            "1": ("Extract lowest energy pose", "most_stable_poses", True),
+            "2": ("Extract all poses", "all_poses", False),
+        },
+    }
+
+    @staticmethod
+    def _pose_extraction_engine(docking_engine) -> str:
+        """Pose extractor family of a docking engine: 'AutoDockGPU', or 'Vina' for every other engine."""
+        return "AutoDockGPU" if docking_engine == "AutoDockGPU" else "Vina"
+
+    def _prompt_pose_extraction_selection(self, engine) -> str:
+        """Prompt for one of the pose selection codes of an engine family until a valid one is given."""
+        options = self._POSE_EXTRACTION_OPTIONS[engine]
+        codes = list(options)
+        codes_text = " or ".join(codes) if len(codes) <= 2 else f"{', '.join(codes[:-1])}, or {codes[-1]}"
+
+        print("Select an option:")
+        for code, (label, _, _) in options.items():
+            print(f"{code} - {label}")
+        selection = input(f"Enter your choice ({codes_text}): ").strip()
+
+        ## Prompt the user which selection to make
+        while selection not in options:
+            print(f"Invalid selection. Only {codes_text} can be selected.")
+            selection = input(f"Enter your choice ({codes_text}): ").strip()
+        return selection
+
+    def _resolve_pose_extraction_assays(self, assay, assay_by_id) -> Optional[List[int]]:
+        """
+        Turn the 'assay' argument of extract_docked_poses() into a list of assay IDs
+        (selection order, no duplicates). None prompts for ID(s); an int is an ID; a str
+        is an assay name or, failing that, an ID selection ('3', '1,3,5', '1-5', 'all');
+        a list/tuple may mix both. Returns None if any requested assay does not exist.
+        """
         if assay is None:
             print("\n📋 Available Docking Assays:")
             print("=" * 60)
-            for i, (aid, name, engine, folder, status) in enumerate(assays, 1):
-                print(f"{i}. {name} (ID: {aid}, Engine: {engine}, Status: {status})\n   Folder: {folder}")
+            for info in assay_by_id.values():
+                print(f"{info['assay_id']}. {info['assay_name']} (Engine: {info['docking_engine']}, "
+                      f"Status: {info['status']})\n   Folder: {info['assay_folder_path']}")
             print("=" * 60)
-            while True:
-                try:
-                    choice = input("Select an assay by number (or press Enter to cancel): ").strip()
-                    if not choice:
-                        print("❌ Operation cancelled.")
-                        return None
-                    idx = int(choice) - 1
-                    if 0 <= idx < len(assays):
-                        selected_assay = assays[idx]
-                        break
-                    else:
-                        print("Invalid selection. Try again.")
-                except (ValueError, KeyboardInterrupt):
-                    print("❌ Operation cancelled.")
-                    return None
-        else:
-            # If assay is provided as ID or name, find it
-            for a in assays:
-                if (isinstance(assay, int) and a[0] == assay) or (isinstance(assay, str) and a[1] == assay):
-                    selected_assay = a
-                    break
-            if not selected_assay:
-                print(f"❌ Assay '{assay}' not found in registry.")
-                return None
+            return self._prompt_assays("for pose extraction", assay_by_id)
 
-        assay_id, assay_name, docking_engine, assay_folder, status = selected_assay
+        id_by_name = {info['assay_name']: aid for aid, info in assay_by_id.items()}
+        items = list(assay) if isinstance(assay, (list, tuple)) else [assay]
+        selected, missing = [], []
+        for item in items:
+            if isinstance(item, int) and not isinstance(item, bool):
+                ids = [item] if item in assay_by_id else []
+                if not ids:
+                    missing.append(item)
+            elif isinstance(item, str) and item in id_by_name:
+                ids = [id_by_name[item]]
+            elif isinstance(item, str):
+                try:
+                    ids, not_found = self._parse_assay_ids(item, assay_by_id)
+                except ValueError:
+                    ids, not_found = [], [item]
+                missing.extend(not_found)
+            else:
+                ids = []
+                missing.append(item)
+            for aid in ids:
+                if aid not in selected:
+                    selected.append(aid)
+
+        if missing:
+            print(f"❌ Assay(s) not found in registry: {', '.join(repr(m) for m in missing)}")
+            return None
+        if not selected:
+            print(f"❌ No docking assay matches '{assay}'.")
+            return None
+        return selected
+
+    def _pose_extraction_results_db(self, assay_info) -> Optional[str]:
+        """Path of an assay's results/assay_<id>.db, or None (with the reason printed) if its folders are missing."""
+        assay_id, assay_name, assay_folder = assay_info['assay_id'], assay_info['assay_name'], assay_info['assay_folder_path']
 
         # Reconstruct assay folder path from self.path to handle project relocations.
         reconstructed_folder = os.path.join(self.path, 'docking', 'docking_assays', assay_name)
         if os.path.exists(reconstructed_folder):
             assay_folder = reconstructed_folder
-        elif not os.path.exists(assay_folder):
+        elif not assay_folder or not os.path.exists(assay_folder):
             print(f"❌ Assay folder not found at reconstructed path: {reconstructed_folder}")
             print(f"   Also not found at stored path: {assay_folder}")
             return None
@@ -12018,14 +12108,130 @@ class MolDock:
             return None
 
         # Create the path were the database to be analyzed lives
-        db_path = os.path.join(results_dir, f"assay_{assay_id}.db")
+        return os.path.join(results_dir, f"assay_{assay_id}.db")
 
-        ## Evaluate the docking engine in order to use the corresponding pose extraction method
-        if docking_engine == "AutoDockGPU":
+    def _run_pose_extractor(self, assay_info, db_path, selection=None, score_column=None, overwrite=False):
+        """Evaluate the docking engine in order to use the corresponding pose extraction method."""
+        if self._pose_extraction_engine(assay_info['docking_engine']) == "AutoDockGPU":
             return self._extract_docked_poses_autodockgpu(db_path, selection=selection, score_column=score_column, overwrite=overwrite)
+        return self._extract_docked_poses_autodockvina(db_path, selection=selection, score_column=score_column, overwrite=overwrite)
 
-        else:
-            return self._extract_docked_poses_autodockvina(db_path, selection=selection, score_column=score_column, overwrite=overwrite)
+    def _extract_docked_poses_from_assays(self, assay_ids, assay_by_id, selection, score_column, overwrite):
+        """
+        Multi-assay branch of extract_docked_poses(): asks every option once (pose selection
+        per engine family, score column, overwrite confirmation), then extracts the assays
+        one after another. Returns {assay_id: output directory or None}.
+        """
+        ## Assays whose results database can be read; the rest are reported and skipped
+        db_paths = {}
+        for assay_id in assay_ids:
+            db_path = self._pose_extraction_results_db(assay_by_id[assay_id])
+            if db_path is None:
+                print(f"⚠️  Assay {assay_id} skipped.")
+                continue
+            if not os.path.isfile(db_path):
+                print(f"⚠️  Assay {assay_id} skipped: results database not found ({db_path}); "
+                      f"has docking been run for this assay?")
+                continue
+            db_paths[assay_id] = db_path
+        if not db_paths:
+            print("❌ None of the selected assays can be processed.")
+            return None
+
+        ## Pose selection, asked once per engine family present among the assays
+        engine_by_assay = {aid: self._pose_extraction_engine(assay_by_id[aid]['docking_engine']) for aid in db_paths}
+        selection_by_assay = {}
+        for engine in dict.fromkeys(engine_by_assay.values()):
+            ids = [aid for aid, e in engine_by_assay.items() if e == engine]
+            options = self._POSE_EXTRACTION_OPTIONS[engine]
+            if selection is None:
+                print(f"\n🔎 Pose selection for {engine} assay(s) {', '.join(map(str, ids))}:")
+                engine_selection = self._prompt_pose_extraction_selection(engine)
+            elif selection in options:
+                engine_selection = selection
+            else:
+                print(f"⚠️  Assay(s) {', '.join(map(str, ids))} skipped: selection '{selection}' is not valid "
+                      f"for {engine} (choose {', '.join(options)}).")
+                continue
+            selection_by_assay.update({aid: engine_selection for aid in ids})
+        if not selection_by_assay:
+            return None
+        # Back to selection order (the prompts above are grouped by engine)
+        selection_by_assay = {aid: selection_by_assay[aid] for aid in db_paths if aid in selection_by_assay}
+
+        ## Lowest-energy criterion, asked once for every assay whose selection uses it
+        score_by_assay = {}
+        scored_ids = [aid for aid, sel in selection_by_assay.items()
+                      if self._POSE_EXTRACTION_OPTIONS[engine_by_assay[aid]][sel][2]]
+        if scored_ids:
+            available = {}
+            for aid in scored_ids:
+                try:
+                    conn = sqlite3.connect(db_paths[aid])
+                    try:
+                        available[aid] = self._available_score_columns(conn)
+                    finally:
+                        conn.close()
+                except sqlite3.Error as e:
+                    print(f"⚠️  Assay {aid} skipped: could not read {db_paths[aid]}: {e}")
+                    del selection_by_assay[aid]
+            all_columns = [col for col in ('docking_score', 'mmgbsa_total_energy', 'mmgbsa_gas_energy')
+                           if any(col in cols for cols in available.values())]
+            chosen = score_column or self._prompt_score_column_from_candidates(all_columns, "the selected assays")
+            for aid, cols in available.items():
+                if chosen in cols or chosen == 'docking_score':
+                    score_by_assay[aid] = chosen
+                else:
+                    print(f"⚠️  Assay {aid} has no '{chosen}' values; using docking_score for it.")
+                    score_by_assay[aid] = 'docking_score'
+
+        ## Previous extractions: confirmed once for all assays (declined ones are skipped)
+        output_dirs = {
+            aid: os.path.join(os.path.dirname(os.path.abspath(db_paths[aid])),
+                              self._POSE_EXTRACTION_OPTIONS[engine_by_assay[aid]][sel][1])
+            for aid, sel in selection_by_assay.items()
+        }
+        existing = [aid for aid, d in output_dirs.items() if os.path.isdir(d) and os.listdir(d)]
+        if existing and not overwrite:
+            print(f"\n⚠️  A previous extraction already exists for assay(s) {', '.join(map(str, existing))}:")
+            for aid in existing:
+                print(f"   {output_dirs[aid]}")
+            ## No terminal to confirm (e.g. GUI process): never delete without an explicit overwrite=True
+            if not sys.stdin.isatty():
+                print("❌ Non-interactive session — re-run with the 'overwrite' option enabled to replace them.")
+                answer = 'n'
+            else:
+                try:
+                    answer = input("Delete them and re-extract? [y/N]: ").strip().lower()
+                except (KeyboardInterrupt, EOFError):
+                    print("\n❌ Operation cancelled.")
+                    return None
+            if answer == 'y':
+                overwrite = True
+            else:
+                print(f"⏭  Skipping assay(s) {', '.join(map(str, existing))}.")
+                for aid in existing:
+                    del selection_by_assay[aid]
+
+        results = {}
+        for i, (aid, sel) in enumerate(selection_by_assay.items(), 1):
+            print(f"\n{'#' * 70}\n# [{i}/{len(selection_by_assay)}] Assay {aid}\n{'#' * 70}")
+            try:
+                results[aid] = self._run_pose_extractor(assay_by_id[aid], db_paths[aid], selection=sel,
+                                                        score_column=score_by_assay.get(aid), overwrite=overwrite)
+            except Exception as e:
+                print(f"❌ Pose extraction failed for assay {aid}: {e}")
+                results[aid] = None
+
+        print("\n📦 Pose extraction summary:")
+        for aid in assay_ids:
+            if results.get(aid):
+                print(f"   ✅ Assay {aid}: {results[aid]}")
+            elif aid in results:
+                print(f"   ❌ Assay {aid}: extraction failed")
+            else:
+                print(f"   ⏭  Assay {aid}: skipped")
+        return {aid: results.get(aid) for aid in assay_ids}
 
     def _extract_docked_poses_autodockgpu(self, db_path, selection=None, score_column=None, overwrite=False):
         ## Start the analysis
@@ -12033,17 +12239,7 @@ class MolDock:
         print("")
 
         if selection is None:
-            print("Select an option:")
-            print("1 - Select lowest energy poses")
-            print("2 - Select most populated poses")
-            print("3 - Select most lowest energy AND populated poses (both criteria)")
-            print("4 - Select ALL poses")
-            selection = input("Enter your choice (1, 2, 3, or 4): ").strip()
-
-            ## Prompt the user which selection to make
-            while selection not in ("1", "2", "3", "4"):
-                print("Invalid selection. Only 1, 2, 3, or 4 can be selected.")
-                selection = input("Enter your choice (1, 2, 3, or 4): ").strip()
+            selection = self._prompt_pose_extraction_selection("AutoDockGPU")
 
         if selection not in ("1", "2", "3", "4"):
             print(f"❌ Invalid selection '{selection}' for AutoDockGPU. Choose 1, 2, 3, or 4.")
@@ -12106,15 +12302,7 @@ class MolDock:
         print("")
 
         if selection is None:
-            print("Select an option:")
-            print("1 - Extract lowest energy pose")
-            print("2 - Extract all poses")
-            selection = input("Enter your choice (1 or 2): ").strip()
-
-            ## Prompt the user which selection to make
-            while selection not in ("1", "2"):
-                print("Invalid selection. Only 1 or 2 can be selected.")
-                selection = input("Enter your choice (1 or 2): ").strip()
+            selection = self._prompt_pose_extraction_selection("Vina")
 
         if selection not in ("1", "2"):
             print(f"❌ Invalid selection '{selection}' for AutoDock Vina. Choose 1 or 2.")
@@ -12232,8 +12420,15 @@ class MolDock:
 
         Returns the chosen column name as a string.
         """
-        import sqlite3
+        return self._prompt_score_column_from_candidates(self._available_score_columns(conn), "this assay")
 
+    @staticmethod
+    def _available_score_columns(conn) -> List[str]:
+        """
+        Scoring columns of the Results table (in conn) holding at least one valid
+        (non-NULL, non -1) value, in priority order: docking_score,
+        mmgbsa_total_energy, mmgbsa_gas_energy.
+        """
         cursor = conn.cursor()
         cursor.execute("PRAGMA table_info(Results)")
         existing = {row[1] for row in cursor.fetchall()}
@@ -12246,7 +12441,15 @@ class MolDock:
                 )
                 if cursor.fetchone()[0] > 0:
                     candidates.append(col)
+        return candidates
 
+    @staticmethod
+    def _prompt_score_column_from_candidates(candidates, scope_label):
+        """
+        Ask which of candidates to use as the 'lowest energy' criterion (no prompt
+        when there are fewer than two). scope_label names where the columns come
+        from in the prompt, e.g. 'this assay' or 'the selected assays'.
+        """
         if len(candidates) <= 1:
             return candidates[0] if candidates else 'docking_score'
 
@@ -12264,7 +12467,7 @@ class MolDock:
             print(f"\nMultiple scoring columns available; defaulting to '{chosen}' (non-interactive session).")
             return chosen
 
-        print("\nMultiple scoring columns are available in this assay:")
+        print(f"\nMultiple scoring columns are available in {scope_label}:")
         for i, col in enumerate(candidates, 1):
             print(f"  {i}. {labels.get(col, col)}")
 
@@ -14124,26 +14327,8 @@ class MolDock:
             if not choice:
                 print("❌ Operation cancelled.")
                 return None
-            if choice == 'all':
-                return list(assay_by_id)
-            selected, not_found = [], []
             try:
-                for part in choice.split(','):
-                    part = part.strip()
-                    if not part:
-                        continue
-                    if '-' in part:
-                        start, end = (int(x) for x in part.split('-', 1))
-                        if start > end:
-                            raise ValueError
-                        candidates = [aid for aid in range(start, end + 1) if aid in assay_by_id]
-                    else:
-                        candidates = [int(part)]
-                    for aid in candidates:
-                        if aid not in assay_by_id:
-                            not_found.append(aid)
-                        elif aid not in selected:
-                            selected.append(aid)
+                selected, not_found = self._parse_assay_ids(choice, assay_by_id)
             except ValueError:
                 print("Please enter numeric assay IDs (e.g. 3, 1,3,5, 1-5) or 'all'.")
                 continue
@@ -14154,6 +14339,36 @@ class MolDock:
                 print("No assay in that selection; choose from the list above.")
                 continue
             return selected
+
+    @staticmethod
+    def _parse_assay_ids(text: str, assay_by_id) -> Tuple[List[int], List[int]]:
+        """
+        Parse an assay ID selection ('3', '1,3,5', '1-5', '1,3-5' or 'all') against
+        assay_by_id. Ranges skip IDs that no longer exist; explicitly named IDs that do
+        not exist are reported. Returns (selected IDs in selection order, missing IDs).
+        Raises ValueError if the text is not a valid selection.
+        """
+        text = text.strip().lower()
+        if text == 'all':
+            return list(assay_by_id), []
+        selected, not_found = [], []
+        for part in text.split(','):
+            part = part.strip()
+            if not part:
+                continue
+            if '-' in part:
+                start, end = (int(x) for x in part.split('-', 1))
+                if start > end:
+                    raise ValueError(f"invalid range '{part}'")
+                candidates = [aid for aid in range(start, end + 1) if aid in assay_by_id]
+            else:
+                candidates = [int(part)]
+            for aid in candidates:
+                if aid not in assay_by_id:
+                    not_found.append(aid)
+                elif aid not in selected:
+                    selected.append(aid)
+        return selected, not_found
 
     def _fingerprints_results_db(self, assay_info) -> str:
         """Path of an assay's docking results database (results/assay_<id>.db)."""
