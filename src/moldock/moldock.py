@@ -15114,13 +15114,19 @@ class MolDock:
         """
         return self._list_queue_jobs('fingerprints', "FINGERPRINTS QUEUE", all_projects)
 
-    def cancel_fingerprints_queue_job(self, queue_id: Optional[Union[int, List[int]]] = None) -> bool:
+    def cancel_fingerprints_queue_job(self, queue_id: Optional[Union[int, List[int]]] = None,
+                                      cleanup: Optional[bool] = None) -> bool:
         """
         Cancel one or more fingerprints jobs on the shared queue that have not started
         running yet. queue_id may be a single id or a list of ids; if not given, this
         project's queued fingerprints jobs are listed for interactive selection
-        ('3', '1,3,5', '1-5', 'all'). Returns True only if every selected job was
-        cancelled. A cancelled job can be re-queued with requeue_fingerprints_queue_job().
+        ('3', '1,3,5', '1-5', 'all').
+
+        cleanup controls what happens to the never-run jobs: True deletes their job
+        script, pickled choices, log and queue row; False keeps everything (so the job
+        can be re-queued with requeue_fingerprints_queue_job()); None (default) asks the
+        user. The docking assay itself and any fingerprints already stored for it are
+        never touched. Returns True only if every selected job was cancelled.
         """
         from tidyscreen.moldyn import md_queue
 
@@ -15133,17 +15139,74 @@ class MolDock:
         else:
             queue_ids = list(queue_id)
 
+        # Snapshot this project's fingerprints jobs before cancelling: cleanup needs
+        # their script_path
+        project_jobs = {job['queue_id']: job for job in md_queue.list_jobs(self.name)
+                        if job['job_type'] == 'fingerprints'}
+
         n_cancelled = 0
+        cancelled_jobs = []  # this project's fingerprints jobs that were cancelled — cleanup candidates
         for qid in queue_ids:
             success, error = md_queue.cancel_job(qid)
             if success:
                 n_cancelled += 1
                 print(f"✅ Queue job {qid} cancelled.")
+                if qid in project_jobs:
+                    cancelled_jobs.append(project_jobs[qid])
             else:
                 print(f"❌ Could not cancel queue job {qid}: {error}")
         if len(queue_ids) > 1:
             print(f"📊 Cancelled {n_cancelled}/{len(queue_ids)} queue jobs.")
+
+        if cancelled_jobs:
+            if cleanup is None:
+                print(f"\n🧹 The {len(cancelled_jobs)} cancelled fingerprints job(s) never ran. Their job "
+                      f"script, stored choices and queue row can be deleted now (the docking assays are kept).")
+                print("   Keep them if you plan to re-queue with requeue_fingerprints_queue_job().")
+                answer = input("Delete the cancelled jobs? (y/n, default: n): ").strip().lower()
+                cleanup = answer in ('y', 'yes')
+            if cleanup:
+                for job in cancelled_jobs:
+                    self._cleanup_cancelled_fingerprints_job(job)
+            else:
+                print("📁 Cancelled jobs kept on disk and in the queue registry.")
+
         return n_cancelled == len(queue_ids)
+
+    def _cleanup_cancelled_fingerprints_job(self, job: Dict[str, Any]) -> None:
+        """
+        Delete everything a cancelled (never-run) fingerprints queue job left behind:
+        its script (.py), pickled choices (.pkl), log (.log, if any) in the assay's
+        logs/ folder, and its queue row. Only paths inside this project are removed;
+        the docking assay and its results are not touched.
+        """
+        from tidyscreen.moldyn import md_queue
+
+        qid = job['queue_id']
+        print(f"\n🧹 Cleaning up cancelled fingerprints queue job {qid} (assay {job['assay_id']}):")
+        project_root = os.path.realpath(self.path)
+
+        def _inside_project(path: str) -> bool:
+            real = os.path.realpath(path)
+            return real != project_root and real.startswith(project_root + os.sep)
+
+        script_path = self._remap_project_path(job.get('script_path')) if job.get('script_path') else None
+        if script_path:
+            # _enqueue_fingerprints_assays() writes <base>.py, <base>.pkl and <base>.log
+            base = os.path.splitext(script_path)[0]
+            for path in (script_path, base + '.pkl', base + '.log'):
+                if os.path.isfile(path) and _inside_project(path):
+                    try:
+                        os.remove(path)
+                        print(f"   ✓ Removed: {path}")
+                    except OSError as e:
+                        print(f"   ⚠️  Could not remove {path}: {e}")
+
+        success, error = md_queue.delete_job(qid)
+        if success:
+            print(f"   ✓ Queue row {qid} deleted")
+        else:
+            print(f"   ⚠️  Could not delete queue row {qid}: {error}")
 
     def requeue_fingerprints_queue_job(self, queue_id: int) -> bool:
         """
