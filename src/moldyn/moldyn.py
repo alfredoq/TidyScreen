@@ -1831,16 +1831,14 @@ class MolDyn:
         residues) or multiple chains. Empirically verified actual rule for a
         fresh load:
 
-        - Within a single chain, tleap's internal residue index tracks the
-          PDB resSeq value directly: when tleap detects a break in the chain
-          (a resSeq gap), it jumps the internal counter by the same gap so
-          the index keeps matching the literal resSeq for the rest of that
-          chain. Net effect: for the first chain loaded, internal index ==
-          literal resSeq.
-        - At a chain boundary (new chain ID, e.g. separated by a TER record),
-          the internal counter advances by exactly 1 from the previous
-          chain's last index, regardless of the new chain's own resSeq
-          numbering (it does NOT jump to align with it).
+        - The first residue in the file gets index == its literal resSeq
+          (e.g. a file starting at resSeq 11 is addressed from `unit.11`).
+        - Every subsequent residue advances the index by exactly 1, in file
+          order, regardless of resSeq gaps (missing loop residues listed in
+          REMARK 465), TER records or chain ID changes. tleap does NOT jump
+          the counter across a resSeq gap, so after a gap the index no
+          longer matches the literal resSeq (e.g. 5MAE: residues 176-178
+          missing, so CYS A 209 is addressed as `unit.206`).
 
         `target_already_tleap_processed` selects which file the computed
         indices must address (see MolDock._get_tleap_bond_lines() for the
@@ -1867,10 +1865,7 @@ class MolDyn:
         index_by_chain_resnum = {}
         index_by_resnum = {}
         seen_residue = None
-        current_chain = None
-        chain_base_index = 0
-        chain_first_resnum = None
-        tleap_index = 0
+        tleap_index = None
         with open(pdb_path, 'r') as f:
             for line in f:
                 if line.startswith(('ATOM', 'HETATM')):
@@ -1882,15 +1877,10 @@ class MolDyn:
                     res_uid = (chain_id, resnum)
                     if res_uid != seen_residue:
                         seen_residue = res_uid
-                        if target_already_tleap_processed:
-                            tleap_index += 1
-                        elif chain_id != current_chain:
-                            tleap_index = resnum if current_chain is None else tleap_index + 1
-                            current_chain = chain_id
-                            chain_base_index = tleap_index
-                            chain_first_resnum = resnum
+                        if tleap_index is None:
+                            tleap_index = 1 if target_already_tleap_processed else resnum
                         else:
-                            tleap_index = chain_base_index + (resnum - chain_first_resnum)
+                            tleap_index += 1
                         index_by_chain_resnum.setdefault(res_uid, tleap_index)
                         index_by_resnum.setdefault(resnum, tleap_index)
 
