@@ -7,6 +7,7 @@ import sqlite3
 from turtle import pd
 from io import StringIO
 from tidyscreen import tidyscreen
+from tidyscreen.databases import DatabaseManager as dbm
 import sys
 from typing import Dict, List, Tuple, Optional, Any, Union
 from rdkit.Chem import AllChem
@@ -14414,7 +14415,8 @@ class MolDock:
         need the docking results: results DB path, receptor PDB, renumbering dict and,
         for stub (imported) receptors, the tleap template — which may be prompted for
         once and is then persisted (see _get_or_store_receptor_tleap_template()).
-        Returns None if a stub receptor has no tleap template.
+        Returns None if a stub receptor has no tleap template, or if the receptor is a
+        CHARMM36 receptor (fingerprints not supported yet).
         """
         import json
 
@@ -14442,6 +14444,11 @@ class MolDock:
                     is_stub_receptor = True
             except Exception:
                 pass
+
+        if self._get_receptor_force_field(receptor_info.get('receptor_model_name')) == 'charmm36':
+            print(f"❌ Receptor '{receptor_info.get('receptor_model_name')}' is a CHARMM36 receptor: "
+                  f"fingerprints are not supported yet for CHARMM36 receptors.")
+            return None
 
         if is_stub_receptor:
             fps_tleap_config = self._get_or_store_receptor_tleap_template(receptor_info.get('receptor_model_name'))
@@ -18942,6 +18949,80 @@ Example — cyclodextrin receptor:
 """)
         print("=" * 70)
 
+    def _get_receptor_force_field(self, receptor_model_name):
+        """Force field of a receptor model ('amber' for receptors without a stored value)."""
+        receptors_db_path = os.path.join(self.path, 'docking', 'receptors', 'receptors.db')
+        return dbm.get_receptor_force_field(receptors_db_path, receptor_model_name)
+
+    @staticmethod
+    def _pdb_atom_names(pdb_path):
+        """
+        Atom names of a PDB file read from columns 13-16, without a PDB parser: CHARMM residue
+        names such as AGLC spill into the altLoc column, which parsers misread or filter.
+        """
+        names = []
+        with open(pdb_path, 'r') as fh:
+            for line in fh:
+                if line.startswith('ENDMDL'):
+                    break
+                if line.startswith(('ATOM', 'HETATM')):
+                    names.append(line[12:16].strip())
+        return names
+
+    def _validate_charmm36_receptor_inputs(self, psf_path, toppar_files, receptor_pdb):
+        """
+        Check the inputs of a CHARMM36 receptor: the PSF and toppar files exist, the PSF
+        parameters load from the toppar files without missing terms, and receptor_pdb has the
+        same atoms, names and order as the PSF. The PSF/parameter check is cached per
+        (psf, toppar) pair, since an ensemble reuses each PSF for many receptors.
+        Returns a list of error messages (empty if everything is valid).
+        """
+        errors = []
+        if not psf_path or not os.path.isfile(os.path.expanduser(psf_path)):
+            errors.append(f"psf_path not found: {psf_path}")
+        if not isinstance(toppar_files, list) or not toppar_files:
+            errors.append("toppar_files must be a non-empty list")
+            toppar_files = []
+        missing = [p for p in toppar_files if not os.path.isfile(os.path.expanduser(p))]
+        for p in missing:
+            errors.append(f"toppar file not found: {p}")
+        basenames = [os.path.basename(p) for p in toppar_files]
+        if len(set(basenames)) != len(basenames):
+            errors.append("toppar_files contain repeated file names")
+        if not receptor_pdb or not os.path.isfile(os.path.expanduser(receptor_pdb)):
+            errors.append(f"receptor PDB not found: {receptor_pdb} (required for CHARMM36 receptors)")
+        if errors:
+            return errors
+
+        psf_path = os.path.abspath(os.path.expanduser(psf_path))
+        toppar_files = [os.path.abspath(os.path.expanduser(p)) for p in toppar_files]
+        cache = self.__dict__.setdefault('_charmm36_psf_check_cache', {})
+        key = (psf_path, tuple(toppar_files))
+        if key not in cache:
+            try:
+                from parmed.charmm import CharmmParameterSet, CharmmPsfFile
+                psf = CharmmPsfFile(psf_path)
+                psf_names = [a.name for a in psf.atoms]
+                psf.load_parameters(CharmmParameterSet(*toppar_files))  # raises on a missing parameter
+                cache[key] = (psf_names, None)
+            except ImportError:
+                return ["ParmEd is required to validate CHARMM36 receptors"]
+            except Exception as ex:
+                cache[key] = (None, f"PSF/toppar check failed: {type(ex).__name__}: {ex}")
+        psf_names, psf_error = cache[key]
+        if psf_error:
+            return [psf_error]
+
+        pdb_names = self._pdb_atom_names(os.path.expanduser(receptor_pdb))
+        if len(pdb_names) != len(psf_names):
+            errors.append(f"receptor PDB has {len(pdb_names)} atoms, PSF has {len(psf_names)}")
+        else:
+            diff = next((i for i, (a, b) in enumerate(zip(pdb_names, psf_names)) if a != b), None)
+            if diff is not None:
+                errors.append(f"atom {diff + 1} is '{pdb_names[diff]}' in the receptor PDB "
+                              f"but '{psf_names[diff]}' in the PSF")
+        return errors
+
     def _get_or_store_receptor_tleap_template(self, receptor_model_name):
         """
         Return the tleap_config dict (template + custom param files) for a stub
@@ -18952,9 +19033,18 @@ Example — cyclodextrin receptor:
         The stored template is shared between compute_fingerprints() (solvation
         commands are stripped automatically) and perform_md_assay() (solvation
         commands are kept).
+
+        CHARMM36 receptors have no tleap template: raises NotImplementedError without
+        prompting or writing anything (callers are expected to check the force field first).
         """
         import sqlite3
         import json
+
+        if self._get_receptor_force_field(receptor_model_name) == 'charmm36':
+            raise NotImplementedError(
+                f"Receptor '{receptor_model_name}' is a CHARMM36 receptor: it has no tleap "
+                f"template, and fingerprints/MD are not supported yet for CHARMM36 receptors."
+            )
 
         receptors_db_path = os.path.join(self.path, 'docking', 'receptors', 'receptors.db')
 
@@ -19043,7 +19133,8 @@ Example — cyclodextrin receptor:
     def import_receptor_model(self, input_folder_path=None, receptor_model_name=None,
                               charge_model='gasteiger', notes=None, receptor_pdb=None,
                               setup_tleap_template=None, tleap_template_path=None,
-                              custom_parameter_files=None, non_interactive=False):
+                              custom_parameter_files=None, non_interactive=False,
+                              force_field='amber', psf_path=None, toppar_files=None):
         """
         Import a precomputed receptor model (PDBQT + grid files) directly into the project.
 
@@ -19075,6 +19166,16 @@ Example — cyclodextrin receptor:
                 the template. When given (even empty), the custom-file prompt is skipped.
             non_interactive (bool): Never call input(); ambiguous situations are treated
                 as errors (used by import_receptor_models_in_batch()).
+            force_field (str): Force field of the receptor topology: 'amber' (built with
+                tleap, e.g. GLYCAM06 or ff14SB; alias 'glycam06') or 'charmm36'.
+            psf_path (str, optional): CHARMM36 only — PSF of the receptor (no water), with
+                the same atoms, names and order as receptor_pdb. Required for 'charmm36'.
+            toppar_files (list[str], optional): CHARMM36 only — topology/parameter files
+                (.rtf/.prm/.str) for the PSF. Required for 'charmm36'.
+
+        CHARMM36 receptors store the PSF as processed/receptor_dry.psf and the toppar files in
+        processed/toppar/ (paths relative to processed/ in receptor_models.charmm_config). They
+        take no tleap template; receptor_checked.pdb is used only for its coordinates.
 
         Returns:
             int or None: The new receptor model ID on success, None on failure.
@@ -19197,6 +19298,11 @@ Example — cyclodextrin receptor:
                 notes TEXT
             )
         """)
+        for col in ('force_field', 'charmm_config'):
+            try:
+                cur_r.execute(f"ALTER TABLE receptor_models ADD COLUMN {col} TEXT")
+            except sqlite3.OperationalError:
+                pass  # column already exists
         conn_r.commit()
         cur_r.execute("SELECT COUNT(*) FROM receptor_models WHERE receptor_model_name = ?",
                       (receptor_model_name,))
@@ -19205,6 +19311,25 @@ Example — cyclodextrin receptor:
             conn_r.close()
             return None
         conn_r.close()
+
+        # --- Force field: CHARMM36 receptors carry a PSF + toppar files, not a tleap template ---
+        requested_force_field = force_field
+        force_field = dbm.normalize_receptor_force_field(force_field)
+        if force_field is None:
+            print(f"  Error: unknown force_field {requested_force_field!r} "
+                  f"(expected one of {list(dbm.RECEPTOR_FORCE_FIELDS)}).")
+            return None
+        if force_field == 'charmm36':
+            if tleap_template_path or setup_tleap_template:
+                print("  Error: CHARMM36 receptors do not use a tleap template "
+                      "(remove tleap_template_path / setup_tleap_template).")
+                return None
+            charmm_errors = self._validate_charmm36_receptor_inputs(psf_path, toppar_files, pdb_src)
+            if charmm_errors:
+                print("  Validation errors for the CHARMM36 receptor:")
+                for err in charmm_errors:
+                    print(f"    - {err}")
+                return None
 
         # --- Step 2: Parse box parameters from .gpf (preferred) or .map header (fallback) ---
         if gpf_src is not None:
@@ -19238,6 +19363,23 @@ Example — cyclodextrin receptor:
         if pdb_src is not None:
             shutil.copy2(pdb_src, checked_pdb_dest)
             print(f"  Copied receptor PDB: {checked_pdb_dest}")
+
+        # CHARMM36: the topology comes from the PSF; receptor_checked.pdb only gives coordinates
+        # (its residue names, e.g. AGLC, spill into the altLoc column).
+        charmm_config = None
+        if force_field == 'charmm36':
+            psf_dest = os.path.join(processed_folder, 'receptor_dry.psf')
+            shutil.copy2(os.path.expanduser(psf_path), psf_dest)
+            toppar_dest = os.path.join(processed_folder, 'toppar')
+            os.makedirs(toppar_dest, exist_ok=True)
+            for p in toppar_files:
+                shutil.copy2(os.path.expanduser(p), os.path.join(toppar_dest, os.path.basename(p)))
+            charmm_config = {
+                'psf_file': 'receptor_dry.psf',
+                'toppar_files': [os.path.join('toppar', os.path.basename(p)) for p in toppar_files],
+            }
+            print(f"  Copied PSF: {psf_dest}")
+            print(f"  Copied {len(toppar_files)} toppar file(s) to: {toppar_dest}")
 
         # --- Step 4: Create stub pdb_model record ---
         stub_name = f"stub_{receptor_model_name}"
@@ -19327,8 +19469,8 @@ Example — cyclodextrin receptor:
         cur_r.execute('''
             INSERT INTO receptor_models
                 (pdb_id, receptor_model_name, template_name, pdb_model_name,
-                 pdb_to_convert, pdbqt_file, configs, notes)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 pdb_to_convert, pdbqt_file, configs, notes, force_field, charmm_config)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             stub_pdb_id,
             receptor_model_name,
@@ -19337,7 +19479,9 @@ Example — cyclodextrin receptor:
             pdbqt_dest,
             pdbqt_dest,
             '{}',
-            resolved_notes
+            resolved_notes,
+            force_field,
+            json.dumps(charmm_config) if charmm_config else None
         ))
         new_id = cur_r.lastrowid
         conn_r.commit()
@@ -19389,110 +19533,116 @@ Example — cyclodextrin receptor:
         conn_r.close()
 
         # --- Step 9: Collect tleap template (shared by fingerprints and MD) ---
-        print(f"\n{'=' * 70}")
-        print("TLEAP TEMPLATE SETUP")
-        print(f"{'=' * 70}")
-        print("A tleap template is needed for compute_fingerprints() (MMGBSA/ProLIF)")
-        print("and for perform_md_assay() when using this imported receptor.")
-        print("Providing it now avoids prompts during later analyses.")
-        print("Solvation commands in the template are stripped automatically for")
-        print("fingerprints/MMGBSA and kept intact for molecular dynamics.")
-        print()
-        if setup_tleap_template is None and tleap_template_path:
-            setup_tleap_template = True
-        if setup_tleap_template is None:
-            if non_interactive:
-                setup_tleap_template = False
-            else:
-                setup_now = input("Set up tleap template now? (yes/skip) [yes]: ").strip().lower()
-                setup_tleap_template = setup_now not in ('skip', 'no', 'n')
-        if setup_tleap_template and non_interactive and not tleap_template_path:
-            print("⚠️  setup_tleap_template is set but no tleap_template_path given — template skipped.")
-            setup_tleap_template = False
-        if not setup_tleap_template:
-            print("⚠️  Template skipped — will be requested on first use.")
-        if setup_tleap_template:
-            template_content = None
-            if tleap_template_path:
-                tpath = os.path.abspath(os.path.expanduser(tleap_template_path))
-                if not os.path.isfile(tpath):
-                    print(f"❌ tleap template not found: {tpath} — template skipped.")
+        if force_field == 'charmm36':
+            print("\n  CHARMM36 receptor: topology stored as PSF + toppar files; no tleap template needed.")
+        else:
+            print(f"\n{'=' * 70}")
+            print("TLEAP TEMPLATE SETUP")
+            print(f"{'=' * 70}")
+            print("A tleap template is needed for compute_fingerprints() (MMGBSA/ProLIF)")
+            print("and for perform_md_assay() when using this imported receptor.")
+            print("Providing it now avoids prompts during later analyses.")
+            print("Solvation commands in the template are stripped automatically for")
+            print("fingerprints/MMGBSA and kept intact for molecular dynamics.")
+            print()
+            if setup_tleap_template is None and tleap_template_path:
+                setup_tleap_template = True
+            if setup_tleap_template is None:
+                if non_interactive:
+                    setup_tleap_template = False
                 else:
+                    setup_now = input("Set up tleap template now? (yes/skip) [yes]: ").strip().lower()
+                    setup_tleap_template = setup_now not in ('skip', 'no', 'n')
+            if setup_tleap_template and non_interactive and not tleap_template_path:
+                print("⚠️  setup_tleap_template is set but no tleap_template_path given — template skipped.")
+                setup_tleap_template = False
+            if not setup_tleap_template:
+                print("⚠️  Template skipped — will be requested on first use.")
+            if setup_tleap_template:
+                template_content = None
+                if tleap_template_path:
+                    tpath = os.path.abspath(os.path.expanduser(tleap_template_path))
+                    if not os.path.isfile(tpath):
+                        print(f"❌ tleap template not found: {tpath} — template skipped.")
+                    else:
+                        with open(tpath, 'r') as fh:
+                            template_content = fh.read()
+                        n_lines = len(template_content.splitlines())
+                        print(f"✅ Template loaded: {os.path.basename(tpath)} ({n_lines} lines)")
+                else:
+                    self._show_tleap_template_guide_for_fps()
+                while not tleap_template_path:
+                    tpath = self._prompt("\n📂 Path to tleap template file (or 'skip'): ")
+                    if tpath.lower() in ('skip', ''):
+                        print("⚠️  Template skipped — will be requested on first use.")
+                        break
+                    tpath = os.path.expanduser(tpath)
+                    if not os.path.isfile(tpath):
+                        print(f"❌ File not found: {tpath}")
+                        continue
                     with open(tpath, 'r') as fh:
                         template_content = fh.read()
                     n_lines = len(template_content.splitlines())
                     print(f"✅ Template loaded: {os.path.basename(tpath)} ({n_lines} lines)")
-            else:
-                self._show_tleap_template_guide_for_fps()
-            while not tleap_template_path:
-                tpath = self._prompt("\n📂 Path to tleap template file (or 'skip'): ")
-                if tpath.lower() in ('skip', ''):
-                    print("⚠️  Template skipped — will be requested on first use.")
                     break
-                tpath = os.path.expanduser(tpath)
-                if not os.path.isfile(tpath):
-                    print(f"❌ File not found: {tpath}")
-                    continue
-                with open(tpath, 'r') as fh:
-                    template_content = fh.read()
-                n_lines = len(template_content.splitlines())
-                print(f"✅ Template loaded: {os.path.basename(tpath)} ({n_lines} lines)")
-                break
 
-            if template_content is not None and custom_parameter_files is not None:
-                attached = []
-                for raw in custom_parameter_files:
-                    raw = os.path.abspath(os.path.expanduser(raw))
-                    if not os.path.isfile(raw):
-                        print(f"  ❌ Custom parameter file not found: {raw}")
-                        print("  Aborting tleap template storage — the receptor model was imported without it.")
-                        template_content = None
-                        break
-                    with open(raw, 'r') as fh:
-                        attached.append({'filename': os.path.basename(raw), 'content': fh.read()})
-                    print(f"  ✓ Attached: {os.path.basename(raw)}")
-                custom_parameter_files = attached
-            elif template_content is not None:
-                print("\nAttach any custom .lib or .frcmod files required by the template.")
-                print("Enter 'done' when finished.")
-                custom_parameter_files = []
-                while True:
-                    raw = input("  Path to custom file (or 'done'): ").strip()
-                    if raw.lower() in ('done', ''):
-                        break
-                    raw = os.path.expanduser(raw)
-                    if not os.path.isfile(raw):
-                        print(f"  ❌ File not found: {raw}")
-                        continue
-                    with open(raw, 'r') as fh:
-                        content = fh.read()
-                    filename = os.path.basename(raw)
-                    custom_parameter_files.append({'filename': filename, 'content': content})
-                    print(f"  ✓ Attached: {filename}")
+                if template_content is not None and custom_parameter_files is not None:
+                    attached = []
+                    for raw in custom_parameter_files:
+                        raw = os.path.abspath(os.path.expanduser(raw))
+                        if not os.path.isfile(raw):
+                            print(f"  ❌ Custom parameter file not found: {raw}")
+                            print("  Aborting tleap template storage — the receptor model was imported without it.")
+                            template_content = None
+                            break
+                        with open(raw, 'r') as fh:
+                            attached.append({'filename': os.path.basename(raw), 'content': fh.read()})
+                        print(f"  ✓ Attached: {os.path.basename(raw)}")
+                    custom_parameter_files = attached
+                elif template_content is not None:
+                    print("\nAttach any custom .lib or .frcmod files required by the template.")
+                    print("Enter 'done' when finished.")
+                    custom_parameter_files = []
+                    while True:
+                        raw = input("  Path to custom file (or 'done'): ").strip()
+                        if raw.lower() in ('done', ''):
+                            break
+                        raw = os.path.expanduser(raw)
+                        if not os.path.isfile(raw):
+                            print(f"  ❌ File not found: {raw}")
+                            continue
+                        with open(raw, 'r') as fh:
+                            content = fh.read()
+                        filename = os.path.basename(raw)
+                        custom_parameter_files.append({'filename': filename, 'content': content})
+                        print(f"  ✓ Attached: {filename}")
 
-            if template_content is not None:
-                tleap_config_to_store = {
-                    'template_content': template_content,
-                    'custom_parameter_files': custom_parameter_files,
-                }
-                conn_r = sqlite3.connect(receptors_db_path)
-                cur_r = conn_r.cursor()
-                try:
-                    cur_r.execute("ALTER TABLE receptor_models ADD COLUMN tleap_config TEXT")
-                except sqlite3.OperationalError:
-                    pass
-                cur_r.execute(
-                    "UPDATE receptor_models SET tleap_config = ? WHERE id = ?",
-                    (json.dumps(tleap_config_to_store), new_id)
-                )
-                conn_r.commit()
-                conn_r.close()
-                print(f"✅ tleap template stored — will not be requested again.")
+                if template_content is not None:
+                    tleap_config_to_store = {
+                        'template_content': template_content,
+                        'custom_parameter_files': custom_parameter_files,
+                    }
+                    conn_r = sqlite3.connect(receptors_db_path)
+                    cur_r = conn_r.cursor()
+                    try:
+                        cur_r.execute("ALTER TABLE receptor_models ADD COLUMN tleap_config TEXT")
+                    except sqlite3.OperationalError:
+                        pass
+                    cur_r.execute(
+                        "UPDATE receptor_models SET tleap_config = ? WHERE id = ?",
+                        (json.dumps(tleap_config_to_store), new_id)
+                    )
+                    conn_r.commit()
+                    conn_r.close()
+                    print(f"✅ tleap template stored — will not be requested again.")
 
         print(f"\n{'=' * 80}")
         print(f"RECEPTOR MODEL IMPORTED SUCCESSFULLY")
         print(f"{'=' * 80}")
         print(f"  Name:       {receptor_model_name}  (ID: {new_id})")
+        print(f"  Force field: {force_field}")
+        if charmm_config:
+            print(f"  PSF:        {os.path.join(processed_folder, charmm_config['psf_file'])}")
         print(f"  PDBQT:      {pdbqt_dest}")
         print(f"  Grid files: {grids_dest}")
         print(f"  Center:     x={configs['center']['x']}, y={configs['center']['y']}, z={configs['center']['z']}")
@@ -19529,6 +19679,12 @@ Example — cyclodextrin receptor:
         (skip; only allowed when the folder has no single .pdb to auto-detect).
         on_existing: 'skip' (report as skipped) or 'error' (report as failed) when the
         receptor_model_name is already registered.
+
+        CHARMM36 receptors set "force_field": "charmm36" (default 'amber'; 'glycam06' is an
+        alias of 'amber') together with "psf_path" and "toppar_files" (list of .rtf/.prm/.str),
+        and take no tleap template (setup_tleap_template defaults to false for them). The PSF
+        must have the same atoms, names and order as receptor_pdb, and its parameters must load
+        from toppar_files.
 
         Every entry is validated before anything is imported; invalid entries are reported
         and not imported, the rest proceed.
@@ -19567,7 +19723,8 @@ Example — cyclodextrin receptor:
 
         allowed_keys = {'input_folder_path', 'receptor_model_name', 'charge_model', 'notes',
                         'receptor_pdb', 'setup_tleap_template', 'tleap_template_path',
-                        'custom_parameter_files', 'on_existing'}
+                        'custom_parameter_files', 'on_existing',
+                        'force_field', 'psf_path', 'toppar_files'}
 
         # Names already registered in this project
         existing_names = set()
@@ -19617,6 +19774,7 @@ Example — cyclodextrin receptor:
             folder = e.get('input_folder_path')
             folder = os.path.abspath(os.path.expanduser(folder)) if folder else None
             e['input_folder_path'] = folder
+            resolved_pdb = None  # receptor PDB as import_receptor_model() will resolve it
             if not folder or not os.path.isdir(folder):
                 errors.append(f"input_folder_path not found: {folder}")
             else:
@@ -19634,12 +19792,33 @@ Example — cyclodextrin receptor:
                     pdb_path = pdb if os.path.isabs(pdb) else os.path.join(folder, pdb)
                     if not os.path.isfile(os.path.expanduser(pdb_path)):
                         errors.append(f"receptor_pdb not found: {pdb_path}")
+                    else:
+                        resolved_pdb = os.path.expanduser(pdb_path)
                 elif len(pdbs) > 1:
                     errors.append(f"multiple .pdb files {pdbs} and no receptor_pdb given")
                 elif not pdbs:
                     warnings.append("no receptor PDB — fingerprints and MD will fail for this receptor")
+                else:
+                    resolved_pdb = os.path.join(folder, pdbs[0])
 
-            if e.get('setup_tleap_template', bool(e.get('tleap_template_path'))):
+            requested_ff = e.get('force_field')
+            force_field = dbm.normalize_receptor_force_field(requested_ff)
+            if force_field is None:
+                errors.append(f"unknown force_field {requested_ff!r} "
+                              f"(expected one of {list(dbm.RECEPTOR_FORCE_FIELDS)})")
+            e['force_field'] = force_field
+            if force_field == 'charmm36':
+                if e.get('tleap_template_path') or e.get('setup_tleap_template'):
+                    errors.append("CHARMM36 receptors do not use a tleap template "
+                                  "(remove tleap_template_path / setup_tleap_template)")
+                e['setup_tleap_template'] = False
+                if folder and os.path.isdir(folder) and not any('receptor_pdb' in err for err in errors):
+                    errors.extend(self._validate_charmm36_receptor_inputs(
+                        e.get('psf_path'), e.get('toppar_files'), resolved_pdb))
+            elif force_field is not None and (e.get('psf_path') or e.get('toppar_files')):
+                warnings.append("psf_path/toppar_files ignored: they are only used with force_field 'charmm36'")
+
+            if force_field != 'charmm36' and e.get('setup_tleap_template', bool(e.get('tleap_template_path'))):
                 tpath = e.get('tleap_template_path')
                 if not tpath or not os.path.isfile(os.path.expanduser(tpath)):
                     errors.append(f"tleap_template_path not found: {tpath}")
@@ -19697,6 +19876,9 @@ Example — cyclodextrin receptor:
                     tleap_template_path=e.get('tleap_template_path'),
                     custom_parameter_files=e.get('custom_parameter_files'),
                     non_interactive=True,
+                    force_field=e.get('force_field'),
+                    psf_path=e.get('psf_path'),
+                    toppar_files=e.get('toppar_files'),
                 )
             except Exception as ex:
                 new_id = None

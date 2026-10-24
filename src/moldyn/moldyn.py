@@ -1223,6 +1223,22 @@ class MolDyn:
             if docking_assay_params_dict is None:
                 return
 
+            # CHARMM36 receptors have no tleap template and every MD system here is built with
+            # tleap: stop before any pose, ligand file or MD assay folder is prepared.
+            import json as _json
+            _assay_receptor = docking_assay_params_dict.get('receptor_info') or {}
+            if isinstance(_assay_receptor, str):
+                try:
+                    _assay_receptor = _json.loads(_assay_receptor)
+                except Exception:
+                    _assay_receptor = {}
+            _assay_receptor_name = _assay_receptor.get('receptor_model_name')
+            _receptors_db = os.path.join(self.path, 'docking', 'receptors', 'receptors.db')
+            if dbm.get_receptor_force_field(_receptors_db, _assay_receptor_name) == 'charmm36':
+                print(f"❌ Receptor '{_assay_receptor_name}' is a CHARMM36 receptor: "
+                      f"MD assays are not supported yet for CHARMM36 receptors.")
+                return
+
             if procedure == 'guided':
                 # Select unique ligand molecules in the selected docking assay
                 docking_assay_params_dict = self._select_unique_ligands_in_docking_assay(docking_assay_params_dict)

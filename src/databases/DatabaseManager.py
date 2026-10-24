@@ -542,3 +542,43 @@ def insert_data_dinamically_into_table(cursor: sqlite3.Cursor, table_name: str, 
     ).fetchone()[0]
 
     return template_id
+# Force fields a receptor model topology can come from. 'amber' covers every receptor built
+# with tleap (GLYCAM06 carbohydrates, ff14SB proteins); 'charmm36' receptors carry a PSF and
+# CHARMM toppar files instead of a tleap template.
+RECEPTOR_FORCE_FIELDS = ('amber', 'charmm36')
+RECEPTOR_FORCE_FIELD_ALIASES = {'glycam06': 'amber'}
+
+
+def normalize_receptor_force_field(value):
+    """
+    Canonical receptor force field name: None/empty -> 'amber', aliases resolved, case ignored.
+    Returns None if the value is not a known force field.
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return 'amber'
+    if not isinstance(value, str):
+        return None
+    ff = value.strip().lower()
+    ff = RECEPTOR_FORCE_FIELD_ALIASES.get(ff, ff)
+    return ff if ff in RECEPTOR_FORCE_FIELDS else None
+
+
+def get_receptor_force_field(receptors_db_path, receptor_model_name):
+    """
+    Force field of a receptor model, read from receptor_models.force_field. Receptors created
+    before that column existed (missing column, row or value) are 'amber'.
+    """
+    if not receptor_model_name or not os.path.isfile(receptors_db_path):
+        return 'amber'
+    conn = sqlite3.connect(receptors_db_path)
+    try:
+        row = conn.execute(
+            "SELECT force_field FROM receptor_models WHERE receptor_model_name = ?",
+            (receptor_model_name,)
+        ).fetchone()
+    except sqlite3.OperationalError:
+        row = None  # no force_field column yet
+    finally:
+        conn.close()
+    raw = row[0] if row else None
+    return normalize_receptor_force_field(raw) or str(raw).strip().lower()
